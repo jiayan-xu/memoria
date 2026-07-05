@@ -1,0 +1,28 @@
+# Rust
+target/
+
+# Python (for optional PyO3 builds)
+__pycache__/
+*.pyc
+*.egg-info/
+*.pyd
+*.so
+
+# Runtime data
+data/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Logs
+*.log
+
+# OS
+Thumbs.db
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+*.swp

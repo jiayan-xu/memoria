@@ -1,0 +1,355 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+<meta http-equiv="Pragma" content="no-cache">
+<meta http-equiv="Expires" content="0">
+<link rel="icon" href="data:,">
+<title>Memoria · 个人记忆中心</title>
+<style>
+  :root {
+    --bg: #0a0a0f;
+    --surface: #14141f;
+    --surface2: #1a1a2e;
+    --text: #e8e4dd;
+    --text2: #98948c;
+    --accent: #d4a853;
+    --accent2: #b8860b;
+    --line: #2a2a3a;
+    --glow: rgba(212,168,83,0.12);
+  }
+  * { margin:0; padding:0; box-sizing:border-box }
+  body {
+    font-family: "PingFang SC","Microsoft YaHei","Source Han Sans CN",sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    line-height: 1.7;
+    overflow-x: hidden;
+  }
+
+  /* -- Navigation -- */
+  .nav {
+    position: fixed; top:0; left:0; right:0; z-index:100;
+    padding: 16px 40px;
+    display: flex; gap: 32px; align-items: center;
+    background: linear-gradient(180deg, var(--bg) 60%, transparent);
+  }
+  .nav a {
+    color: var(--text2); text-decoration: none; font-size: 14px;
+    transition: color .3s; letter-spacing: .5px;
+  }
+  .nav a:hover, .nav a.active { color: var(--accent) }
+  .nav-logo { font-size: 18px; font-weight:700; color: var(--text); margin-right: auto; letter-spacing: 2px; }
+  .nav-logo span { color: var(--accent) }
+
+  /* -- Hero -- */
+  .hero {
+    min-height: 70vh; display: flex; flex-direction: column;
+    justify-content: center; align-items: center; text-align: center;
+    padding: 120px 40px 80px; position: relative;
+  }
+  .hero::before {
+    content:''; position:absolute; top:20%; left:50%; transform:translate(-50%,-50%);
+    width:600px; height:600px; border-radius:50%;
+    background: radial-gradient(circle, var(--glow) 0%, transparent 70%);
+    pointer-events:none;
+  }
+  .hero-tag {
+    font-size:12px; text-transform:uppercase; letter-spacing:6px;
+    color: var(--accent); margin-bottom: 24px;
+  }
+  .hero h1 {
+    font-size: clamp(48px, 8vw, 96px); font-weight: 200;
+    letter-spacing: -2px; line-height: 1.1; margin-bottom: 24px;
+  }
+  .hero h1 span { color: var(--accent); font-weight: 300 }
+  .hero p {
+    max-width: 560px; font-size: 18px; color: var(--text2); font-weight: 300;
+  }
+  .hero-stats {
+    display: flex; gap: 48px; margin-top: 56px;
+  }
+  .hero-stat {
+    text-align: center;
+  }
+  .hero-stat .num {
+    font-size: 42px; font-weight: 100; color: var(--accent); letter-spacing: -1px;
+    display: block; line-height: 1;
+  }
+  .hero-stat .label {
+    font-size: 12px; color: var(--text2); text-transform: uppercase; letter-spacing: 3px; margin-top: 8px;
+  }
+
+  /* -- Sections -- */
+  .section {
+    max-width: 1000px; margin: 0 auto; padding: 60px 40px;
+  }
+  .section-title {
+    font-size: 13px; text-transform: uppercase; letter-spacing: 5px;
+    color: var(--accent); margin-bottom: 16px;
+  }
+  .section h2 {
+    font-size: 36px; font-weight: 200; letter-spacing: -1px;
+    margin-bottom: 40px;
+  }
+
+  /* -- Philosophy -- */
+  .philosophy-grid {
+    display: grid; grid-template-columns: repeat(3, 1fr); gap: 32px;
+  }
+  .phil-card {
+    background: var(--surface); border: 1px solid var(--line);
+    padding: 32px; border-radius: 2px;
+    transition: border-color .3s, transform .3s;
+  }
+  .phil-card:hover { border-color: var(--accent2); transform: translateY(-2px) }
+  .phil-icon { font-size: 28px; margin-bottom: 16px; }
+  .phil-card h3 { font-size: 18px; font-weight: 500; margin-bottom: 12px; }
+  .phil-card p { font-size: 14px; color: var(--text2); line-height: 1.7; }
+
+  /* -- Timeline -- */
+  .timeline { position: relative; padding-left: 40px; margin-top: 5px; will-change: transform; }
+  .timeline::before {
+    content:''; position:absolute; left:15px; top:0; bottom:0;
+    width: 1px; background: var(--line);
+  }
+  .tl-item {
+    position: relative; margin-bottom: 36px;
+  }
+  .tl-item::before {
+    content:''; position:absolute; left:-29px; top:6px;
+    width:9px; height:9px; border-radius:50%;
+    border: 2px solid var(--accent); background: var(--bg);
+  }
+  .tl-date { font-size: 12px; color: var(--accent); letter-spacing: 2px; margin-bottom: 4px; }
+  .tl-title { font-size: 18px; font-weight: 500; margin-bottom: 6px; }
+  .tl-desc { font-size: 14px; color: var(--text2); }
+
+  /* -- Tech -- */
+  .tech-grid {
+    display: grid; grid-template-columns: repeat(4, 1fr); gap: 20px;
+  }
+  .tech-card {
+    background: var(--surface2); padding: 28px 20px; text-align: center;
+    border-radius: 2px; border: 1px solid transparent; transition: border-color .3s;
+  }
+  .tech-card:hover { border-color: var(--line) }
+  .tech-card .tech-name { font-size: 16px; font-weight: 500; margin-bottom: 4px; }
+  .tech-card .tech-role { font-size: 12px; color: var(--text2); }
+
+  /* -- Quote -- */
+  .quote-section {
+    text-align: center; padding: 80px 40px; position: relative;
+  }
+  .quote-section blockquote {
+    font-size: 24px; font-weight: 200; font-style: italic;
+    max-width: 640px; margin: 0 auto; line-height: 1.6;
+    position: relative;
+  }
+  .quote-section blockquote::before {
+    content: '"'; position: absolute; top: -50px; left: -20px;
+    font-size: 120px; color: var(--accent); opacity: .15; font-style: normal;
+    line-height: 1;
+  }
+
+  /* -- Footer -- */
+  .footer {
+    text-align: center; padding: 60px 40px; border-top: 1px solid var(--line);
+    color: var(--text2); font-size: 13px;
+  }
+  .footer a { color: var(--accent); text-decoration: none; }
+
+  /* -- Responsive -- */
+  @media (max-width:768px) {
+    .philosophy-grid, .tech-grid { grid-template-columns: 1fr }
+    .hero-stats { gap: 24px }
+    .nav { padding: 12px 20px; gap: 16px }
+    .section { padding: 40px 20px }
+  }
+</style>
+</head>
+<body>
+
+<nav class="nav">
+  <div class="nav-logo">MEMO<span>RIA</span></div>
+  <a href="#about" class="active">关于</a>
+  <a href="#section-evolution">演进</a>
+  <a href="#tech">技术</a>
+  <a href="flow.html">架构流程 →</a>
+</nav>
+
+<section class="hero" id="about">
+  <div class="hero-tag">Independent Memory Center</div>
+  <h1>记忆<span>不绑定</span>软件<br>只服务于人</h1>
+  <p>一个跨应用的 AI 长期记忆系统。无论你使用哪个 AI 助手，记忆都在这里，不会丢失。</p>
+  <div class="hero-stats">
+    <div class="hero-stat"><span class="num" id="memCount">加载中...</span><span class="label">记忆条目</span></div>
+    <div class="hero-stat"><span class="num" id="dataSources">加载中...</span><span class="label">数据源</span></div>
+    <div class="hero-stat"><span class="num" id="version">加载中...</span><span class="label">当前版本</span></div>
+    <div class="hero-stat"><span class="num" id="uptime">计算中...</span><span class="label">持续运行</span></div>
+  </div>
+</section>
+
+<section class="section">
+  <div class="section-title">Philosophy</div>
+  <h2>设计理念</h2>
+  <div class="philosophy-grid">
+    <div class="phil-card">
+      <div class="phil-icon">🧠</div>
+      <h3>三层梦境引擎</h3>
+      <p>Light Sleep 每日摘要 → Deep Sleep 记忆衰减 → REM Sleep 跨域关联。模拟人脑记忆加工过程，让 AI 记忆自然沉淀与升华。</p>
+    </div>
+    <div class="phil-card">
+      <div class="phil-icon">🔗</div>
+      <h3>多源桥接</h3>
+      <p>QClaw（微信聊天）、Reasonix（代码开发）、gbrain（知识库）——三路数据自动汇聚，不依赖任何单一 AI 客户端。</p>
+    </div>
+    <div class="phil-card">
+      <div class="phil-icon">📦</div>
+      <h3>数据主权</h3>
+      <p>SQLite 单文件数据库 + 一键备份/恢复。你的记忆永远归你所有，随时可以迁移到任何机器。</p>
+    </div>
+  </div>
+</section>
+
+<section class="section" id="section-evolution" style="padding-top:80px;margin-top:-20px;">
+  <div class="section-title">Evolution</div>
+  <h2>项目演进</h2>
+  <div style="overflow:hidden;max-height:560px;">
+    <div class="timeline" id="timeline-list">
+      <div style="color:var(--text2);font-size:14px;">加载中...</div>
+    </div>
+  </div>
+</section>
+
+<section class="section" id="tech">
+  <div class="section-title">Tech Stack</div>
+  <h2>技术架构</h2>
+  <div class="tech-grid">
+    <div class="tech-card"><div class="tech-name">FastAPI</div><div class="tech-role">Web 框架</div></div>
+    <div class="tech-card"><div class="tech-name">SQLite + FTS5</div><div class="tech-role">结构存储 · 全文检索</div></div>
+    <div class="tech-card"><div class="tech-name">ChromaDB</div><div class="tech-role">向量检索</div></div>
+    <div class="tech-card"><div class="tech-name">vis.js</div><div class="tech-role">图谱可视化</div></div>
+    <div class="tech-card"><div class="tech-name">MCP 协议</div><div class="tech-role">标准化集成接口</div></div>
+    <div class="tech-card"><div class="tech-name">梦境引擎</div><div class="tech-role">自研衰减算法</div></div>
+    <div class="tech-card"><div class="tech-name">Bridge 管道</div><div class="tech-role">多源数据桥接</div></div>
+    <div class="tech-card"><div class="tech-name">Python SDK</div><div class="tech-role">零依赖客户端</div></div>
+  </div>
+</section>
+
+<div class="quote-section">
+  <blockquote>AI Agent 不应该每次醒来都像失忆一样重新认识你。</blockquote>
+</div>
+
+<footer class="footer">
+  <p>Memoria <span id="footerVersion">v1.5</span> · Gitee: <a href="https://gitee.com/xujiayn/memoria">xujiayn/memoria</a> · 个人项目</p>
+</footer>
+
+<script>
+// Animate stats on load
+document.addEventListener('DOMContentLoaded', () => {
+  document.querySelectorAll('.hero-stat .num').forEach(el => {
+    el.style.opacity = '0';
+    el.style.transform = 'translateY(20px)';
+    el.style.transition = 'all .8s cubic-bezier(0.16, 1, 0.3, 1)';
+  });
+  setTimeout(() => {
+    document.querySelectorAll('.hero-stat .num').forEach((el,i) => {
+      setTimeout(() => { el.style.opacity='1'; el.style.transform='translateY(0)' }, i*150)
+    })
+  }, 300);
+  
+  // 动态加载统计数据
+  var xhrStats = new XMLHttpRequest();
+  xhrStats.open('GET', '/stats?namespace=' + encodeURIComponent('常熟浦发2/工程部/固废监管'), true);
+  xhrStats.onload = function() {
+    if (xhrStats.status === 200) {
+      var stats = JSON.parse(xhrStats.responseText);
+      var mc = document.getElementById('memCount');
+      if (mc && stats.memories) {
+        var total = (stats.memories.hot||0) + (stats.memories.warm||0) + (stats.memories.cold||0);
+        mc.textContent = total > 999 ? (total/1000).toFixed(1) + 'K' : total;
+      }
+      var ds = document.getElementById('dataSources');
+      if (ds && stats.source_count !== undefined) ds.textContent = stats.source_count;
+    }
+  };
+  xhrStats.send();
+  
+  var xhrHealth = new XMLHttpRequest();
+  xhrHealth.open('GET', '/health', true);
+  xhrHealth.onload = function() {
+    if (xhrHealth.status === 200) {
+      var health = JSON.parse(xhrHealth.responseText);
+      var v = document.getElementById('version');
+      if (v && health.version) v.textContent = 'v' + health.version;
+      var fv = document.getElementById('footerVersion');
+      if (fv && health.version) fv.textContent = 'v' + health.version;
+      var up = document.getElementById('uptime');
+      if (up && health.cumulative_days) {
+        var days = Math.floor(health.cumulative_days);
+        var hours = Math.round((health.cumulative_days - days) * 24);
+        up.textContent = days + '天' + (hours > 0 ? hours + '时' : '');
+      }
+    }
+  };
+  xhrHealth.send();
+  
+  // 3秒后如果还没加载完成，显示占位符
+  setTimeout(function() {
+    var ids = ['memCount','dataSources','version','uptime'];
+    for (var i = 0; i < ids.length; i++) {
+      var el = document.getElementById(ids[i]);
+      if (el && el.textContent === '加载中...') el.textContent = '--';
+    }
+  }, 3000);
+  // HTML转义函数
+  function esc(s) { var d=document.createElement('div'); d.textContent=s||''; return d.innerHTML; }
+  // 内联演进日志
+  var changelogData = [
+    {"date":"2026-06-16","title":"Web 管理面板 v1 + 数据流监控","desc":"上线 Memoria Web 面板，搜索/浏览/图谱/设置四个标签页，vis-network 图谱可视化，数据流监控页面"},
+    {"date":"2026-06-15","title":"多信号融合搜索 v2","desc":"RRF 5路信号融合 (Keyword+Semantic+Temporal+Importance+Category)，查询意图分类，多跳关系扩展 2-3 hop"},
+    {"date":"2026-06-14","title":"记忆关系图谱构建","desc":"same_entity/chronological/semantic_related 三类型关系边，批量构建，vis-network 渲染"},
+    {"date":"2026-06-13","title":"Agent Gateway 桥接集成","desc":"Memoria ↔ A2A Bridge ↔ Reasonix/OpenClaw/Hermes Agent 链路打通，20+ MCP 工具注册"},
+    {"date":"2026-06-12","title":"梦境消化系统 v1","desc":"Light→Deep→REM 三层消化周期，自动提取记忆，断点续传，去重入库"},
+    {"date":"2026-06-11","title":"衰减管理系统","desc":"score = recall_count × decay_factor × (importance/3)，Hot→Warm→Cold 自动降级"},
+    {"date":"2026-06-10","title":"中文嵌入 + 多命名空间","desc":"text2vec-base-chinese 替换默认英文模型，768维嵌入，命名空间隔离"},
+    {"date":"2026-06-09","title":"Memoria v1 初始版本","desc":"SQLite+FTS5+ChromaDB 三层架构，MCP 协议，6 个初始工具，gbrain 桥接"}
+  ];
+  (function(entries) {
+    const tl = document.getElementById('timeline-list');
+    if (!tl || !entries?.length) return;
+    let html = '';
+    // 复制多份用于循环滚动
+    const triple = [...entries, ...entries, ...entries];
+    triple.forEach((e, i) => {
+      const dateStr = e.date.replace(/-/g, '.');
+      html += `<div class="tl-item">
+        <div class="tl-date">${dateStr}</div>
+        <div class="tl-title">${esc(e.title)}</div>
+        <div class="tl-desc">${esc(e.desc)}</div>
+      </div>`;
+    });
+    tl.innerHTML = html;
+    // 循环滚动：每30ms移动0.8px
+    var offset = 0, paused = false;
+    var itemH = 140, maxH = entries.length * itemH;
+    var wrapper = tl.parentElement;
+    wrapper.style.overflow = 'hidden';
+    wrapper.style.maxHeight = itemH * 4 + 'px';
+    wrapper.onmouseenter = function() { paused = true; };
+    wrapper.onmouseleave = function() { paused = false; };
+    setInterval(function() {
+      if (paused) return;
+      offset += 0.8;
+      if (offset >= maxH) offset = 0;
+      tl.style.transform = 'translateY(-' + offset + 'px)';
+    }, 30);
+  })(changelogData);
+})
+</script>
+
+</body>
+</html>

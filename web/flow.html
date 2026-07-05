@@ -1,0 +1,392 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Memoria · 架构流程</title>
+<style>
+  :root {
+    --bg: #0a0a0f;
+    --surface: #14141f;
+    --text: #e8e4dd;
+    --text2: #98948c;
+    --accent: #d4a853;
+    --accent2: #b8860b;
+    --blue: #5b9bd5;
+    --green: #6baf6b;
+    --purple: #9b7ec4;
+    --line: #2a2a3a;
+    --node-bg: #1a1a2e;
+  }
+  * { margin:0; padding:0; box-sizing:border-box }
+  body {
+    font-family: "PingFang SC","Microsoft YaHei","Source Han Sans CN",sans-serif;
+    background: var(--bg); color: var(--text); overflow-x: hidden;
+  }
+
+  /* Nav */
+  .nav {
+    position: fixed; top:0; left:0; right:0; z-index:100;
+    padding: 16px 40px; display: flex; gap: 32px; align-items: center;
+    background: linear-gradient(180deg, var(--bg) 60%, transparent);
+  }
+  .nav a { color: var(--text2); text-decoration: none; font-size: 14px; transition: color .3s; }
+  .nav a:hover, .nav a.active { color: var(--accent) }
+  .nav-logo { font-size: 18px; font-weight:700; color: var(--text); margin-right: auto; letter-spacing: 2px; }
+  .nav-logo span { color: var(--accent) }
+
+  /* Main layout */
+  .main {
+    padding: 100px 60px 60px; min-height: 100vh;
+  }
+  .header {
+    text-align: center; margin-bottom: 48px;
+  }
+  .header .tag { font-size: 12px; letter-spacing: 5px; color: var(--accent); text-transform: uppercase; margin-bottom: 12px; }
+  .header h1 { font-size: 42px; font-weight: 200; letter-spacing: -1px; }
+  .header p { color: var(--text2); margin-top: 8px; font-size: 15px; }
+
+  /* Flow diagram */
+  .flow-container {
+    position: relative; max-width: 1200px; margin: 0 auto;
+  }
+
+  /* Layers */
+  .flow-layer {
+    margin-bottom: 60px; position: relative;
+  }
+  .layer-label {
+    position: absolute; left: -80px; top: 50%; transform: translateY(-50%) rotate(-90deg);
+    font-size: 11px; letter-spacing: 4px; color: var(--text2); text-transform: uppercase;
+    white-space: nowrap;
+  }
+  .layer-nodes {
+    display: flex; justify-content: center; gap: 32px; flex-wrap: wrap;
+  }
+
+  /* Nodes */
+  .node {
+    background: var(--node-bg); border: 1px solid var(--line);
+    border-radius: 4px; padding: 24px 28px; min-width: 180px;
+    text-align: center; cursor: pointer; position: relative;
+    transition: all .4s cubic-bezier(0.16, 1, 0.3, 1);
+  }
+  .node:hover {
+    border-color: var(--accent);
+    transform: translateY(-4px);
+    box-shadow: 0 12px 40px rgba(0,0,0,.3), 0 0 60px var(--glow, rgba(212,168,83,.05));
+  }
+  .node.source { --glow: rgba(91,155,213,.08); border-top: 2px solid var(--blue) }
+  .node.source:hover { border-color: var(--blue); --glow: rgba(91,155,213,.12) }
+  .node.core { --glow: rgba(212,168,83,.08); border-top: 2px solid var(--accent) }
+  .node.core:hover { border-color: var(--accent) }
+  .node.output { --glow: rgba(107,175,107,.08); border-top: 2px solid var(--green) }
+  .node.output:hover { border-color: var(--green); --glow: rgba(107,175,107,.12) }
+  .node .icon { font-size: 32px; margin-bottom: 12px; display: block; }
+  .node .title { font-size: 16px; font-weight: 500; margin-bottom: 6px; }
+  .node .sub { font-size: 12px; color: var(--text2); line-height: 1.5; }
+
+  /* Arrows between layers */
+  .layer-arrows {
+    display: flex; justify-content: center; padding: 16px 0; position: relative;
+    height: 50px;
+  }
+  .arrow-group {
+    display: flex; flex-direction: column; align-items: center; gap: 4px;
+  }
+  .arrow-line {
+    width: 1px; height: 28px; background: var(--line); position: relative;
+  }
+  .arrow-line::after {
+    content:''; position:absolute; bottom:-4px; left:50%; transform:translateX(-50%);
+    width:0; height:0; border-left:5px solid transparent; border-right:5px solid transparent;
+    border-top:6px solid var(--line);
+  }
+  .arrow-label {
+    font-size: 10px; color: var(--text2); letter-spacing: 2px;
+  }
+
+  /* Expanded detail panel */
+  .detail-panel {
+    display: none; background: var(--surface); border: 1px solid var(--line);
+    border-radius: 4px; padding: 24px; margin-top: 24px; max-width: 700px;
+    margin-left: auto; margin-right: auto;
+    animation: slideDown .4s cubic-bezier(0.16, 1, 0.3, 1);
+  }
+  .detail-panel.active { display: block; }
+  .detail-panel h3 { font-size: 20px; font-weight: 500; margin-bottom: 12px; }
+  .detail-panel .meta { font-size: 12px; color: var(--accent); letter-spacing: 2px; margin-bottom: 16px; }
+  .detail-panel p { font-size: 14px; color: var(--text2); line-height: 1.8; }
+  .detail-panel .tags { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 16px; }
+  .detail-panel .tag-item {
+    font-size: 11px; padding: 3px 10px; border: 1px solid var(--line);
+    border-radius: 12px; color: var(--text2);
+  }
+
+  /* Pipeline visualization */
+  .pipeline {
+    display: flex; align-items: center; gap: 0; margin: 40px auto;
+    max-width: 900px; justify-content: center;
+  }
+  .pipe-step {
+    background: var(--node-bg); border: 1px solid var(--line);
+    padding: 16px 20px; text-align: center; font-size: 13px;
+    position: relative; min-width: 100px;
+  }
+  .pipe-step::after {
+    content:'→'; position:absolute; right:-22px; top:50%; transform:translateY(-50%);
+    color: var(--accent); font-size: 18px;
+  }
+  .pipe-step:last-child::after { display: none }
+  .pipe-step .step-num {
+    font-size: 10px; color: var(--accent); letter-spacing: 2px; margin-bottom: 4px;
+  }
+  .pipe-step .step-name { font-weight: 500; }
+
+  @keyframes slideDown {
+    from { opacity:0; transform:translateY(-12px) }
+    to { opacity:1; transform:translateY(0) }
+  }
+
+  /* Connection dots animation */
+  .connector {
+    display: flex; justify-content: center; gap: 20px; padding: 8px 0 0;
+  }
+  .connector-dot {
+    width: 4px; height: 4px; border-radius: 50%; background: var(--line);
+    animation: pulse 2s infinite;
+  }
+  .connector-dot:nth-child(2) { animation-delay: .3s }
+  .connector-dot:nth-child(3) { animation-delay: .6s }
+  .connector-dot:nth-child(4) { animation-delay: .9s }
+  .connector-dot:nth-child(5) { animation-delay: 1.2s }
+  @keyframes pulse {
+    0%,100% { opacity:.3; background:var(--line) }
+    50% { opacity:1; background:var(--accent) }
+  }
+
+  /* Responsive */
+  @media (max-width:768px) {
+    .main { padding: 80px 20px 40px }
+    .layer-label { display: none }
+    .layer-nodes { flex-direction: column; align-items: center }
+    .pipeline { flex-direction: column; gap: 8px }
+    .pipe-step::after { content:'↓'; right:50%; top:auto; bottom:-22px; transform:translateX(50%) }
+    .nav { padding: 12px 20px; gap: 16px }
+  }
+</style>
+</head>
+<body>
+
+<nav class="nav">
+  <div class="nav-logo">MEMO<span>RIA</span></div>
+  <a href="intro.html">← 项目介绍</a>
+  <a href="flow.html" class="active">架构流程</a>
+  <a href="index.html">数据面板</a>
+</nav>
+
+<div class="main">
+  <div class="header">
+    <div class="tag">Architecture &amp; Data Flow</div>
+    <h1>系统架构与数据流程</h1>
+    <p>三源汇聚 → 三层梦境加工 → 多渠道输出</p>
+  </div>
+
+  <div class="flow-container">
+
+    <!-- Layer 1: Data Sources -->
+    <div class="flow-layer">
+      <div class="layer-label">数据源</div>
+      <div class="layer-nodes">
+        <div class="node source" onclick="showDetail('qclaw')">
+          <span class="icon">💬</span>
+          <div class="title">QClaw</div>
+          <div class="sub">微信聊天对话<br>15s 轮询 JSONL</div>
+        </div>
+        <div class="node source" onclick="showDetail('reasonix')">
+          <span class="icon">⚙️</span>
+          <div class="title">Reasonix</div>
+          <div class="sub">代码开发会话<br>项目目录扫描</div>
+        </div>
+        <div class="node source" onclick="showDetail('gbrain')">
+          <span class="icon">📚</span>
+          <div class="title">gbrain</div>
+          <div class="sub">知识库页面<br>5min 轮询同步</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Connector -->
+    <div class="connector"><div class="connector-dot"></div><div class="connector-dot"></div><div class="connector-dot"></div><div class="connector-dot"></div><div class="connector-dot"></div></div>
+    <div class="layer-arrows">
+      <div class="arrow-group">
+        <div class="arrow-line"></div>
+        <div class="arrow-label">Bridge 管道</div>
+      </div>
+    </div>
+
+    <!-- Layer 2: Memoria Core -->
+    <div class="flow-layer">
+      <div class="layer-label">核心引擎</div>
+      <div class="layer-nodes">
+        <div class="node core" onclick="showDetail('ingest')">
+          <span class="icon">📥</span>
+          <div class="title">摄入层</div>
+          <div class="sub">MCP 协议 · HTTP API<br>批量去重 · FTS5 索引</div>
+        </div>
+        <div class="node core" onclick="showDetail('storage')">
+          <span class="icon">🗄️</span>
+          <div class="title">存储层</div>
+          <div class="sub">SQLite 结构化<br>ChromaDB 向量<br>FTS5 全文检索</div>
+        </div>
+        <div class="node core" onclick="showDetail('dream')">
+          <span class="icon">🌙</span>
+          <div class="title">梦境引擎</div>
+          <div class="sub">Light → Deep → REM<br>衰减 · 关联 · 晋升</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Processing Pipeline -->
+    <div class="pipeline">
+      <div class="pipe-step"><div class="step-num">STEP 1</div><div class="step-name">文本提取</div></div>
+      <div class="pipe-step"><div class="step-num">STEP 2</div><div class="step-name">去重判重</div></div>
+      <div class="pipe-step"><div class="step-num">STEP 3</div><div class="step-name">向量嵌入</div></div>
+      <div class="pipe-step"><div class="step-num">STEP 4</div><div class="step-name">全文索引</div></div>
+      <div class="pipe-step"><div class="step-num">STEP 5</div><div class="step-name">梦境加工</div></div>
+      <div class="pipe-step"><div class="step-num">STEP 6</div><div class="step-name">衰减清理</div></div>
+    </div>
+
+    <!-- Connector -->
+    <div class="connector"><div class="connector-dot"></div><div class="connector-dot"></div><div class="connector-dot"></div><div class="connector-dot"></div><div class="connector-dot"></div></div>
+    <div class="layer-arrows">
+      <div class="arrow-group">
+        <div class="arrow-line"></div>
+        <div class="arrow-label">输出接口</div>
+      </div>
+    </div>
+
+    <!-- Layer 3: Outputs -->
+    <div class="flow-layer">
+      <div class="layer-label">输出</div>
+      <div class="layer-nodes">
+        <div class="node output" onclick="showDetail('dashboard')">
+          <span class="icon">🖥️</span>
+          <div class="title">Web Dashboard</div>
+          <div class="sub">搜索 · 浏览 · 图谱<br>SPA 单页应用</div>
+        </div>
+        <div class="node output" onclick="showDetail('api')">
+          <span class="icon">🔌</span>
+          <div class="title">REST API</div>
+          <div class="sub">CRUD · 导入导出<br>Swagger 文档</div>
+        </div>
+        <div class="node output" onclick="showDetail('sdk')">
+          <span class="icon">📦</span>
+          <div class="title">Python SDK</div>
+          <div class="sub">零依赖客户端<br>一行代码接入</div>
+        </div>
+        <div class="node output" onclick="showDetail('mcp')">
+          <span class="icon">🔗</span>
+          <div class="title">MCP 协议</div>
+          <div class="sub">标准化 AI 集成<br>任意 Agent 可用</div>
+        </div>
+      </div>
+    </div>
+
+  </div>
+
+  <!-- Detail Panels -->
+  <div class="detail-panel" id="detail-qclaw">
+    <h3>QClaw Bridge</h3>
+    <div class="meta">数据源 · 微信对话索引</div>
+    <p>监控 QClaw 的 JSONL 会话日志文件，每 15 秒轮询增量。剥离 Conversation info 元数据头，提取纯文本对话内容，过滤系统消息和 Pre-compaction flush。单条消息捕获 + pending 持久化，确保不丢数据。</p>
+    <div class="tags"><span class="tag-item">15s 轮询</span><span class="tag-item">JSONL 解析</span><span class="tag-item">元数据剥离</span><span class="tag-item">增量扫描</span></div>
+  </div>
+  <div class="detail-panel" id="detail-reasonix">
+    <h3>Reasonix Bridge</h3>
+    <div class="meta">数据源 · 开发会话索引</div>
+    <p>多根目录递归扫描：全局 sessions/ + 项目目录 projects/*/sessions/。支持 JSONL 会话文件和 .ckpt turn 文件。分批处理（50 条/批，批次间 sleep 2s），断点续传（.bridge_processed.json 状态追踪），避免内存溢出。</p>
+    <div class="tags"><span class="tag-item">多根目录</span><span class="tag-item">分批处理</span><span class="tag-item">断点续传</span><span class="tag-item">120s 轮询</span></div>
+  </div>
+  <div class="detail-panel" id="detail-gbrain">
+    <h3>gbrain Bridge</h3>
+    <div class="meta">数据源 · 知识库同步</div>
+    <p>双向桥接管道。正向：gbrain list/get → MCP memory_remember，每 5 分钟轮询新页面。支持三种运行模式：--sync（一次性全量）、--daemon（守护轮询）、--watch（手动触发）。当前已同步概念/实体/时间线页面。</p>
+    <div class="tags"><span class="tag-item">5min 轮询</span><span class="tag-item">双向管道</span><span class="tag-item">增量同步</span><span class="tag-item">守护模式</span></div>
+  </div>
+  <div class="detail-panel" id="detail-ingest">
+    <h3>摄入层</h3>
+    <div class="meta">核心 · 数据入口</div>
+    <p>统一的记忆摄入接口。支持 MCP 协议（memory_remember / memory_observe）和 HTTP POST /api/memories 两种方式。自动去重（内容哈希判重），实时更新 FTS5 全文索引，触发 ChromaDB 向量嵌入。</p>
+    <div class="tags"><span class="tag-item">MCP v1.1.0</span><span class="tag-item">REST API</span><span class="tag-item">SHA256 去重</span><span class="tag-item">实时索引</span></div>
+  </div>
+  <div class="detail-panel" id="detail-storage">
+    <h3>存储层</h3>
+    <div class="meta">核心 · 三引擎架构</div>
+    <p><strong>SQLite</strong>：结构化记忆存储（content、category、importance、decay_factor、source、时间戳），轻量零配置。<br><strong>FTS5</strong>：全文搜索引擎，支持中文分词和布尔查询。<br><strong>ChromaDB</strong>：向量数据库，语义相似度检索，为梦境引擎的跨域关联提供基础。</p>
+    <div class="tags"><span class="tag-item">SQLite</span><span class="tag-item">FTS5</span><span class="tag-item">ChromaDB</span><span class="tag-item">单文件</span></div>
+  </div>
+  <div class="detail-panel" id="detail-dream">
+    <h3>梦境引擎</h3>
+    <div class="meta">核心 · 记忆加工</div>
+    <p><strong>Light Sleep</strong>：每日自动提取主题、生成摘要。<br><strong>Deep Sleep</strong>：按 importance × decay_factor 衰减记忆权重，60 天冷记忆自动清理。<br><strong>REM Sleep</strong>：跨记忆关联发现、模式识别、Warm→Hot 记忆晋升。模拟人脑记忆巩固过程。</p>
+    <div class="tags"><span class="tag-item">衰减算法</span><span class="tag-item">关联发现</span><span class="tag-item">记忆晋升</span><span class="tag-item">自动清理</span></div>
+  </div>
+  <div class="detail-panel" id="detail-dashboard">
+    <h3>Web Dashboard</h3>
+    <div class="meta">输出 · 用户界面</div>
+    <p>深色主题 SPA 单页应用，嵌入 Memoria 服务内（:9003/app/）。四个功能 Tab：🔍 搜索（全文+语义混合）、🗂️ 浏览（时间线+tier 筛选+行内编辑）、📊 图谱（vis.js 交互式网络图）、⚙️ 设置（备份/恢复/参数调节）。</p>
+    <div class="tags"><span class="tag-item">SPA</span><span class="tag-item">vis.js</span><span class="tag-item">深色主题</span><span class="tag-item">零构建</span></div>
+  </div>
+  <div class="detail-panel" id="detail-api">
+    <h3>REST API</h3>
+    <div class="meta">输出 · 程序接口</div>
+    <p>完整的 CRUD 端点：GET/POST /api/memories、PUT/DELETE /api/memories/:id。数据导入导出（/api/export、/api/import），系统配置（/api/config）。FastAPI 自动生成 Swagger 文档（/docs），调试友好。</p>
+    <div class="tags"><span class="tag-item">RESTful</span><span class="tag-item">Swagger</span><span class="tag-item">CRUD</span><span class="tag-item">JSON</span></div>
+  </div>
+  <div class="detail-panel" id="detail-sdk">
+    <h3>Python SDK</h3>
+    <div class="meta">输出 · 客户端库</div>
+    <p>零依赖 Python 客户端（memoria_client.py，8.6KB）。提供 10+ 方法：remember()、search()、recall()、get_memories()、update_memory()、delete_memory()、export_data()、import_data()、stats()。一行代码接入任何 Python 项目。</p>
+    <div class="tags"><span class="tag-item">零依赖</span><span class="tag-item">8.6KB</span><span class="tag-item">10+ API</span><span class="tag-item">pip-free</span></div>
+  </div>
+  <div class="detail-panel" id="detail-mcp">
+    <h3>MCP 协议</h3>
+    <div class="meta">输出 · AI Agent 集成</div>
+    <p>基于 MCP 2026-07-28 (v1.1.0) 协议。提供 6 个工具：memory_search（语义搜索）、memory_recall（上下文召回）、memory_remember（写入记忆）、memory_observe（会话记录）、memory_close_session（会话关闭）、memory_prefetch（预加载）。任意支持 MCP 的 AI Agent 可直接接入。</p>
+    <div class="tags"><span class="tag-item">MCP v1.1.0</span><span class="tag-item">6 工具</span><span class="tag-item">标准化</span><span class="tag-item">跨平台</span></div>
+  </div>
+
+</div>
+
+<script>
+function showDetail(id) {
+  const panel = document.getElementById('detail-' + id);
+  const allPanels = document.querySelectorAll('.detail-panel');
+  const wasActive = panel.classList.contains('active');
+  
+  allPanels.forEach(p => p.classList.remove('active'));
+  
+  if (!wasActive) {
+    panel.classList.add('active');
+    panel.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+  }
+}
+
+// Close detail on Escape
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') {
+    document.querySelectorAll('.detail-panel').forEach(p => p.classList.remove('active'));
+  }
+});
+
+// Click outside to close
+document.addEventListener('click', e => {
+  if (!e.target.closest('.node') && !e.target.closest('.detail-panel')) {
+    document.querySelectorAll('.detail-panel').forEach(p => p.classList.remove('active'));
+  }
+});
+</script>
+
+</body>
+</html>

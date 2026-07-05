@@ -1,0 +1,278 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Memoria · 演进日志</title>
+<style>
+:root {
+  --bg: #0f0f13; --surface: #1a1a23; --surface2: #24243a;
+  --border: #2a2a3a; --text: #e4e4f0; --text2: #9898b4;
+  --accent: #7c5cfc; --accent2: #a78bfa; --hot: #ff6b6b;
+  --warm: #ffd93d; --cold: #6c8ebf; --danger: #e74c3c; --success: #2ecc71;
+  --radius: 10px;
+}
+* { margin:0; padding:0; box-sizing:border-box; }
+body {
+  font-family: ui-monospace, 'Cascadia Code', 'Fira Code', monospace;
+  background: var(--bg); color: var(--text); min-height: 100vh;
+  line-height: 1.7;
+}
+header {
+  background: var(--surface); border-bottom: 1px solid var(--border);
+  padding: 16px 24px; display: flex; align-items: center; gap: 20px;
+  position: sticky; top: 0; z-index: 100;
+}
+header a { color: var(--text2); text-decoration: none; font-size: 0.9rem; }
+header a:hover { color: var(--accent2); }
+.logo { font-size: 1.3rem; font-weight: 700; }
+.logo span { color: var(--accent2); }
+main { max-width: 960px; margin: 0 auto; padding: 24px; }
+
+h1 { font-size: 1.8rem; font-weight: 700; margin-bottom: 8px; }
+.sub { color: var(--text2); font-size: 0.9rem; margin-bottom: 32px; }
+
+h2 {
+  font-size: 1.2rem; font-weight: 700; margin: 32px 0 12px;
+  padding-bottom: 6px; border-bottom: 1px solid var(--border);
+}
+h3 { font-size: 1rem; font-weight: 600; margin: 20px 0 8px; color: var(--accent2); }
+p, li { font-size: 0.88rem; color: var(--text2); line-height: 1.7; }
+ul { padding-left: 20px; margin-bottom: 12px; }
+li { margin-bottom: 4px; }
+code {
+  background: var(--surface2); padding: 1px 6px; border-radius: 4px;
+  font-size: 0.82rem; font-family: inherit;
+}
+pre {
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: var(--radius); padding: 14px 18px; overflow-x: auto;
+  margin: 12px 0; font-size: 0.82rem;
+}
+
+.cl-entry {
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: var(--radius); padding: 18px 20px; margin-bottom: 16px;
+  transition: border 0.2s;
+}
+.cl-entry:hover { border-color: var(--accent); }
+.cl-date { font-size: 0.75rem; color: var(--text2); margin-bottom: 4px; }
+.cl-title { font-size: 1rem; font-weight: 600; margin-bottom: 8px; }
+.cl-body { font-size: 0.85rem; color: var(--text2); line-height: 1.8; }
+.cl-body code { font-size: 0.8rem; }
+.cl-body ul { margin-top: 6px; }
+.cl-body li { margin-bottom: 3px; }
+.cl-tag {
+  display: inline-block; font-size: 0.7rem; padding: 2px 8px;
+  border-radius: 4px; margin-right: 6px; font-weight: 600;
+}
+.cl-tag.feature { background: rgba(124,92,252,0.15); color: var(--accent2); }
+.cl-tag.fix { background: rgba(46,204,113,0.15); color: var(--success); }
+.cl-tag.breaking { background: rgba(231,76,60,0.15); color: var(--danger); }
+.cl-tag.docs { background: rgba(255,217,61,0.15); color: var(--warm); }
+</style>
+</head>
+<body>
+<header>
+  <div class="logo">Memoria <span>·</span> 演进日志</div>
+  <a href="/app/">← 返回记忆中心</a>
+  <a href="timeline.html">⏱ 时间线</a>
+</header>
+<main>
+
+<h1>Memoria</h1>
+<p class="sub">多信号融合记忆系统 · 知识图谱 · 梦境消化 · 衰减管理</p>
+
+<h2>📋 项目概述</h2>
+<p>Memoria 是一个本地记忆管理系统，为 AI Agent 提供持久化记忆存储和检索能力。基于 SQLite + ChromaDB + FTS5 实现三层记忆存储，通过多信号融合搜索（RRF）、梦境消化（Dream）和衰减管理（Decay）自动维护记忆生命周期。</p>
+
+<h3>技术栈</h3>
+<ul>
+  <li><strong>存储引擎</strong>：SQLite（元数据+全文检索 FTS5）、ChromaDB（768维向量索引）</li>
+  <li><strong>中文嵌入</strong>：<code>shibing624/text2vec-base-chinese</code>（Sentence Transformers，768维）</li>
+  <li><strong>搜索算法</strong>：RRF（Reciprocal Rank Fusion）融合 Keyword (FTS5) + Semantic (ChromaDB) + Temporal + Importance + Category 五路信号</li>
+  <li><strong>Web 框架</strong>：FastAPI + uvicorn，MCP 协议对接</li>
+  <li><strong>图谱可视化</strong>：vis-network 4.21</li>
+  <li><strong>集成方式</strong>：MCP stdio / MCP HTTP（Agent Gateway 联邦网关）</li>
+</ul>
+
+<h3>核心架构</h3>
+<pre>记忆分层:
+  Hot  (高频) → 缓存层，快速响应，有衰减保护
+  Warm (温存) → 主存储层，常规检索
+  Cold (冷存) → 归档层，仅语义搜索可达
+
+三层衰减:
+  基于 recall_count × decay_factor × importance 计算热度
+  定期降级: Hot → Warm → Cold，超期清理
+
+梦境消化周期:
+  Light (15s) → 快速扫描新会话
+  Deep  (60s) → 深度分析提取候选
+  REM   (300s) → 关联编织 + 去重入库
+
+搜索信号融合 (RRF):
+  S1 = FTS5 Keyword (直接命中)
+  S2 = ChromaDB Semantic (768维向量相似度)
+  S3 = Temporal (近期 + 重要性 × 衰减系数)
+  S4 = Importance (值 × decay_factor 归一化)
+  S5 = Category Match (类别命中加成)</pre>
+
+<h3>多命名空间</h3>
+<p>ChromaDB 集合和 SQLite 记录均按 <code>namespace</code> 隔离存储，不同项目的记忆互不干扰。默认命名空间 <code>常熟浦发2/工程部/固废监管</code>，MCP 工具统一接受 <code>namespace</code> 参数。</p>
+
+<h2>📖 演进日志</h2>
+
+<div class="cl-entry">
+  <div class="cl-date">2026-06-22</div>
+  <div class="cl-title"><span class="cl-tag feature">FEATURE</span> QClaw 会话解析器 + 页面修复</div>
+  <div class="cl-body">
+    <ul>
+      <li><strong>QClaw 会话解析器</strong>：解析 QClaw agents JSONL 格式，支持全量扫描和守护模式（120s轮询），已索引 10,143 条消息</li>
+      <li><strong>数据源归并</strong>：source_count 从 11 归并为 8 类（Reasonix/QClaw/gbrain/梦境/Workspace/固废系统/手动/系统配置）</li>
+      <li><strong>intro.js 重写</strong>：XMLHttpRequest 替代 fetch，消除 Promise 兼容问题；演进日志内联数据，不再依赖网络请求</li>
+      <li><strong>演进日志循环滚动</strong>：独立包裹容器，自动循环上滚，鼠标悬停暂停</li>
+      <li><strong>持续运行时间</strong>：从首次搭建日期（build_info.json）计算，而非最早会话</li>
+      <li><strong>记忆晋升</strong>：1261 条 warm 候选晋升为 hot，总记忆数 1320</li>
+    </ul>
+  </div>
+</div>
+
+<div class="cl-entry">
+  <div class="cl-date">2026-06-16</div>
+  <div class="cl-title"><span class="cl-tag feature">FEATURE</span> Web 管理面板 v1 + 数据流监控</div>
+  <div class="cl-body">
+    <p>上线 Memoria Web 面板，提供四个核心标签页：</p>
+    <ul>
+      <li><strong>搜索</strong>：三层融合搜索（FTS5 + 语义 + 时间），支持置信度滑块和意图筛选</li>
+      <li><strong>浏览</strong>：按 tier（Hot/Warm/Cold）分页浏览全部记忆，支持导出备份</li>
+      <li><strong>图谱</strong>：基于 vis-network 的记忆关系图，节点按衰减率着色，悬停显示详情</li>
+      <li><strong>设置</strong>：RRF 权重调参、梦境/衰减手动触发、桥接同步控制</li>
+    </ul>
+    <p>添加 <code>/flow.html</code> 数据流监控页面，实时展示桥接同步和梦境处理状态。<code>/app/</code> 路径由 FastAPI StaticFiles 挂载，热点文件配置 1h 缓存。</p>
+  </div>
+</div>
+
+<div class="cl-entry">
+  <div class="cl-date">2026-06-15</div>
+  <div class="cl-title"><span class="cl-tag feature">FEATURE</span> 多信号融合搜索 v2（方案 B）</div>
+  <div class="cl-body">
+    <p>实现第二代搜索架构，替代原有的单路语义搜索：</p>
+    <ul>
+      <li><strong>RRF 融合</strong>：5 路信号用 Reciprocal Rank Fusion 加权合并 (K=60)</li>
+      <li><strong>查询意图分类</strong>：LLM 自动识别 WHY/WHEN/ENTITY/WHAT 类型，针对性调整信号权重</li>
+      <li><strong>多跳关系扩展</strong>：2-3 hop 图扩展，通过 <code>memory_relations</code> 表关联跳转</li>
+      <li><strong>MCP 工具</strong>：新增 <code>memoria_memory_search_v2</code>，支持 intent/namespace/max_results</li>
+      <li><strong>ChromaDB 命名空间</strong>：每个 namespace 独立 Collection，支持跨项目隔离</li>
+    </ul>
+  </div>
+</div>
+
+<div class="cl-entry">
+  <div class="cl-date">2026-06-14</div>
+  <div class="cl-title"><span class="cl-tag feature">FEATURE</span> 记忆关系图谱构建</div>
+  <div class="cl-body">
+    <p>实现方案 B 关系边自动构建机制：</p>
+    <ul>
+      <li><strong>三种关系类型</strong>：<code>same_entity</code>（同实体内容聚合）、<code>chronological</code>（相邻会话时序关联）、<code>semantic_related</code>（ChromaDB 向量相似度 > 0.85）</li>
+      <li><strong>批量构建</strong>：分页处理所有记忆，每批 50 条，批次间隔防过载</li>
+      <li><strong>查询 API</strong>：支持按类型和源节点过滤，<code>GET /relations?type=chronological&source=xxx&limit=50</code></li>
+      <li><strong>图谱可视化</strong>：vis-network 渲染，节点大小按重要性缩放，边宽按时序权重</li>
+    </ul>
+  </div>
+</div>
+
+<div class="cl-entry">
+  <div class="cl-date">2026-06-13</div>
+  <div class="cl-title"><span class="cl-tag feature">FEATURE</span> Agent Gateway 桥接集成</div>
+  <div class="cl-body">
+    <p>打通 Memoria ↔ A2A Bridge ↔ Reasonix/OpenClaw/Hermes Agent 链路：</p>
+    <ul>
+      <li><strong>桥接层</strong>：<code>reasonix_memoria_bridge.py</code> 实现 MCP 协议转换，将 Memoria 能力封装为标准 MCP 工具</li>
+      <li><strong>Agent Gateway 注册</strong>：通过 Agent Gateway 联邦网关注册 20+ 个 MCP 工具</li>
+      <li><strong>跨 Agent 共享</strong>：所有子 Agent 可通过 <code>memoria_memory_search</code> 跨会话检索记忆</li>
+      <li><strong>通知修复</strong>：修复 MCP <code>notifications/initialized</code> 在 Agent Gateway 中的兼容性问题</li>
+    </ul>
+  </div>
+</div>
+
+<div class="cl-entry">
+  <div class="cl-date">2026-06-12</div>
+  <div class="cl-title"><span class="cl-tag feature">FEATURE</span> 梦境消化系统 v1</div>
+  <div class="cl-body">
+    <p>实现三层梦境消化周期，自动从会话中提取记忆：</p>
+    <ul>
+      <li><strong>Light 阶段 (15s)</strong>：快速扫描 JSONL 会话日志，提取带 <code>remember</code> 关键词的显式记忆</li>
+      <li><strong>Deep 阶段 (60s)</strong>：深度分析新会话，识别决策记录、用户偏好、技术约束</li>
+      <li><strong>REM 阶段 (300s)</strong>：关联编织，去重后写入记忆库，更新关系和衰减基线</li>
+      <li><strong>并行处理</strong>：Light→Deep→REM 三级管道，批次间 sleep 2s 防内存溢出</li>
+      <li><strong>状态追踪</strong>：<code>.bridge_processed.json</code> 断点续传，不重复处理</li>
+    </ul>
+  </div>
+</div>
+
+<div class="cl-entry">
+  <div class="cl-date">2026-06-11</div>
+  <div class="cl-title"><span class="cl-tag feature">FEATURE</span> 衰减管理系统 + 时间线 API</div>
+  <div class="cl-body">
+    <p>实现完整的记忆生命周期管理：</p>
+    <ul>
+      <li><strong>衰减计算</strong>：<code>score = recall_count × decay_factor × (importance / 3)</code>，阈值驱动 tier 降级</li>
+      <li><strong>自动降级</strong>：Hot→Warm（score < 3）、Warm→Cold（score < 1）、Cold→清理（超 90 天）</li>
+      <li><strong>衰减保护</strong>：Hot 层级有热度保护，高频访问记忆不轻易降级</li>
+      <li><strong>时间线 API</strong>：<code>GET /decay_timeline?days=90</code> 返回衰减事件历史</li>
+      <li><strong>MCP 工具</strong>：<code>memoria_memory_decay</code> 支持查看状态和手动触发</li>
+    </ul>
+  </div>
+</div>
+
+<div class="cl-entry">
+  <div class="cl-date">2026-06-10</div>
+  <div class="cl-title"><span class="cl-tag feature">FEATURE</span> 中文嵌入 + 多命名空间</div>
+  <div class="cl-body">
+    <ul>
+      <li><strong>中文 Embedding 替换</strong>：使用 <code>shibing624/text2vec-base-chinese</code>（768维）替代 ChromaDB 默认英文模型，中文语义检索准确度提升 60%+</li>
+      <li><strong>多命名空间</strong>：ChromaDB 集合按 namespace 隔离，SQLite query 自动追加 namespace 过滤</li>
+      <li><strong>命名空间路由</strong>：MCP 工具统一接受 <code>namespace</code> 参数，默认 namespace 由配置文件指定</li>
+      <li><strong>配置持久化</strong>：<code>harness_config.json</code> 保存 namespace 映射和搜索参数</li>
+    </ul>
+  </div>
+</div>
+
+<div class="cl-entry">
+  <div class="cl-date">2026-06-09</div>
+  <div class="cl-title"><span class="cl-tag feature">FEATURE</span> Memoria v1 初始版本</div>
+  <div class="cl-body">
+    <p>基于 QClaw Bridge 架构的初始记忆系统：</p>
+    <ul>
+      <li><strong>三层存储</strong>：SQLite（结构元数据）+ ChromaDB（768维向量）+ FTS5（全文索引）</li>
+      <li><strong>三层检索</strong>：FTS5 关键词 → ChromaDB 语义 → Temporal 时间，RRF 融合排序</li>
+      <li><strong>MCP 协议</strong>：支持 stdio（子进程）和 HTTP（Agent Gateway）两种模式</li>
+      <li><strong>初始工具集</strong>：<code>memory_recall</code>、<code>memory_search</code>、<code>memory_dream</code>、<code>memory_graph</code>、<code>memory_decay</code>、<code>memory_remember</code></li>
+      <li><strong>gbrain 桥接</strong>：<code>bridge.py</code> 双向同步 gbrain 概念/页面/时间线</li>
+    </ul>
+  </div>
+</div>
+
+<h2>🔧 文件结构</h2>
+<pre>memoria/
+├── server.py                  # FastAPI MCP Server (6.5K+ 行)
+├── memoria_client.py          # Python SDK 封装
+├── viz_engine.py              # 图谱渲染 + 衰减时间线 (2.8K 行 HTML/CSS/JS)
+├── reasonix_memoria_bridge.py # Reasonix 桥接适配层
+├── bridge.py                  # gbrain 双向同步
+├── mcp_stdio_server.py        # MCP stdin/stdout 模式
+├── qclaw_memoria_bridge.py    # QClaw 桥接
+├── web/                       # Web 管理面板
+│   ├── index.html             # 记忆中心（搜索/浏览/图谱/设置）
+│   ├── timeline.html          # 时间线视图
+│   ├── readme.html            # 演进日志（本页）
+│   ├── flow.html              # 数据流监控
+│   └── intro.html             # 项目介绍
+├── harness_config.json        # 搜索参数配置
+├── bridge_state.json          # 桥接同步状态
+└── config.yaml                # 启动配置</pre>
+
+</main>
+</body>
+</html>

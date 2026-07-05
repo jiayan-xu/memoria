@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Memoria · 时间线</title>
+<style>
+:root {
+  --bg: #0f0f13; --surface: #1a1a23; --surface2: #24243a;
+  --border: #2a2a3a; --text: #e4e4f0; --text2: #9898b4;
+  --accent: #7c5cfc; --accent2: #a78bfa; --hot: #ff6b6b;
+  --warm: #ffd93d; --cold: #6c8ebf; --danger: #e74c3c; --success: #2ecc71;
+  --radius: 10px;
+}
+* { margin:0; padding:0; box-sizing:border-box; }
+body {
+  font-family: ui-monospace, 'Cascadia Code', 'Fira Code', monospace;
+  background: var(--bg); color: var(--text); min-height: 100vh;
+  line-height: 1.6;
+}
+header {
+  background: var(--surface); border-bottom: 1px solid var(--border);
+  padding: 16px 24px; display: flex; align-items: center; gap: 20px;
+  position: sticky; top: 0; z-index: 100;
+}
+header a { color: var(--text2); text-decoration: none; font-size: 0.9rem; }
+header a:hover { color: var(--accent2); }
+.logo { font-size: 1.3rem; font-weight: 700; }
+.logo span { color: var(--accent2); }
+main { max-width: 1100px; margin: 0 auto; padding: 24px; }
+
+/* Stats row */
+.stats-row {
+  display: flex; gap: 16px; flex-wrap: wrap; margin-bottom: 28px;
+}
+.stat-card {
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: var(--radius); padding: 16px 20px; flex: 1; min-width: 140px;
+}
+.stat-card .num { font-size: 1.8rem; font-weight: 700; }
+.stat-card .lbl { font-size: 0.78rem; color: var(--text2); margin-top: 4px; }
+
+/* Timeline */
+.timeline { position: relative; padding-left: 32px; }
+.timeline::before {
+  content: ''; position: absolute; left: 10px; top: 0; bottom: 0;
+  width: 2px; background: var(--border);
+}
+.tl-item {
+  position: relative; margin-bottom: 20px; padding: 14px 18px;
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: var(--radius); transition: border 0.2s;
+}
+.tl-item:hover { border-color: var(--accent); }
+.tl-item::before {
+  content: ''; position: absolute; left: -26px; top: 18px;
+  width: 10px; height: 10px; border-radius: 50%;
+  background: var(--accent2); border: 2px solid var(--bg);
+}
+.tl-item.hot::before { background: var(--hot); }
+.tl-item.warm::before { background: var(--warm); }
+.tl-item.cold::before { background: var(--cold); }
+.tl-time { font-size: 0.75rem; color: var(--text2); margin-bottom: 6px; }
+.tl-title { font-size: 0.95rem; font-weight: 600; margin-bottom: 4px; }
+.tl-desc { font-size: 0.82rem; color: var(--text2); }
+.tl-tag {
+  display: inline-block; font-size: 0.7rem; padding: 2px 8px;
+  border-radius: 4px; margin-top: 6px; font-weight: 600;
+}
+.tl-tag.hot { background: rgba(255,107,107,0.15); color: var(--hot); }
+.tl-tag.warm { background: rgba(255,217,61,0.15); color: var(--warm); }
+.tl-tag.cold { background: rgba(108,142,191,0.15); color: var(--cold); }
+
+/* Decay section */
+.section-title { font-size: 1.1rem; font-weight: 700; margin: 32px 0 16px; color: var(--text); }
+.decay-bar {
+  display: flex; align-items: center; gap: 12px; margin-bottom: 10px;
+}
+.decay-bar .label { width: 80px; font-size: 0.82rem; color: var(--text2); }
+.decay-bar .track {
+  flex: 1; height: 8px; background: var(--surface2); border-radius: 4px;
+  overflow: hidden;
+}
+.decay-bar .fill {
+  height: 100%; border-radius: 4px; transition: width 0.5s;
+}
+.fill-hot { background: var(--hot); }
+.fill-warm { background: var(--warm); }
+.fill-cold { background: var(--cold); }
+.legend { display: flex; gap: 20px; margin: 16px 0; font-size: 0.82rem; }
+.legend span { display: flex; align-items: center; gap: 6px; }
+.legend .dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
+</style>
+</head>
+<body>
+<header>
+  <div class="logo">Memoria <span>·</span> 时间线</div>
+  <a href="/app/">← 返回记忆中心</a>
+</header>
+<main>
+  <div class="stats-row" id="statsRow">
+    <div class="stat-card"><div class="num" id="statSessions">--</div><div class="lbl">会话数</div></div>
+    <div class="stat-card"><div class="num" id="statMessages">--</div><div class="lbl">消息数</div></div>
+    <div class="stat-card"><div class="num" id="statHot" style="color:var(--hot)">--</div><div class="lbl">热点记忆</div></div>
+    <div class="stat-card"><div class="num" id="statWarm" style="color:var(--warm)">--</div><div class="lbl">温存记忆</div></div>
+    <div class="stat-card"><div class="num" id="statCold" style="color:var(--cold)">--</div><div class="lbl">冷存记忆</div></div>
+  </div>
+
+  <div class="section-title">📊 记忆衰减分布</div>
+  <div id="decayBars"></div>
+
+  <div class="section-title">⏱ 衰减时间线</div>
+  <div class="legend">
+    <span><span class="dot" style="background:var(--hot)"></span> Hot</span>
+    <span><span class="dot" style="background:var(--warm)"></span> Warm</span>
+    <span><span class="dot" style="background:var(--cold)"></span> Cold</span>
+  </div>
+  <div class="timeline" id="timeline"></div>
+</main>
+<script>
+async function loadStats() {
+  try {
+    const r = await fetch('/stats');
+    const d = await r.json();
+    document.getElementById('statSessions').textContent = d.sessions ?? '--';
+    document.getElementById('statMessages').textContent = d.messages ?? '--';
+    document.getElementById('statHot').textContent = d.memories?.hot ?? 0;
+    document.getElementById('statWarm').textContent = d.memories?.warm ?? 0;
+    document.getElementById('statCold').textContent = d.memories?.cold ?? 0;
+
+    // Decay bars
+    const total = (d.memories?.hot||0) + (d.memories?.warm||0) + (d.memories?.cold||0) || 1;
+    document.getElementById('decayBars').innerHTML = `
+      <div class="decay-bar"><span class="label">Hot</span><div class="track"><div class="fill fill-hot" style="width:${(d.memories?.hot||0)/total*100}%"></div></div><span>${d.memories?.hot||0}</span></div>
+      <div class="decay-bar"><span class="label">Warm</span><div class="track"><div class="fill fill-warm" style="width:${(d.memories?.warm||0)/total*100}%"></div></div><span>${d.memories?.warm||0}</span></div>
+      <div class="decay-bar"><span class="label">Cold</span><div class="track"><div class="fill fill-cold" style="width:${(d.memories?.cold||0)/total*100}%"></div></div><span>${d.memories?.cold||0}</span></div>
+    `;
+  } catch(e) { console.error(e); }
+}
+
+async function loadTimeline() {
+  const el = document.getElementById('timeline');
+  el.innerHTML = '<div style="color:var(--text2)">加载中...</div>';
+  try {
+    const r = await fetch('/decay_timeline?days=90');
+    const data = await r.json();
+    if (!data?.entries?.length) {
+      el.innerHTML = '<div style="color:var(--text2)">暂无衰减记录</div>';
+      return;
+    }
+    el.innerHTML = data.entries.map(e => {
+      const level = e.tier || 'cold';
+      const ts = e.ts ? e.ts.slice(0, 19).replace('T', ' ') : '';
+      return `<div class="tl-item ${level}">
+        <div class="tl-time">${ts}</div>
+        <div class="tl-title">${esc(e.title||'')}</div>
+        ${e.detail ? `<div class="tl-desc">${esc(e.detail)}</div>` : ''}
+        <span class="tl-tag ${level}">${level.toUpperCase()}</span>
+      </div>`;
+    }).join('');
+  } catch(e) {
+    el.innerHTML = `<div style="color:var(--danger)">加载失败: ${e.message}</div>`;
+  }
+}
+function esc(s) { const d=document.createElement('div'); d.textContent=s; return d.innerHTML; }
+
+loadStats();
+loadTimeline();
+</script>
+</body>
+</html>

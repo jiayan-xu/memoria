@@ -1,0 +1,62 @@
+[
+  {
+    "date": "2026-06-23",
+    "title": "代码整洁度优化 + 审查修复收官",
+    "body": "P0-3: tools/list schema 提取为模块级常量 _TOOLS_SCHEMA（14个工具，~170行JSON移出handler）\nP1-7: reembed_endpoint 移除硬编码业务路径（常熟浦发2/工程部/固废监管）\n修复: _safe_print() 函数体被regex误替换的递归调用bug\n修复: tools/list 引用未定义常量导致 NameError\n统计: 三轮审查累计修复28+项，memoria 当前 707 hot + 5483 warm 记忆，23838 关系边"
+  },
+  {
+    "date": "2026-06-23",
+    "title": "三轮代码审查修复 (24项)",
+    "body": "P0(7): _memory_recall db变量修复 | 3处ChromaDB namespace隔离 | _memory_dream/close_session namespace参数 | 路径遍历2处 | capture_proxy hash去重\nP1(6): _ingest哈希绑定namespace | FTS条件创建 | 增量FTS | API namespace WHERE | daemon async | 版本号统一\nR2(5): _build_relations NameError | 2处_build_edges namespace补全 | rowid-memory id | hours_diff初始化 | FTS删除顺序\nR3(1): _build_semantic_edges INSERT namespace列\n"
+  },
+  {
+    "date": "2026-06-23",
+    "title": "三轮代码审查修复 (24项)",
+    "body": "### 修复清单\n\n#### P0 — 严重 Bug (7项)\n- **_memory_recall** — 修复未定义变量  导致的 NameError\n- **_build_semantic_edges** — 改用  替换全局 collection\n- **_memory_observe** — ChromaDB/SQLite INSERT 增加 namespace 隔离\n- **_memory_dream** — 补全缺失的  参数\n- **_memory_close_session** — 补全 namespace 隔离\n- **/api/import / cli_restore** — 修复路径穿越漏洞 (target.resolve() 校验)\n- **capture_proxy** — 修复  跨进程去重失效 (改用 hashlib.sha256)\n\n#### P1 — 重要修复 (6项)\n- **/ingest** — 哈希去重绑定 namespace ()\n- **init_db()** — FTS 表条件创建 (仅不存在时创建，避免每次启动全量 rebuild)\n- **/ingest/DELETE** — 增量 FTS 更新替代全量 rebuild\n- **API memories** — DELETE/UPDATE 增加 namespace WHERE 条件\n- **bridge/qclaw daemon** — 改用 asyncio subprocess (避免阻塞事件循环)\n- **版本号** — 统一为 MEMORIA_VERSION 常量 (v1.7.0)\n\n#### 第二轮审查修复 (6项)\n- **_build_relations** — 修复  未定义(NameError)，补全 namespace 参数\n- **_build_same_entity_edges / _build_chronological_edges** — 补全 namespace 隔离\n- **_batch_semantic_relation_discovery** — 修复 rowid → memory id 数据不一致\n- **_build_relation_edges** — 修复 hours_diff 未初始化\n- **死代码** — 删除  双重 return\n- **api_delete_memory** — FTS 删除顺序修复 (先存 rowid 再删 memory)\n\n#### 第三轮审查修复 (1项)\n- **_build_semantic_edges** — INSERT 补全 namespace 列"
+  },
+  {
+    "date": "2026-06-22",
+    "title": "QClaw会话解析器 + 页面修复",
+    "desc": "QClaw JSONL解析器，10143条消息索引，数据源归并8类，intro.js重写（XMLHttpRequest+内联数据），演进日志循环滚动+悬停暂停，持续运行时间修复"
+  },
+  {
+    "date": "2026-06-16",
+    "title": "Web 管理面板 v1 + 数据流监控",
+    "desc": "上线 Memoria Web 面板，搜索/浏览/图谱/设置四个标签页，vis-network 图谱可视化，数据流监控页面"
+  },
+  {
+    "date": "2026-06-15",
+    "title": "多信号融合搜索 v2",
+    "desc": "RRF 5路信号融合 (Keyword+Semantic+Temporal+Importance+Category)，查询意图分类，多跳关系扩展 2-3 hop"
+  },
+  {
+    "date": "2026-06-14",
+    "title": "记忆关系图谱构建",
+    "desc": "same_entity/chronological/semantic_related 三类型关系边，批量构建，vis-network 渲染"
+  },
+  {
+    "date": "2026-06-13",
+    "title": "Agent Gateway 桥接集成",
+    "desc": "Memoria ↔ A2A Bridge ↔ Reasonix/OpenClaw/Hermes Agent 链路打通，20+ MCP 工具注册"
+  },
+  {
+    "date": "2026-06-12",
+    "title": "梦境消化系统 v1",
+    "desc": "Light→Deep→REM 三层消化周期，自动提取记忆，断点续传，去重入库"
+  },
+  {
+    "date": "2026-06-11",
+    "title": "衰减管理系统",
+    "desc": "score = recall_count × decay_factor × (importance/3)，Hot→Warm→Cold 自动降级"
+  },
+  {
+    "date": "2026-06-10",
+    "title": "中文嵌入 + 多命名空间",
+    "desc": "text2vec-base-chinese 替换默认英文模型，768维嵌入，命名空间隔离"
+  },
+  {
+    "date": "2026-06-09",
+    "title": "Memoria v1 初始版本",
+    "desc": "SQLite+FTS5+ChromaDB 三层架构，MCP 协议，6 个初始工具，gbrain 桥接"
+  }
+]
