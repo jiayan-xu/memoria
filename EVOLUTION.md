@@ -1,0 +1,238 @@
+# 演进日志 / Evolution Log
+
+---
+
+## 2026-06-24 — Memoria Rust 重构 v4：全线交付
+
+### 背景
+
+经过 5 轮审阅迭代，完成 Memoria 核心从 Python 到 Rust（PyO3）的重构。项目代码共 **24 个文件，1723 行 Rust**，覆盖搜索、写入、衰减、图构建全部管线。
+
+### 架构概览
+
+```
+Python server.py (瘦身版)
+  └── MEMORIA_BACKEND=rust (默认)
+       └── memoria_core.pyd (PyO3)
+            ├── storage/  — r2d2 + rusqlite + jieba-rs FTS5
+            ├── search/   — 5 信号 RRF 融合 + 2-hop 图扩展
+            ├── vector/   — hnsw_rs HNSW + LRU 缓存
+            └── tools/    — observe/remember/prefs/decay/graph
+```
+
+### 关键数据
+
+| 指标 | Phase 1 (Python) | Phase 4 (Rust) | 提升 |
+|------|:-:|:-:|:-:|
+| 平均搜索延迟 | 410ms | 112ms | 3.7× |
+| P50 搜索延迟 | 182ms | 99ms | 1.8× |
+| 零结果率 | 32.2% | 0% | ↓ |
+| HNSW 向量数 | 0 | 1174 | — |
+
+### 演进要点
+
+- **PyO3 替代 HTTP 通信**：零序列化开销，单进程共享连接池
+- **hnsw_rs 替代 ChromaDB**：HNSW 原生向量索引，省去 HTTP 开销
+- **jieba-rs 替代 Python jieba**：FTS5 中文分词，编译期内置
+- **SHA-256 去重**：与 Python `hashlib.sha256` 兼容，双写无重复
+
+---
+
+## 2026-06-25 — MCP 独立服务 + 认证系统 + PyO3 可选化
+
+### 变更
+
+#### 独立 MCP 服务
+- **`mcp_server.rs`**：独立模块，`build_app()` 返回 axum Router
+- **工具**：`memory_search`/`memory_search_v2`/`memory_remember`/`memory_observe`/`register_agent`/`audit_query`/`db_stats`
+- **环境变量**：`MEMORIA_DB_PATH`/`MEMORIA_PORT`/`MEMORIA_HOST`/`MEMORIA_ADMIN_KEY`
+
+#### 名牌认证 + NS 隔离 + 审计
+- **`agent_registry` 表**：`badge_token`/`namespace`/`permission`/`allowed_skills`/`expires_at`
+- **`register_agent`**：自助注册（需 admin key），返回唯一令牌
+- **`check_ns_access`**：精确 namespace 匹配
+- **`audit_log` 表**：每次 MCP 调用自动记录，`audit_query` 可查
+
+#### PyO3 去依赖
+- **可选 feature**：`default = []`，`cargo build --no-default-features` 无 pyo3
+- **`#[cfg]` 条件编译**：PyO3 绑定与纯 Rust API 分离
+- **二进制**：8.5MB → 7.8MB
+
+### 修复
+
+| 问题 | 级别 | 修复 |
+|------|:-:|------|
+| Admin 认证死锁 | P0 | admin_key 明文写入 badge_token |
+| NS starts_with 越权 | P0 | 改为精确匹配 `==` |
+| badge_token 可预测 | P0 | getrandom 随机数 |
+| INSERT OR REPLACE 覆盖 | P1 | INSERT OR IGNORE + 查询现有 |
+| pyo3 硬依赖 | P1 | 改为可选 feature |
+
+---
+
+## 2026-06-26~29 — A2A 总线 + 技能市场
+
+### A2A 跨 Agent 通信
+- `a2a_send` / `a2a_recv` MCP 工具上线
+- Agent 间消息路由，跨 namespace 通信
+- 配合 A2A Bridge 服务实现异构 Agent 互通
+
+### 技能市场
+- `skill_market_search` / `skill_market_install` / `skill_market_publish` / `skill_market_info` / `skill_market_list_installed` 五个 MCP 工具
+- SKILL.md 规范发布，兼容 WorkBuddy/QClaw 技能格式
+- 按 agent 白名单控制技能安装
+
+---
+
+## 2026-07-01 — Python 全部退役，Rust 全线接管
+
+### 背景
+
+Python 组件（`server.py`、`viz_engine.py`、`capture_proxy.py`）此前仍负责 Web UI、可视化、文件监听。本轮将 Python 全部功能并入 Rust。
+
+### 架构变更
+
+```
+旧架构：
+  :9003  Rust (MCP)              :9005  Python (Web API + 静态文件)
+  /mcp  /health                  /visualize  /stats  /graph  /app/
+
+新架构：
+  :9003  Rust (MCP + Web API + 静态文件)
+  /mcp  /health  /stats  /graph  /decay_timeline  /api/memories  /api/relations  /app/
+```
+
+### 新增文件
+
+| 文件 | 行数 | 职责 |
+|------|:-:|------|
+| `web_api.rs` | ~260 | `/stats` `/graph` `/decay_timeline` `/api/memories` CRUD `/api/relations` |
+| `search/hybrid.rs` | ~68 | 5 信号统一搜索函数，消除重复代码 |
+
+### 修复清单
+
+| 问题 | 级别 | 修复 |
+|------|:-:|------|
+| Rust 不建业务表 | P0 | `init_core_tables()` 建 11 张核心表 + FTS5 + triggers |
+| MCP 搜索缺 semantic + category 信号 | P0 | 补全 5 信号 |
+| `memory_relations` 无 namespace 列 | P0 | 加列 + 索引 |
+| `decisions` 无 namespace 列 | P0 | 加列 |
+| AppState 缺 query_cache | P1 | 加字段 |
+| `hybrid_search` 两处重复 | P1 | 提取公共函数 |
+
+### 当前架构
+
+```
+memoria-server (:9003)  — Rust 独立二进制
+├── MCP 协议（15 个工具）
+│   ├── memory_search / memory_search_v2
+│   ├── memory_remember / memory_observe
+│   ├── register_agent / audit_query / db_stats
+│   ├── a2a_send / a2a_recv
+│   ├── agent_list / agent_revoke
+│   └── skill_market_* (5 个工具)
+├── Web API
+│   ├── GET /stats           — 记忆统计
+│   ├── GET /graph           — 记忆拓扑图
+│   ├── GET /decay_timeline  — 衰减时间线
+│   ├── GET /api/memories    — 记忆列表 + 过滤查询
+│   ├── GET /api/memories/:id — 单条记忆
+│   └── GET /api/relations   — 关系列表
+├── 静态文件
+│   └── /app/ → web/ 目录
+└── 会话文件监听
+    └── session_watcher (5s 轮询)
+```
+
+---
+
+## 2026-07-03 — 独立审计 + 按周分表
+
+### 背景
+
+审计日志与主数据库混用，高频写入影响搜索性能；数据只追加不清理，长期膨胀。
+
+### 变更
+
+#### 审计独立数据库
+- 新增 `audit.db`，与 `memoria.db` 物理分离
+- `auth_pool` 独立连接池（2 连接），不跟主库争锁
+
+#### 按周分表
+- `audit_log` → `audit_log_2026W27`（ISO 周自动分区）
+- `audit_log()` 自动创建当周表并写入
+- `init_auth_tables()` 启动时创建当周表 + 清理超 90 天分区
+- `audit_query` UNION ALL 跨分区查询
+- `db_stats` 跨分区统计审计行数
+
+### 审计容量估算
+
+| 场景 | 日均行数 | 年增长 |
+|------|:-:|:-:|
+| 3 agents | ~1,500 | ~3MB |
+| 20 agents | ~20,000 | ~40MB |
+| 50 agents | ~100,000 | ~200MB |
+
+---
+
+## 2026-07-03 — P0 索引修复
+
+### 修复
+新增 6 个数据库索引，解决搜索性能瓶颈：
+- `idx_mem_ns` — memories 按命名空间查询
+- `idx_mem_ns_tier` — memories 按命名空间 + 层级查询
+- `idx_mem_ns_created` — memories 按命名空间 + 时间排序
+- `idx_msg_session` — messages 按会话查询
+- `idx_decay_log_time` — 衰减日志按时间查询
+- `idx_audit_time` — 审计日志按时间查询
+
+---
+
+## 2026-07-04 — Agent-Core 完整审计 + 12 项修复
+
+### Agent-Core 审计
+7 个源文件，20 项问题（3 P0、7 P1、10 P2），复审后 P0 全部清零。
+
+### 12 项修复
+- `mcp_client` 超时处理
+- `chat_stream` failover
+- `tools_cache` 缓存
+- `SkillClassifier` 配置驱动
+- `canonical_ordered_stringify` 去重
+- SQL 注入增强
+- system_prompt 可配置
+- LRU 会话历史
+- 其他 5 项
+
+### 代码健壮性
+- 11 处生产代码 `unwrap` 清除
+- warning 降至 0
+
+### 并发优化
+- `Mutex<Option<AgentCore>>` → `RwLock<Option<Arc<AgentCore>>>`
+- 锁持有从 chat 周期缩短至微秒级
+- 支持 20-30 并发用户
+
+---
+
+## 2026-07-05 — 开源仓库准备（方案 A）
+
+### 决策
+采用方案 A：新建干净仓库，只提取 Rust 源码 + 配置 + Web 前端，零历史包袱。
+
+### 完成
+- 40 个文件，8503 行，单次干净 commit
+- `cargo check` 零 warning 零 error
+- 中英文双版 README
+- GitHub Actions CI（三平台矩阵）
+- MIT License
+- 零个人数据泄露
+
+### Cargo.toml 优化
+- edition 从 `2024` 改为 `2021`（稳定版）
+- PyO3 改为可选依赖（`default = []`）
+- `crate-type` 从 `["cdylib", "rlib"]` 改为 `["rlib"]`
+
+---
+
+*Memoria — Not bound to any software. Serving only you.*

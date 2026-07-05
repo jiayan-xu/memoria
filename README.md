@@ -6,6 +6,8 @@ AI agents shouldn't forget you every time they restart. Memoria is a standalone 
 
 **Not bound to any software. Serving only you.**
 
+**[中文文档](README_CN.md)** | **[Evolution Log](EVOLUTION.md)**
+
 ---
 
 ## Why Memoria?
