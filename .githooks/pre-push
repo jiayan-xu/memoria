@@ -9,7 +9,7 @@
 #
 # BLOCKS:
 #  - any push from a checkout marked with a root-level .NO_PUSH file
-#  - any branch/tag deletion via push (zero oid on the remote side)
+#  - any branch/tag deletion via push (zero local/oid on the SOURCE side)
 #  - pushing to a branch other than the canonical default branch
 #  - pushing to a remote other than the canonical GitHub remote
 
@@ -26,8 +26,8 @@ DEFAULT_BRANCH="main"
 CANONICAL_REMOTE_SUBSTR="github.com/jiayan-xu/memoria"
 
 while read local_ref local_oid remote_ref remote_oid; do
-  # Block any deletion via push (zero oid on the remote side)
-  case "$remote_oid" in
+  # Block deletion via push: the SOURCE (local) oid is all zeros.
+  case "$local_oid" in
     0000000000000000000000000000000000000000)
       echo "BLOCKED: branch/tag deletion via push is disabled by repository policy." >&2
       exit 1 ;;
