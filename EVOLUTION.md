@@ -235,4 +235,26 @@ memoria-server (:9003)  — Rust 独立二进制
 
 ---
 
+## 2026-07-08 — 开源隐私与安全整改
+
+### 背景
+开源后发现工作区残留密钥与绝对路径，按隐私红线统一清理。
+
+### 变更
+- **密钥轮换**：`MEMORIA_ADMIN_KEY` 改为随机值；agent API key 在提供方注销旧值并换发新 key
+- **托盘脚本去硬编码**：`start_tray.ps1` / `start_agentcore_tray.ps1` 改用 `$PSScriptRoot` 与 `$env:AGENT_CORE_DIR`，不再写死 `C:\Users\<user>\...`
+- **内部文档移出公开树**：24 份内部审查/设计文档 `git rm --cached`（本地保留），补全 `.gitignore`
+- **`.env` 纳入忽略**：密钥一律走环境变量 / `.env`（gitignore），代码只读 `std::env::var(...)`
+- **历史扫描**：全量 `git rev-list --all` 扫描，旧明文密钥已在提供方注销（惰性死串），无需改写历史
+
+### 当前状态
+| 项 | 状态 |
+|------|------|
+| 工作区密钥/绝对路径 | ✅ 已清除 |
+| admin key 轮换 | ✅ |
+| agent API key 换发 | ✅ |
+| 公开历史改写 | ⛔ 免做（旧 key 已注销） |
+
+---
+
 *Memoria — Not bound to any software. Serving only you.*
