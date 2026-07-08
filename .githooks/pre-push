@@ -1,0 +1,55 @@
+#!/bin/sh
+# Safe-push guardrail for jiayan-xu/memoria (public open-source repo).
+# Installed via `git config core.hooksPath .githooks` (canonical checkout) or copied to
+# .git/hooks/pre-push (stale checkouts). See AGENTS.md for the full policy.
+#
+# pre-push receives, per pushed ref, FOUR fields on stdin:
+#     <local-ref> <local-oid> <remote-ref> <remote-oid>
+# and the remote NAME as $1 (remote URL via `git remote get-url "$1"`).
+#
+# BLOCKS:
+#  - any push from a checkout marked with a root-level .NO_PUSH file
+#  - any branch/tag deletion via push (zero oid on the remote side)
+#  - pushing to a branch other than the canonical default branch
+#  - pushing to a remote other than the canonical GitHub remote
+
+remote_name="$1"
+repo_root=$(git rev-parse --show-toplevel 2>/dev/null)
+
+if [ -f "$repo_root/.NO_PUSH" ]; then
+  echo "BLOCKED: this local checkout is marked .NO_PUSH (not the canonical publish source)." >&2
+  echo "         Edit/push from the canonical directory instead. Aborting." >&2
+  exit 1
+fi
+
+DEFAULT_BRANCH="main"
+CANONICAL_REMOTE_SUBSTR="github.com/jiayan-xu/memoria"
+
+while read local_ref local_oid remote_ref remote_oid; do
+  # Block any deletion via push (zero oid on the remote side)
+  case "$remote_oid" in
+    0000000000000000000000000000000000000000)
+      echo "BLOCKED: branch/tag deletion via push is disabled by repository policy." >&2
+      exit 1 ;;
+  esac
+
+  # Block pushing to any non-default branch
+  branch="${remote_ref#refs/heads/}"
+  if [ "$remote_ref" != "refs/heads/$DEFAULT_BRANCH" ]; then
+    echo "BLOCKED: pushing to branch '$branch' is not allowed." >&2
+    echo "         Canonical default branch is '$DEFAULT_BRANCH'. Aborting." >&2
+    exit 1
+  fi
+
+  # Block pushing to a non-canonical remote
+  remote_url=$(git remote get-url "$remote_name" 2>/dev/null || true)
+  case "$remote_url" in
+    *"$CANONICAL_REMOTE_SUBSTR"*) ;;
+    *)
+      echo "BLOCKED: remote '$remote_name' ($remote_url) is not the canonical publish remote." >&2
+      echo "         Must push to '$CANONICAL_REMOTE_SUBSTR'. Aborting." >&2
+      exit 1 ;;
+  esac
+done
+
+exit 0
