@@ -365,6 +365,11 @@ fn dispatch(
             let subject = args.get("subject").and_then(|v| v.as_str()).unwrap_or("");
             let body = args.get("body").and_then(|v| v.as_str()).unwrap_or("");
             if to.is_empty() { return format!(r#"{{"status":"error","message":"missing 'to'"}}"#); }
+            // P0-M1: 校验目标 agent/{to} 属于调用者 allowed_ns，防跨命名空间消息注入
+            let target_ns = format!("agent/{}", to);
+            if !auth::check_ns_access(_auth, &target_ns) {
+                return format!(r#"{{"status":"error","message":"target namespace not allowed"}}"#);
+            }
             match state.pool.get() {
                 Ok(conn) => {
                     let _ = conn.execute(
