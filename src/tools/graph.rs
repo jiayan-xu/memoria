@@ -10,7 +10,7 @@ pub fn build_graph(
     pool: &SqlitePool,
     namespace: &str,
     batch_size: u32,
-) -> Result<(u32, u32, u32), String> {
+) -> Result<(u32, u32), String> {
     let conn = pool.get().map_err(|e| format!("pool: {}", e))?;
     let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S").to_string();
 
@@ -30,7 +30,6 @@ pub fn build_graph(
     let candidates: Vec<(String, String, Option<String>)> = rows.flatten().collect();
     let mut same_entity = 0u32;
     let mut chronological = 0u32;
-    let mut _semantic = 0u32;
 
     for i in 0..candidates.len() {
         for j in (i + 1)..candidates.len() {
@@ -66,5 +65,5 @@ pub fn build_graph(
         }
     }
 
-    Ok((same_entity, chronological, _semantic))
+    Ok((same_entity, chronological))
 }

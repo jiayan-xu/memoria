@@ -4,6 +4,8 @@
 use std::sync::Arc;
 
 pub mod auth;
+pub mod backup;
+pub mod health;
 pub mod search;
 pub mod session_watcher;
 pub mod storage;

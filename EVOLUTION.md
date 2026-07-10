@@ -257,4 +257,28 @@ memoria-server (:9003)  — Rust 独立二进制
 
 ---
 
+## 2026-07-10 — 死锁根治 + 自噬清理 + spawn_blocking 全程隔离
+
+### 背景
+恢复生产后发现 memoria-server 占 60–190% CPU，MCP 工具调用（尤其 register_agent）稳定 40s 超时。经 tokio-console 线程栈精确定位，锁定两类根因：① 同一 spawn_blocking 闭包内对 auth_pool 连续两次同步写（dispatch 写 + 尾部 audit_log）在 WAL 串行写下死等；② 所有同步阻塞点（authenticate/audit_log/dispatch/health_check）直接跑在 async worker 上，慢查询即耗尽 worker。
+
+### 修复清单
+| 问题 | 级别 | 修复 |
+|------|:-:|------|
+| register_agent 40s 死锁 | P0 | 闭包尾部 `auth::audit_log` 改为 fire-and-forget `spawn_audit`（与 get_allowed_ns 一致），消除同池连续两次同步写死等 |
+| 同步阻塞占满 async worker | P0 | `authenticate`/`audit_log`/`dispatch`/`health_check` 全部 `spawn_blocking` 隔离，WAL 下 SQLite 串行写不再饿死 worker |
+| auth_pool 漏 init_schema | P0 | 补 WAL + busy_timeout；连接池 auth_pool 2→16、pool 4→16 |
+| observe() 无去重 | P1 | content_hash UNIQUE + INSERT OR IGNORE（与 remember.rs 一致），消除重复 INSERT |
+| WATCH_DIRS 自噬 14GB | P0 | 从监视目录移除 agent 自身 sessions（14GB/1164 文件），仅留 reasonix/sessions；Memoria 不再「观察自身输出」 |
+| 页面/工具强鉴权卡启动 | P1 | tools/list、initialize 不再强制鉴权 |
+
+### 诊断脚手架
+- 可选 `diag` feature（`console-subscriber`，需 `RUSTFLAGS="--cfg tokio_unstable"`）暴露 tokio 任务级栈，`:6669` console 端口；默认关闭，不影响生产构建。
+- 结论：当前代码无 busy-loop，空闲 0% CPU，死锁随干净版根治。
+
+### 验证
+- `/health` 1.5ms；`tools/list` 3.7ms；register_agent **21ms**（原 40s 超时）；agent-core `/v1/chat/completions` 端到端 **2.9s** 真实回复。
+
+---
+
 *Memoria — Not bound to any software. Serving only you.*

@@ -84,13 +84,23 @@ async fn poll_once(
                 Ok(m) => m,
                 Err(_) => continue,
             };
+            // 微信网关等频繁创建新文件：创建不足 30 秒的不处理
+            let elapsed = meta.modified()
+                .ok()
+                .and_then(|t| t.elapsed().ok())
+                .unwrap_or_default();
+            if elapsed < std::time::Duration::from_secs(30) {
+                continue;
+            }
             let new_len = meta.len();
-            if new_len <= offset {
+            if new_len == offset {
                 continue; // 未增长
             }
+            // 文件变短（被覆盖重写）：从头开始读
+            let read_offset = if new_len < offset { 0 } else { offset };
 
             // 只读新增部分
-            let lines = match read_new_lines(&p, offset) {
+            let lines = match read_new_lines(&p, read_offset) {
                 Ok(l) => l,
                 Err(_) => continue,
             };
@@ -119,9 +129,14 @@ async fn poll_once(
     Ok(())
 }
 
-/// 读文件从 offset 开始的所有行
+/// 读文件从 offset 开始的所有行（只读模式，不触发文件系统变更通知）
 fn read_new_lines(path: &Path, offset: u64) -> Result<Vec<String>, String> {
-    let file = std::fs::File::open(path).map_err(|e| format!("open: {}", e))?;
+    use std::fs::OpenOptions;
+    let file = OpenOptions::new()
+        .read(true)
+        .write(false)
+        .open(path)
+        .map_err(|e| format!("open: {}", e))?;
     let mut reader = BufReader::new(file);
     reader.seek(SeekFrom::Start(offset)).map_err(|e| format!("seek: {}", e))?;
 

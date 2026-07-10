@@ -21,6 +21,7 @@ pub struct Memory {
     pub evidence: Option<String>,
     pub importance: i64,
     pub decay_factor: f64,
+    pub superseded_by: Option<String>,
 }
 
 /// A conversation message (matches `messages` table).

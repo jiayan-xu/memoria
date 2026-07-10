@@ -5,11 +5,9 @@
 
 use crate::storage::SqlitePool;
 
-/// Get user preferences from `user_prefs` table (matching Python).
-pub fn user_prefs(pool: &SqlitePool, _namespace: &str) -> Result<Vec<(String, String, f64)>, String> {
+/// Get user preferences from `user_prefs` table (globally, no namespace column).
+pub fn user_prefs(pool: &SqlitePool) -> Result<Vec<(String, String, f64)>, String> {
     let conn = pool.get().map_err(|e| format!("pool: {}", e))?;
-    // user_prefs has key-value structure, no namespace column.
-    // All prefs are global — use key as id, value as content, confidence from table.
     let mut stmt = conn.prepare(
         "SELECT key, value, confidence FROM user_prefs ORDER BY updated_at DESC LIMIT 50"
     ).map_err(|e| format!("prepare: {}", e))?;

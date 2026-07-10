@@ -1,16 +1,16 @@
 [package]
 name = "memoria-core"
 version = "0.2.0"
-edition = "2021"
+edition = "2024"
 description = "Independent memory center for AI agents — MCP protocol, Rust-native"
 license = "MIT"
-repository = "https://github.com/memoria-ai/memoria"
+repository = "https://github.com/jiayan-xu/memoria"
 keywords = ["mcp", "ai", "memory", "agent", "vector-search"]
 categories = ["database", "web-programming::http-server"]
 
 [lib]
 name = "memoria_core"
-crate-type = ["rlib"]
+crate-type = ["cdylib", "rlib"]
 
 [[bin]]
 name = "memoria-server"
@@ -34,15 +34,15 @@ axum = "0.7"
 tokio = { version = "1", features = ["full"] }
 tower-http = { version = "0.5", features = ["cors", "fs"] }
 reqwest = { version = "0.12", features = ["json"] }
+pyo3 = { version = "0.29", features = ["extension-module"], optional = true }
+# 诊断依赖：仅 --features diag 时编译进二进制（默认不开启，不影响生产）
+console-subscriber = { version = "0.4", optional = true }
 
 [features]
-default = []
-python = ["dep:pyo3"]
-
-[dependencies.pyo3]
-version = "0.29"
-features = ["extension-module"]
-optional = true
+default = ["python"]
+python = ["pyo3"]
+# 诊断构建：暴露 tokio 任务级栈（需 RUSTFLAGS="--cfg tokio_unstable"）
+diag = ["console-subscriber"]
 
 [profile.release]
 lto = "fat"

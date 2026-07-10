@@ -187,3 +187,34 @@ pub fn wal_checkpoint(pool: &SqlitePool) -> Result<(), String> {
     conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE);")
         .map_err(|e| format!("checkpoint: {}", e))
 }
+
+/// 迁移：添加 superseded_by 列到 memories 表（P0: 近义重复检测）
+/// SQLite 不支持 ADD COLUMN IF NOT EXISTS，需要先检查
+pub fn migrate_superseded_by(pool: &SqlitePool) -> Result<(), String> {
+    let conn = pool.get().map_err(|e| format!("pool get: {}", e))?;
+
+    // 检查 superseded_by 列是否已存在
+    let has_column: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('memories') WHERE name = 'superseded_by'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+
+    if has_column == 0 {
+        conn.execute_batch(
+            "ALTER TABLE memories ADD COLUMN superseded_by TEXT;",
+        )
+        .map_err(|e| format!("add superseded_by: {}", e))?;
+        println!("[Memoria] Migration: added superseded_by column to memories");
+    }
+
+    // 列确保存在后再建索引（P0 fix: 2026-07-06 近义重复检测）
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_mem_superseded ON memories(superseded_by) WHERE superseded_by IS NOT NULL;",
+    )
+    .map_err(|e| format!("superseded index: {}", e))?;
+
+    Ok(())
+}

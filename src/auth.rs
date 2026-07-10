@@ -16,6 +16,15 @@ use chrono::Datelike;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+/// 审计日志脱敏：敏感字段名片段（不区分大小写匹配）
+const SENSITIVE_KEYS: &[&str] = &[
+    "api_key", "api-key", "apikey", "token", "secret",
+    "password", "passwd", "credential", "auth",
+    "authorization", "bearer", "access_key", "accesskey",
+    "private_key", "privatekey", "ssl_key", "ssh_key",
+    "admin_key", "adminkey",
+];
+
 /// Agent 名牌（注册后返回给 Agent）
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct AgentBadge {
@@ -29,6 +38,7 @@ pub struct AgentBadge {
 }
 
 /// 认证结果（内部使用）
+#[derive(Clone)]
 pub struct AuthResult {
     pub agent_id: String,
     pub allowed_ns: Vec<String>,
@@ -128,7 +138,7 @@ pub fn authenticate(
 
     match row {
         Ok((stored_token, ns_list, permission)) => {
-            if stored_token != badge_token {
+            if !ct_eq(&stored_token, badge_token) {
                 return Err("invalid badge token".to_string());
             }
             let allowed_ns: Vec<String> = ns_list.split(',')
@@ -145,16 +155,118 @@ pub fn authenticate(
     }
 }
 
-/// 检查 namespace 是否有权限（精确匹配）
+/// 恒定时间字符串比较（防 timing side-channel）
+pub fn ct_eq(a: &str, b: &str) -> bool {
+    let ab = a.as_bytes();
+    let bb = b.as_bytes();
+    let mut diff = (ab.len() ^ bb.len()) as u8;
+    let max = ab.len().max(bb.len());
+    for i in 0..max {
+        let x = *ab.get(i).unwrap_or(&0);
+        let y = *bb.get(i).unwrap_or(&0);
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+/// 检查 namespace 是否有权限（层级 / 包含匹配）
+///
+/// 授权 ns 与目标 ns 满足以下任一即放行：
+/// - 完全一致（`ns == namespace`）
+/// - 目标是授权 ns 的后代（`namespace` 以 `ns/` 开头）
+/// - 授权 ns 是目标的后代（两者共享同一子树，`ns` 以 `namespace/` 开头）
+///
+/// 例：授权 `org/公司/div/工程线` 可覆盖其下 `dept/工程部/proj/P1` 等全部后代；
+///     部门级工具 `dept/工程部` 又对其下属 `proj/P1` 可见（共享子树）。
 pub fn check_ns_access(auth: &AuthResult, namespace: &str) -> bool {
     if auth.role == "admin" { return true; }
     if auth.allowed_ns.contains(&"*".to_string()) { return true; }
-    auth.allowed_ns.iter().any(|ns| ns == namespace)
+    auth.allowed_ns.iter().any(|ns| {
+        *ns == namespace
+            || namespace.starts_with(&format!("{}/", ns))
+            || ns.starts_with(&format!("{}/", namespace))
+    })
 }
 
-/// 写入审计日志（自动按周分表）
+/// 审计日志参数脱敏（移除敏感字段值，保留结构）
+///
+/// 敏感字段：api_key, token, secret, password, credential, bearer 等
+/// 脱敏方式：保留前4字符 + `****`
+pub fn sanitize_params(params: &str) -> String {
+    // 尝试解析为 JSON，对 value 字段脱敏
+    if let Ok(mut v) = serde_json::from_str::<serde_json::Value>(params) {
+        sanitize_json_value(&mut v);
+        return serde_json::to_string(&v).unwrap_or_else(|_| params.to_string());
+    }
+
+    // 非 JSON 格式 → 通用脱敏：替换敏感 key=value 模式
+    let mut result = params.to_string();
+    for key in SENSITIVE_KEYS {
+        let candidates = [
+            format!("{}=", key),
+            format!("{}'", key),
+            format!("\"{}\":", key),
+            format!("{}:", key),
+        ];
+        for cand in &candidates {
+            let lower_cand = cand.to_lowercase();
+            while let Some(pos) = result.to_lowercase().find(&lower_cand) {
+                let end_key = pos + cand.len();
+                if end_key >= result.len() {
+                    break;
+                }
+                // 定位到值结束（逗号/引号/空格/}）
+                let end_val = result[end_key..]
+                    .find(|c: char| c == ',' || c == '}' || c == ')' || c == ' ' || c == '\n' || c == '\r')
+                    .map(|e| end_key + e)
+                    .unwrap_or(result.len());
+                let val = result[end_key..end_val].to_string();
+                let masked = if val.len() > 4 {
+                    format!("{}****", &val[..4])
+                } else {
+                    "****".to_string()
+                };
+                result.replace_range(end_key..end_val, &masked);
+            }
+        }
+    }
+    result
+}
+
+/// 递归脱敏 JSON 值中的敏感字段
+fn sanitize_json_value(v: &mut serde_json::Value) {
+    match v {
+        serde_json::Value::Object(map) => {
+            for (key, val) in map.iter_mut() {
+                let key_lower = key.to_lowercase();
+                if SENSITIVE_KEYS.iter().any(|k| key_lower.contains(k)) {
+                    if val.is_string() {
+                        let s = val.as_str().unwrap();
+                        let masked = if s.len() > 4 {
+                            format!("{}****", &s[..4])
+                        } else {
+                            "****".to_string()
+                        };
+                        *val = serde_json::Value::String(masked);
+                    }
+                } else {
+                    sanitize_json_value(val);
+                }
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            for item in arr.iter_mut() {
+                sanitize_json_value(item);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// 写入审计日志（自动按周分表，参数自动脱敏）
 pub fn audit_log(pool: &SqlitePool, agent_id: &str, tool: &str, params: &str, allowed: bool) {
     if let Ok(conn) = pool.get() {
+        let sanitized = sanitize_params(params);
         let week_table = format!("audit_log_{}", iso_week());
         // 自动创建当周表（幂等）
         let _ = conn.execute(
@@ -175,7 +287,7 @@ pub fn audit_log(pool: &SqlitePool, agent_id: &str, tool: &str, params: &str, al
                 "INSERT INTO {} (agent_id, tool, params, allowed, timestamp)
                  VALUES (?, ?, ?, ?, datetime('now'))", week_table
             ),
-            rusqlite::params![agent_id, tool, params, if allowed { 1 } else { 0 }],
+            rusqlite::params![agent_id, tool, sanitized, if allowed { 1 } else { 0 }],
         );
     }
 }

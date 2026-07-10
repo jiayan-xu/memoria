@@ -3,23 +3,54 @@
 //! 与 React SPA (web/ 目录) 直接对接，JSON 结构与旧版 Python 保持一致。
 
 use axum::{
-    extract::{Path, Query, State},
+    extract::{Extension, Path, Query, Request, State},
     http::StatusCode,
-    routing::get,
+    middleware::{self, Next},
+    response::Response,
+    routing::{get},
     Json, Router,
 };
 use serde::Deserialize;
 use std::sync::Arc;
 use serde_json::{json, Value};
 
+use crate::auth::{self, AuthResult};
 use crate::storage::SqlitePool;
 
 /// App state shared across web API handlers
 pub struct WebApiState {
     pub pool: SqlitePool,
+    pub auth_pool: SqlitePool,
 }
 
-/// 构建 Web API 路由
+/// Auth middleware: 校验 X-Agent-Id / X-Agent-Key
+async fn auth_middleware(
+    State(state): State<Arc<WebApiState>>,
+    mut request: Request,
+    next: Next,
+) -> Result<Response, StatusCode> {
+    let agent_id = request.headers()
+        .get("X-Agent-Id")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let badge_token = request.headers()
+        .get("X-Agent-Key")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+
+    if agent_id.is_empty() || badge_token.is_empty() {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+
+    let auth = auth::authenticate(&state.auth_pool, agent_id, badge_token)
+        .map_err(|_| StatusCode::UNAUTHORIZED)?;
+
+    // P1-1 修复：把认证结果注入请求 extensions，供下游 handler 做 NS 授权校验
+    request.extensions_mut().insert(auth);
+    Ok(next.run(request).await)
+}
+
+/// 构建 Web API 路由（所有路由需要 X-Agent-Id / X-Agent-Key 认证）
 pub fn build_web_api_routes(state: Arc<WebApiState>) -> Router {
     Router::new()
         .route("/stats", get(api_stats))
@@ -28,6 +59,7 @@ pub fn build_web_api_routes(state: Arc<WebApiState>) -> Router {
         .route("/api/memories", get(api_list_memories))
         .route("/api/memories/{id}", get(api_get_memory))
         .route("/api/relations", get(api_list_relations))
+        .layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
         .with_state(state)
 }
 
@@ -39,9 +71,13 @@ pub struct StatsQuery {
 
 async fn api_stats(
     State(state): State<Arc<WebApiState>>,
+    Extension(auth): Extension<AuthResult>,
     Query(q): Query<StatsQuery>,
 ) -> Result<Json<Value>, StatusCode> {
     let ns = q.namespace.as_deref().unwrap_or("default");
+    if !auth::check_ns_access(&auth, ns) {
+        return Err(StatusCode::FORBIDDEN);
+    }
     let conn = state.pool.get().map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
 
     let sessions: i64 = conn
@@ -94,9 +130,13 @@ pub struct GraphQuery {
 
 async fn api_graph(
     State(state): State<Arc<WebApiState>>,
+    Extension(auth): Extension<AuthResult>,
     Query(q): Query<GraphQuery>,
 ) -> Result<Json<Value>, StatusCode> {
     let ns = q.namespace.as_deref().unwrap_or("default");
+    if !auth::check_ns_access(&auth, ns) {
+        return Err(StatusCode::FORBIDDEN);
+    }
     let conn = state.pool.get().map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
 
     // 读取 memories
@@ -241,19 +281,45 @@ pub struct DecayQuery {
 
 async fn api_decay_timeline(
     State(state): State<Arc<WebApiState>>,
+    Extension(auth): Extension<AuthResult>,
     Query(q): Query<DecayQuery>,
 ) -> Result<Json<Vec<Value>>, StatusCode> {
     let _ns = q.namespace.as_deref().unwrap_or("default");
-    let _days = q.days.unwrap_or(90);
     let conn = state.pool.get().map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
 
-    let mut stmt = conn.prepare(
-        "SELECT memory_id, old_tier, new_tier, old_decay, new_decay, reason, logged_at
-         FROM decay_log ORDER BY logged_at DESC LIMIT 500"
-    ).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    // P1-1 修复：NS 过滤。admin/通配看全部；否则仅返回可访问 NS 的记忆衰减历史
+    // （decay_log 无 namespace 列，需 JOIN memories）
+    let is_admin = auth.role == "admin" || auth.allowed_ns.iter().any(|n| n == "*");
+    let (sql, params): (String, Vec<String>) = if is_admin {
+        (
+            "SELECT memory_id, old_tier, new_tier, old_decay, new_decay, reason, logged_at
+             FROM decay_log ORDER BY logged_at DESC LIMIT 500".to_string(),
+            vec![],
+        )
+    } else if auth.allowed_ns.is_empty() {
+        (
+            "SELECT memory_id, old_tier, new_tier, old_decay, new_decay, reason, logged_at
+             FROM decay_log WHERE 0=1".to_string(),
+            vec![],
+        )
+    } else {
+        let placeholders: Vec<String> = (1..=auth.allowed_ns.len()).map(|i| format!("?{}", i)).collect();
+        (
+            format!(
+                "SELECT dl.memory_id, dl.old_tier, dl.new_tier, dl.old_decay, dl.new_decay, dl.reason, dl.logged_at
+                 FROM decay_log dl JOIN memories m ON dl.memory_id = m.id
+                 WHERE m.namespace IN ({}) ORDER BY dl.logged_at DESC LIMIT 500",
+                placeholders.join(",")
+            ),
+            auth.allowed_ns.clone(),
+        )
+    };
+
+    let mut stmt = conn.prepare(&sql).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let param_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p as &dyn rusqlite::types::ToSql).collect();
 
     let mut results = Vec::new();
-    let rows = stmt.query_map([], |r| {
+    let rows = stmt.query_map(param_refs.as_slice(), |r| {
         Ok((
             r.get::<_, String>(0)?,
             r.get::<_, String>(1)?,
@@ -295,9 +361,13 @@ pub struct MemoriesQuery {
 
 async fn api_list_memories(
     State(state): State<Arc<WebApiState>>,
+    Extension(auth): Extension<AuthResult>,
     Query(q): Query<MemoriesQuery>,
 ) -> Result<Json<Value>, StatusCode> {
     let ns = q.namespace.as_deref().unwrap_or("default");
+    if !auth::check_ns_access(&auth, ns) {
+        return Err(StatusCode::FORBIDDEN);
+    }
     let limit = q.limit.unwrap_or(50).min(500);
     let offset = q.offset.unwrap_or(0);
     let conn = state.pool.get().map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
@@ -368,9 +438,19 @@ async fn api_list_memories(
 // ── /api/memories/:id ──
 async fn api_get_memory(
     State(state): State<Arc<WebApiState>>,
+    Extension(auth): Extension<AuthResult>,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, StatusCode> {
     let conn = state.pool.get().map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+    // P1-1 修复：先取该记忆所属 NS，做授权校验（防 IDOR 跨 NS 读取）
+    let mem_ns: String = conn.query_row(
+        "SELECT namespace FROM memories WHERE id = ?1",
+        [&id],
+        |r| r.get::<_, String>(0),
+    ).unwrap_or_default();
+    if !mem_ns.is_empty() && !auth::check_ns_access(&auth, &mem_ns) {
+        return Err(StatusCode::FORBIDDEN);
+    }
     let result = conn.query_row(
         "SELECT id, content, category, tier, importance, decay_factor, recall_count, created_at, namespace FROM memories WHERE id = ?1",
         [&id],
@@ -400,13 +480,37 @@ async fn api_get_memory(
 // ── /api/relations ──
 async fn api_list_relations(
     State(state): State<Arc<WebApiState>>,
+    Extension(auth): Extension<AuthResult>,
 ) -> Result<Json<Value>, StatusCode> {
     let conn = state.pool.get().map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
-    let mut stmt = conn.prepare(
-        "SELECT id, source_id, target_id, relation_type, weight, created_at FROM memory_relations LIMIT 200"
-    ).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    let relations: Vec<Value> = stmt.query_map([], |r| {
+    // P1-1 修复：NS 过滤。admin/通配看全部；否则仅返回可访问 NS 的关系边
+    let is_admin = auth.role == "admin" || auth.allowed_ns.iter().any(|n| n == "*");
+    let (sql, params): (String, Vec<String>) = if is_admin {
+        (
+            "SELECT id, source_id, target_id, relation_type, weight, created_at FROM memory_relations LIMIT 200".to_string(),
+            vec![],
+        )
+    } else if auth.allowed_ns.is_empty() {
+        (
+            "SELECT id, source_id, target_id, relation_type, weight, created_at FROM memory_relations WHERE 0=1".to_string(),
+            vec![],
+        )
+    } else {
+        let placeholders: Vec<String> = (1..=auth.allowed_ns.len()).map(|i| format!("?{}", i)).collect();
+        (
+            format!(
+                "SELECT id, source_id, target_id, relation_type, weight, created_at
+                 FROM memory_relations WHERE namespace IN ({}) LIMIT 200",
+                placeholders.join(",")
+            ),
+            auth.allowed_ns.clone(),
+        )
+    };
+
+    let mut stmt = conn.prepare(&sql).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let param_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p as &dyn rusqlite::types::ToSql).collect();
+    let relations: Vec<Value> = stmt.query_map(param_refs.as_slice(), |r| {
         Ok(json!({
             "id": r.get::<_, i64>(0)?,
             "source_id": r.get::<_, String>(1)?,
