@@ -121,11 +121,18 @@ pub fn init_core_tables(pool: &SqlitePool) -> Result<(), String> {
             content_rowid='rowid'
         );
 
-        -- Dream state (decay/consolidation tracker)
+        -- Dream state (decay/consolidation tracker, per (phase, namespace))
+        -- phase: 'consolidate' | 'entity_extract' | 'decay' | 'graph'
+        -- cursor_ts: 幂等游标，已处理到的最大 memories.created_at
         CREATE TABLE IF NOT EXISTS dream_state (
-            phase TEXT PRIMARY KEY,
+            phase TEXT NOT NULL,
+            namespace TEXT NOT NULL DEFAULT 'default',
             last_run TEXT,
-            sessions_processed INTEGER DEFAULT 0
+            cursor_ts TEXT,
+            runs INTEGER DEFAULT 0,
+            items_out INTEGER DEFAULT 0,
+            sessions_processed INTEGER DEFAULT 0,
+            PRIMARY KEY (phase, namespace)
         );
 
         -- Memory relations (edges between memories)
@@ -155,6 +162,46 @@ pub fn init_core_tables(pool: &SqlitePool) -> Result<(), String> {
             logged_at TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_decay_log_time ON decay_log(logged_at DESC);
+
+        -- Entity knowledge graph (B phase)
+        CREATE TABLE IF NOT EXISTS entities (
+            id TEXT PRIMARY KEY,
+            namespace TEXT NOT NULL DEFAULT 'default',
+            entity_type TEXT NOT NULL CHECK(entity_type IN ('person','system','tool','concept','org','project','location','event','other')),
+            name TEXT NOT NULL,
+            aliases TEXT DEFAULT '[]',
+            summary TEXT,
+            created_at TEXT DEFAULT (datetime('now'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_entity_ns_type ON entities(namespace, entity_type);
+        CREATE INDEX IF NOT EXISTS idx_entity_name ON entities(name);
+
+        CREATE TABLE IF NOT EXISTS entity_mentions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            entity_id TEXT NOT NULL REFERENCES entities(id),
+            memory_id TEXT NOT NULL REFERENCES memories(id),
+            context TEXT,
+            namespace TEXT NOT NULL DEFAULT 'default',
+            created_at TEXT DEFAULT (datetime('now'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_mention_entity ON entity_mentions(entity_id);
+        CREATE INDEX IF NOT EXISTS idx_mention_memory ON entity_mentions(memory_id);
+        CREATE INDEX IF NOT EXISTS idx_mention_ns ON entity_mentions(namespace);
+
+        CREATE TABLE IF NOT EXISTS entity_edges (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            namespace TEXT NOT NULL DEFAULT 'default',
+            source_entity_id TEXT NOT NULL REFERENCES entities(id),
+            target_entity_id TEXT NOT NULL REFERENCES entities(id),
+            relation_type TEXT NOT NULL,
+            weight REAL DEFAULT 1.0,
+            evidence TEXT,
+            created_at TEXT DEFAULT (datetime('now')),
+            UNIQUE(namespace, source_entity_id, target_entity_id, relation_type)
+        );
+        CREATE INDEX IF NOT EXISTS idx_edge_source ON entity_edges(source_entity_id);
+        CREATE INDEX IF NOT EXISTS idx_edge_target ON entity_edges(target_entity_id);
+        CREATE INDEX IF NOT EXISTS idx_edge_ns ON entity_edges(namespace);
 
         -- Performance indexes (P0 fix: 2026-07-03)
         CREATE INDEX IF NOT EXISTS idx_mem_ns ON memories(namespace);
@@ -237,6 +284,43 @@ pub fn migrate_user_prefs_namespace(pool: &SqlitePool) -> Result<(), String> {
         )
         .map_err(|e| format!("add user_prefs.namespace: {}", e))?;
         println!("[Memoria] Migration: added namespace column to user_prefs");
+    }
+    Ok(())
+}
+
+/// 暗知识层 A1 迁移：`dream_state` 由 PK(phase) 升级为复合 PK(phase, namespace)，
+/// 并补 cursor_ts / runs / items_out 列（夜间巩固幂等游标与审计）。
+/// SQLite 不支持直接改 PK。`dream_state` 历史上从未被任何代码写入（空表），
+/// 故检测到旧结构（无 namespace 列）时直接 DROP + 按新结构重建，无数据损失。
+/// 幂等：已是新结构（含 namespace 列）则跳过。
+pub fn migrate_dream_state_ns(pool: &SqlitePool) -> Result<(), String> {
+    let conn = pool.get().map_err(|e| format!("pool get: {}", e))?;
+    let has_ns: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('dream_state') WHERE name = 'namespace'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    if has_ns == 0 {
+        conn.execute_batch(
+            "ALTER TABLE dream_state RENAME TO _dream_state_old;
+             CREATE TABLE dream_state (
+                 phase TEXT NOT NULL,
+                 namespace TEXT NOT NULL DEFAULT 'default',
+                 last_run TEXT,
+                 cursor_ts TEXT,
+                 runs INTEGER DEFAULT 0,
+                 items_out INTEGER DEFAULT 0,
+                 sessions_processed INTEGER DEFAULT 0,
+                 PRIMARY KEY (phase, namespace)
+             );
+             INSERT INTO dream_state(phase, namespace, last_run, sessions_processed)
+                 SELECT phase, 'default', last_run, sessions_processed FROM _dream_state_old;
+             DROP TABLE _dream_state_old;",
+        )
+        .map_err(|e| format!("migrate dream_state: {}", e))?;
+        println!("[Memoria] Migration: rebuilt dream_state with (phase, namespace) composite PK (preserved old rows)");
     }
     Ok(())
 }

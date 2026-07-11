@@ -83,6 +83,8 @@ fn main() {
     storage::migrate_superseded_by(&pool).expect("migration: superseded_by");
     // P0: 迁移 — user_prefs 增加 namespace 列（跨租户隔离，B3 修复）
     storage::migrate_user_prefs_namespace(&pool).expect("migration: user_prefs namespace");
+    // 暗知识层 A1: dream_state 升级为 (phase, namespace) 复合 PK + cursor_ts 幂等游标
+    storage::migrate_dream_state_ns(&pool).expect("migration: dream_state namespace");
 
     println!("[Memoria] Auth DB: {}", auth_db_path);
     let auth_pool = storage::create_pool(&auth_db_path, 16).expect("auth pool");

@@ -103,3 +103,39 @@ pub struct DecayLog {
     pub reason: Option<String>,
     pub logged_at: Option<String>,
 }
+
+/// A knowledge graph entity (matches `entities` table).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Entity {
+    pub id: String,
+    pub namespace: String,
+    pub entity_type: String,
+    pub name: String,
+    pub aliases: Option<String>,
+    pub summary: Option<String>,
+    pub created_at: Option<String>,
+}
+
+/// An entity mention in a memory (matches `entity_mentions` table).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EntityMention {
+    pub id: i64,
+    pub entity_id: String,
+    pub memory_id: String,
+    pub context: Option<String>,
+    pub namespace: String,
+    pub created_at: Option<String>,
+}
+
+/// A relation edge between two entities (matches `entity_edges` table).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EntityEdge {
+    pub id: i64,
+    pub namespace: String,
+    pub source_entity_id: String,
+    pub target_entity_id: String,
+    pub relation_type: String,
+    pub weight: f64,
+    pub evidence: Option<String>,
+    pub created_at: Option<String>,
+}

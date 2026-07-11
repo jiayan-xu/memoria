@@ -1,69 +1,84 @@
-//! Rust memory_graph — 记忆关系边自动构建。
-//! Phase 3: 基于 content 相似性和时间顺序建立关系边。
+//! Knowledge graph — entity-based relation edges and graph queries.
+//! Phase B: replaces the old heuristic prefix-matching `build_graph`.
+//!
+//! The engine stores edges in `entity_edges` table (inserted by NER / manual tools).
+//! This module reads from that table to return graph data for visualization.
 
 use crate::storage::SqlitePool;
 
-/// Build relation edges between memories in a namespace.
-/// Uses content hash prefix matching and temporal proximity.
-/// Returns (same_entity, chronological, semantic) counts.
+/// Legacy entry point (backward compatible with `memory_graph` MCP tool).
+/// Now reads from `entity_edges` + `entities` instead of heuristic matches.
+/// Returns (nodes_count, edges_count).
 pub fn build_graph(
     pool: &SqlitePool,
     namespace: &str,
-    batch_size: u32,
+    _batch_size: u32,  // kept for backward compat
 ) -> Result<(u32, u32), String> {
     let conn = pool.get().map_err(|e| format!("pool: {}", e))?;
-    let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S").to_string();
 
-    // Get candidate memories
+    // Count existing entity edges
+    let edges: u32 = conn.query_row(
+        "SELECT COUNT(*) FROM entity_edges WHERE namespace = ?1",
+        rusqlite::params![namespace],
+        |r| r.get::<_, u32>(0),
+    ).map_err(|e| format!("count edges: {}", e))?;
+
+    let nodes: u32 = conn.query_row(
+        "SELECT COUNT(*) FROM entities WHERE namespace = ?1",
+        rusqlite::params![namespace],
+        |r| r.get::<_, u32>(0),
+    ).map_err(|e| format!("count nodes: {}", e))?;
+
+    Ok((nodes, edges))
+}
+
+/// Export full graph as JSON payload (nodes + edges) for the frontend.
+pub fn export_graph(
+    pool: &SqlitePool,
+    namespace: &str,
+) -> Result<serde_json::Value, String> {
+    let conn = pool.get().map_err(|e| format!("pool: {}", e))?;
+
+    // Nodes
     let mut stmt = conn.prepare(
-        "SELECT id, content, created_at FROM memories WHERE namespace = ? AND tier IN ('hot','warm') ORDER BY created_at DESC LIMIT ?"
-    ).map_err(|e| format!("prepare: {}", e))?;
+        "SELECT id, entity_type, name, aliases, summary, created_at
+         FROM entities WHERE namespace = ?1
+         ORDER BY name"
+    ).map_err(|e| format!("prep nodes: {}", e))?;
+    let nodes: Vec<serde_json::Value> = stmt.query_map(
+        rusqlite::params![namespace],
+        |r| Ok(serde_json::json!({
+            "id": r.get::<_, String>(0)?,
+            "type": r.get::<_, String>(1)?,
+            "label": r.get::<_, String>(2)?,
+            "aliases": r.get::<_, Option<String>>(3)?,
+            "summary": r.get::<_, Option<String>>(4)?,
+            "created_at": r.get::<_, Option<String>>(5)?,
+        })),
+    ).map_err(|e| format!("query nodes: {}", e))?
+    .flatten().collect();
 
-    let rows = stmt.query_map(rusqlite::params![namespace, batch_size], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, Option<String>>(2)?,
-        ))
-    }).map_err(|e| format!("query: {}", e))?;
+    // Edges
+    let mut stmt2 = conn.prepare(
+        "SELECT source_entity_id, target_entity_id, relation_type, weight, evidence
+         FROM entity_edges WHERE namespace = ?1
+         ORDER BY weight DESC"
+    ).map_err(|e| format!("prep edges: {}", e))?;
+    let edges: Vec<serde_json::Value> = stmt2.query_map(
+        rusqlite::params![namespace],
+        |r| Ok(serde_json::json!({
+            "source": r.get::<_, String>(0)?,
+            "target": r.get::<_, String>(1)?,
+            "relation": r.get::<_, String>(2)?,
+            "weight": r.get::<_, f64>(3)?,
+            "evidence": r.get::<_, Option<String>>(4)?,
+        })),
+    ).map_err(|e| format!("query edges: {}", e))?
+    .flatten().collect();
 
-    let candidates: Vec<(String, String, Option<String>)> = rows.flatten().collect();
-    let mut same_entity = 0u32;
-    let mut chronological = 0u32;
-
-    for i in 0..candidates.len() {
-        for j in (i + 1)..candidates.len() {
-            let (id_a, content_a, _) = &candidates[i];
-            let (id_b, content_b, _) = &candidates[j];
-
-            // Same entity: content has matching key phrases (skip generic prefixes)
-            if content_a.len() > 20 && content_b.len() > 20 {
-                // Use the first non-generic 15 characters
-                let a_prefix: String = content_a.chars().skip_while(|c| *c == '[' || *c == '(').take(15).collect();
-                let b_prefix: String = content_b.chars().skip_while(|c| *c == '[' || *c == '(').take(15).collect();
-                if a_prefix == b_prefix {
-                    conn.execute(
-                        "INSERT OR IGNORE INTO memory_relations (namespace, source_id, target_id, relation_type, weight, evidence, created_at)
-                         VALUES (?, ?, ?, 'same_entity', 0.8, 'auto_graph', ?)",
-                        rusqlite::params![namespace, id_a, id_b, now],
-                    ).ok();
-                    same_entity += 1;
-                }
-            }
-
-            // Chronological: same day creation
-            if let (Some(da), Some(db)) = (&candidates[i].2, &candidates[j].2) {
-                if da.len() >= 10 && db.len() >= 10 && &da[..10] == &db[..10] {
-                    conn.execute(
-                        "INSERT OR IGNORE INTO memory_relations (namespace, source_id, target_id, relation_type, weight, evidence, created_at)
-                         VALUES (?, ?, ?, 'chronological', 0.5, 'auto_graph', ?)",
-                        rusqlite::params![namespace, id_a, id_b, now],
-                    ).ok();
-                    chronological += 1;
-                }
-            }
-        }
-    }
-
-    Ok((same_entity, chronological))
+    Ok(serde_json::json!({
+        "nodes": nodes,
+        "edges": edges,
+        "stats": {"node_count": nodes.len(), "edge_count": edges.len()}
+    }))
 }

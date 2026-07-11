@@ -269,6 +269,51 @@ fn tools_list() -> Vec<serde_json::Value> {
         "merge_id": {"type": "string", "description": "被合并的记忆 ID（必填）"},
         "admin_key": {"type": "string", "description": "Admin Key"}
     })));
+    // ── 暗知识层 A1：夜间巩固哑工具（认知在 agent-core，此处只做纯 SQL）──
+    tools.push(tool("memory_fetch_unconsolidated", "取本命名空间中 created_at > since 的未巩固观察记录（供 agent-core 夜间巩固提炼；纯读取）", serde_json::json!({
+        "namespace": {"type": "string", "description": "命名空间，默认 default"},
+        "since": {"type": "string", "description": "游标：只取 created_at 大于此 ISO8601 时间的记录，默认 1970-01-01"},
+        "limit": {"type": "number", "description": "最多返回条数，默认 200"}
+    })));
+    tools.push(tool("dream_state_get", "读取某命名空间某阶段的巩固进度（last_run / cursor_ts）", serde_json::json!({
+        "namespace": {"type": "string", "description": "命名空间，默认 default"},
+        "phase": {"type": "string", "description": "阶段：consolidate/entity_extract/decay/graph，默认 consolidate"}
+    })));
+    tools.push(tool("dream_state_update", "推进某命名空间某阶段的巩固进度游标（幂等，只写进度表）", serde_json::json!({
+        "namespace": {"type": "string", "description": "命名空间，默认 default"},
+        "phase": {"type": "string", "description": "阶段，默认 consolidate"},
+        "cursor_ts": {"type": "string", "description": "本批处理到的最大 created_at（推进游标）"},
+        "items_out": {"type": "number", "description": "本批产出条数，默认 0"}
+    })));
+    // ── 知识图谱 B1：实体 MCP 工具 ──
+    tools.push(tool("entity_upsert", "创建或更新一个实体（幂等：同名同类型的实体仅更新别名/摘要）", serde_json::json!({
+        "namespace": {"type": "string", "description": "命名空间"},
+        "entity_id": {"type": "string", "description": "实体唯一 ID（建议 UUID4，留空自动生成）"},
+        "entity_type": {"type": "string", "description": "类型：person/system/tool/concept/org/project/location/event/other"},
+        "name": {"type": "string", "description": "实体名称（必填）"},
+        "aliases": {"type": "string", "description": "别名 JSON 数组字符串，如 [\"别名1\",\"别名2\"]"},
+        "summary": {"type": "string", "description": "实体摘要描述"}
+    })));
+    tools.push(tool("entity_add_mention", "记录实体在某条记忆中的提及", serde_json::json!({
+        "entity_id": {"type": "string", "description": "实体 ID"},
+        "memory_id": {"type": "string", "description": "记忆 ID"},
+        "context": {"type": "string", "description": "上下文片段（实体在记忆中出现的周围的文字）"},
+        "namespace": {"type": "string", "description": "命名空间，默认 default"}
+    })));
+    tools.push(tool("entity_add_edge", "创建实体间关系边", serde_json::json!({
+        "source_entity_id": {"type": "string", "description": "源实体 ID"},
+        "target_entity_id": {"type": "string", "description": "目标实体 ID"},
+        "relation_type": {"type": "string", "description": "关系类型，如 uses/depends_on/mentions/part_of/similar_to"},
+        "weight": {"type": "number", "description": "关系权重 0-1，默认 1.0"},
+        "evidence": {"type": "string", "description": "证据来源描述"},
+        "namespace": {"type": "string", "description": "命名空间，默认 default"}
+    })));
+    tools.push(tool("entity_search", "搜索实体（按类型/名称/关键词）", serde_json::json!({
+        "query": {"type": "string", "description": "搜索关键词（搜索 name/aliases/summary）"},
+        "entity_type": {"type": "string", "description": "按类型过滤，可选"},
+        "namespace": {"type": "string", "description": "命名空间，默认 default"},
+        "max_results": {"type": "number", "description": "最大返回数，默认 20"}
+    })));
     tools
 }
 
@@ -934,9 +979,8 @@ fn dispatch(
             }
         },
         "memory_graph" => {
-            let batch_size = args.get("batch_size").and_then(|v| v.as_u64()).unwrap_or(50) as u32;
-            match tools::graph::build_graph(&state.pool, ns, batch_size) {
-                Ok((entity, chrono_cnt)) => format!(r#"{{"status":"ok","same_entity":{},"chronological":{}}}"#, entity, chrono_cnt),
+            match tools::graph::build_graph(&state.pool, ns, 50) {
+                Ok((nodes, edges)) => format!(r#"{{"status":"ok","nodes":{},"edges":{}}}"#, nodes, edges),
                 Err(e) => format!(r#"{{"status":"error","message":"{}"}}"#, e),
             }
         },
@@ -1040,6 +1084,193 @@ fn dispatch(
                 Ok(()) => format!(r#"{{"status":"merged","keep":"{}","merged":"{}"}}"#, keep_id, merge_id),
                 Err(e) => format!(r#"{{"status":"error","message":"{}"}}"#, e),
             }
+        },
+        // ── 暗知识层 A1：夜间巩固哑工具（ns 门控已在 handle_tool_call 完成）──
+        "memory_fetch_unconsolidated" => {
+            let since = args.get("since").and_then(|v| v.as_str()).unwrap_or("1970-01-01");
+            let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(200) as i64;
+            let conn = match state.pool.get() {
+                Ok(c) => c, Err(e) => return format!(r#"{{"error":"pool: {}"}}"#, e),
+            };
+            let mut stmt = match conn.prepare(
+                "SELECT id, content, category, created_at FROM memories
+                 WHERE namespace = ?1 AND created_at > ?2
+                   AND (category = 'observation' OR category IS NULL)
+                 ORDER BY created_at ASC LIMIT ?3",
+            ) {
+                Ok(s) => s, Err(e) => return format!(r#"{{"error":"{}"}}"#, e),
+            };
+            let rows = stmt.query_map(rusqlite::params![ns, since, limit], |r| {
+                Ok(serde_json::json!({
+                    "id": r.get::<_, String>(0)?,
+                    "content": r.get::<_, Option<String>>(1)?,
+                    "category": r.get::<_, Option<String>>(2)?,
+                    "created_at": r.get::<_, Option<String>>(3)?,
+                }))
+            });
+            let items: Vec<serde_json::Value> = match rows {
+                Ok(r) => r.flatten().collect(),
+                Err(e) => return format!(r#"{{"error":"{}"}}"#, e),
+            };
+            serde_json::to_string(&serde_json::json!({"status":"ok","count":items.len(),"items":items})).unwrap_or_default()
+        },
+        "dream_state_get" => {
+            let phase = args.get("phase").and_then(|v| v.as_str()).unwrap_or("consolidate");
+            let conn = match state.pool.get() {
+                Ok(c) => c, Err(e) => return format!(r#"{{"error":"pool: {}"}}"#, e),
+            };
+            let row = conn.query_row(
+                "SELECT last_run, cursor_ts, runs, items_out FROM dream_state
+                 WHERE phase = ?1 AND namespace = ?2",
+                rusqlite::params![phase, ns],
+                |r| Ok((
+                    r.get::<_, Option<String>>(0)?,
+                    r.get::<_, Option<String>>(1)?,
+                    r.get::<_, i64>(2)?,
+                    r.get::<_, i64>(3)?,
+                )),
+            );
+            match row {
+                Ok((last_run, cursor_ts, runs, items_out)) => serde_json::to_string(&serde_json::json!({
+                    "status":"ok","phase":phase,"namespace":ns,
+                    "last_run":last_run,
+                    "cursor_ts":cursor_ts.unwrap_or_else(|| "1970-01-01".into()),
+                    "runs":runs,"items_out":items_out
+                })).unwrap_or_default(),
+                // 首跑：无记录，返回 epoch 游标让其处理全量
+                Err(rusqlite::Error::QueryReturnedNoRows) => serde_json::to_string(&serde_json::json!({
+                    "status":"ok","phase":phase,"namespace":ns,
+                    "last_run":serde_json::Value::Null,"cursor_ts":"1970-01-01","runs":0,"items_out":0
+                })).unwrap_or_default(),
+                Err(e) => format!(r#"{{"error":"{}"}}"#, e),
+            }
+        },
+        "dream_state_update" => {
+            let phase = args.get("phase").and_then(|v| v.as_str()).unwrap_or("consolidate");
+            let cursor_ts = args.get("cursor_ts").and_then(|v| v.as_str()).unwrap_or("");
+            let items_out = args.get("items_out").and_then(|v| v.as_u64()).unwrap_or(0) as i64;
+            let conn = match state.pool.get() {
+                Ok(c) => c, Err(e) => return format!(r#"{{"error":"pool: {}"}}"#, e),
+            };
+            match conn.execute(
+                "INSERT INTO dream_state(phase, namespace, last_run, cursor_ts, runs, items_out)
+                 VALUES(?1, ?2, datetime('now'), ?3, 1, ?4)
+                 ON CONFLICT(phase, namespace) DO UPDATE SET
+                   last_run=datetime('now'),
+                   cursor_ts=excluded.cursor_ts,
+                   runs=dream_state.runs+1,
+                   items_out=dream_state.items_out+excluded.items_out",
+                rusqlite::params![phase, ns, cursor_ts, items_out],
+            ) {
+                Ok(_) => serde_json::to_string(&serde_json::json!({"status":"ok","phase":phase,"namespace":ns,"cursor_ts":cursor_ts})).unwrap_or_default(),
+                Err(e) => format!(r#"{{"status":"error","message":"{}"}}"#, e),
+            }
+        },
+        // ── 知识图谱 B：实体工具 ──
+        "entity_upsert" => {
+            let default_id = uuid::Uuid::new_v4().to_string();
+            let entity_id = args.get("entity_id").and_then(|v| v.as_str())
+                .unwrap_or(&default_id)
+                .to_string();
+            let entity_type = args.get("entity_type").and_then(|v| v.as_str()).unwrap_or("other");
+            let name = args.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            let aliases = args.get("aliases").and_then(|v| v.as_str()).unwrap_or("[]");
+            let summary = args.get("summary").and_then(|v| v.as_str()).unwrap_or("");
+            let conn = match state.pool.get() {
+                Ok(c) => c, Err(e) => return format!(r#"{{"error":"pool: {}"}}"#, e),
+            };
+            match conn.execute(
+                "INSERT INTO entities(id, namespace, entity_type, name, aliases, summary)
+                 VALUES(?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(id) DO UPDATE SET
+                   name=excluded.name, aliases=excluded.aliases, summary=excluded.summary",
+                rusqlite::params![entity_id, ns, entity_type, name, aliases, summary],
+            ) {
+                Ok(_) => serde_json::to_string(&serde_json::json!({"status":"ok","entity_id":entity_id})).unwrap_or_default(),
+                Err(e) => format!(r#"{{"status":"error","message":"{}"}}"#, e),
+            }
+        },
+        "entity_add_mention" => {
+            let entity_id = args.get("entity_id").and_then(|v| v.as_str()).unwrap_or("");
+            let memory_id = args.get("memory_id").and_then(|v| v.as_str()).unwrap_or("");
+            let context = args.get("context").and_then(|v| v.as_str()).unwrap_or("");
+            let conn = match state.pool.get() {
+                Ok(c) => c, Err(e) => return format!(r#"{{"error":"pool: {}"}}"#, e),
+            };
+            match conn.execute(
+                "INSERT INTO entity_mentions(entity_id, memory_id, context, namespace) VALUES(?1, ?2, ?3, ?4)",
+                rusqlite::params![entity_id, memory_id, context, ns],
+            ) {
+                Ok(_) => serde_json::to_string(&serde_json::json!({"status":"ok"})).unwrap_or_default(),
+                Err(e) => format!(r#"{{"status":"error","message":"{}"}}"#, e),
+            }
+        },
+        "entity_add_edge" => {
+            let source = args.get("source_entity_id").and_then(|v| v.as_str()).unwrap_or("");
+            let target = args.get("target_entity_id").and_then(|v| v.as_str()).unwrap_or("");
+            let rtype = args.get("relation_type").and_then(|v| v.as_str()).unwrap_or("related_to");
+            let weight = args.get("weight").and_then(|v| v.as_f64()).unwrap_or(1.0);
+            let evidence = args.get("evidence").and_then(|v| v.as_str()).unwrap_or("");
+            let conn = match state.pool.get() {
+                Ok(c) => c, Err(e) => return format!(r#"{{"error":"pool: {}"}}"#, e),
+            };
+            match conn.execute(
+                "INSERT INTO entity_edges(namespace, source_entity_id, target_entity_id, relation_type, weight, evidence)
+                 VALUES(?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(namespace, source_entity_id, target_entity_id, relation_type) DO UPDATE SET
+                   weight=excluded.weight, evidence=excluded.evidence",
+                rusqlite::params![ns, source, target, rtype, weight, evidence],
+            ) {
+                Ok(_) => serde_json::to_string(&serde_json::json!({"status":"ok"})).unwrap_or_default(),
+                Err(e) => format!(r#"{{"status":"error","message":"{}"}}"#, e),
+            }
+        },
+        "entity_search" => {
+            let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
+            let ent_type = args.get("entity_type").and_then(|v| v.as_str());
+            let max_results = args.get("max_results").and_then(|v| v.as_u64()).unwrap_or(20) as i64;
+            let conn = match state.pool.get() {
+                Ok(c) => c, Err(e) => return format!(r#"{{"error":"pool: {}"}}"#, e),
+            };
+            let has_type_filter = ent_type.is_some();
+            let sql = if has_type_filter {
+                "SELECT id, entity_type, name, aliases, summary FROM entities
+                 WHERE namespace=?1 AND entity_type=?2
+                   AND (name LIKE ?3 OR aliases LIKE ?3 OR summary LIKE ?3)
+                 ORDER BY name LIMIT ?4"
+            } else {
+                "SELECT id, entity_type, name, aliases, summary FROM entities
+                 WHERE namespace=?1
+                   AND (name LIKE ?2 OR aliases LIKE ?2 OR summary LIKE ?2)
+                 ORDER BY name LIMIT ?3"
+            };
+            let like = format!("%{}%", query);
+            let rows = if let Some(et) = ent_type {
+                conn.prepare(sql).ok().and_then(|mut st| {
+                    st.query_map(rusqlite::params![ns, et, like, max_results], |r| {
+                        Ok(serde_json::json!({
+                            "id": r.get::<_, String>(0)?,
+                            "entity_type": r.get::<_, String>(1)?,
+                            "name": r.get::<_, String>(2)?,
+                            "aliases": r.get::<_, Option<String>>(3)?,
+                            "summary": r.get::<_, Option<String>>(4)?,
+                        }))
+                    }).ok().map(|r| r.flatten().collect::<Vec<_>>())
+                }).unwrap_or_default()
+            } else {
+                conn.prepare(sql).ok().and_then(|mut st| {
+                    st.query_map(rusqlite::params![ns, like, max_results], |r| {
+                        Ok(serde_json::json!({
+                            "id": r.get::<_, String>(0)?,
+                            "entity_type": r.get::<_, String>(1)?,
+                            "name": r.get::<_, String>(2)?,
+                            "aliases": r.get::<_, Option<String>>(3)?,
+                            "summary": r.get::<_, Option<String>>(4)?,
+                        }))
+                    }).ok().map(|r| r.flatten().collect::<Vec<_>>())
+                }).unwrap_or_default()
+            };
+            serde_json::to_string(&serde_json::json!({"status":"ok","count":rows.len(),"entities":rows})).unwrap_or_default()
         },
         _ => format!(r#"{{"error":"Unknown tool: {}"}}"#, tool),
     }
