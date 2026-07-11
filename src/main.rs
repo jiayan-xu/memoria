@@ -16,8 +16,21 @@ use std::sync::Arc;
 use tower_http::services::ServeDir;
 use chrono::Datelike;
 
-#[tokio::main]
-async fn main() {
+/// 限制 tokio worker 线程数和 blocking 线程池上限
+/// 防止 spawn_blocking 在锁争用时无限创建线程导致 CPU 膨胀
+fn build_runtime() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)              // async worker 线程（< CPU 8 核，留余量给 blocking）
+        .max_blocking_threads(8)        // spawn_blocking 线程池上限
+        .thread_name("memoria")
+        .enable_all()
+        .build()
+        .expect("failed to build tokio runtime")
+}
+
+fn main() {
+    let runtime = build_runtime();
+    runtime.block_on(async {
     // ── 诊断入口（默认关闭）──
     // 仅当以 `--features diag` 且 `RUSTFLAGS="--cfg tokio_unstable"` 编译时启用，
     // 通过 tokio-console 客户端（默认连 :6669）暴露任务级栈，定位 busy-loop。
@@ -68,6 +81,8 @@ async fn main() {
 
     // P0: 迁移 — 添加 superseded_by 列
     storage::migrate_superseded_by(&pool).expect("migration: superseded_by");
+    // P0: 迁移 — user_prefs 增加 namespace 列（跨租户隔离，B3 修复）
+    storage::migrate_user_prefs_namespace(&pool).expect("migration: user_prefs namespace");
 
     println!("[Memoria] Auth DB: {}", auth_db_path);
     let auth_pool = storage::create_pool(&auth_db_path, 16).expect("auth pool");
@@ -270,4 +285,5 @@ async fn main() {
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
     println!("[Memoria] Ready on {}", addr);
     axum::serve(listener, app).await.unwrap();
+    }); // block_on
 }

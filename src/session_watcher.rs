@@ -24,11 +24,14 @@ fn watch_dirs() -> Vec<String> {
 const MAX_PER_POLL: usize = 20;
 
 /// 启动持久监听循环（在 tokio::spawn 中运行）
+/// 所有文件系统操作使用 spawn_blocking 隔离，避免阻塞 async worker 线程。
 pub async fn watch_sessions_loop(pool: SqlitePool) {
     // 文件偏移跟踪: canonical_path -> bytes_read
     let mut offsets: HashMap<String, u64> = HashMap::new();
 
     println!("[SessionWatcher] Started (poll every 5s)");
+
+    // 初始化 watch_dirs（一次性读取，不再每次 poll 都重新读环境变量）
     let dirs = watch_dirs();
     if dirs.is_empty() {
         println!("[SessionWatcher] WATCH_DIRS 未设置，不监听");
@@ -36,41 +39,60 @@ pub async fn watch_sessions_loop(pool: SqlitePool) {
     }
     for d in &dirs {
         println!("[SessionWatcher] Watching: {}", d);
-        // 初始化文件偏移
-        if let Ok(entries) = std::fs::read_dir(d) {
-            for entry in entries.flatten() {
-                let p = entry.path();
-                if p.extension().and_then(|e| e.to_str()) == Some("jsonl") {
-                    if let Ok(meta) = std::fs::metadata(&p) {
-                        offsets.insert(canonical(&p), meta.len());
+        // 初始化文件偏移 — 用 spawn_blocking 隔离文件系统操作
+        let dir_clone = d.clone();
+        let init_offsets: HashMap<String, u64> = tokio::task::spawn_blocking(move || {
+            let mut off = HashMap::new();
+            if let Ok(entries) = std::fs::read_dir(&dir_clone) {
+                for entry in entries.flatten() {
+                    let p = entry.path();
+                    if p.extension().and_then(|e| e.to_str()) == Some("jsonl") {
+                        if let Ok(meta) = std::fs::metadata(&p) {
+                            off.insert(canonical(&p), meta.len());
+                        }
                     }
                 }
             }
-        }
+            off
+        }).await.unwrap_or_default();
+        offsets.extend(init_offsets);
     }
 
     let mut interval = tokio::time::interval(Duration::from_secs(5));
     loop {
         interval.tick().await;
-        if let Err(e) = poll_once(&pool, &mut offsets).await {
-            eprintln!("[SessionWatcher] poll error: {}", e);
+        // poll_once 内含同步文件系统操作，用 spawn_blocking 隔离
+        let pool_clone = pool.clone();
+        let dirs_clone = dirs.clone();
+        let offsets_clone = offsets.clone();
+        match tokio::task::spawn_blocking(move || {
+            poll_once_blocking(&pool_clone, &dirs_clone, &mut offsets_clone.clone())
+        }).await {
+            Ok(new_offsets) => { offsets = new_offsets; }
+            Err(e) => eprintln!("[SessionWatcher] poll task panicked: {}", e),
         }
     }
 }
 
-async fn poll_once(
+/// 同步版本的 poll_once（在 spawn_blocking 中调用）
+/// 所有文件系统操作在此函数内同步执行，不会阻塞 async worker 线程。
+fn poll_once_blocking(
     pool: &SqlitePool,
+    dirs: &[String],
     offsets: &mut HashMap<String, u64>,
-) -> Result<(), String> {
+) -> HashMap<String, u64> {
     let mut total = 0usize;
 
-    for dir in &watch_dirs() {
+    for dir in dirs {
         let dir_path = Path::new(dir);
         if !dir_path.exists() {
             continue;
         }
 
-        let entries = std::fs::read_dir(dir_path).map_err(|e| format!("read_dir: {}", e))?;
+        let entries = match std::fs::read_dir(dir_path) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
         for entry in entries.flatten() {
             let p = entry.path();
             if p.extension().and_then(|e| e.to_str()) != Some("jsonl") {
@@ -126,7 +148,8 @@ async fn poll_once(
         }
     }
 
-    Ok(())
+    // 返回更新后的 offsets
+    offsets.clone()
 }
 
 /// 读文件从 offset 开始的所有行（只读模式，不触发文件系统变更通知）

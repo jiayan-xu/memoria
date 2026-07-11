@@ -115,6 +115,110 @@ pub fn register_agent(
     })
 }
 
+/// 注册个人登录账号（本地账密）：以 `user_id` 为身份，命名空间 `agent/{user_id}`，
+/// `badge_token` 存 `SHA256(password || user_id)`（口令哈希即令牌，客户端登录时自行算）。
+/// 已存在同名账号则拒绝（避免无提示覆盖口令）。返回名牌但 `badge_token` 留空（不回显哈希）。
+pub fn register_user(
+    pool: &SqlitePool,
+    user_id: &str,
+    display_name: &str,
+    password: &str,
+    namespace_override: Option<&str>,
+) -> Result<AgentBadge, String> {
+    let conn = pool.get().map_err(|e| format!("pool: {}", e))?;
+
+    // 已存在同名账号 → 拒绝（防止无提示覆盖口令）
+    let exists = conn
+        .query_row(
+            "SELECT 1 FROM agent_registry WHERE agent_id = ?1",
+            rusqlite::params![user_id],
+            |_| Ok(true),
+        )
+        .unwrap_or(false);
+    if exists {
+        return Err("用户已存在".to_string());
+    }
+
+    // 默认命名空间 agent/{user_id}；调用方（agent-core 代理层）可传入部署相关的
+    // 组织命名空间（如追加 org/cs-pufa-2nd-thermal 以获得 dashboard 等共享工具可见性）。
+    let namespace = namespace_override
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| format!("agent/{}", user_id));
+    // badge_token = SHA256(password || user_id)
+    let mut hasher = Sha256::new();
+    hasher.update(format!("{}{}", password, user_id).as_bytes());
+    let badge_token = format!("{:x}", hasher.finalize());
+
+    let expires = (chrono::Utc::now() + chrono::Duration::days(365))
+        .format("%Y-%m-%dT%H:%M:%S").to_string();
+
+    conn.execute(
+        "INSERT INTO agent_registry
+         (agent_id, display_name, namespace, badge_token, permission, allowed_skills, created_at, expires_at)
+         VALUES (?1, ?2, ?3, ?4, 'user', '[]', datetime('now'), ?5)",
+        rusqlite::params![user_id, display_name, namespace, badge_token, expires],
+    ).map_err(|e| format!("insert: {}", e))?;
+
+    Ok(AgentBadge {
+        agent_id: user_id.to_string(),
+        display_name: display_name.to_string(),
+        namespace,
+        badge_token: String::new(), // 不回显哈希
+        permission: "user".to_string(),
+        allowed_skills: vec![],
+        expires_at: expires,
+    })
+}
+
+/// 个人账号登录：校验 `user_id` + `password`，成功返回该账号的 `badge_token`
+/// （= `SHA256(password || user_id)`）与命名空间，供客户端后续作为 `x-user-key` 使用。
+/// 口令错误或账号不存在均返回统一错误（不区分，防账号枚举）。
+pub fn login_user(
+    pool: &SqlitePool,
+    user_id: &str,
+    password: &str,
+) -> Result<AgentBadge, String> {
+    let conn = pool.get().map_err(|e| format!("pool: {}", e))?;
+
+    let row = conn.query_row(
+        "SELECT badge_token, display_name, namespace, permission FROM agent_registry
+         WHERE agent_id = ?1 AND expires_at > datetime('now')",
+        rusqlite::params![user_id],
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        },
+    );
+
+    let (stored_token, display_name, namespace, permission) = match row {
+        Ok(v) => v,
+        Err(_) => return Err("用户名或口令错误".to_string()),
+    };
+
+    // 重算 SHA256(password || user_id) 与库内比对（恒定时间）
+    let mut hasher = Sha256::new();
+    hasher.update(format!("{}{}", password, user_id).as_bytes());
+    let computed = format!("{:x}", hasher.finalize());
+    if !ct_eq(&computed, &stored_token) {
+        return Err("用户名或口令错误".to_string());
+    }
+
+    Ok(AgentBadge {
+        agent_id: user_id.to_string(),
+        display_name,
+        namespace,
+        badge_token: computed, // 回传令牌供客户端存储
+        permission,
+        allowed_skills: vec![],
+        expires_at: String::new(),
+    })
+}
+
 /// 校验名牌 → 返回允许的 namespace 列表
 pub fn authenticate(
     pool: &SqlitePool,
@@ -210,7 +314,17 @@ pub fn sanitize_params(params: &str) -> String {
         ];
         for cand in &candidates {
             let lower_cand = cand.to_lowercase();
-            while let Some(pos) = result.to_lowercase().find(&lower_cand) {
+            // 关键修复：维护搜索起点 start，每轮打完码后推进到本次打码区域之后。
+            // 原实现每轮都从 result 开头 find 同一 key 模式，而 replace_range 只替换了
+            // 「值」、key 本身仍在，导致下一轮 find 在同一位置重复命中 → 死循环，
+            // 卡死 spawn_blocking 线程 → Memoria 单核 100% 常驻（Memoria CPU 84% 根因）。
+            let mut start = 0usize;
+            while start < result.len() {
+                let rel = result[start..].to_lowercase().find(&lower_cand);
+                let pos = match rel {
+                    Some(r) => start + r,
+                    None => break,
+                };
                 let end_key = pos + cand.len();
                 if end_key >= result.len() {
                     break;
@@ -226,7 +340,9 @@ pub fn sanitize_params(params: &str) -> String {
                 } else {
                     "****".to_string()
                 };
+                let masked_len = masked.len();
                 result.replace_range(end_key..end_val, &masked);
+                start = end_key + masked_len;
             }
         }
     }

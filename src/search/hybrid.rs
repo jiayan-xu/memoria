@@ -26,7 +26,7 @@ pub fn hybrid_search(
 
     // S2: Semantic (HNSW vector)
     if let (Some(hnsw), Some(qc)) = (hnsw, query_cache) {
-        if let Ok(sem) = search::semantic::semantic_search(query, namespace, fts_limit, Some(hnsw), Some(qc)) {
+        if let Ok(sem) = search::semantic::semantic_search(query, namespace, fts_limit, Some(hnsw), Some(qc), Some(pool)) {
             if !sem.is_empty() { signals.push(sem); weights.push(1.0); }
         }
     }

@@ -5,14 +5,16 @@
 
 use crate::storage::SqlitePool;
 
-/// Get user preferences from `user_prefs` table (globally, no namespace column).
-pub fn user_prefs(pool: &SqlitePool) -> Result<Vec<(String, String, f64)>, String> {
+/// Get user preferences from `user_prefs` table, scoped to the caller's namespace.
+/// 同时返回 `default` 命名空间下的全局偏好（兼容旧数据 + 全局共享偏好），
+/// 但仅返回归属当前 ns 或全局 `default` 的行，杜绝跨租户泄露（B3 修复）。
+pub fn user_prefs(pool: &SqlitePool, namespace: &str) -> Result<Vec<(String, String, f64)>, String> {
     let conn = pool.get().map_err(|e| format!("pool: {}", e))?;
     let mut stmt = conn.prepare(
-        "SELECT key, value, confidence FROM user_prefs ORDER BY updated_at DESC LIMIT 50"
+        "SELECT key, value, confidence FROM user_prefs WHERE (namespace = ? OR namespace = 'default') ORDER BY updated_at DESC LIMIT 50"
     ).map_err(|e| format!("prepare: {}", e))?;
 
-    let rows = stmt.query_map([], |row| {
+    let rows = stmt.query_map(rusqlite::params![namespace], |row| {
         Ok((
             row.get::<_, String>(0)?,
             row.get::<_, String>(1)?,

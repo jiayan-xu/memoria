@@ -170,6 +170,21 @@ fn tools_list() -> Vec<serde_json::Value> {
             "admin_key": {"type": "string", "description": "Admin Key"},
             "namespace": {"type": "string", "description": "命名空间"}
         })),
+        tool("register_user", "注册个人登录账号（本地账密）：user_id + password，命名空间默认 agent/{user_id}（可选 namespace 覆盖）", serde_json::json!({
+            "user_id": {"type": "string", "description": "登录用户名（唯一）"},
+            "display_name": {"type": "string", "description": "显示名"},
+            "password": {"type": "string", "description": "登录口令"},
+            "namespace": {"type": "string", "description": "可选：命名空间覆盖（逗号分隔多个）"}
+        })),
+        tool("login_user", "个人账号登录：校验 user_id + password，成功回传 badge_token 供客户端后续鉴权", serde_json::json!({
+            "user_id": {"type": "string", "description": "登录用户名"},
+            "password": {"type": "string", "description": "登录口令"}
+        })),
+        tool("import_install_memories", "迁移记忆命名空间（需 Admin key）：把 from_ns 下记忆整体移到 to_ns（换设备/登录后归并旧记忆）。id=内容哈希与 ns 无关，故仅改 namespace，无需重建索引。", serde_json::json!({
+            "from_ns": {"type": "string", "description": "源命名空间"},
+            "to_ns": {"type": "string", "description": "目标命名空间"},
+            "admin_key": {"type": "string", "description": "Admin Key"}
+        })),
         tool("get_allowed_ns", "返回当前调用者自身的命名空间授权列表（供 agent-core 按项目过滤 MCP 工具）", serde_json::json!({})),
         tool("audit_query", "查询审计日志", serde_json::json!({
             "limit": {"type": "number", "description": "返回条数，默认 50"}
@@ -292,7 +307,7 @@ async fn handle_tool_call(
     let auth = match auth_result {
         Some(a) => a,
         None => {
-            spawn_audit(state, agent_id, tool, &format!("{:?}", args), false);
+            spawn_audit(state, agent_id, tool, &serde_json::to_string(&args).unwrap_or_else(|_| format!("{:?}", args)), false);
             return rpc_error(id, -32001, "Authentication failed. Send X-Agent-Id and X-Agent-Key headers.");
         }
     };
@@ -309,7 +324,7 @@ async fn handle_tool_call(
 
     let ns = safe_args.get("namespace").and_then(|v| v.as_str()).unwrap_or("default");
     if !auth::check_ns_access(&auth, ns) {
-        spawn_audit(state, agent_id, tool, &format!("{:?}", args), false);
+        spawn_audit(state, agent_id, tool, &serde_json::to_string(&args).unwrap_or_else(|_| format!("{:?}", args)), false);
         return rpc_error(id, -32002, &format!("Namespace '{}' not authorized.", ns));
     }
 
@@ -317,7 +332,7 @@ async fn handle_tool_call(
     if BRIDGE_TOOLS.contains(&tool) {
         let text = forward_to_bridge(state, tool, safe_args).await;
         let allowed = !text.contains(r#""error""#);
-        spawn_audit(state, agent_id, tool, &format!("{:?}", args), allowed);
+        spawn_audit(state, agent_id, tool, &serde_json::to_string(&args).unwrap_or_else(|_| format!("{:?}", args)), allowed);
         return rpc_ok_text(id, &text);
     }
 
@@ -335,7 +350,11 @@ async fn handle_tool_call(
         // 再同步调 auth::audit_log 写同一池 → WAL 串行写下第二次写死等第一次写锁释放，
         // 导致 spawn_blocking 的 .await 卡到超时（实测 40s）。改为 fire-and-forget，
         // 审计在独立阻塞线程异步写，与 get_allowed_ns / 鉴权失败分支保持一致，不阻塞响应。
-        spawn_audit(&st, &agent_id_owned, &tool_owned, &format!("{:?}", args_owned), allowed);
+        // 审计参数改用标准 JSON（而非 Rust Debug 格式）：Debug 串如
+        // `Object({"api_key": String("...")})` 会让 sanitize_params 走非 JSON 分支，
+        // 其 value 提取在 `:` 后第一个空格截断 → 只把空格打码、真实密钥明文落库。
+        // 改成 JSON 后走 sanitize_json_value 分支，按值正确打码（secret 卫生）。
+        spawn_audit(&st, &agent_id_owned, &tool_owned, &serde_json::to_string(&args_owned).unwrap_or_else(|_| format!("{:?}", args_owned)), allowed);
         text
     }).await {
         Ok(t) => t,
@@ -399,7 +418,7 @@ fn dispatch(
                 if !kw.is_empty() { signals.push(kw); weights.push(1.0); }
             }
             // S2: Semantic (HNSW)
-            if let Ok(sem) = search::semantic::semantic_search(query, ns, fts_limit, Some(&state.hnsw), Some(&state.query_cache)) {
+            if let Ok(sem) = search::semantic::semantic_search(query, ns, fts_limit, Some(&state.hnsw), Some(&state.query_cache), Some(&state.pool)) {
                 if !sem.is_empty() { signals.push(sem); weights.push(1.0); }
             }
             // S3: Temporal
@@ -493,6 +512,80 @@ fn dispatch(
             match auth::register_agent(&state.auth_pool, new_id, display_name, &[ns], "user") {
                 Ok(badge) => serde_json::to_string(&serde_json::json!({"status":"registered","badge":badge})).unwrap_or_default(),
                 Err(e) => format!(r#"{{"status":"error","message":"{}"}}"#, e),
+            }
+        },
+        "register_user" => {
+            let user_id = args.get("user_id").and_then(|v| v.as_str()).unwrap_or("");
+            let display_name = args.get("display_name").and_then(|v| v.as_str()).unwrap_or(user_id);
+            let password = args.get("password").and_then(|v| v.as_str()).unwrap_or("");
+            if user_id.is_empty() || password.is_empty() {
+                return r#"{"status":"error","message":"user_id 与 password 必填"}"#.to_string();
+            }
+            // 口令强度最低要求：长度 >= 6（内部可信 LAN，仅作基本防线）
+            if password.len() < 6 {
+                return r#"{"status":"error","message":"口令至少 6 位"}"#.to_string();
+            }
+            let ns_override = args.get("namespace").and_then(|v| v.as_str());
+            match auth::register_user(&state.auth_pool, user_id, display_name, password, ns_override) {
+                Ok(badge) => serde_json::to_string(&serde_json::json!({
+                    "status": "registered",
+                    "agent_id": badge.agent_id,
+                    "namespace": badge.namespace
+                })).unwrap_or_default(),
+                Err(e) => format!(r#"{{"status":"error","message":"{}"}}"#, e),
+            }
+        },
+        "login_user" => {
+            let user_id = args.get("user_id").and_then(|v| v.as_str()).unwrap_or("");
+            let password = args.get("password").and_then(|v| v.as_str()).unwrap_or("");
+            if user_id.is_empty() || password.is_empty() {
+                return r#"{"status":"error","message":"user_id 与 password 必填"}"#.to_string();
+            }
+            match auth::login_user(&state.auth_pool, user_id, password) {
+                Ok(badge) => serde_json::to_string(&serde_json::json!({
+                    "status": "ok",
+                    "agent_id": badge.agent_id,
+                    "display_name": badge.display_name,
+                    "namespace": badge.namespace,
+                    "badge_token": badge.badge_token
+                })).unwrap_or_default(),
+                Err(e) => format!(r#"{{"status":"error","message":"{}"}}"#, e),
+            }
+        },
+        "import_install_memories" => {
+            let from_ns = args.get("from_ns").and_then(|v| v.as_str()).unwrap_or("");
+            let to_ns = args.get("to_ns").and_then(|v| v.as_str()).unwrap_or("");
+            let admin_key = args.get("admin_key").and_then(|v| v.as_str()).unwrap_or("");
+            if !auth::ct_eq(admin_key, &state.admin_key) {
+                return r#"{"status":"error","message":"Invalid admin key"}"#.to_string();
+            }
+            if from_ns.is_empty() || to_ns.is_empty() || from_ns == to_ns {
+                return r#"{"status":"error","message":"from_ns / to_ns 必填且不能相同"}"#.to_string();
+            }
+            match state.pool.get() {
+                Ok(conn) => {
+                    // 迁移仅改 namespace 列：memory id = SHA256(content) 与 ns 无关，
+                    // 全局唯一 PK；HNSW 按 id 索引、FTS 索引 content，均不含 ns，
+                    // 故移动 ns 后向量/全文索引仍指向同一条记忆，无需重建。
+                    let n1 = conn.execute(
+                        "UPDATE memories SET namespace=?1 WHERE namespace=?2",
+                        rusqlite::params![to_ns, from_ns],
+                    ).unwrap_or(0);
+                    let n2 = conn.execute(
+                        "UPDATE memory_relations SET namespace=?1 WHERE namespace=?2",
+                        rusqlite::params![to_ns, from_ns],
+                    ).unwrap_or(0);
+                    // user_prefs（B3 已加 namespace 列）一并迁移；若无该列则忽略。
+                    let n3 = conn.execute(
+                        "UPDATE user_prefs SET namespace=?1 WHERE namespace=?2",
+                        rusqlite::params![to_ns, from_ns],
+                    ).unwrap_or(0);
+                    format!(
+                        r#"{{"status":"ok","memories_moved":{},"relations_moved":{},"prefs_moved":{}}}"#,
+                        n1, n2, n3
+                    )
+                }
+                Err(e) => format!(r#"{{"status":"error","message":"pool: {}"}}"#, e),
             }
         },
         "audit_query" => {
@@ -848,7 +941,7 @@ fn dispatch(
             }
         },
         "memory_user_prefs" => {
-            match tools::prefs::user_prefs(&state.pool) {
+            match tools::prefs::user_prefs(&state.pool, &ns) {
                 Ok(prefs) => {
                     let items: Vec<serde_json::Value> = prefs.into_iter().map(|(k,v,c)| {
                         serde_json::json!({"key": k, "value": v, "confidence": c})

@@ -98,7 +98,8 @@ pub fn init_core_tables(pool: &SqlitePool) -> Result<(), String> {
             value TEXT,
             evidence TEXT,
             confidence REAL DEFAULT 0.5,
-            updated_at TEXT
+            updated_at TEXT,
+            namespace TEXT NOT NULL DEFAULT 'default'
         );
 
         -- Decisions table
@@ -216,5 +217,26 @@ pub fn migrate_superseded_by(pool: &SqlitePool) -> Result<(), String> {
     )
     .map_err(|e| format!("superseded index: {}", e))?;
 
+    Ok(())
+}
+
+/// P0 迁移：为 `user_prefs` 增加 `namespace` 列（跨租户隔离，B3 修复）。
+/// 幂等：列已存在则跳过。
+pub fn migrate_user_prefs_namespace(pool: &SqlitePool) -> Result<(), String> {
+    let conn = pool.get().map_err(|e| format!("pool get: {}", e))?;
+    let has_column: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('user_prefs') WHERE name = 'namespace'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    if has_column == 0 {
+        conn.execute_batch(
+            "ALTER TABLE user_prefs ADD COLUMN namespace TEXT NOT NULL DEFAULT 'default';",
+        )
+        .map_err(|e| format!("add user_prefs.namespace: {}", e))?;
+        println!("[Memoria] Migration: added namespace column to user_prefs");
+    }
     Ok(())
 }
