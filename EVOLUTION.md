@@ -281,4 +281,27 @@ memoria-server (:9003)  — Rust 独立二进制
 
 ---
 
+## 2026-07-11 — 本地账密登录体系 + 跨租户命名空间隔离（B2/B3）
+
+### 背景
+在多用户/多安装实例场景下，需要「个人登录身份」而非仅靠随机 install_id 归属记忆；同时排查发现两处跨租户泄露隐患：① HNSW 语义索引是全局的、无 namespace 维度，`semantic_search` 原实现完全忽略调用者 ns，会把其他租户的记忆一并召回；② `user_prefs` 表缺 namespace 列，偏好数据跨租户共享。此外脱敏逻辑存在一处死循环，是此前 Memoria CPU 飙高的根因之一。
+
+### 变更清单
+| 项 | 级别 | 变更 |
+|------|:-:|------|
+| 本地账密注册/登录 | P0 | `auth.rs` 新增 `register_user`/`login_user`（SHA256(password‖user_id)），登录回传 `badge_token` 供客户端后续鉴权 |
+| 新增 MCP 工具 | P0 | `mcp_server.rs` 暴露 `register_user`/`login_user`/`import_install_memories`（记忆命名空间迁移，仅改 namespace 列——id=内容哈希与 ns 无关，无需重建索引） |
+| 语义搜索跨租户泄露 | P0 | `search/semantic.rs` 按调用者 ns 回查 `memories` 表过滤 HNSW 结果（单条 IN 查询避免 N+1）；无 pool 时保守返回空。`search/hybrid.rs` 透传 pool |
+| user_prefs 跨租户共享 | P0 | `storage/{mod,sqlite}.rs` + `tools/prefs.rs`：`user_prefs` 加 `namespace` 列并做迁移（B3 隔离） |
+| 脱敏死循环 | P0 | `auth.rs` 修复脱敏逻辑死循环（此前 CPU 飙高根因之一） |
+| runtime 线程限制 | P1 | `main.rs` 显式构建 runtime 限制 worker 线程数，避免线程膨胀 |
+| 文件 IO 隔离 | P1 | `session_watcher.rs` 用 `spawn_blocking` 隔离文件读取，不阻塞 async worker |
+
+### 验证
+- 账密登录链路：`register_user` → `login_user` 回传 badge → 客户端带 badge 鉴权通过；命名空间默认 `agent/{user_id}`（可选覆盖）。
+- 跨租户隔离：语义检索仅返回归属当前 ns 的记忆；`user_prefs` 按 ns 隔离。
+- 记忆迁移：`import_install_memories` 换设备/登录后归并旧记忆，仅改 namespace 列，无索引重建。
+
+---
+
 *Memoria — Not bound to any software. Serving only you.*
