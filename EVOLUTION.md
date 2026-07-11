@@ -304,4 +304,40 @@ memoria-server (:9003)  — Rust 独立二进制
 
 ---
 
+## 2026-07-11 (evening) — 实体三表 + NER MCP 工具 + graph.rs 重写（B1+B2+B3）
+
+### 背景
+旧 `graph.rs` 的 `build_graph` 用前缀匹配 + 同日时间线启发式生成假图谱（无真实实体概念），不足以支撑跨会话的实体级知识检索与可视化。设计文档确定实体三表方案：代理端（agent-core）通过 LLM NER 提取实体和关系，存储端（memoria）仅提供哑工具管理实体数据。
+
+### 变更
+
+#### B1. 实体三表 schema（`storage/sqlite.rs` + `storage/models.rs`）
+- `CREATE TABLE IF NOT EXISTS` 在 `init_core_tables` 内，自动升级现有 DB：
+  - **`entities`**：`id TEXT PK`（缺省自动 UUID）、`namespace`、`entity_type`（CHECK 9 类：person/system/tool/concept/org/project/location/event/other）、`name`、`aliases`、`summary`、`created_at`、`updated_at`
+  - **`entity_mentions`**：`id INTEGER AUTO PK`、`entity_id TEXT FK→entities`、`memory_id TEXT FK→memories`、`context`、`namespace`、`created_at`（FK 校验确保引用完整性）
+  - **`entity_edges`**：`id INTEGER AUTO PK`、`namespace`、`source_entity_id FK→entities`、`target_entity_id FK→entities`、`relation_type`、`weight REAL`、`evidence`、`created_at`
+- 索引：`entities(namespace, entity_type)`、`entity_mentions(entity_id)`、`entity_edges(source_entity_id)`、`entity_edges(target_entity_id)`
+- 模型：新增 `Entity` / `EntityMention` / `EntityEdge` 三个 serde struct
+
+#### B2. 4 个实体 MCP 工具（`mcp_server.rs`）
+- **`entity_upsert`**：UPSERT 实体（`name`+`namespace` 联合幂等），缺 `entity_id` 自动 UUID，支持 `summary`/`aliases` 更新
+- **`entity_add_mention`**：实体→记忆 FK 关联（外键校验，内存_ID 不存在时返回 FK 错误）
+- **`entity_add_edge`**：实体间关系，`(source, target, relation_type, namespace)` 唯一幂等，`weight` 保留最大值
+- **`entity_search`**：按 `name`/`aliases`/`summary` LIKE 模糊匹配，可选 `entity_type` 过滤，ns 门控已接入
+
+#### B3. graph.rs 重写（`tools/graph.rs`）
+- `build_graph`：改从 `entities` 表统计计数 + `entity_edges` 表统计边数
+- 新增 `export_graph`：返回 `entities` + `entity_edges` 完整 JSON（`{entities:[...], edges:[...]}`）
+- `memory_graph` MCP 工具同步适应新返回格式
+
+### 验证
+- tools/list 4 实体工具注册 ✅
+- entity_upsert 创建 3 实体（agent-core / memory_search / 暗知识层）✅
+- entity_add_mention 关联真实记忆（FK 校验通过）✅
+- entity_add_edge 建立 2 关系（calls / builds）✅
+- entity_search 按名/别名/类型搜索 ✅
+- memory_graph 返回 nodes=3, edges=2 ✅
+
+---
+
 *Memoria — Not bound to any software. Serving only you.*
