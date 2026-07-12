@@ -259,7 +259,9 @@ pub fn tools_list() -> Vec<serde_json::Value> {
     tools.push(tool("memory_graph", "构建记忆关系图", serde_json::json!({
         "batch_size": {"type": "number", "description": "批大小，默认 50"}
     })));
-    tools.push(tool("memory_user_prefs", "获取用户偏好设置", serde_json::json!({})));
+    tools.push(tool("memory_user_prefs", "获取用户偏好设置（按 ns 聚合，hard_rule 优先；写入走 memory_remember，category=preference，tags∈pref|hard_rule|style）", serde_json::json!({
+        "tag": {"type": "string", "description": "可选：仅返回指定类型偏好 hard_rule|pref|style"}
+    })));
     tools.push(tool("memory_recent_decisions", "获取最近的决策记录", serde_json::json!({
         "limit": {"type": "number", "description": "返回条数，默认 10"}
     })));
@@ -987,11 +989,21 @@ fn dispatch(
             }
         },
         "memory_user_prefs" => {
+            // 可选 tag 过滤（hard_rule|pref|style），默认返回全部偏好
+            let tag_filter = args.get("tag").and_then(|v| v.as_str()).map(|s| s.to_string());
             match tools::prefs::user_prefs(&state.pool, &ns) {
                 Ok(prefs) => {
-                    let items: Vec<serde_json::Value> = prefs.into_iter().map(|(k,v,c)| {
-                        serde_json::json!({"key": k, "value": v, "confidence": c})
-                    }).collect();
+                    let items: Vec<serde_json::Value> = prefs.into_iter()
+                        .filter(|p| tag_filter.as_ref().map_or(true, |t| &p.tag == t))
+                        .map(|p| serde_json::json!({
+                            "key": p.key,
+                            "value": p.value,
+                            "importance": p.importance,
+                            "tag": p.tag,
+                            "confidence": p.confidence,
+                            "created_at": p.created_at,
+                        }))
+                        .collect();
                     serde_json::to_string(&serde_json::json!({"status":"ok","prefs":items})).unwrap_or_default()
                 },
                 Err(e) => format!(r#"{{"status":"error","message":"{}"}}"#, e),
