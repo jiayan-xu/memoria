@@ -41,6 +41,7 @@ pub fn run_health_check(
   auth_pool: &SqlitePool,
   hnsw: &HnswIndex,
   db_path: &str,
+  hnsw_status: &str,
 ) -> HealthReport {
   let timestamp = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
   let version = env!("CARGO_PKG_VERSION").to_string();
@@ -72,7 +73,7 @@ pub fn run_health_check(
   // ═══════════════════════════════════════════
 
   // 6. HNSW 索引状态
-  soft_checks.push(check_hnsw_index(hnsw));
+  soft_checks.push(check_hnsw_index(hnsw, hnsw_status));
 
   // 7. 磁盘空间
   soft_checks.push(check_disk_space(db_path));
@@ -344,25 +345,32 @@ fn check_fts5(pool: &SqlitePool) -> CheckResult {
 
 // ── 软失败检查 ──
 
-fn check_hnsw_index(hnsw: &HnswIndex) -> CheckResult {
+fn check_hnsw_index(hnsw: &HnswIndex, status: &str) -> CheckResult {
   let start = std::time::Instant::now();
   let count = hnsw.len();
   let duration_ms = start.elapsed().as_millis() as u64;
 
-  if count > 0 {
-    CheckResult {
-      name: "hnsw_index".to_string(),
-      status: "pass".to_string(),
-      message: format!("{} vectors loaded", count),
-      duration_ms,
-    }
-  } else {
-    CheckResult {
-      name: "hnsw_index".to_string(),
-      status: "warn".to_string(),
-      message: "HNSW index empty — semantic search disabled".to_string(),
-      duration_ms,
-    }
+  // 区分首跑（无索引文件，正常）/ 损坏回退（有文件但 load 失败）/ 空索引
+  let (st, msg) = match (status, count) {
+    ("corrupted", _) => (
+      "warn",
+      "HNSW 索引损坏已回退空索引 — 语义检索降级".to_string(),
+    ),
+    ("uninitialized", _) => (
+      "warn",
+      "HNSW 索引未初始化（首次运行）— 语义检索未启用".to_string(),
+    ),
+    (_, 0) => (
+      "warn",
+      "HNSW 索引为空 — 语义检索无结果".to_string(),
+    ),
+    (_, n) => ("pass", format!("{} vectors loaded", n)),
+  };
+  CheckResult {
+    name: "hnsw_index".to_string(),
+    status: st.to_string(),
+    message: msg,
+    duration_ms,
   }
 }
 

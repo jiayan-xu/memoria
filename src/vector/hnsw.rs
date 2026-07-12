@@ -149,7 +149,7 @@ impl HnswIndex {
         if data.len() < 4 {
             return Err("truncated file".to_string());
         }
-        let n = u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
+        let n = u32::from_le_bytes(data[0..4].try_into().map_err(|_| "bad header slice".to_string())?) as usize;
         offset += 4;
 
         let mut id_map: Vec<String> = Vec::with_capacity(n);
@@ -160,7 +160,7 @@ impl HnswIndex {
             if offset + 4 > data.len() {
                 return Err("truncated at ID length".to_string());
             }
-            let id_len = u32::from_le_bytes(data[offset..offset+4].try_into().unwrap()) as usize;
+            let id_len = u32::from_le_bytes(data[offset..offset+4].try_into().map_err(|_| "bad id-len slice".to_string())?) as usize;
             offset += 4;
             if offset + id_len + 768 * 4 > data.len() {
                 return Err("truncated at vector data".to_string());
@@ -170,7 +170,7 @@ impl HnswIndex {
             offset += id_len;
             let mut vector = Vec::with_capacity(768);
             for _ in 0..768 {
-                let val = f32::from_le_bytes(data[offset..offset+4].try_into().unwrap());
+                let val = f32::from_le_bytes(data[offset..offset+4].try_into().map_err(|_| "bad vector slice".to_string())?);
                 vector.push(val);
                 offset += 4;
             }
@@ -197,5 +197,50 @@ impl HnswIndex {
     /// Check if saved vector store exists on disk.
     pub fn exists(path: impl AsRef<Path>) -> bool {
         path.as_ref().with_extension("bin").exists()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn load_corrupted_bin_returns_err_not_panic() {
+        let dir = std::env::temp_dir().join("memoria_hnsw_test_corrupt");
+        let _ = std::fs::create_dir_all(&dir);
+        let p = dir.join("hnsw_vectors.bin");
+        let mut f = std::fs::File::create(&p).unwrap();
+        f.write_all(&[1u8, 2, 3]).unwrap(); // len < 4 → 截断错误，不应 panic
+        drop(f);
+        let res = HnswIndex::load(&p);
+        assert!(res.is_err(), "corrupted bin must return Err, not panic");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn new_index_is_empty() {
+        assert_eq!(HnswIndex::new().len(), 0);
+    }
+
+    #[test]
+    fn concurrent_search_stable() {
+        let h = std::sync::Arc::new(HnswIndex::new());
+        let entries: Vec<VectorEntry> = (0..20)
+            .map(|i| VectorEntry { id: format!("v{}", i), vector: vec![(i as f32) / 20.0; DIM] })
+            .collect();
+        assert_eq!(h.add(&entries).expect("add"), 20);
+
+        // 20 路并发 search（读锁），全部完成不得 panic / 死锁
+        let mut handles = Vec::new();
+        for _ in 0..20 {
+            let h2 = h.clone();
+            handles.push(std::thread::spawn(move || {
+                let _ = h2.search(&vec![0.5f32; DIM], 5);
+            }));
+        }
+        for handle in handles {
+            handle.join().expect("thread must not panic");
+        }
     }
 }

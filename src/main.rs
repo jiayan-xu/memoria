@@ -20,9 +20,26 @@ use chrono::Datelike;
 /// 限制 tokio worker 线程数和 blocking 线程池上限
 /// 防止 spawn_blocking 在锁争用时无限创建线程导致 CPU 膨胀
 fn build_runtime() -> tokio::runtime::Runtime {
+    // 运行时线程数可经 env 覆盖，默认沿用 2026-07-11 现场验证值（4 worker / 8 blocking）
+    let worker_threads = std::env::var("MEMORIA_WORKER_THREADS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| (1..=32).contains(&n))
+        .unwrap_or(4);
+    let max_blocking_threads = std::env::var("MEMORIA_MAX_BLOCKING_THREADS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| (1..=256).contains(&n))
+        .unwrap_or(8);
+    if worker_threads != 4 || max_blocking_threads != 8 {
+        eprintln!(
+            "[Memoria] Runtime threads: worker={}, max_blocking={} (env override)",
+            worker_threads, max_blocking_threads
+        );
+    }
     tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(4)              // async worker 线程（< CPU 8 核，留余量给 blocking）
-        .max_blocking_threads(8)        // spawn_blocking 线程池上限
+        .worker_threads(worker_threads)
+        .max_blocking_threads(max_blocking_threads)
         .thread_name("memoria")
         .enable_all()
         .build()
@@ -125,19 +142,26 @@ fn main() {
     let vec_path = std::path::Path::new(&db_path)
         .parent().unwrap_or_else(|| std::path::Path::new("."))
         .join("vector_index").join("hnsw_vectors");
-    let hnsw = if HnswIndex::exists(&vec_path) {
-        HnswIndex::load(&vec_path).unwrap_or_else(|e| {
-            eprintln!("[Memoria] HNSW load: {}", e);
-            HnswIndex::new()
-        })
+    // 加载 HNSW 索引；损坏/无法加载 → 软失败回退空索引（语义检索降级），不 panic
+    let (hnsw, hnsw_status) = if HnswIndex::exists(&vec_path) {
+        match HnswIndex::load(&vec_path) {
+            Ok(h) => (h, "ok"),
+            Err(e) => {
+                eprintln!(
+                    "[Memoria] WARN: HNSW 索引损坏/无法加载 ({}); 回退空索引, 语义检索降级",
+                    e
+                );
+                (HnswIndex::new(), "corrupted")
+            }
+        }
     } else {
-        HnswIndex::new()
+        (HnswIndex::new(), "uninitialized")
     };
     println!("[Memoria] HNSW vectors: {}", hnsw.len());
 
     // ── P0: 启动健康检查 ──
     println!("[Memoria] Running startup health check...");
-    let report = health::run_health_check(&pool, &auth_pool, &hnsw, &db_path);
+    let report = health::run_health_check(&pool, &auth_pool, &hnsw, &db_path, hnsw_status);
     match report.overall.as_str() {
         "pass" => println!("[Memoria] Health check: PASS (all checks OK)"),
         "degraded" => {
@@ -160,6 +184,7 @@ fn main() {
         pool,
         auth_pool,
         hnsw: Arc::new(hnsw),
+        hnsw_status: hnsw_status.to_string(),
         query_cache: Arc::new(memoria_core::vector::QueryCache::new()),
         admin_key,
         bridge_url: std::env::var("MEMORIA_BRIDGE_URL")

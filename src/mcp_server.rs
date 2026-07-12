@@ -31,6 +31,7 @@ pub struct AppState {
     pub pool: storage::SqlitePool,
     pub auth_pool: storage::SqlitePool,
     pub hnsw: Arc<memoria_core::vector::HnswIndex>,
+    pub hnsw_status: String,
     pub query_cache: Arc<memoria_core::vector::QueryCache>,
     pub admin_key: String,
     pub bridge_url: String,
@@ -71,6 +72,7 @@ async fn health_check_full(
             &st.auth_pool,
             &st.hnsw,
             &st.db_path,
+            &st.hnsw_status,
         )
     }).await.unwrap_or_else(|_| memoria_core::health::HealthReport {
         overall: "fail".to_string(),
@@ -1061,7 +1063,7 @@ fn dispatch(
                 return r#"{"status":"error","message":"admin key required"}"#.to_string();
             }
             let report = memoria_core::health::run_health_check(
-                &state.pool, &state.auth_pool, &state.hnsw, &state.db_path,
+                &state.pool, &state.auth_pool, &state.hnsw, &state.db_path, &state.hnsw_status,
             );
             serde_json::to_string(&serde_json::json!({"status":"ok","report":report})).unwrap_or_default()
         },
