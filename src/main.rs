@@ -48,16 +48,25 @@ fn build_runtime() -> tokio::runtime::Runtime {
 
 fn main() {
     let runtime = build_runtime();
-    runtime.block_on(async {
+    // P0-4 单写者守卫：启动早期加锁，防止两个 memoria-server 实例并发写同一数据库（双写损坏）。
+    let db_path_for_lock = std::env::var("MEMORIA_DB_PATH")
+        .unwrap_or_else(|_| "data/memoria.db".to_string());
+    let lock_path = single_writer_lock_path(&db_path_for_lock);
+    let _single_writer_lock = match acquire_single_writer_lock(&db_path_for_lock) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("[Memoria][ERROR] {}", e);
+            std::process::exit(1);
+        }
+    };
+    runtime.block_on(async move {
     // ── 诊断入口（默认关闭）──
     // 仅当以 `--features diag` 且 `RUSTFLAGS="--cfg tokio_unstable"` 编译时启用，
     // 通过 tokio-console 客户端（默认连 :6669）暴露任务级栈，定位 busy-loop。
     #[cfg(feature = "diag")]
     let _console_guard = console_subscriber::init();
 
-    let db_path = std::env::var("MEMORIA_DB_PATH").unwrap_or_else(|_| {
-        "data/memoria.db".to_string()
-    });
+    let db_path = db_path_for_lock;
     let auth_db_path = std::env::var("MEMORIA_AUTH_DB_PATH").unwrap_or_else(|_| {
         let p = std::path::Path::new(&db_path);
         p.parent().unwrap_or_else(|| std::path::Path::new("."))
@@ -326,6 +335,8 @@ fn main() {
     println!("[Memoria] Ready on {}", addr);
     axum::serve(listener, app).await.unwrap();
     }); // block_on
+    // P0-4：优雅退出时移除单写者锁文件；进程崩溃残留的锁由下次启动的存活检测接管。
+    let _ = std::fs::remove_file(&lock_path);
 }
 
 // ── P0-2 辅助函数（纯逻辑，便于单测）──
@@ -351,6 +362,89 @@ pub fn write_auto_admin_key(db_path: &str, key: &str) -> std::io::Result<std::pa
     Ok(key_path)
 }
 
+// ── P0-4 单写者守卫（纯 std，零新依赖）──
+
+/// P0-4：返回单写者锁文件路径（与数据库同目录，名为 memoria.pid）。
+pub fn single_writer_lock_path(db_path: &str) -> std::path::PathBuf {
+    std::path::Path::new(db_path)
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join("memoria.pid")
+}
+
+/// P0-4：获取单写者锁。成功返回持有锁文件的 File（main 退出时删文件）；
+/// 若已有存活实例持有锁，则返回 Err 拒绝启动，避免双写同一数据库。
+pub fn acquire_single_writer_lock(db_path: &str) -> Result<std::fs::File, String> {
+    let lock_path = single_writer_lock_path(db_path);
+    match std::fs::OpenOptions::new().write(true).create_new(true).open(&lock_path) {
+        Ok(mut f) => {
+            write_pid(&mut f)?;
+            Ok(f)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            if let Some(old_pid) = read_pid(&lock_path) {
+                if is_process_alive(old_pid) {
+                    return Err(format!(
+                        "Memoria 已在运行（pid {}）。拒绝启动第二个写者以避免双写同一数据库。\
+                        如需强制，请先停止旧进程或删除锁文件：{}",
+                        old_pid, lock_path.display()
+                    ));
+                }
+                // 残留锁（旧进程已退出）：接管
+                let _ = std::fs::remove_file(&lock_path);
+                match std::fs::OpenOptions::new().write(true).create_new(true).open(&lock_path) {
+                    Ok(mut f) => {
+                        write_pid(&mut f)?;
+                        eprintln!("[Memoria][WARN] 检测到残留锁文件（pid {} 已退出），已接管。", old_pid);
+                        Ok(f)
+                    }
+                    Err(e2) => Err(format!("无法接管锁文件 {}: {}", lock_path.display(), e2)),
+                }
+            } else {
+                // 无法解析旧 PID：强制重建
+                let _ = std::fs::remove_file(&lock_path);
+                let mut f = std::fs::OpenOptions::new().write(true).create_new(true).open(&lock_path)
+                    .map_err(|e| format!("无法创建锁文件 {}: {}", lock_path.display(), e))?;
+                write_pid(&mut f)?;
+                Ok(f)
+            }
+        }
+        Err(e) => Err(format!("无法创建锁文件 {}: {}", lock_path.display(), e)),
+    }
+}
+
+fn write_pid(f: &mut std::fs::File) -> Result<(), String> {
+    use std::io::Write;
+    f.write_all(format!("{}", std::process::id()).as_bytes())
+        .map_err(|e| format!("写入 PID 到锁文件失败: {}", e))?;
+    f.flush().map_err(|e| format!("flush 锁文件失败: {}", e))
+}
+
+fn read_pid(lock_path: &std::path::Path) -> Option<u32> {
+    std::fs::read_to_string(lock_path).ok()?.trim().parse::<u32>().ok()
+}
+
+#[cfg(unix)]
+fn is_process_alive(pid: u32) -> bool {
+    std::path::Path::new(&format!("/proc/{}", pid)).exists()
+}
+
+#[cfg(windows)]
+fn is_process_alive(pid: u32) -> bool {
+    use std::process::Command;
+    if let Ok(out) = Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {}", pid), "/NH", "/FO", "CSV"])
+        .output()
+    {
+        // 命中时 CSV 行含该 PID；未命中时输出 "INFO: No tasks..."
+        return String::from_utf8_lossy(&out.stdout).contains(&pid.to_string());
+    }
+    // 无法判定时保守认为存活（拒绝接管，避免误杀健康进程）
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -374,6 +468,29 @@ mod tests {
         let p = write_auto_admin_key(db.to_str().unwrap(), key).unwrap();
         assert_eq!(std::fs::read_to_string(&p).unwrap(), key);
         let _ = std::fs::remove_file(&p);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_single_writer_lock_path() {
+        let p = single_writer_lock_path("data/memoria.db");
+        assert_eq!(p.file_name().unwrap(), "memoria.pid");
+        let p2 = single_writer_lock_path("/abs/path/memoria.db");
+        assert_eq!(p2.file_name().unwrap(), "memoria.pid");
+    }
+
+    #[test]
+    fn test_second_writer_refused_when_alive() {
+        let dir = std::env::temp_dir().join(format!("memoria_lock_test_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let db = dir.join("memoria.db");
+        let db_s = db.to_str().unwrap().to_string();
+        let f1 = acquire_single_writer_lock(&db_s).expect("first writer should acquire lock");
+        // 第二个写者持有相同（存活）PID，应被拒绝
+        let res = acquire_single_writer_lock(&db_s);
+        assert!(res.is_err(), "second writer must be refused while first is alive");
+        drop(f1);
+        let _ = std::fs::remove_file(single_writer_lock_path(&db_s));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

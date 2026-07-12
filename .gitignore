@@ -18,6 +18,9 @@ data/
 # Auto-generated admin key (P0-2: never commit)
 admin_key.secret
 
+# Single-writer lock file (P0-4)
+*.pid
+
 # Logs
 *.log
 
