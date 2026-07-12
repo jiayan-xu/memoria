@@ -291,11 +291,12 @@ pub fn tools_list() -> Vec<serde_json::Value> {
         "namespace": {"type": "string", "description": "命名空间，默认 default"},
         "phase": {"type": "string", "description": "阶段：consolidate/entity_extract/decay/graph，默认 consolidate"}
     })));
-    tools.push(tool("dream_state_update", "推进某命名空间某阶段的巩固进度游标（幂等，只写进度表）", serde_json::json!({
+    tools.push(tool("dream_state_update", "推进某命名空间某阶段的巩固进度游标（P1-4 限流 + cursor 校验；幂等，只写进度表）", serde_json::json!({
         "namespace": {"type": "string", "description": "命名空间，默认 default"},
         "phase": {"type": "string", "description": "阶段，默认 consolidate"},
-        "cursor_ts": {"type": "string", "description": "本批处理到的最大 created_at（推进游标）"},
-        "items_out": {"type": "number", "description": "本批产出条数，默认 0"}
+        "cursor_ts": {"type": "string", "description": "本批处理到的最大 created_at（推进游标），必填且须比现有游标新"},
+        "items_out": {"type": "number", "description": "本批产出条数，默认 0"},
+        "sessions_processed": {"type": "number", "description": "本批处理会话数，默认 0"}
     })));
     // ── 知识图谱 B1：实体 MCP 工具 ──
     tools.push(tool("entity_upsert", "创建或更新一个实体（幂等：同名同类型的实体仅更新别名/摘要）", serde_json::json!({
@@ -442,6 +443,24 @@ fn spawn_audit(state: &Arc<AppState>, agent_id: &str, tool: &str, params: &str, 
     tokio::task::spawn_blocking(move || {
         auth::audit_log(&st.auth_pool, &aid, &t, &p, allowed);
     });
+}
+
+/// P1-4：Dream 阶段 ns 限流（per-(phase, namespace) cooldown，秒）。
+/// 各阶段可通过环境变量 `MEMORIA_DREAM_COOLDOWN_<PHASE>` 覆盖，默认：
+///   consolidate / entity_extract / graph = 300s，decay = 60s。
+fn dream_cooldown(phase: &str) -> u64 {
+    let key = format!("MEMORIA_DREAM_COOLDOWN_{}", phase.to_uppercase());
+    if let Ok(v) = std::env::var(&key) {
+        if let Ok(secs) = v.parse::<u64>() { return secs; }
+    }
+    // 兜底（未设环境变量时）
+    if let Ok(v) = std::env::var("MEMORIA_DREAM_COOLDOWN_DEFAULT") {
+        if let Ok(secs) = v.parse::<u64>() { return secs; }
+    }
+    match phase {
+        "decay" => 60,
+        _ => 300,
+    }
 }
 
 fn dispatch(
@@ -1177,20 +1196,62 @@ fn dispatch(
             let phase = args.get("phase").and_then(|v| v.as_str()).unwrap_or("consolidate");
             let cursor_ts = args.get("cursor_ts").and_then(|v| v.as_str()).unwrap_or("");
             let items_out = args.get("items_out").and_then(|v| v.as_u64()).unwrap_or(0) as i64;
+            let sessions = args.get("sessions_processed").and_then(|v| v.as_u64()).unwrap_or(0) as i64;
+
+            // P1-4 一：cursor_ts 非空校验（防止游标回退到 epoch）
+            if cursor_ts.is_empty() {
+                return r#"{"status":"error","message":"cursor_ts must be non-empty ISO-8601"}"#.to_string();
+            }
+
             let conn = match state.pool.get() {
                 Ok(c) => c, Err(e) => return format!(r#"{{"error":"pool: {}"}}"#, e),
             };
+
+            // P1-4 二：cursor_ts 必须是前进的（比现有游标新）
+            let current_cursor: Option<String> = conn
+                .query_row(
+                    "SELECT cursor_ts FROM dream_state WHERE phase=?1 AND namespace=?2",
+                    rusqlite::params![phase, ns],
+                    |r| r.get(0),
+                )
+                .ok()
+                .flatten();
+            if let Some(ref prev) = current_cursor {
+                if cursor_ts <= prev.as_str() {
+                    return format!(r#"{{"status":"error","message":"cursor_ts must advance: new '{}' not newer than previous '{}'"}}"#, cursor_ts, prev);
+                }
+            }
+
+            // P1-4 三：ns 限流（per-(phase,namespace) cooldown，防监听洪流冲库）
+            let cooldown_secs = dream_cooldown(phase);
+            let ok_to_proceed: bool = conn
+                .query_row(
+                    "SELECT (julianday('now') - julianday(COALESCE(last_run,'1970-01-01'))) * 86400 >= ?1
+                     FROM dream_state WHERE phase=?2 AND namespace=?3",
+                    rusqlite::params![cooldown_secs as f64, phase, ns],
+                    |r| r.get(0),
+                )
+                .unwrap_or(true); // 首跑无记录 = 放行
+            if !ok_to_proceed {
+                return format!(r#"{{"status":"error","message":"rate limited: phase '{}' for ns '{}' requires {}s cooldown"}}"#, phase, ns, cooldown_secs);
+            }
+
+            // P1-4 四：推进游标（含 sessions_processed 累加）
             match conn.execute(
-                "INSERT INTO dream_state(phase, namespace, last_run, cursor_ts, runs, items_out)
-                 VALUES(?1, ?2, datetime('now'), ?3, 1, ?4)
+                "INSERT INTO dream_state(phase, namespace, last_run, cursor_ts, runs, items_out, sessions_processed)
+                 VALUES(?1, ?2, datetime('now'), ?3, 1, ?4, ?5)
                  ON CONFLICT(phase, namespace) DO UPDATE SET
                    last_run=datetime('now'),
                    cursor_ts=excluded.cursor_ts,
                    runs=dream_state.runs+1,
-                   items_out=dream_state.items_out+excluded.items_out",
-                rusqlite::params![phase, ns, cursor_ts, items_out],
+                   items_out=dream_state.items_out+excluded.items_out,
+                   sessions_processed=dream_state.sessions_processed+excluded.sessions_processed",
+                rusqlite::params![phase, ns, cursor_ts, items_out, sessions],
             ) {
-                Ok(_) => serde_json::to_string(&serde_json::json!({"status":"ok","phase":phase,"namespace":ns,"cursor_ts":cursor_ts})).unwrap_or_default(),
+                Ok(_) => serde_json::to_string(&serde_json::json!({
+                    "status":"ok","phase":phase,"namespace":ns,"cursor_ts":cursor_ts,
+                    "runs":"(incremented)","items_out":"(accumulated)"
+                })).unwrap_or_default(),
                 Err(e) => format!(r#"{{"status":"error","message":"{}"}}"#, e),
             }
         },

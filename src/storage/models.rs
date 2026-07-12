@@ -87,7 +87,11 @@ pub struct MemoryRelation {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DreamState {
     pub phase: String,
+    pub namespace: String,
     pub last_run: Option<String>,
+    pub cursor_ts: Option<String>,
+    pub runs: i64,
+    pub items_out: i64,
     pub sessions_processed: i64,
 }
 
