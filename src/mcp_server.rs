@@ -460,33 +460,12 @@ fn dispatch(
                 }
             });
 
-            let fts_limit = max_results * 3;
-            let mut signals: Vec<Vec<search::SignalResult>> = Vec::new();
-            let mut weights: Vec<f64> = Vec::new();
-
-            // S1: Keyword
-            if let Ok(kw) = search::keyword::keyword_search(&state.pool, query, ns, fts_limit) {
-                if !kw.is_empty() { signals.push(kw); weights.push(1.0); }
-            }
-            // S2: Semantic (HNSW)
-            if let Ok(sem) = search::semantic::semantic_search(query, ns, fts_limit, Some(&state.hnsw), Some(&state.query_cache), Some(&state.pool)) {
-                if !sem.is_empty() { signals.push(sem); weights.push(1.0); }
-            }
-            // S3: Temporal
-            if let Ok(temp) = search::temporal::temporal_search(&state.pool, ns, fts_limit) {
-                if !temp.is_empty() { signals.push(temp); weights.push(1.0); }
-            }
-            // S4: Importance
-            if let Ok(imp) = search::importance::importance_search(&state.pool, ns, fts_limit) {
-                if !imp.is_empty() { signals.push(imp); weights.push(1.0); }
-            }
-            // S5: Category
-            if let Ok(cat) = search::importance::category_search(&state.pool, query, ns, max_results as u32) {
-                if !cat.is_empty() { signals.push(cat); weights.push(0.5); }
-            }
-
-            let mut fused = if signals.is_empty() { vec![] } else { search::rrf::rrf_merge(&signals, &weights, 60.0) };
-            if let Ok(expanded) = search::rrf::graph_expand(&state.pool, &fused, 2, ns) { fused.extend(expanded); }
+            // P1-1: 统一检索入口（与评测 harness 同一路径），替代内联 5 信号构建。
+            // 生产路径传入 hnsw/query_cache（运行时语义通道可用）；CI 评测无 embedding 后端时传 None。
+            let fused = search::hybrid::hybrid_search(
+                &state.pool, query, ns, max_results,
+                Some(&state.hnsw), Some(&state.query_cache),
+            ).unwrap_or_default();
 
             // Tags 过滤（如果有）
             let filtered: Vec<search::rrf::FusedResult> = if let Some(ref tags) = tags_filter {

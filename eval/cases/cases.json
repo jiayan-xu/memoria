@@ -1,0 +1,14 @@
+[
+  {"id":"exact_fact_plate","type":"exact_fact","query":"绿牌","ns":"agent/default","k":5,"expect_indices":[0]},
+  {"id":"exact_fact_license","type":"exact_fact","query":"MIT","ns":"agent/default","k":5,"expect_indices":[1]},
+  {"id":"pref_delete","type":"preference","query":"移动","ns":"agent/default","k":5,"expect_indices":[2]},
+  {"id":"pref_doc","type":"preference","query":"文档优先","ns":"agent/default","k":5,"expect_indices":[3]},
+  {"id":"pref_lang_code","type":"preference","query":"代码实现","ns":"agent/default","k":5,"expect_indices":[4]},
+  {"id":"temporal_github","type":"temporal","query":"开源到 GitHub","ns":"agent/default","k":5,"expect_indices":[5]},
+  {"id":"negative_secret","type":"negative","query":"数据库","ns":"agent/default","k":5,"expect_indices":[7],"must_not_indices":[8]},
+  {"id":"dedup_doc","type":"dedup","query":"对外文档","ns":"agent/default","k":5,"expect_indices":[9],"dedup_pair":[9,10]},
+  {"id":"fact_agentcore_p0","type":"exact_fact","query":"统一鉴权中间件","ns":"agent/default","k":5,"expect_indices":[11]},
+  {"id":"fact_pat_scope","type":"exact_fact","query":"GitHub PAT scope","ns":"agent/default","k":5,"expect_indices":[12]},
+  {"id":"pref_commit","type":"preference","query":"扫描密钥","ns":"agent/default","k":5,"expect_indices":[14]},
+  {"id":"fact_hnsw","type":"exact_fact","query":"HNSW 向量索引","ns":"agent/default","k":5,"expect_indices":[16]}
+]

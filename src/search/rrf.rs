@@ -45,30 +45,56 @@ pub fn rrf_merge(
     weights: &[f64],
     k: f64,
 ) -> Vec<FusedResult> {
-    let mut score_map: HashMap<String, (f64, String, String)> = HashMap::new();
+    let mut score_map: HashMap<String, (f64, String, String, Vec<(String, f64)>)> = HashMap::new();
 
     for (signal_idx, results) in signals.iter().enumerate() {
         let weight = weights.get(signal_idx).copied().unwrap_or(1.0);
         for (rank, result) in results.iter().enumerate() {
             let rrf = weight / (k + rank as f64 + 1.0);
             let entry = score_map.entry(result.memory_id.clone());
-            let (current_score, _, _) = entry.or_insert((0.0, result.content.clone(), result.source.clone()));
+            let (current_score, _, _, sigs) = entry.or_insert_with(|| {
+                (0.0, result.content.clone(), result.source.clone(), Vec::new())
+            });
             *current_score += rrf;
+            // 记录贡献通道（粗粒度），供评测的通道贡献度量使用
+            let ch = channel_of(&result.source);
+            if let Some(existing) = sigs.iter_mut().find(|(n, _)| n == &ch) {
+                existing.1 += rrf;
+            } else {
+                sigs.push((ch, rrf));
+            }
         }
     }
 
-    let mut fused: Vec<FusedResult> = score_map.into_iter().map(|(memory_id, (rrf_score, content, source))| {
+    let mut fused: Vec<FusedResult> = score_map.into_iter().map(|(memory_id, (rrf_score, content, source, signal_scores))| {
         FusedResult {
             memory_id,
             content,
             rrf_score,
             source,
-            signal_scores: vec![],
+            signal_scores,
         }
     }).collect();
 
     fused.sort_by(|a, b| b.rrf_score.partial_cmp(&a.rrf_score).unwrap_or(std::cmp::Ordering::Equal));
     fused
+}
+
+/// 将信号 source 映射为粗粒度通道名，用于通道贡献度量。
+fn channel_of(source: &str) -> String {
+    if source.contains("keyword") || source.contains("like") {
+        "keyword".to_string()
+    } else if source.contains("semantic") {
+        "semantic".to_string()
+    } else if source.contains("temporal") {
+        "temporal".to_string()
+    } else if source.contains("importance") {
+        "importance".to_string()
+    } else if source.contains("category") {
+        "category".to_string()
+    } else {
+        source.to_string()
+    }
 }
 
 /// 2-hop graph expansion via memory_relations table.
