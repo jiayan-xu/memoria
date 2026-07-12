@@ -60,9 +60,13 @@ async fn health_check_full(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    // P2-4 修复：/health/full 返回完整健康报告（含 schema 检查），需 admin 校验
-    let admin_key = headers.get("x-admin-key").and_then(|v| v.to_str().ok()).unwrap_or("");
-    if !auth::ct_eq(admin_key, &state.admin_key) {
+    // P0-2 统一 require_admin：admin 角色（X-Agent-Id/Key）或 x-admin-key 兜底，与 P0-1 一致
+    let agent_id = headers.get("x-agent-id").and_then(|v| v.to_str().ok()).unwrap_or("");
+    let agent_key = headers.get("x-agent-key").and_then(|v| v.to_str().ok()).unwrap_or("");
+    let legacy_key = headers.get("x-admin-key").and_then(|v| v.to_str().ok()).unwrap_or("");
+    let auth_result = auth::authenticate(&state.auth_pool, agent_id, agent_key)
+        .unwrap_or_else(|_| auth::AuthResult { agent_id: String::new(), allowed_ns: Vec::new(), role: String::new() });
+    if !crate::permissions::require_admin(&auth_result, legacy_key, &state.admin_key) {
         return Err(StatusCode::FORBIDDEN);
     }
     let st = state.clone();
@@ -1359,4 +1363,54 @@ fn matches_memory_tags(pool: &storage::SqlitePool, memory_id: &str, tags: &[Stri
     };
     // tags 存为 JSON 数组 ["a","b"]，检查每个请求标签是否在其中
     tags.iter().all(|tag| tags_str.contains(&format!("\"{}\"", tag)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn build_test_state() -> Arc<AppState> {
+        let pool = memoria_core::storage::create_pool(":memory:", 4).expect("pool");
+        memoria_core::storage::init_schema(&pool).expect("schema");
+        memoria_core::storage::init_core_tables(&pool).expect("core");
+        let auth_pool = memoria_core::storage::create_pool(":memory:", 4).expect("auth pool");
+        memoria_core::storage::init_schema(&auth_pool).expect("auth schema");
+        memoria_core::auth::init_auth_tables(&auth_pool).expect("auth tables");
+        Arc::new(AppState {
+            pool,
+            auth_pool,
+            hnsw: Arc::new(memoria_core::vector::HnswIndex::new()),
+            hnsw_status: "uninitialized".to_string(),
+            query_cache: Arc::new(memoria_core::vector::QueryCache::new()),
+            admin_key: "test-admin-key".to_string(),
+            bridge_url: "http://127.0.0.1:9000/mcp".to_string(),
+            http_client: reqwest::Client::new(),
+            db_path: ":memory:".to_string(),
+            backup_dir: ".".to_string(),
+            vec_index_path: ":memory:".to_string(),
+        })
+    }
+
+    #[test]
+    fn test_health_full_no_auth_is_forbidden() {
+        let state = build_test_state();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let headers = axum::http::HeaderMap::new();
+            let res = health_check_full(axum::extract::State(state), headers).await;
+            assert!(res.is_err(), "anonymous /health/full must return 403");
+        });
+    }
+
+    #[test]
+    fn test_health_full_legacy_admin_key_ok() {
+        let state = build_test_state();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut headers = axum::http::HeaderMap::new();
+            headers.insert("x-admin-key", axum::http::HeaderValue::from_static("test-admin-key"));
+            let res = health_check_full(axum::extract::State(state), headers).await;
+            assert!(res.is_ok(), "valid admin key must allow /health/full");
+        });
+    }
 }

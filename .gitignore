@@ -15,6 +15,9 @@ data/
 *.db-wal
 *.db-shm
 
+# Auto-generated admin key (P0-2: never commit)
+admin_key.secret
+
 # Logs
 *.log
 

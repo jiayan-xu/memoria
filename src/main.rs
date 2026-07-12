@@ -88,9 +88,21 @@ fn main() {
     println!("[Memoria] DB: {}", db_path);
     println!("[Memoria] Backup dir: {}", backup_dir);
     println!("[Memoria] Listen: {}:{}", host, port);
-    // P2-3 修复：密钥前缀仅当自动生成时打印，且改 stderr（避免被 stdout 日志捕获泄露）
+    // P0-2 修复：显式暴露到 0.0.0.0 / :: 时告警（远程须走反代 + TLS + auth）
+    if is_exposed_bind(&host) {
+        eprintln!("[Memoria][WARN] Binding to {} — service is exposed to the network. Use a reverse proxy + TLS + auth for remote access.", host);
+    }
+    // P0-2 修复：自动生成的 key 不再回显任何片段，写入本地受控文件（仅本次启动可查）
     if admin_key_auto {
-        eprintln!("[Memoria] Admin key (auto-generated): {}...", &admin_key[..16.min(admin_key.len())]);
+        match write_auto_admin_key(&db_path, &admin_key) {
+            Ok(p) => {
+                eprintln!("[Memoria] Admin key auto-generated and written to: {}", p.display());
+                eprintln!("[Memoria] Shown only once — store it securely. Set MEMORIA_ADMIN_KEY to persist across restarts.");
+            }
+            Err(e) => {
+                eprintln!("[Memoria][WARN] Admin key auto-generated but failed to write key file ({}); it will NOT be recoverable after restart.", e);
+            }
+        }
     }
 
     let pool = storage::create_pool(&db_path, 16).expect("pool");
@@ -315,3 +327,54 @@ fn main() {
     axum::serve(listener, app).await.unwrap();
     }); // block_on
 }
+
+// ── P0-2 辅助函数（纯逻辑，便于单测）──
+
+/// P0-2：判断监听地址是否暴露到所有网络接口。
+pub fn is_exposed_bind(host: &str) -> bool {
+    host == "0.0.0.0" || host == "::" || host == "[::]"
+}
+
+/// P0-2：自动生成的 admin key 写入本地受控文件（仅本次启动可查，不回显任何片段）。
+/// 返回写入路径。Unix 下设为 0600；Windows 下仅写入数据目录（ACL 模型不同）。
+pub fn write_auto_admin_key(db_path: &str, key: &str) -> std::io::Result<std::path::PathBuf> {
+    let key_path = std::path::Path::new(db_path)
+        .parent()
+        .map(|p| p.join("admin_key.secret"))
+        .unwrap_or_else(|| std::path::PathBuf::from("admin_key.secret"));
+    std::fs::write(&key_path, key)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(key_path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_exposed_bind() {
+        assert!(is_exposed_bind("0.0.0.0"));
+        assert!(is_exposed_bind("::"));
+        assert!(is_exposed_bind("[::]"));
+        assert!(!is_exposed_bind("127.0.0.1"));
+        assert!(!is_exposed_bind("localhost"));
+        assert!(!is_exposed_bind("192.168.1.10"));
+    }
+
+    #[test]
+    fn test_write_auto_admin_key() {
+        let dir = std::env::temp_dir().join(format!("memoria_p02_test_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let db = dir.join("test.db");
+        let key = "mem-admin-deadbeefcafe0000";
+        let p = write_auto_admin_key(db.to_str().unwrap(), key).unwrap();
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), key);
+        let _ = std::fs::remove_file(&p);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
