@@ -127,7 +127,7 @@ async fn handle_mcp(
 ///
 /// 每个工具必须包含合法的 `inputSchema`（JSON Schema 对象），
 /// 否则 MCP 客户端（如 WorkBuddy）的 schema 校验会拒绝整个 tools/list 响应。
-fn tools_list() -> Vec<serde_json::Value> {
+pub fn tools_list() -> Vec<serde_json::Value> {
     // 构造工具条目：name + description + 符合 MCP 规范的 inputSchema（必须存在且为 object）
     let tool = |name: &str, description: &str, props: serde_json::Value| -> serde_json::Value {
         serde_json::json!({
@@ -549,8 +549,9 @@ fn dispatch(
             let new_id = args.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
             let display_name = args.get("display_name").and_then(|v| v.as_str()).unwrap_or(new_id);
             let admin_key = args.get("admin_key").and_then(|v| v.as_str()).unwrap_or("");
-            if !auth::ct_eq(admin_key, &state.admin_key) {
-                return r#"{"status":"error","message":"Invalid admin key"}"#.to_string();
+            // P0-1：统一 admin 门禁（角色优先 + body key 兜底）
+            if !crate::permissions::require_admin(&_auth, admin_key, &state.admin_key) {
+                return r#"{"status":"error","message":"admin required"}"#.to_string();
             }
             let default_ns = format!("agent/{}", new_id);
             let ns = args.get("namespace").and_then(|v| v.as_str()).unwrap_or(&default_ns);
@@ -601,8 +602,9 @@ fn dispatch(
             let from_ns = args.get("from_ns").and_then(|v| v.as_str()).unwrap_or("");
             let to_ns = args.get("to_ns").and_then(|v| v.as_str()).unwrap_or("");
             let admin_key = args.get("admin_key").and_then(|v| v.as_str()).unwrap_or("");
-            if !auth::ct_eq(admin_key, &state.admin_key) {
-                return r#"{"status":"error","message":"Invalid admin key"}"#.to_string();
+            // P0-1：统一 admin 门禁（角色优先 + body key 兜底）
+            if !crate::permissions::require_admin(&_auth, admin_key, &state.admin_key) {
+                return r#"{"status":"error","message":"admin required"}"#.to_string();
             }
             if from_ns.is_empty() || to_ns.is_empty() || from_ns == to_ns {
                 return r#"{"status":"error","message":"from_ns / to_ns 必填且不能相同"}"#.to_string();
@@ -667,6 +669,11 @@ fn dispatch(
             }
         },
         "db_stats" => {
+            // P0-1 修复：全库统计含 agent_registry / 审计总数 / HNSW 向量数，需 admin 门禁
+            let ak = args.get("admin_key").and_then(|v| v.as_str()).unwrap_or("");
+            if !crate::permissions::require_admin(&_auth, ak, &state.admin_key) {
+                return r#"{"status":"error","message":"admin required"}"#.to_string();
+            }
             let conn = match state.pool.get() {
                 Ok(c) => c, Err(e) => return format!(r#"{{"error":"{}"}}"#, e),
             };
@@ -757,8 +764,9 @@ fn dispatch(
         },
         "agent_list" => {
             let admin_key = args.get("admin_key").and_then(|v| v.as_str()).unwrap_or("");
-            if !auth::ct_eq(admin_key, &state.admin_key) {
-                return r#"{"status":"error","message":"admin key required"}"#.to_string();
+            // P0-1：统一 admin 门禁（角色优先 + body key 兜底）
+            if !crate::permissions::require_admin(&_auth, admin_key, &state.admin_key) {
+                return r#"{"status":"error","message":"admin required"}"#.to_string();
             }
             match state.auth_pool.get() {
                 Ok(conn) => {
@@ -786,8 +794,9 @@ fn dispatch(
             if target.is_empty() { return format!(r#"{{"status":"error","message":"missing agent_id"}}"#); }
             // 只有 admin 可以吊销 agent
             let admin_key = args.get("admin_key").and_then(|v| v.as_str()).unwrap_or("");
-            if !auth::ct_eq(admin_key, &state.admin_key) {
-                return format!(r#"{{"status":"error","message":"admin key required"}}"#);
+            // P0-1：统一 admin 门禁（角色优先 + body key 兜底）
+            if !crate::permissions::require_admin(&_auth, admin_key, &state.admin_key) {
+                return format!(r#"{{"status":"error","message":"admin required"}}"#);
             }
             match state.auth_pool.get() {
                 Ok(conn) => {
@@ -951,6 +960,14 @@ fn dispatch(
         "skill_market_list_installed" => {
             let agent_id = args.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
             if agent_id.is_empty() { return r#"{"status":"error","message":"missing agent_id"}"#.to_string(); }
+            // P0-1 修复：NS 隔离 —— 仅自身（同 agent）或授权命名空间内的 agent 可查，
+            // 防任意已认证 agent 查他人已装技能清单（信息泄露）。
+            if _auth.role != "admin" && agent_id != _auth.agent_id.as_str() {
+                let target_ns = format!("agent/{}", agent_id);
+                if !auth::check_ns_access(_auth, &target_ns) {
+                    return r#"{"status":"error","message":"no permission to view this agent's installed skills"}"#.to_string();
+                }
+            }
             match state.auth_pool.get() {
                 Ok(conn) => {
                     let mut rows: Vec<serde_json::Value> = Vec::new();
@@ -1072,8 +1089,9 @@ fn dispatch(
         },
         "memory_merge" => {
             let admin_key_val = args.get("admin_key").and_then(|v| v.as_str()).unwrap_or("");
-            if !auth::ct_eq(admin_key_val, &state.admin_key) {
-                return r#"{"status":"error","message":"admin key required"}"#.to_string();
+            // P0-1：统一 admin 门禁（角色优先 + body key 兜底）
+            if !crate::permissions::require_admin(&_auth, admin_key_val, &state.admin_key) {
+                return r#"{"status":"error","message":"admin required"}"#.to_string();
             }
             let keep_id = args.get("keep_id").and_then(|v| v.as_str()).unwrap_or("");
             let merge_id = args.get("merge_id").and_then(|v| v.as_str()).unwrap_or("");

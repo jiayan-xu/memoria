@@ -9,6 +9,7 @@
 //!   MEMORIA_BACKUP_INTERVAL_HOURS (default: 24)
 
 mod mcp_server;
+mod permissions;
 
 use memoria_core::{auth, backup, health, storage, vector::HnswIndex, web_api};
 use mcp_server::AppState;
