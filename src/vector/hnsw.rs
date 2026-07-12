@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::RwLock;
 
-const DIM: usize = 768;
+pub const DIM: usize = 768;
 const DEFAULT_M: usize = 16;
 const DEFAULT_EF_C: usize = 200;
 const DEFAULT_EF_S: usize = 50;

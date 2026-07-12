@@ -178,6 +178,10 @@ fn main() {
     } else {
         (HnswIndex::new(), "uninitialized")
     };
+    // P1-3：以 memory_vectors 持久表为权威源重建 HNSW（.bin 仅作可选快取）
+    if let Err(e) = memoria_core::vector::persist::rebuild_hnsw_from_store(&pool, &hnsw) {
+        eprintln!("[Memoria] WARN: HNSW rebuild from memory_vectors: {}", e);
+    }
     println!("[Memoria] HNSW vectors: {}", hnsw.len());
 
     // ── P0: 启动健康检查 ──

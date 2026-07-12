@@ -30,6 +30,11 @@ impl MemoriaEngine {
         let pool = storage::create_pool(db_path, 4)?;
         storage::init_schema(&pool)?;
         storage::init_core_tables(&pool)?;
+        // 迁移必须随引擎自洽（之前仅在 main.rs 调用，导致 lib/MemoriaEngine 路径下
+        // superseded_by 等列缺失，近义去重静默失效）。统一在此收口，避免入口分叉。
+        storage::migrate_superseded_by(&pool)?;
+        storage::migrate_user_prefs_namespace(&pool)?;
+        storage::migrate_dream_state_ns(&pool)?;
 
         let vec_path = std::path::Path::new(db_path)
             .parent().unwrap_or_else(|| std::path::Path::new("."))
@@ -42,6 +47,12 @@ impl MemoriaEngine {
         } else {
             HnswIndex::new()
         };
+
+        // P1-3：以 memory_vectors 持久表为权威源重建 HNSW（.bin 仅作可选快取）。
+        // 即使 .bin 缺失/损坏或 QueryCache 进程内丢失，近义去重仍可跨重启可靠工作。
+        if let Err(e) = vector::persist::rebuild_hnsw_from_store(&pool, &hnsw) {
+            eprintln!("HNSW rebuild from memory_vectors: {}", e);
+        }
 
         Ok(Self { db_path: db_path.to_string(), pool: Arc::new(pool), hnsw, query_cache: QueryCache::new() })
     }
@@ -81,8 +92,14 @@ impl MemoriaEngine {
 
     pub fn add_vectors(&self, ids: Vec<String>, vectors: Vec<Vec<f32>>) -> Result<usize, String> {
         if ids.len() != vectors.len() { return Err("ids/vectors length mismatch".to_string()); }
-        let entries: Vec<VectorEntry> = ids.into_iter().zip(vectors).map(|(id, v)| VectorEntry { id, vector: v }).collect();
-        self.hnsw.add(&entries)
+        let entries: Vec<VectorEntry> = ids.iter().cloned().zip(vectors.iter().cloned()).map(|(id, v)| VectorEntry { id, vector: v }).collect();
+        let added = self.hnsw.add(&entries)?;
+        // P1-3：批量向量也落 memory_vectors 表，统一为权威持久源（namespace 取自 memories）。
+        for (id, v) in ids.iter().zip(vectors.iter()) {
+            let ns = vector::persist::lookup_namespace(&self.pool, id).unwrap_or_else(|| "default".to_string());
+            let _ = vector::persist::put_stored_vector(&self.pool, id, &ns, v);
+        }
+        Ok(added)
     }
 
     pub fn vector_search(&self, qv: Vec<f32>, k: u32) -> Result<String, String> {
