@@ -735,6 +735,11 @@ fn dispatch(
             let subject = args.get("subject").and_then(|v| v.as_str()).unwrap_or("");
             let body = args.get("body").and_then(|v| v.as_str()).unwrap_or("");
             if to.is_empty() { return format!(r#"{{"status":"error","message":"missing 'to'"}}"#); }
+            // P1-6：to 格式校验 — 仅允许字母数字连字符（agent-id 格式），
+            // 拒绝含 ".." ".." "/" 等路径遍历/注入字符。
+            if !to.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') || to.len() > 64 {
+                return r#"{"status":"error","message":"invalid 'to' format: agent-id only, max 64 chars"}"#.to_string();
+            }
             // P0-M1 修复：校验目标 Agent 的命名空间属于调用者授权范围，
             // 防止任意已认证 agent 向任意 namespace 注入消息（跨租户/跨项目消息投毒）。
             // 调用者自身（to == 自己）或 admin(*) 始终允许；其余必须落在 allowed_ns 内。
@@ -752,6 +757,9 @@ fn dispatch(
                                           format!("agent:{}", _auth.agent_id),
                                           format!("[{}] {}", subject, body)],
                     );
+                    // P1-6：a2a_send 审计（记录目标 agent + subject 摘要）
+                    auth::audit_log(&state.auth_pool, &_auth.agent_id, "a2a_send",
+                        &format!("to={},subject={:.40}", to, subject), true);
                     format!(r#"{{"status":"sent","to":"{}"}}"#, to)
                 },
                 Err(e) => format!(r#"{{"status":"error","message":"{}"}}"#, e),
@@ -909,13 +917,11 @@ fn dispatch(
             let dependencies = args.get("dependencies").map(|v| v.to_string()).unwrap_or_else(|| "[]".to_string());
             let source = args.get("source").and_then(|v| v.as_str()).unwrap_or("manual");
 
-            // 权限检查：admin_key 或同 namespace
-            if !auth::ct_eq(admin_key, &state.admin_key) {
-                // 非 admin：检查 namespace 是否匹配 visibility
+            // 权限检查：admin_key 或 require_admin（精确角色，非子串）
+            if !auth::ct_eq(admin_key, &state.admin_key) && _auth.role != "admin" {
                 if visibility.starts_with("tenant/") {
-                    let vis_ns = &visibility[7..]; // "tenant/finance" → "finance"
-                    let caller_ns = _auth.allowed_ns.first().map(|s| s.as_str()).unwrap_or("");
-                    if !caller_ns.contains(vis_ns) {
+                    let vis_ns = &format!("agent/{}", &visibility[7..]); // "tenant/finance" → "agent/finance"
+                    if !auth::check_ns_access(_auth, vis_ns) {
                         return r#"{"status":"error","message":"no permission to publish to this visibility"}"#.to_string();
                     }
                 } else if visibility != "public" {
@@ -923,7 +929,7 @@ fn dispatch(
                 }
             }
 
-            match state.auth_pool.get() {
+            let publish_result = match state.auth_pool.get() {
                 Ok(conn) => {
                     let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
                     conn.execute(
@@ -940,7 +946,13 @@ fn dispatch(
                     format!(r#"{{"status":"published","name":"{}","visibility":"{}"}}"#, name, visibility)
                 },
                 Err(e) => format!(r#"{{"status":"error","message":"{}"}}"#, e),
+            };
+            // P1-6：publish 审计（记录 name + visibility）
+            if publish_result.contains("\"status\":\"published\"") {
+                auth::audit_log(&state.auth_pool, &_auth.agent_id, "skill_market_publish",
+                    &format!("name={},visibility={}", name, visibility), true);
             }
+            return publish_result;
         },
         "skill_market_install" => {
             let skill_name = args.get("skill_name").and_then(|v| v.as_str()).unwrap_or("");
@@ -950,17 +962,15 @@ fn dispatch(
                 return r#"{"status":"error","message":"missing skill_name or target_agent"}"#.to_string();
             }
 
-            // 权限检查：admin_key 或同 namespace
+            // 权限检查：admin_key 或 同 namespace
             if !auth::ct_eq(admin_key, &state.admin_key) {
-                // 非 admin：只能给同 namespace 的 Agent 安装
-                let caller_ns = _auth.allowed_ns.first().map(|s| s.as_str()).unwrap_or("");
-                let target_ns = format!("agent/{}", target_agent);
-                if !caller_ns.contains(&target_ns) && !caller_ns.contains("admin") {
+                // 非 admin：只能给同 namespace 的 Agent 安装（使用精确角色判定，非子串）
+                if _auth.role != "admin" && !auth::check_ns_access(_auth, &format!("agent/{}", target_agent)) {
                     return r#"{"status":"error","message":"no permission to install on this agent"}"#.to_string();
                 }
             }
 
-            match state.auth_pool.get() {
+            let install_result = match state.auth_pool.get() {
                 Ok(conn) => {
                     let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
                     conn.execute(
@@ -974,7 +984,13 @@ fn dispatch(
                     format!(r#"{{"status":"installed","skill":"{}","target_agent":"{}"}}"#, skill_name, target_agent)
                 },
                 Err(e) => format!(r#"{{"status":"error","message":"{}"}}"#, e),
+            };
+            // P1-6：install 审计（记录 skill_name + target_agent）
+            if install_result.contains("\"status\":\"installed\"") {
+                auth::audit_log(&state.auth_pool, &_auth.agent_id, "skill_market_install",
+                    &format!("skill={},target={}", skill_name, target_agent), true);
             }
+            return install_result;
         },
         "skill_market_list_installed" => {
             let agent_id = args.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
