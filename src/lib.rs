@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 pub mod auth;
 pub mod backup;
+pub mod quota;
 pub mod health;
 pub mod search;
 pub mod session_watcher;
@@ -36,6 +37,8 @@ impl MemoriaEngine {
         storage::migrate_user_prefs_namespace(&pool)?;
         storage::migrate_dream_state_ns(&pool)?;
         storage::migrate_temporal(&pool)?;
+        // P2-2：配额计数表随引擎自洽（与 main.rs 一致，避免 lib/MemoriaEngine 路径缺表）
+        quota::init_quota_table(&pool)?;
 
         let vec_path = std::path::Path::new(db_path)
             .parent().unwrap_or_else(|| std::path::Path::new("."))

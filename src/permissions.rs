@@ -56,6 +56,7 @@ pub const PERMISSION_MATRIX: &[Entry] = &[
     Entry { tool: "memory_decay", min_role: MinRole::Agent, ns_policy: NsPolicy::NamespaceArg, note: "衰减循环" },
     Entry { tool: "memory_graph", min_role: MinRole::Agent, ns_policy: NsPolicy::NamespaceArg, note: "构建关系图" },
     Entry { tool: "memory_user_prefs", min_role: MinRole::Agent, ns_policy: NsPolicy::NamespaceArg, note: "用户偏好" },
+    Entry { tool: "memory_quota_status", min_role: MinRole::Agent, ns_policy: NsPolicy::NamespaceArg, note: "配额用量查询（P2-2）" },
     Entry { tool: "memory_recent_decisions", min_role: MinRole::Agent, ns_policy: NsPolicy::NamespaceArg, note: "最近决策" },
     Entry { tool: "memory_fetch_unconsolidated", min_role: MinRole::Agent, ns_policy: NsPolicy::NamespaceArg, note: "巩固原料读取" },
     Entry { tool: "dream_state_get", min_role: MinRole::Agent, ns_policy: NsPolicy::NamespaceArg, note: "巩固进度读取" },

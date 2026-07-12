@@ -179,6 +179,9 @@ pub fn tools_list() -> Vec<serde_json::Value> {
             "source": {"type": "string", "description": "来源，默认 mcp"},
             "session_id": {"type": "string", "description": "会话 ID"}
         })),
+        tool("memory_quota_status", "查询本命名空间当前配额用量与上限（P2-2 滥用防护；写入=日限额，搜索=分钟限额，备份=小时限额）", serde_json::json!({
+            "namespace": {"type": "string", "description": "命名空间，默认 default"}
+        })),
         tool("register_agent", "注册Agent（需要Admin key）", serde_json::json!({
             "agent_id": {"type": "string", "description": "新 Agent ID"},
             "display_name": {"type": "string", "description": "显示名"},
@@ -472,6 +475,31 @@ fn dream_cooldown(phase: &str) -> u64 {
     }
 }
 
+/// P2-2：结构化配额超限错误。spawn_audit 会将其记 `allowed=false`（denied），
+/// 形成滥用可见性；客户端可据 `retry_after_sec` 退避。
+fn quota_error_json(kind: &str, limit: u64, retry_after_sec: u64) -> String {
+    serde_json::to_string(&serde_json::json!({
+        "status": "error",
+        "code": "quota_exceeded",
+        "message": format!("namespace quota exceeded for '{}' (limit {} per window)", kind, limit),
+        "kind": kind,
+        "limit": limit,
+        "retry_after_sec": retry_after_sec,
+    })).unwrap_or_default()
+}
+
+/// P2-2：配额闸门。写/搜对 admin 豁免（避免运维自锁）；备份本身已 admin 门禁，
+/// 故备份配额对所有人生效（限制备份频率、防备份风暴）。返回 true=放行。
+fn quota_gate(state: &Arc<AppState>, ns: &str, kind: &str, role: &str) -> Option<String> {
+    if kind != memoria_core::quota::KIND_BACKUP && role == "admin" {
+        return None; // admin 免写/搜配额
+    }
+    match memoria_core::quota::check_quota(&state.pool, ns, kind) {
+        Ok(()) => None,
+        Err(e) => Some(quota_error_json(kind, e.limit, e.retry_after_sec)),
+    }
+}
+
 fn dispatch(
     state: &Arc<AppState>,
     tool: &str,
@@ -482,6 +510,10 @@ fn dispatch(
 
     match tool {
         "memory_search" | "memory_search_v2" => {
+            // P2-2 配额：搜索 QPS（admin 豁免）
+            if let Some(err) = quota_gate(state, ns, memoria_core::quota::KIND_SEARCH, &_auth.role) {
+                return err;
+            }
             let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
             let max_results = args.get("max_results").and_then(|v| v.as_u64()).unwrap_or(5) as u32;
             let tags_filter: Option<Vec<String>> = args.get("tags").and_then(|v| {
@@ -526,6 +558,10 @@ fn dispatch(
             serde_json::to_string(&serde_json::json!({"status":"ok","total_results":filtered.len(),"results":results})).unwrap_or_default()
         },
         "memory_remember" => {
+            // P2-2 配额：写入限流（admin 豁免）
+            if let Some(err) = quota_gate(state, ns, memoria_core::quota::KIND_WRITE, &_auth.role) {
+                return err;
+            }
             let content = args.get("content").and_then(|v| v.as_str()).unwrap_or("");
             let cat = args.get("category").and_then(|v| v.as_str()).unwrap_or("fact");
             let imp = args.get("importance").and_then(|v| v.as_i64()).unwrap_or(3);
@@ -564,6 +600,10 @@ fn dispatch(
             }
         },
         "memory_observe" => {
+            // P2-2 配额：写入限流（admin 豁免）
+            if let Some(err) = quota_gate(state, ns, memoria_core::quota::KIND_WRITE, &_auth.role) {
+                return err;
+            }
             let dialog = args.get("dialog").and_then(|v| v.as_str()).unwrap_or("");
             let role = args.get("role").and_then(|v| v.as_str()).unwrap_or("user");
             let src = args.get("source").and_then(|v| v.as_str()).unwrap_or("mcp");
@@ -572,6 +612,34 @@ fn dispatch(
                 Ok(id) => format!(r#"{{"status":"observed","id":"{}"}}"#, id),
                 Err(e) => format!(r#"{{"status":"error","message":"{}"}}"#, e),
             }
+        },
+        "memory_quota_status" => {
+            // P2-2：返回本 ns 当前配额用量与上限（写入=日、搜索=分钟、备份=小时）
+            use memoria_core::quota::{KIND_WRITE, KIND_SEARCH, KIND_BACKUP};
+            let kinds: [(&str, &str, &str); 3] = [
+                ("write", KIND_WRITE, "MEMORIA_QUOTA_WRITES_PER_DAY"),
+                ("search", KIND_SEARCH, "MEMORIA_QUOTA_SEARCHES_PER_MIN"),
+                ("backup", KIND_BACKUP, "MEMORIA_QUOTA_BACKUPS_PER_HOUR"),
+            ];
+            let mut quotas = serde_json::Map::new();
+            for (label, k, env_key) in &kinds {
+                let window = memoria_core::quota::quota_window(k);
+                let limit: serde_json::Value = std::env::var(env_key)
+                    .ok().and_then(|v| v.parse::<u64>().ok())
+                    .map(|n| serde_json::json!(n))
+                    .unwrap_or_else(|| serde_json::json!(memoria_core::quota::quota_limit(k)));
+                let used = memoria_core::quota::current_usage(&state.pool, ns, k);
+                quotas.insert(label.to_string(), serde_json::json!({
+                    "window": window,
+                    "limit": limit,
+                    "used": used,
+                }));
+            }
+            serde_json::to_string(&serde_json::json!({
+                "status": "ok",
+                "namespace": ns,
+                "quotas": quotas,
+            })).unwrap_or_default()
         },
         "register_agent" => {
             let new_id = args.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
@@ -1084,6 +1152,10 @@ fn dispatch(
             let ak = args.get("admin_key").and_then(|v| v.as_str()).unwrap_or("");
             if _auth.role != "admin" && !auth::ct_eq(ak, &state.admin_key) {
                 return r#"{"status":"error","message":"admin key required"}"#.to_string();
+            }
+            // P2-2 备份配额（对所有人生效，含 admin；限制备份频率、防备份风暴）
+            if let Some(err) = quota_gate(state, ns, memoria_core::quota::KIND_BACKUP, &_auth.role) {
+                return err;
             }
             // 手动触发备份
             match memoria_core::backup::perform_backup(
