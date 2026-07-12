@@ -108,6 +108,11 @@ async fn handle_mcp(
         .and_then(|v| v.to_str().ok()).unwrap_or("anonymous");
     let agent_key = headers.get("x-agent-key")
         .and_then(|v| v.to_str().ok()).unwrap_or("");
+    // 联调：入站 x-trace-id（agent-core 转发），接入统一 trace 链
+    let trace_id = headers.get("x-trace-id")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("none")
+        .to_string();
 
     let result = match method {
         "initialize" => {
@@ -123,7 +128,7 @@ async fn handle_mcp(
             }))
         }
         "tools/list" => rpc_ok(&id, serde_json::json!({"tools": tools_list()})),
-        "tools/call" => handle_tool_call(&state, &params, &id, agent_id, agent_key).await,
+        "tools/call" => handle_tool_call(&state, &params, &id, agent_id, agent_key, &trace_id).await,
         _ => rpc_error(&id, -32601, &format!("Method not found: {}", method)),
     };
     Json(result)
@@ -354,8 +359,12 @@ async fn handle_tool_call(
     id: &serde_json::Value,
     agent_id: &str,
     agent_key: &str,
+    trace_id: &str,
 ) -> serde_json::Value {
     let tool = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
+    // 联调：mcp.request span（与 agent-core http.request span 对接 x-trace-id 链）
+    let span = tracing::info_span!("mcp.request", trace_id = %trace_id, tool = %tool, agent_id = %agent_id);
+    let _guard = span.enter();
     let args = params.get("arguments").and_then(|v| v.as_object()).cloned().unwrap_or_default();
     let empty_args = serde_json::Map::new();
     let safe_args = if args.is_empty() { &empty_args } else { &args };

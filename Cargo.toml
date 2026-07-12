@@ -25,6 +25,7 @@ r2d2_sqlite = "0.25"
 hnsw_rs = "0.3"
 jieba-rs = "0.7"
 tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4"] }
 chrono = "0.4"
 lru = "0.12"

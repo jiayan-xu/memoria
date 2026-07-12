@@ -17,6 +17,20 @@ use std::sync::Arc;
 use tower_http::services::ServeDir;
 use chrono::Datelike;
 
+/// 联调：tracing 底板（与 agent-core 对齐）。
+/// 日志级别：AGENT_CORE_LOG > RUST_LOG > 默认 info。
+/// 格式：带 target 的 fmt subscriber。
+fn init_tracing() {
+    use tracing_subscriber::filter::EnvFilter;
+    let filter = EnvFilter::try_from_env("AGENT_CORE_LOG")
+        .or_else(|_| EnvFilter::try_from_env("RUST_LOG"))
+        .unwrap_or_else(|_| EnvFilter::new("info"));
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_target(true)
+        .try_init();
+}
+
 /// 限制 tokio worker 线程数和 blocking 线程池上限
 /// 防止 spawn_blocking 在锁争用时无限创建线程导致 CPU 膨胀
 fn build_runtime() -> tokio::runtime::Runtime {
@@ -47,6 +61,8 @@ fn build_runtime() -> tokio::runtime::Runtime {
 }
 
 fn main() {
+    // 联调：tracing 底板（与 agent-core 对齐：AGENT_CORE_LOG > RUST_LOG > 默认 info）
+    init_tracing();
     let runtime = build_runtime();
     // P0-4 单写者守卫：启动早期加锁，防止两个 memoria-server 实例并发写同一数据库（双写损坏）。
     let db_path_for_lock = std::env::var("MEMORIA_DB_PATH")
