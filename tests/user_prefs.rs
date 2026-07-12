@@ -19,9 +19,9 @@ fn user_prefs_nonempty_after_writes() {
     let ns = "agent/p1_2_test";
 
     // 写 3 条偏好，分布三种标签；hard_rule 的 importance 最低也应排最前
-    remember(&pool, "绝不使用 rm -rf 删除用户个人文件", "preference", 5, "test", ns, "[\"hard_rule\"]").unwrap();
-    remember(&pool, "中文回复优先于英文", "preference", 4, "test", ns, "[\"pref\"]").unwrap();
-    remember(&pool, "代码注释使用英文", "preference", 3, "test", ns, "[\"style\"]").unwrap();
+    remember(&pool, "绝不使用 rm -rf 删除用户个人文件", "preference", 5, "test", ns, "[\"hard_rule\"]", None, None).unwrap();
+    remember(&pool, "中文回复优先于英文", "preference", 4, "test", ns, "[\"pref\"]", None, None).unwrap();
+    remember(&pool, "代码注释使用英文", "preference", 3, "test", ns, "[\"style\"]", None, None).unwrap();
 
     let prefs = user_prefs(&pool, ns).expect("user_prefs");
     assert!(!prefs.is_empty(), "写入 3 条偏好后工具必须非空");

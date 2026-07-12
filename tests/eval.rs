@@ -41,7 +41,7 @@ fn memory_eval() {
         let importance = item["importance"].as_i64().unwrap_or(3);
         let ns = item["ns"].as_str().unwrap_or("agent/default");
         let tags = item["tags"].as_str().unwrap_or("[]");
-        let id = remember(&pool, content, category, importance, "eval", ns, tags)
+        let id = remember(&pool, content, category, importance, "eval", ns, tags, None, None)
             .unwrap_or_else(|e| panic!("remember failed for '{}': {}", content, e));
         // 应用时序偏移（控制 temporal 信号）
         if let Some(off) = item["created_offset_days"].as_i64() {
@@ -87,7 +87,7 @@ fn memory_eval() {
 
         let start = Instant::now();
         // 与生产同一路径；CI 无 embedding 后端，hnsw/query_cache 传 None
-        let results = hybrid_search(&pool, q, ns, k, None, None).unwrap_or_default();
+        let results = hybrid_search(&pool, q, ns, k, None, None, None).unwrap_or_default();
         latencies.push(start.elapsed().as_secs_f64() * 1000.0);
 
         let result_ids: Vec<&str> = results.iter().map(|r| r.memory_id.as_str()).collect();

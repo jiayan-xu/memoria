@@ -124,6 +124,8 @@ fn main() {
     storage::migrate_user_prefs_namespace(&pool).expect("migration: user_prefs namespace");
     // 暗知识层 A1: dream_state 升级为 (phase, namespace) 复合 PK + cursor_ts 幂等游标
     storage::migrate_dream_state_ns(&pool).expect("migration: dream_state namespace");
+    // P1-5: 三表补充 valid_from/valid_to 列（轻量时序真值 / as_of 查询）
+    storage::migrate_temporal(&pool).expect("migration: temporal columns");
 
     println!("[Memoria] Auth DB: {}", auth_db_path);
     let auth_pool = storage::create_pool(&auth_db_path, 16).expect("auth pool");

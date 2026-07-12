@@ -49,8 +49,10 @@ pub fn remember(
     source: &str,
     namespace: &str,
     tags: &str,
+    valid_from: Option<&str>,
+    valid_to: Option<&str>,
 ) -> Result<String, String> {
-    let result = remember_with_dedup(pool, content, category, importance, source, namespace, tags, None, None)?;
+    let result = remember_with_dedup(pool, content, category, importance, source, namespace, tags, None, None, valid_from, valid_to)?;
     Ok(result.id)
 }
 
@@ -61,6 +63,9 @@ pub fn remember(
 /// 2. 新记忆插入后，如果 query_cache 中有 content 的 embedding，
 ///    用 HNSW 搜索 top-N，cosine > 0.92 的标记为 superseded
 /// 3. 被标记的记忆保留（不删除），但 superseded_by 指向新记忆
+///
+/// `valid_from` / `valid_to`：P1-5 轻量时序真值。两值均为 ISO-8601 字符串；
+/// `None` 时 valid_from 取插入时刻、valid_to 为 NULL（长期有效）。
 pub fn remember_with_dedup(
     pool: &SqlitePool,
     content: &str,
@@ -71,6 +76,8 @@ pub fn remember_with_dedup(
     tags: &str,
     hnsw: Option<&HnswIndex>,
     query_cache: Option<&QueryCache>,
+    valid_from: Option<&str>,
+    valid_to: Option<&str>,
 ) -> Result<RememberResult, String> {
     let conn = pool.get().map_err(|e| format!("pool: {}", e))?;
 
@@ -113,11 +120,14 @@ pub fn remember_with_dedup(
     // Insert new memory
     let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S").to_string();
     let tags_safe = if tags.is_empty() || tags == "[]" { "[]".to_string() } else { tags.to_string() };
+    // P1-5: valid_from/valid_to 默认 now / NULL（长期有效）。
+    let valid_from_val = valid_from.unwrap_or(&now);
+    let valid_to_val = valid_to; // Option<&str> → NULL 即开放
     conn.execute(
         "INSERT INTO memories (id, namespace, source, content, category, confidence,
-         recall_count, created_at, tier, importance, decay_factor, tags)
-         VALUES (?, ?, ?, ?, ?, 0.8, 0, ?, 'hot', ?, 1.0, ?)",
-        rusqlite::params![mem_id, namespace, source, content, category, now, importance, tags_safe],
+         recall_count, created_at, tier, importance, decay_factor, tags, valid_from, valid_to)
+         VALUES (?, ?, ?, ?, ?, 0.8, 0, ?, 'hot', ?, 1.0, ?, ?, ?)",
+        rusqlite::params![mem_id, namespace, source, content, category, now, importance, tags_safe, valid_from_val, valid_to_val],
     ).map_err(|e| format!("insert: {}", e))?;
 
     // ── 近义重复检测（P1-3：可配 + 向量持久化兜底）──

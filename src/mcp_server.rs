@@ -150,19 +150,23 @@ pub fn tools_list() -> Vec<serde_json::Value> {
         tool("memory_search", "搜索记忆", serde_json::json!({
             "query": {"type": "string", "description": "搜索关键词（必填）"},
             "max_results": {"type": "number", "description": "最大返回结果数", "default": 5},
-            "tags": {"type": "string", "description": "标签过滤，JSON 数组字符串如 [\"a\",\"b\"]"}
+            "tags": {"type": "string", "description": "标签过滤，JSON 数组字符串如 [\"a\",\"b\"]"},
+            "as_of": {"type": "string", "description": "P1-5 时序真值：仅返回该 ISO-8601 时刻有效的记忆；不传则默认 now，自动过滤已失效"}
         })),
         tool("memory_search_v2", "多信号融合搜索", serde_json::json!({
             "query": {"type": "string", "description": "搜索关键词（必填）"},
             "max_results": {"type": "number", "description": "最大返回结果数", "default": 5},
-            "tags": {"type": "string", "description": "标签过滤，JSON 数组字符串"}
+            "tags": {"type": "string", "description": "标签过滤，JSON 数组字符串"},
+            "as_of": {"type": "string", "description": "P1-5 时序真值：仅返回该 ISO-8601 时刻有效的记忆；不传则默认 now，自动过滤已失效"}
         })),
         tool("memory_remember", "记录一条记忆", serde_json::json!({
             "content": {"type": "string", "description": "记忆内容（必填）"},
             "category": {"type": "string", "description": "类别，默认 fact"},
             "importance": {"type": "number", "description": "重要度 1-5，默认 3"},
             "source": {"type": "string", "description": "来源，默认 mcp"},
-            "tags": {"type": "string", "description": "标签 JSON 数组字符串"}
+            "tags": {"type": "string", "description": "标签 JSON 数组字符串"},
+            "valid_from": {"type": "string", "description": "P1-5 时序真值：记忆生效起点 ISO-8601（默认插入时刻）"},
+            "valid_to": {"type": "string", "description": "P1-5 时序真值：记忆失效点 ISO-8601（默认 NULL，长期有效）"}
         })),
         tool("memory_observe", "记录观察（低优先级）", serde_json::json!({
             "dialog": {"type": "string", "description": "对话/观察内容"},
@@ -314,7 +318,9 @@ pub fn tools_list() -> Vec<serde_json::Value> {
         "relation_type": {"type": "string", "description": "关系类型，如 uses/depends_on/mentions/part_of/similar_to"},
         "weight": {"type": "number", "description": "关系权重 0-1，默认 1.0"},
         "evidence": {"type": "string", "description": "证据来源描述"},
-        "namespace": {"type": "string", "description": "命名空间，默认 default"}
+        "namespace": {"type": "string", "description": "命名空间，默认 default"},
+        "valid_from": {"type": "string", "description": "P1-5 时序真值：关系生效起点 ISO-8601（默认插入时刻）"},
+        "valid_to": {"type": "string", "description": "P1-5 时序真值：关系失效点 ISO-8601（默认 NULL，长期有效）"}
     })));
     tools.push(tool("entity_search", "搜索实体（按类型/名称/关键词）", serde_json::json!({
         "query": {"type": "string", "description": "搜索关键词（搜索 name/aliases/summary）"},
@@ -464,9 +470,13 @@ fn dispatch(
 
             // P1-1: 统一检索入口（与评测 harness 同一路径），替代内联 5 信号构建。
             // 生产路径传入 hnsw/query_cache（运行时语义通道可用）；CI 评测无 embedding 后端时传 None。
+            // P1-5: as_of 时序真值（默认 now → 自动过滤已失效记忆）。
+            let now_str = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S").to_string();
+            let as_of: Option<&str> = args.get("as_of").and_then(|v| v.as_str())
+                .or(Some(&now_str));
             let fused = search::hybrid::hybrid_search(
                 &state.pool, query, ns, max_results,
-                Some(&state.hnsw), Some(&state.query_cache),
+                Some(&state.hnsw), Some(&state.query_cache), as_of,
             ).unwrap_or_default();
 
             // Tags 过滤（如果有）
@@ -501,10 +511,13 @@ fn dispatch(
             } else {
                 "[]".to_string()
             };
+            // P1-5: 可选时序真值区间
+            let valid_from = args.get("valid_from").and_then(|v| v.as_str());
+            let valid_to = args.get("valid_to").and_then(|v| v.as_str());
             // P0: 带近义重复检测的 remember
             match tools::remember::remember_with_dedup(
                 &state.pool, content, cat, imp, src, ns, &tags,
-                Some(&state.hnsw), Some(&state.query_cache),
+                Some(&state.hnsw), Some(&state.query_cache), valid_from, valid_to,
             ) {
                 Ok(result) => {
                     if result.action == "superseded_near_dup" && !result.superseded_ids.is_empty() {
@@ -1226,15 +1239,18 @@ fn dispatch(
             let rtype = args.get("relation_type").and_then(|v| v.as_str()).unwrap_or("related_to");
             let weight = args.get("weight").and_then(|v| v.as_f64()).unwrap_or(1.0);
             let evidence = args.get("evidence").and_then(|v| v.as_str()).unwrap_or("");
+            // P1-5: 可选时序真值区间
+            let valid_from = args.get("valid_from").and_then(|v| v.as_str());
+            let valid_to = args.get("valid_to").and_then(|v| v.as_str());
             let conn = match state.pool.get() {
                 Ok(c) => c, Err(e) => return format!(r#"{{"error":"pool: {}"}}"#, e),
             };
             match conn.execute(
-                "INSERT INTO entity_edges(namespace, source_entity_id, target_entity_id, relation_type, weight, evidence)
-                 VALUES(?1, ?2, ?3, ?4, ?5, ?6)
+                "INSERT INTO entity_edges(namespace, source_entity_id, target_entity_id, relation_type, weight, evidence, valid_from, valid_to)
+                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
                  ON CONFLICT(namespace, source_entity_id, target_entity_id, relation_type) DO UPDATE SET
                    weight=excluded.weight, evidence=excluded.evidence",
-                rusqlite::params![ns, source, target, rtype, weight, evidence],
+                rusqlite::params![ns, source, target, rtype, weight, evidence, valid_from, valid_to],
             ) {
                 Ok(_) => serde_json::to_string(&serde_json::json!({"status":"ok"})).unwrap_or_default(),
                 Err(e) => format!(r#"{{"status":"error","message":"{}"}}"#, e),

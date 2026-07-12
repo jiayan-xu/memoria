@@ -82,8 +82,11 @@ pub fn init_core_tables(pool: &SqlitePool) -> Result<(), String> {
             evidence TEXT,
             importance INTEGER DEFAULT 3,
             decay_factor REAL DEFAULT 1.0,
-            tags TEXT DEFAULT '[]'
+            tags TEXT DEFAULT '[]',
+            valid_from TEXT DEFAULT (datetime('now')),
+            valid_to TEXT
         );
+        CREATE INDEX IF NOT EXISTS idx_mem_valid ON memories(namespace, valid_from);
 
         -- Memories FTS5 (virtual table)
         CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
@@ -144,7 +147,9 @@ pub fn init_core_tables(pool: &SqlitePool) -> Result<(), String> {
             relation_type TEXT NOT NULL CHECK(relation_type IN ('same_entity','chronological','semantic_related')),
             weight REAL DEFAULT 0.5,
             evidence TEXT,
-            created_at TEXT DEFAULT (datetime('now'))
+            created_at TEXT DEFAULT (datetime('now')),
+            valid_from TEXT DEFAULT (datetime('now')),
+            valid_to TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_rel_source ON memory_relations(source_id);
 
@@ -208,6 +213,8 @@ pub fn init_core_tables(pool: &SqlitePool) -> Result<(), String> {
             weight REAL DEFAULT 1.0,
             evidence TEXT,
             created_at TEXT DEFAULT (datetime('now')),
+            valid_from TEXT DEFAULT (datetime('now')),
+            valid_to TEXT,
             UNIQUE(namespace, source_entity_id, target_entity_id, relation_type)
         );
         CREATE INDEX IF NOT EXISTS idx_edge_source ON entity_edges(source_entity_id);
@@ -333,5 +340,45 @@ pub fn migrate_dream_state_ns(pool: &SqlitePool) -> Result<(), String> {
         .map_err(|e| format!("migrate dream_state: {}", e))?;
         println!("[Memoria] Migration: rebuilt dream_state with (phase, namespace) composite PK (preserved old rows)");
     }
+    Ok(())
+}
+
+/// P1-5 迁移：为 `memories` / `memory_relations` / `entity_edges` 三表补充
+/// `valid_from` / `valid_to` 列（轻量时序真值 / as_of 查询）。
+/// 幂等：列已存在则跳过；新库由 CREATE TABLE 直接带列，本迁移仅覆盖旧库。
+pub fn migrate_temporal(pool: &SqlitePool) -> Result<(), String> {
+    let conn = pool.get().map_err(|e| format!("pool get: {}", e))?;
+    for table in ["memories", "memory_relations", "entity_edges"] {
+        for col in ["valid_from", "valid_to"] {
+            let has: i64 = conn
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM pragma_table_info('{}') WHERE name = '{}'", table, col),
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0);
+            if has == 0 {
+                if col == "valid_from" {
+                    conn.execute_batch(&format!(
+                        "ALTER TABLE {} ADD COLUMN valid_from TEXT DEFAULT (datetime('now'));",
+                        table
+                    ))
+                    .map_err(|e| format!("add {}.{}: {}", table, col, e))?;
+                } else {
+                    conn.execute_batch(&format!(
+                        "ALTER TABLE {} ADD COLUMN valid_to TEXT;",
+                        table
+                    ))
+                    .map_err(|e| format!("add {}.{}: {}", table, col, e))?;
+                }
+                println!("[Memoria] Migration: added {}.{} column", table, col);
+            }
+        }
+    }
+    // 为 as_of 过滤建立索引（memories 高频查询）
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_mem_valid ON memories(namespace, valid_from);",
+    )
+    .map_err(|e| format!("temporal index: {}", e))?;
     Ok(())
 }

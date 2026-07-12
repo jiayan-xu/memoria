@@ -35,6 +35,7 @@ impl MemoriaEngine {
         storage::migrate_superseded_by(&pool)?;
         storage::migrate_user_prefs_namespace(&pool)?;
         storage::migrate_dream_state_ns(&pool)?;
+        storage::migrate_temporal(&pool)?;
 
         let vec_path = std::path::Path::new(db_path)
             .parent().unwrap_or_else(|| std::path::Path::new("."))
@@ -60,7 +61,7 @@ impl MemoriaEngine {
     pub fn hybrid_search(&self, query: &str, max_results: u32, _intent: &str, namespace: &str, _tier: &str) -> Result<String, String> {
         let results = search::hybrid::hybrid_search(
             &self.pool, query, namespace, max_results,
-            Some(&self.hnsw), Some(&self.query_cache),
+            Some(&self.hnsw), Some(&self.query_cache), None,
         )?;
         let items: Vec<serde_json::Value> = results.iter().map(|r| {
             serde_json::json!({

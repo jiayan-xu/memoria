@@ -7,6 +7,9 @@ use crate::storage::SqlitePool;
 use crate::vector::{HnswIndex, QueryCache};
 
 /// 执行 5 信号融合搜索，返回 RRF 排序结果
+///
+/// `as_of`: P1-5 轻量时序真值。传 `Some("2026-01-02T00:00:00")` 仅返回该时刻「有效」的记忆
+/// （valid_from <= as_of 且 (valid_to IS NULL 或 valid_to >= as_of)）。`None` 不过滤（默认 now）。
 pub fn hybrid_search(
     pool: &SqlitePool,
     query: &str,
@@ -14,6 +17,7 @@ pub fn hybrid_search(
     max_results: u32,
     hnsw: Option<&HnswIndex>,
     query_cache: Option<&QueryCache>,
+    as_of: Option<&str>,
 ) -> Result<Vec<FusedResult>, String> {
     let fts_limit = max_results * 3;
     let mut signals: Vec<Vec<SignalResult>> = Vec::new();
@@ -59,10 +63,56 @@ pub fn hybrid_search(
 
     // Dedup by memory_id
     let mut seen = std::collections::HashSet::new();
-    let unique: Vec<FusedResult> = fused.into_iter()
+    let mut unique: Vec<FusedResult> = fused.into_iter()
         .filter(|r| seen.insert(r.memory_id.clone()))
-        .take(max_results as usize)
         .collect();
 
+    // P1-5: as_of 时序真值过滤（默认 now，不过滤）。
+    // 一次性取候选记忆的有效区间，剔除 as_of 时刻无效的行。
+    if let Some(as_of) = as_of {
+        if !unique.is_empty() {
+            if let Ok(conn) = pool.get() {
+                let ids: Vec<String> = unique.iter().map(|r| r.memory_id.clone()).collect();
+                let ph = vec!["?"; ids.len()].join(",");
+                let sql = format!(
+                    "SELECT id, valid_from, valid_to FROM memories WHERE id IN ({})",
+                    ph
+                );
+                if let Ok(mut stmt) = conn.prepare(&sql) {
+                    let valid: std::collections::HashMap<String, (Option<String>, Option<String>)> = stmt
+                        .query_map(rusqlite::params_from_iter(ids.iter()), |row| {
+                            Ok((
+                                row.get::<_, String>(0)?,
+                                (row.get::<_, Option<String>>(1)?, row.get::<_, Option<String>>(2)?),
+                            ))
+                        })
+                        .map(|rows| rows.flatten().collect())
+                        .unwrap_or_default();
+                    unique.retain(|r| match valid.get(&r.memory_id) {
+                        Some((vf, vt)) => valid_at(vf.as_deref(), vt.as_deref(), as_of),
+                        None => false,
+                    });
+                }
+            }
+        }
+    }
+
+    let unique: Vec<FusedResult> = unique.into_iter().take(max_results as usize).collect();
+
     Ok(unique)
+}
+
+/// P1-5: 判断记忆在 `as_of` 时刻是否有效。
+/// 有效区间：[valid_from, valid_to]，端点闭合。任一端点缺失按「无界」处理。
+/// 注意：valid_from/valid_to 为固定格式 ISO-8601 字符串，字典序即时间序，可直接比较。
+fn valid_at(valid_from: Option<&str>, valid_to: Option<&str>, as_of: &str) -> bool {
+    let from_ok = match valid_from {
+        None => true,
+        Some(v) => v <= as_of,
+    };
+    let to_ok = match valid_to {
+        None => true,
+        Some(v) => v >= as_of,
+    };
+    from_ok && to_ok
 }

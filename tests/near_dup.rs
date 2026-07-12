@@ -46,7 +46,7 @@ fn near_dup_survives_restart() {
     engine1.cache_query_vector("句子A", v_a.clone());
     let r1 = remember_with_dedup(
         &engine1.pool, "句子A", "fact", 5, "test", ns, "[]",
-        Some(&engine1.hnsw), Some(&engine1.query_cache),
+        Some(&engine1.hnsw), Some(&engine1.query_cache), None, None,
     )
     .expect("remember A");
     let id_a = r1.id.clone();
@@ -65,7 +65,7 @@ fn near_dup_survives_restart() {
     engine2.cache_query_vector("句子A的近义表述", v_b.clone());
     let r2 = remember_with_dedup(
         &engine2.pool, "句子A的近义表述", "fact", 5, "test", ns, "[]",
-        Some(&engine2.hnsw), Some(&engine2.query_cache),
+        Some(&engine2.hnsw), Some(&engine2.query_cache), None, None,
     )
     .expect("remember B");
 
@@ -88,7 +88,7 @@ fn near_dup_below_threshold_not_merged() {
     engine.cache_query_vector("概念甲", v_a.clone());
     let r1 = remember_with_dedup(
         &engine.pool, "概念甲", "fact", 5, "test", ns, "[]",
-        Some(&engine.hnsw), Some(&engine.query_cache),
+        Some(&engine.hnsw), Some(&engine.query_cache), None, None,
     )
     .expect("remember A");
 
@@ -97,7 +97,7 @@ fn near_dup_below_threshold_not_merged() {
     engine.cache_query_vector("概念乙", v_b.clone());
     let r2 = remember_with_dedup(
         &engine.pool, "概念乙", "fact", 5, "test", ns, "[]",
-        Some(&engine.hnsw), Some(&engine.query_cache),
+        Some(&engine.hnsw), Some(&engine.query_cache), None, None,
     )
     .expect("remember B");
 
@@ -120,7 +120,7 @@ fn near_dup_respects_namespace() {
     engine.cache_query_vector("跨ns-A", v.clone());
     let r1 = remember_with_dedup(
         &engine.pool, "跨ns-A", "fact", 5, "test", "agent/ns1", "[]",
-        Some(&engine.hnsw), Some(&engine.query_cache),
+        Some(&engine.hnsw), Some(&engine.query_cache), None, None,
     )
     .expect("remember A");
 
@@ -128,7 +128,7 @@ fn near_dup_respects_namespace() {
     engine.cache_query_vector("跨ns-B", v.clone());
     let r2 = remember_with_dedup(
         &engine.pool, "跨ns-B", "fact", 5, "test", "agent/ns2", "[]",
-        Some(&engine.hnsw), Some(&engine.query_cache),
+        Some(&engine.hnsw), Some(&engine.query_cache), None, None,
     )
     .expect("remember B");
 
