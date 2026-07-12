@@ -332,7 +332,7 @@ pub fn tools_list() -> Vec<serde_json::Value> {
         "valid_to": {"type": "string", "description": "P1-5 时序真值：关系失效点 ISO-8601（默认 NULL，长期有效）"}
     })));
     tools.push(tool("entity_search", "搜索实体（按类型/名称/关键词）", serde_json::json!({
-        "query": {"type": "string", "description": "搜索关键词（搜索 name/aliases/summary）"},
+        "query": {"type": "string", "description": "搜索关键词（匹配 name/aliases/summary 及记忆提及上下文 context）"},
         "entity_type": {"type": "string", "description": "按类型过滤，可选"},
         "namespace": {"type": "string", "description": "命名空间，默认 default"},
         "max_results": {"type": "number", "description": "最大返回数，默认 20"}
@@ -1395,6 +1395,13 @@ fn dispatch(
             let source = args.get("source_entity_id").and_then(|v| v.as_str()).unwrap_or("");
             let target = args.get("target_entity_id").and_then(|v| v.as_str()).unwrap_or("");
             let rtype = args.get("relation_type").and_then(|v| v.as_str()).unwrap_or("related_to");
+            // P2-3：关系类型受控枚举，拒绝未知类型（防止关系爆炸/垃圾关系污染图谱）
+            if !memoria_core::tools::graph::is_valid_relation_type(rtype) {
+                return format!(
+                    r#"{{"status":"error","message":"invalid relation_type '{}'. allowed: {}"}}"#,
+                    rtype, memoria_core::tools::graph::relation_type_list()
+                );
+            }
             let weight = args.get("weight").and_then(|v| v.as_f64()).unwrap_or(1.0);
             let evidence = args.get("evidence").and_then(|v| v.as_str()).unwrap_or("");
             // P1-5: 可选时序真值区间
@@ -1418,48 +1425,11 @@ fn dispatch(
             let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
             let ent_type = args.get("entity_type").and_then(|v| v.as_str());
             let max_results = args.get("max_results").and_then(|v| v.as_u64()).unwrap_or(20) as i64;
-            let conn = match state.pool.get() {
-                Ok(c) => c, Err(e) => return format!(r#"{{"error":"pool: {}"}}"#, e),
-            };
-            let has_type_filter = ent_type.is_some();
-            let sql = if has_type_filter {
-                "SELECT id, entity_type, name, aliases, summary FROM entities
-                 WHERE namespace=?1 AND entity_type=?2
-                   AND (name LIKE ?3 OR aliases LIKE ?3 OR summary LIKE ?3)
-                 ORDER BY name LIMIT ?4"
-            } else {
-                "SELECT id, entity_type, name, aliases, summary FROM entities
-                 WHERE namespace=?1
-                   AND (name LIKE ?2 OR aliases LIKE ?2 OR summary LIKE ?2)
-                 ORDER BY name LIMIT ?3"
-            };
-            let like = format!("%{}%", query);
-            let rows = if let Some(et) = ent_type {
-                conn.prepare(sql).ok().and_then(|mut st| {
-                    st.query_map(rusqlite::params![ns, et, like, max_results], |r| {
-                        Ok(serde_json::json!({
-                            "id": r.get::<_, String>(0)?,
-                            "entity_type": r.get::<_, String>(1)?,
-                            "name": r.get::<_, String>(2)?,
-                            "aliases": r.get::<_, Option<String>>(3)?,
-                            "summary": r.get::<_, Option<String>>(4)?,
-                        }))
-                    }).ok().map(|r| r.flatten().collect::<Vec<_>>())
-                }).unwrap_or_default()
-            } else {
-                conn.prepare(sql).ok().and_then(|mut st| {
-                    st.query_map(rusqlite::params![ns, like, max_results], |r| {
-                        Ok(serde_json::json!({
-                            "id": r.get::<_, String>(0)?,
-                            "entity_type": r.get::<_, String>(1)?,
-                            "name": r.get::<_, String>(2)?,
-                            "aliases": r.get::<_, Option<String>>(3)?,
-                            "summary": r.get::<_, Option<String>>(4)?,
-                        }))
-                    }).ok().map(|r| r.flatten().collect::<Vec<_>>())
-                }).unwrap_or_default()
-            };
-            serde_json::to_string(&serde_json::json!({"status":"ok","count":rows.len(),"entities":rows})).unwrap_or_default()
+            // P2-3：核心搜索逻辑下放到 tools::graph::search_entities（可测；含 mention context 搜索 + mentions_count）
+            match memoria_core::tools::graph::search_entities(&state.pool, ns, query, ent_type, max_results) {
+                Ok(rows) => serde_json::to_string(&serde_json::json!({"status":"ok","count":rows.len(),"entities":rows})).unwrap_or_default(),
+                Err(e) => format!(r#"{{"status":"error","message":"{}"}}"#, e),
+            }
         },
         _ => format!(r#"{{"error":"Unknown tool: {}"}}"#, tool),
     }
