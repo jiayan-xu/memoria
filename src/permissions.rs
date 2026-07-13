@@ -49,64 +49,288 @@ pub struct Entry {
 /// 全量权限矩阵（P0-1 单一真源）。与 `mcp_server::tools_list()` 双向覆盖有测试守护。
 pub const PERMISSION_MATRIX: &[Entry] = &[
     // ── 普通记忆读写（顶层 namespace 门控）──
-    Entry { tool: "memory_search", min_role: MinRole::Agent, ns_policy: NsPolicy::NamespaceArg, note: "混合检索" },
-    Entry { tool: "memory_search_v2", min_role: MinRole::Agent, ns_policy: NsPolicy::NamespaceArg, note: "多信号融合检索" },
-    Entry { tool: "memory_remember", min_role: MinRole::Agent, ns_policy: NsPolicy::NamespaceArg, note: "写入记忆" },
-    Entry { tool: "memory_observe", min_role: MinRole::Agent, ns_policy: NsPolicy::NamespaceArg, note: "低优先级观察" },
-    Entry { tool: "memory_decay", min_role: MinRole::Agent, ns_policy: NsPolicy::NamespaceArg, note: "衰减循环" },
-    Entry { tool: "memory_graph", min_role: MinRole::Agent, ns_policy: NsPolicy::NamespaceArg, note: "构建关系图" },
-    Entry { tool: "memory_user_prefs", min_role: MinRole::Agent, ns_policy: NsPolicy::NamespaceArg, note: "用户偏好" },
-    Entry { tool: "memory_quota_status", min_role: MinRole::Agent, ns_policy: NsPolicy::NamespaceArg, note: "配额用量查询（P2-2）" },
-    Entry { tool: "memory_recent_decisions", min_role: MinRole::Agent, ns_policy: NsPolicy::NamespaceArg, note: "最近决策" },
-    Entry { tool: "memory_fetch_unconsolidated", min_role: MinRole::Agent, ns_policy: NsPolicy::NamespaceArg, note: "巩固原料读取" },
-    Entry { tool: "dream_state_get", min_role: MinRole::Agent, ns_policy: NsPolicy::NamespaceArg, note: "巩固进度读取" },
-    Entry { tool: "dream_state_update", min_role: MinRole::Agent, ns_policy: NsPolicy::NamespaceArg, note: "巩固进度推进" },
-    Entry { tool: "entity_upsert", min_role: MinRole::Agent, ns_policy: NsPolicy::NamespaceArg, note: "实体创建/更新" },
-    Entry { tool: "entity_add_mention", min_role: MinRole::Agent, ns_policy: NsPolicy::NamespaceArg, note: "实体提及" },
-    Entry { tool: "entity_add_edge", min_role: MinRole::Agent, ns_policy: NsPolicy::NamespaceArg, note: "实体关系边" },
-    Entry { tool: "entity_search", min_role: MinRole::Agent, ns_policy: NsPolicy::NamespaceArg, note: "实体搜索" },
-    Entry { tool: "memory_export", min_role: MinRole::Agent, ns_policy: NsPolicy::NamespaceArg, note: "导出本 ns 记忆/实体" },
-    Entry { tool: "memory_import", min_role: MinRole::Agent, ns_policy: NsPolicy::NamespaceArg, note: "导入到本 ns（幂等）" },
-    Entry { tool: "memory_migration_manifest", min_role: MinRole::Admin, ns_policy: NsPolicy::None, note: "迁移包校验和（admin）" },
-
+    Entry {
+        tool: "memory_search",
+        min_role: MinRole::Agent,
+        ns_policy: NsPolicy::NamespaceArg,
+        note: "混合检索",
+    },
+    Entry {
+        tool: "memory_search_v2",
+        min_role: MinRole::Agent,
+        ns_policy: NsPolicy::NamespaceArg,
+        note: "多信号融合检索",
+    },
+    Entry {
+        tool: "memory_remember",
+        min_role: MinRole::Agent,
+        ns_policy: NsPolicy::NamespaceArg,
+        note: "写入记忆",
+    },
+    Entry {
+        tool: "memory_observe",
+        min_role: MinRole::Agent,
+        ns_policy: NsPolicy::NamespaceArg,
+        note: "低优先级观察",
+    },
+    Entry {
+        tool: "memory_decay",
+        min_role: MinRole::Agent,
+        ns_policy: NsPolicy::NamespaceArg,
+        note: "衰减循环",
+    },
+    Entry {
+        tool: "memory_graph",
+        min_role: MinRole::Agent,
+        ns_policy: NsPolicy::NamespaceArg,
+        note: "构建关系图",
+    },
+    Entry {
+        tool: "memory_user_prefs",
+        min_role: MinRole::Agent,
+        ns_policy: NsPolicy::NamespaceArg,
+        note: "用户偏好",
+    },
+    Entry {
+        tool: "memory_quota_status",
+        min_role: MinRole::Agent,
+        ns_policy: NsPolicy::NamespaceArg,
+        note: "配额用量查询（P2-2）",
+    },
+    Entry {
+        tool: "memory_recent_decisions",
+        min_role: MinRole::Agent,
+        ns_policy: NsPolicy::NamespaceArg,
+        note: "最近决策",
+    },
+    Entry {
+        tool: "memory_fetch_unconsolidated",
+        min_role: MinRole::Agent,
+        ns_policy: NsPolicy::NamespaceArg,
+        note: "巩固原料读取",
+    },
+    Entry {
+        tool: "dream_state_get",
+        min_role: MinRole::Agent,
+        ns_policy: NsPolicy::NamespaceArg,
+        note: "巩固进度读取",
+    },
+    Entry {
+        tool: "dream_state_update",
+        min_role: MinRole::Agent,
+        ns_policy: NsPolicy::NamespaceArg,
+        note: "巩固进度推进",
+    },
+    Entry {
+        tool: "entity_upsert",
+        min_role: MinRole::Agent,
+        ns_policy: NsPolicy::NamespaceArg,
+        note: "实体创建/更新",
+    },
+    Entry {
+        tool: "entity_add_mention",
+        min_role: MinRole::Agent,
+        ns_policy: NsPolicy::NamespaceArg,
+        note: "实体提及",
+    },
+    Entry {
+        tool: "entity_add_edge",
+        min_role: MinRole::Agent,
+        ns_policy: NsPolicy::NamespaceArg,
+        note: "实体关系边",
+    },
+    Entry {
+        tool: "entity_search",
+        min_role: MinRole::Agent,
+        ns_policy: NsPolicy::NamespaceArg,
+        note: "实体搜索",
+    },
+    Entry {
+        tool: "memory_export",
+        min_role: MinRole::Agent,
+        ns_policy: NsPolicy::NamespaceArg,
+        note: "导出本 ns 记忆/实体",
+    },
+    Entry {
+        tool: "memory_import",
+        min_role: MinRole::Agent,
+        ns_policy: NsPolicy::NamespaceArg,
+        note: "导入到本 ns（幂等）",
+    },
+    Entry {
+        tool: "memory_migration_manifest",
+        min_role: MinRole::Admin,
+        ns_policy: NsPolicy::None,
+        note: "迁移包校验和（admin）",
+    },
     // ── Admin 专属管理操作 ──
-    Entry { tool: "register_agent", min_role: MinRole::Admin, ns_policy: NsPolicy::NamespaceArg, note: "创建 Agent（admin）" },
-    Entry { tool: "import_install_memories", min_role: MinRole::Admin, ns_policy: NsPolicy::None, note: "命名空间迁移（admin）" },
-    Entry { tool: "db_stats", min_role: MinRole::Admin, ns_policy: NsPolicy::None, note: "全库统计含 agent_registry/审计/HNSW（admin，新增门禁）" },
-    Entry { tool: "agent_list", min_role: MinRole::Admin, ns_policy: NsPolicy::None, note: "列出 Agent（admin）" },
-    Entry { tool: "agent_revoke", min_role: MinRole::Admin, ns_policy: NsPolicy::None, note: "吊销 Agent（admin）" },
-    Entry { tool: "memory_backup", min_role: MinRole::Admin, ns_policy: NsPolicy::None, note: "手动备份（admin）" },
-    Entry { tool: "memory_backup_list", min_role: MinRole::Admin, ns_policy: NsPolicy::None, note: "列出备份（admin）" },
-    Entry { tool: "memory_health", min_role: MinRole::Admin, ns_policy: NsPolicy::None, note: "健康报告（admin）" },
-    Entry { tool: "memory_merge", min_role: MinRole::Admin, ns_policy: NsPolicy::None, note: "合并记忆（admin）" },
-
+    Entry {
+        tool: "register_agent",
+        min_role: MinRole::Admin,
+        ns_policy: NsPolicy::NamespaceArg,
+        note: "创建 Agent（admin）",
+    },
+    Entry {
+        tool: "import_install_memories",
+        min_role: MinRole::Admin,
+        ns_policy: NsPolicy::None,
+        note: "命名空间迁移（admin）",
+    },
+    Entry {
+        tool: "db_stats",
+        min_role: MinRole::Admin,
+        ns_policy: NsPolicy::None,
+        note: "全库统计含 agent_registry/审计/HNSW（admin，新增门禁）",
+    },
+    Entry {
+        tool: "agent_list",
+        min_role: MinRole::Admin,
+        ns_policy: NsPolicy::None,
+        note: "列出 Agent（admin）",
+    },
+    Entry {
+        tool: "agent_revoke",
+        min_role: MinRole::Admin,
+        ns_policy: NsPolicy::None,
+        note: "吊销 Agent（admin）",
+    },
+    Entry {
+        tool: "memory_backup",
+        min_role: MinRole::Admin,
+        ns_policy: NsPolicy::None,
+        note: "手动备份（admin）",
+    },
+    Entry {
+        tool: "memory_backup_list",
+        min_role: MinRole::Admin,
+        ns_policy: NsPolicy::None,
+        note: "列出备份（admin）",
+    },
+    Entry {
+        tool: "memory_health",
+        min_role: MinRole::Admin,
+        ns_policy: NsPolicy::None,
+        note: "健康报告（admin）",
+    },
+    Entry {
+        tool: "memory_merge",
+        min_role: MinRole::Admin,
+        ns_policy: NsPolicy::None,
+        note: "合并记忆（admin）",
+    },
     // ── 无命名空间的身份/自省工具 ──
-    Entry { tool: "register_user", min_role: MinRole::Agent, ns_policy: NsPolicy::None, note: "本地账密注册" },
-    Entry { tool: "login_user", min_role: MinRole::Agent, ns_policy: NsPolicy::None, note: "本地账密登录" },
-    Entry { tool: "get_allowed_ns", min_role: MinRole::Agent, ns_policy: NsPolicy::None, note: "返回自身授权 ns" },
-    Entry { tool: "audit_query", min_role: MinRole::Agent, ns_policy: NsPolicy::None, note: "审计日志查询（自身范围）" },
-
+    Entry {
+        tool: "register_user",
+        min_role: MinRole::Agent,
+        ns_policy: NsPolicy::None,
+        note: "本地账密注册",
+    },
+    Entry {
+        tool: "login_user",
+        min_role: MinRole::Agent,
+        ns_policy: NsPolicy::None,
+        note: "本地账密登录",
+    },
+    Entry {
+        tool: "get_allowed_ns",
+        min_role: MinRole::Agent,
+        ns_policy: NsPolicy::None,
+        note: "返回自身授权 ns",
+    },
+    Entry {
+        tool: "audit_query",
+        min_role: MinRole::Agent,
+        ns_policy: NsPolicy::None,
+        note: "审计日志查询（自身范围）",
+    },
     // ── Bridge 转发工具（无本地 ns 概念）──
-    Entry { tool: "cross_agent_query", min_role: MinRole::Agent, ns_policy: NsPolicy::None, note: "Bridge 转发" },
-    Entry { tool: "system_status", min_role: MinRole::Agent, ns_policy: NsPolicy::None, note: "Bridge 转发" },
-    Entry { tool: "panel_discuss", min_role: MinRole::Agent, ns_policy: NsPolicy::None, note: "Bridge 转发" },
-    Entry { tool: "reasonix_dispatch", min_role: MinRole::Agent, ns_policy: NsPolicy::None, note: "Bridge 转发" },
-    Entry { tool: "continue_task", min_role: MinRole::Agent, ns_policy: NsPolicy::None, note: "Bridge 转发" },
-    Entry { tool: "auto_route", min_role: MinRole::Agent, ns_policy: NsPolicy::None, note: "Bridge 转发" },
-
+    Entry {
+        tool: "cross_agent_query",
+        min_role: MinRole::Agent,
+        ns_policy: NsPolicy::None,
+        note: "Bridge 转发",
+    },
+    Entry {
+        tool: "system_status",
+        min_role: MinRole::Agent,
+        ns_policy: NsPolicy::None,
+        note: "Bridge 转发",
+    },
+    Entry {
+        tool: "panel_discuss",
+        min_role: MinRole::Agent,
+        ns_policy: NsPolicy::None,
+        note: "Bridge 转发",
+    },
+    Entry {
+        tool: "reasonix_dispatch",
+        min_role: MinRole::Agent,
+        ns_policy: NsPolicy::None,
+        note: "Bridge 转发",
+    },
+    Entry {
+        tool: "continue_task",
+        min_role: MinRole::Agent,
+        ns_policy: NsPolicy::None,
+        note: "Bridge 转发",
+    },
+    Entry {
+        tool: "auto_route",
+        min_role: MinRole::Agent,
+        ns_policy: NsPolicy::None,
+        note: "Bridge 转发",
+    },
     // ── 技能市场 ──
-    Entry { tool: "skill_market_search", min_role: MinRole::Agent, ns_policy: NsPolicy::None, note: "公开/同 ns 技能搜索" },
-    Entry { tool: "skill_market_info", min_role: MinRole::Agent, ns_policy: NsPolicy::None, note: "技能详情（公开）" },
-    Entry { tool: "skill_market_publish", min_role: MinRole::Agent, ns_policy: NsPolicy::None, note: "admin 或同 visibility ns 可发布" },
-    Entry { tool: "skill_market_install", min_role: MinRole::Agent, ns_policy: NsPolicy::AgentIdNs, note: "admin 或同 ns 管理权可安装" },
-    Entry { tool: "skill_market_list_installed", min_role: MinRole::Agent, ns_policy: NsPolicy::AgentIdNs, note: "仅自身/授权 ns（新增 NS 校验）" },
-
+    Entry {
+        tool: "skill_market_search",
+        min_role: MinRole::Agent,
+        ns_policy: NsPolicy::None,
+        note: "公开/同 ns 技能搜索",
+    },
+    Entry {
+        tool: "skill_market_info",
+        min_role: MinRole::Agent,
+        ns_policy: NsPolicy::None,
+        note: "技能详情（公开）",
+    },
+    Entry {
+        tool: "skill_market_publish",
+        min_role: MinRole::Agent,
+        ns_policy: NsPolicy::None,
+        note: "admin 或同 visibility ns 可发布",
+    },
+    Entry {
+        tool: "skill_market_install",
+        min_role: MinRole::Agent,
+        ns_policy: NsPolicy::AgentIdNs,
+        note: "admin 或同 ns 管理权可安装",
+    },
+    Entry {
+        tool: "skill_market_list_installed",
+        min_role: MinRole::Agent,
+        ns_policy: NsPolicy::AgentIdNs,
+        note: "仅自身/授权 ns（新增 NS 校验）",
+    },
     // ── A2A 消息 ──
-    Entry { tool: "a2a_send", min_role: MinRole::Agent, ns_policy: NsPolicy::TargetNs, note: "目标 agent ns 须授权" },
-    Entry { tool: "a2a_recv", min_role: MinRole::Agent, ns_policy: NsPolicy::SelfOnly, note: "仅自身收件箱" },
-
+    Entry {
+        tool: "a2a_send",
+        min_role: MinRole::Agent,
+        ns_policy: NsPolicy::TargetNs,
+        note: "目标 agent ns 须授权",
+    },
+    Entry {
+        tool: "a2a_recv",
+        min_role: MinRole::Agent,
+        ns_policy: NsPolicy::SelfOnly,
+        note: "仅自身收件箱",
+    },
     // ── 派生 NS 检查 ──
-    Entry { tool: "memory_dedup_chain", min_role: MinRole::Agent, ns_policy: NsPolicy::MemoryIdNs, note: "记忆所属 ns 须授权" },
+    Entry {
+        tool: "memory_dedup_chain",
+        min_role: MinRole::Agent,
+        ns_policy: NsPolicy::MemoryIdNs,
+        note: "记忆所属 ns 须授权",
+    },
 ];
 
 /// 在矩阵中查找某工具的权限条目
@@ -176,17 +400,43 @@ mod tests {
     /// require_admin：角色优先，key 兜底，空配置不误放行
     #[test]
     fn require_admin_role_and_key() {
-        let admin = AuthResult { agent_id: "admin".into(), allowed_ns: vec!["*".into()], role: "admin".into() };
-        let user = AuthResult { agent_id: "u".into(), allowed_ns: vec!["agent/u".into()], role: "user".into() };
+        let admin = AuthResult {
+            agent_id: "admin".into(),
+            allowed_ns: vec!["*".into()],
+            role: "admin".into(),
+        };
+        let user = AuthResult {
+            agent_id: "u".into(),
+            allowed_ns: vec!["agent/u".into()],
+            role: "user".into(),
+        };
 
-        assert!(require_admin(&admin, "", "cfgkey"), "admin role must pass without key");
-        assert!(!require_admin(&user, "", "cfgkey"), "plain user without key must be rejected");
-        assert!(require_admin(&user, "cfgkey", "cfgkey"), "correct body key must still work (deprecated path)");
-        assert!(!require_admin(&user, "wrong", "cfgkey"), "wrong key must be rejected");
+        assert!(
+            require_admin(&admin, "", "cfgkey"),
+            "admin role must pass without key"
+        );
+        assert!(
+            !require_admin(&user, "", "cfgkey"),
+            "plain user without key must be rejected"
+        );
+        assert!(
+            require_admin(&user, "cfgkey", "cfgkey"),
+            "correct body key must still work (deprecated path)"
+        );
+        assert!(
+            !require_admin(&user, "wrong", "cfgkey"),
+            "wrong key must be rejected"
+        );
         // configured_key 为空：即使 provided 也为空，不能 ct_eq("", "") 误放行
-        assert!(!require_admin(&user, "", ""), "empty configured key must not authorize anyone");
+        assert!(
+            !require_admin(&user, "", ""),
+            "empty configured key must not authorize anyone"
+        );
         // configured_key 为空但 provided 非空：不匹配
-        assert!(!require_admin(&user, "x", ""), "empty configured key + provided must not authorize");
+        assert!(
+            !require_admin(&user, "x", ""),
+            "empty configured key + provided must not authorize"
+        );
     }
 
     /// 附录 A 验收：持 default token 的 read_write agent 不能读 admin 命名空间
@@ -204,7 +454,11 @@ mod tests {
     /// admin 角色放行任意 ns（矩阵语义一致性）
     #[test]
     fn admin_role_bypasses_ns() {
-        let admin = AuthResult { agent_id: "admin".into(), allowed_ns: vec!["*".into()], role: "admin".into() };
+        let admin = AuthResult {
+            agent_id: "admin".into(),
+            allowed_ns: vec!["*".into()],
+            role: "admin".into(),
+        };
         assert!(auth::check_ns_access(&admin, "anything/at/all"));
     }
 }

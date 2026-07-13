@@ -8,8 +8,10 @@
 //! 3. entity_search 返回每实体 mentions_count。
 //! 4. export_graph 节点附带 mentions 证据（memory_id + context），支持 UI 下钻。
 
-use memoria_core::tools::graph::{export_graph, is_valid_relation_type, relation_type_list, search_entities};
 use memoria_core::MemoriaEngine;
+use memoria_core::tools::graph::{
+    export_graph, is_valid_relation_type, relation_type_list, search_entities,
+};
 use rusqlite::params;
 
 fn temp_engine(tag: &str) -> (MemoriaEngine, std::path::PathBuf) {
@@ -26,7 +28,8 @@ fn seed_memory(conn: &rusqlite::Connection, id: &str, ns: &str) {
     conn.execute(
         "INSERT OR IGNORE INTO memories(id, namespace) VALUES(?1, ?2)",
         params![id, ns],
-    ).unwrap();
+    )
+    .unwrap();
 }
 
 #[test]
@@ -62,7 +65,8 @@ fn entity_search_finds_by_mention_context() {
     conn.execute(
         "INSERT INTO entity_mentions(entity_id,memory_id,context,namespace) VALUES(?1,?2,?3,?4)",
         params!["e1", "m1", "该研究基于区块链共识机制", ns],
-    ).unwrap();
+    )
+    .unwrap();
     // 关键词命中 mention context → 仍应召回该实体
     let rows = search_entities(&engine.pool, ns, "区块链", None, 20).unwrap();
     assert_eq!(rows.len(), 1);
@@ -106,7 +110,8 @@ fn export_graph_includes_mentions() {
     conn.execute(
         "INSERT INTO entity_mentions(entity_id,memory_id,context,namespace) VALUES(?1,?2,?3,?4)",
         params!["e3", "memA", "发布了 GPT 系列模型", ns],
-    ).unwrap();
+    )
+    .unwrap();
     let g = export_graph(&engine.pool, ns).unwrap();
     let nodes = g["nodes"].as_array().expect("nodes array");
     assert_eq!(nodes.len(), 1);

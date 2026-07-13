@@ -1,10 +1,10 @@
 //! Semantic search signal (S2) using HNSW vector index.
 //! Uses the query cache to retrieve pre-computed embeddings from Python.
 
+use crate::QueryCache;
 use crate::search::keyword::SignalResult;
 use crate::storage::SqlitePool;
 use crate::vector::HnswIndex;
-use crate::QueryCache;
 use std::collections::{HashMap, HashSet};
 
 /// Semantic search via HNSW vector similarity.
@@ -33,7 +33,7 @@ pub fn semantic_search(
     // Get cached embedding from Python (must have been cached via cache_query_vector)
     let vector = match cache.get(query) {
         Some(v) => v,
-        None => return Ok(vec![]),  // No cached embedding — skip semantic signal
+        None => return Ok(vec![]), // No cached embedding — skip semantic signal
     };
 
     // Search HNSW index

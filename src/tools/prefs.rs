@@ -46,21 +46,25 @@ pub fn user_prefs(pool: &SqlitePool, namespace: &str) -> Result<Vec<PreferenceEn
     let conn = pool.get().map_err(|e| format!("pool: {}", e))?;
 
     // ── 主路径：标准 memories 表 ──
-    let mut stmt = conn.prepare(
-        "SELECT content, importance, tags, confidence, created_at FROM memories \
+    let mut stmt = conn
+        .prepare(
+            "SELECT content, importance, tags, confidence, created_at FROM memories \
          WHERE namespace = ? AND category = 'preference' \
-         AND (tags LIKE '%\"hard_rule\"%' OR tags LIKE '%\"pref\"%' OR tags LIKE '%\"style\"%')"
-    ).map_err(|e| format!("prepare: {}", e))?;
+         AND (tags LIKE '%\"hard_rule\"%' OR tags LIKE '%\"pref\"%' OR tags LIKE '%\"style\"%')",
+        )
+        .map_err(|e| format!("prepare: {}", e))?;
 
-    let rows = stmt.query_map(rusqlite::params![namespace], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, i64>(1)?,
-            row.get::<_, String>(2).unwrap_or_default(),
-            row.get::<_, f64>(3)?,
-            row.get::<_, String>(4).unwrap_or_default(),
-        ))
-    }).map_err(|e| format!("query: {}", e))?;
+    let rows = stmt
+        .query_map(rusqlite::params![namespace], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2).unwrap_or_default(),
+                row.get::<_, f64>(3)?,
+                row.get::<_, String>(4).unwrap_or_default(),
+            ))
+        })
+        .map_err(|e| format!("query: {}", e))?;
 
     let mut entries: Vec<PreferenceEntry> = Vec::new();
     for row in rows.flatten() {
@@ -81,7 +85,8 @@ pub fn user_prefs(pool: &SqlitePool, namespace: &str) -> Result<Vec<PreferenceEn
     entries.sort_by(|a, b| {
         let a_hard = (a.tag == "hard_rule") as u8;
         let b_hard = (b.tag == "hard_rule") as u8;
-        b_hard.cmp(&a_hard)
+        b_hard
+            .cmp(&a_hard)
             .then(b.importance.cmp(&a.importance))
             .then(b.created_at.cmp(&a.created_at))
     });
@@ -111,19 +116,25 @@ pub fn user_prefs(pool: &SqlitePool, namespace: &str) -> Result<Vec<PreferenceEn
 }
 
 /// Get recent decisions from `decisions` table (matching Python).
-pub fn recent_decisions(pool: &SqlitePool, namespace: &str, limit: u32) -> Result<Vec<(String, String, String)>, String> {
+pub fn recent_decisions(
+    pool: &SqlitePool,
+    namespace: &str,
+    limit: u32,
+) -> Result<Vec<(String, String, String)>, String> {
     let conn = pool.get().map_err(|e| format!("pool: {}", e))?;
     let mut stmt = conn.prepare(
         "SELECT id, decision, created_at FROM decisions WHERE namespace = ? ORDER BY created_at DESC LIMIT ?"
     ).map_err(|e| format!("prepare: {}", e))?;
 
-    let rows = stmt.query_map(rusqlite::params![namespace, limit], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, String>(2).unwrap_or_default(),
-        ))
-    }).map_err(|e| format!("query: {}", e))?;
+    let rows = stmt
+        .query_map(rusqlite::params![namespace, limit], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2).unwrap_or_default(),
+            ))
+        })
+        .map_err(|e| format!("query: {}", e))?;
 
     let mut results = Vec::new();
     for row in rows.flatten() {

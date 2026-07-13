@@ -33,10 +33,10 @@ fn near_dup_topk() -> usize {
 /// Remember result with dedup info
 #[derive(Debug, Default)]
 pub struct RememberResult {
-  pub id: String,
-  pub action: String, // "created" | "updated_exact" | "superseded_near_dup"
-  pub superseded_ids: Vec<String>,
-  pub similarities: Vec<f32>,
+    pub id: String,
+    pub action: String, // "created" | "updated_exact" | "superseded_near_dup"
+    pub superseded_ids: Vec<String>,
+    pub similarities: Vec<f32>,
 }
 
 /// Remember a durable memory with SHA-256 dedup (compatible with Python).
@@ -52,7 +52,10 @@ pub fn remember(
     valid_from: Option<&str>,
     valid_to: Option<&str>,
 ) -> Result<String, String> {
-    let result = remember_with_dedup(pool, content, category, importance, source, namespace, tags, None, None, valid_from, valid_to)?;
+    let result = remember_with_dedup(
+        pool, content, category, importance, source, namespace, tags, None, None, valid_from,
+        valid_to,
+    )?;
     Ok(result.id)
 }
 
@@ -98,7 +101,11 @@ pub fn remember_with_dedup(
 
     if let Ok(_existing_id) = existing {
         // 精确重复 — boost importance and merge tags
-        let tags_safe = if tags.is_empty() || tags == "[]" { String::new() } else { tags.to_string() };
+        let tags_safe = if tags.is_empty() || tags == "[]" {
+            String::new()
+        } else {
+            tags.to_string()
+        };
         conn.execute(
             "UPDATE memories SET importance = MAX(importance, ?), confidence = MAX(confidence, 0.8),
              recall_count = recall_count + 1, last_recalled = ? WHERE id = ?",
@@ -119,7 +126,11 @@ pub fn remember_with_dedup(
 
     // Insert new memory
     let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S").to_string();
-    let tags_safe = if tags.is_empty() || tags == "[]" { "[]".to_string() } else { tags.to_string() };
+    let tags_safe = if tags.is_empty() || tags == "[]" {
+        "[]".to_string()
+    } else {
+        tags.to_string()
+    };
     // P1-5: valid_from/valid_to 默认 now / NULL（长期有效）。
     let valid_from_val = valid_from.unwrap_or(&now);
     let valid_to_val = valid_to; // Option<&str> → NULL 即开放
@@ -127,8 +138,20 @@ pub fn remember_with_dedup(
         "INSERT INTO memories (id, namespace, source, content, category, confidence,
          recall_count, created_at, tier, importance, decay_factor, tags, valid_from, valid_to)
          VALUES (?, ?, ?, ?, ?, 0.8, 0, ?, 'hot', ?, 1.0, ?, ?, ?)",
-        rusqlite::params![mem_id, namespace, source, content, category, now, importance, tags_safe, valid_from_val, valid_to_val],
-    ).map_err(|e| format!("insert: {}", e))?;
+        rusqlite::params![
+            mem_id,
+            namespace,
+            source,
+            content,
+            category,
+            now,
+            importance,
+            tags_safe,
+            valid_from_val,
+            valid_to_val
+        ],
+    )
+    .map_err(|e| format!("insert: {}", e))?;
 
     // ── 近义重复检测（P1-3：可配 + 向量持久化兜底）──
     let mut superseded_ids = Vec::new();
@@ -139,7 +162,8 @@ pub fn remember_with_dedup(
             // 向量来源：query_cache 优先；其次 memory_vectors 持久表（重启后仍可用，
             // 解决了 QueryCache 进程内、重启后近义去重弱化的问题）。
             // Python / 调用方在调 memory_remember 前通过 cache_query_vector 提供新内容向量。
-            let query_vector: Option<Vec<f32>> = qc.get(content)
+            let query_vector: Option<Vec<f32>> = qc
+                .get(content)
                 .or_else(|| crate::vector::persist::get_stored_vector(pool, &mem_id));
 
             if let Some(qv) = query_vector {
@@ -200,7 +224,10 @@ pub fn remember_with_dedup(
                 // 之前从不把新记忆向量加入索引，导致后续近义漏标；现在落表并从表重建，
                 // 重启后索引仍包含该向量，近义链可靠。
                 let _ = crate::vector::persist::put_stored_vector(pool, &mem_id, namespace, &qv);
-                let _ = hnsw_idx.add(&[VectorEntry { id: mem_id.clone(), vector: qv }]);
+                let _ = hnsw_idx.add(&[VectorEntry {
+                    id: mem_id.clone(),
+                    vector: qv,
+                }]);
             }
         }
     }
@@ -220,7 +247,10 @@ pub fn remember_with_dedup(
 }
 
 /// 查询被 superseded 的记忆链
-pub fn get_supersession_chain(pool: &SqlitePool, memory_id: &str) -> Result<Vec<serde_json::Value>, String> {
+pub fn get_supersession_chain(
+    pool: &SqlitePool,
+    memory_id: &str,
+) -> Result<Vec<serde_json::Value>, String> {
     let conn = pool.get().map_err(|e| format!("pool: {}", e))?;
     let mut stmt = conn
         .prepare(
@@ -248,20 +278,15 @@ pub fn get_supersession_chain(pool: &SqlitePool, memory_id: &str) -> Result<Vec<
 }
 
 /// 手动合并两条近义记忆（管理员操作）
-pub fn merge_memories(
-    pool: &SqlitePool,
-    keep_id: &str,
-    merge_id: &str,
-) -> Result<(), String> {
+pub fn merge_memories(pool: &SqlitePool, keep_id: &str, merge_id: &str) -> Result<(), String> {
     let conn = pool.get().map_err(|e| format!("pool: {}", e))?;
 
     // 将 merge_id 标记为 superseded
-    conn
-        .execute(
-            "UPDATE memories SET superseded_by = ?, tier = 'cold' WHERE id = ?",
-            rusqlite::params![keep_id, merge_id],
-        )
-        .map_err(|e| format!("update: {}", e))?;
+    conn.execute(
+        "UPDATE memories SET superseded_by = ?, tier = 'cold' WHERE id = ?",
+        rusqlite::params![keep_id, merge_id],
+    )
+    .map_err(|e| format!("update: {}", e))?;
 
     // 转移 recall_count
     let recall: i64 = conn

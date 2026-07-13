@@ -1,7 +1,7 @@
 //! FTS5 keyword search signal (S1).
 //! Searches memories_fts, messages_fts, and decisions_fts via jieba-rs tokenization.
 
-use crate::storage::{fts5, SqlitePool};
+use crate::storage::{SqlitePool, fts5};
 
 /// A single search result from any signal.
 #[derive(Debug, Clone)]

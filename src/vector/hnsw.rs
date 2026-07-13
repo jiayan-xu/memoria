@@ -38,9 +38,8 @@ unsafe impl Sync for HnswIndex {}
 
 impl HnswIndex {
     pub fn new() -> Self {
-        let hnsw = Hnsw::<f32, DistCosine>::new(
-            DEFAULT_M, MAX_CAPACITY, 16, DEFAULT_EF_C, DistCosine,
-        );
+        let hnsw =
+            Hnsw::<f32, DistCosine>::new(DEFAULT_M, MAX_CAPACITY, 16, DEFAULT_EF_C, DistCosine);
         Self {
             inner: RwLock::new(hnsw),
             id_map: RwLock::new(Vec::new()),
@@ -52,9 +51,15 @@ impl HnswIndex {
 
     pub fn add(&self, entries: &[VectorEntry]) -> Result<usize, String> {
         let mut id_map = self.id_map.write().map_err(|e| format!("id_map: {}", e))?;
-        let mut id_to_seq = self.id_to_seq.write().map_err(|e| format!("id_to_seq: {}", e))?;
+        let mut id_to_seq = self
+            .id_to_seq
+            .write()
+            .map_err(|e| format!("id_to_seq: {}", e))?;
         let inner = self.inner.write().map_err(|e| format!("inner: {}", e))?;
-        let mut vectors = self.vectors.write().map_err(|e| format!("vectors: {}", e))?;
+        let mut vectors = self
+            .vectors
+            .write()
+            .map_err(|e| format!("vectors: {}", e))?;
 
         let mut added = 0;
         for entry in entries {
@@ -62,7 +67,9 @@ impl HnswIndex {
             if entry.vector.len() != DIM {
                 return Err(format!(
                     "vector dimension mismatch: expected {}, got {} (id: {})",
-                    DIM, entry.vector.len(), entry.id
+                    DIM,
+                    entry.vector.len(),
+                    entry.id
                 ));
             }
             if id_to_seq.contains_key(&entry.id) {
@@ -84,12 +91,16 @@ impl HnswIndex {
         let id_map = self.id_map.read().map_err(|e| format!("id_map: {}", e))?;
 
         let results = inner.search(query, k, ef);
-        Ok(results.iter().map(|n| {
-            let id = id_map.get(n.get_origin_id())
-                .cloned()
-                .unwrap_or_else(|| format!("<unknown:{}>", n.get_origin_id()));
-            (id, n.get_distance())
-        }).collect())
+        Ok(results
+            .iter()
+            .map(|n| {
+                let id = id_map
+                    .get(n.get_origin_id())
+                    .cloned()
+                    .unwrap_or_else(|| format!("<unknown:{}>", n.get_origin_id()));
+                (id, n.get_distance())
+            })
+            .collect())
     }
 
     pub fn len(&self) -> usize {
@@ -149,7 +160,11 @@ impl HnswIndex {
         if data.len() < 4 {
             return Err("truncated file".to_string());
         }
-        let n = u32::from_le_bytes(data[0..4].try_into().map_err(|_| "bad header slice".to_string())?) as usize;
+        let n = u32::from_le_bytes(
+            data[0..4]
+                .try_into()
+                .map_err(|_| "bad header slice".to_string())?,
+        ) as usize;
         offset += 4;
 
         let mut id_map: Vec<String> = Vec::with_capacity(n);
@@ -160,27 +175,39 @@ impl HnswIndex {
             if offset + 4 > data.len() {
                 return Err("truncated at ID length".to_string());
             }
-            let id_len = u32::from_le_bytes(data[offset..offset+4].try_into().map_err(|_| "bad id-len slice".to_string())?) as usize;
+            let id_len = u32::from_le_bytes(
+                data[offset..offset + 4]
+                    .try_into()
+                    .map_err(|_| "bad id-len slice".to_string())?,
+            ) as usize;
             offset += 4;
             if offset + id_len + 768 * 4 > data.len() {
                 return Err("truncated at vector data".to_string());
             }
-            let id = String::from_utf8(data[offset..offset+id_len].to_vec())
+            let id = String::from_utf8(data[offset..offset + id_len].to_vec())
                 .map_err(|_| "invalid UTF-8 in ID")?;
             offset += id_len;
             let mut vector = Vec::with_capacity(768);
             for _ in 0..768 {
-                let val = f32::from_le_bytes(data[offset..offset+4].try_into().map_err(|_| "bad vector slice".to_string())?);
+                let val = f32::from_le_bytes(
+                    data[offset..offset + 4]
+                        .try_into()
+                        .map_err(|_| "bad vector slice".to_string())?,
+                );
                 vector.push(val);
                 offset += 4;
             }
             id_map.push(id.clone());
             id_to_seq.insert(id, seq);
-            vectors.push(VectorEntry { id: id_map.last().unwrap().clone(), vector });
+            vectors.push(VectorEntry {
+                id: id_map.last().unwrap().clone(),
+                vector,
+            });
         }
 
         // Rebuild HNSW graph
-        let hnsw = Hnsw::<f32, DistCosine>::new(DEFAULT_M, MAX_CAPACITY, 16, DEFAULT_EF_C, DistCosine);
+        let hnsw =
+            Hnsw::<f32, DistCosine>::new(DEFAULT_M, MAX_CAPACITY, 16, DEFAULT_EF_C, DistCosine);
         for entry in &vectors {
             hnsw.insert_slice((&entry.vector, id_to_seq[&entry.id]));
         }
@@ -227,7 +254,10 @@ mod tests {
     fn concurrent_search_stable() {
         let h = std::sync::Arc::new(HnswIndex::new());
         let entries: Vec<VectorEntry> = (0..20)
-            .map(|i| VectorEntry { id: format!("v{}", i), vector: vec![(i as f32) / 20.0; DIM] })
+            .map(|i| VectorEntry {
+                id: format!("v{}", i),
+                vector: vec![(i as f32) / 20.0; DIM],
+            })
             .collect();
         assert_eq!(h.add(&entries).expect("add"), 20);
 

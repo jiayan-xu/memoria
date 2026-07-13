@@ -9,8 +9,11 @@
 //! 4. 备份配额（小时桶）+ current_usage 计数可见。
 //! 5. quota_limit 默认值与 quota_window 格式正确（运维可预期）。
 
-use memoria_core::quota::{check_quota_with, current_usage, quota_limit, quota_window, QuotaError, KIND_BACKUP, KIND_SEARCH, KIND_WRITE};
 use memoria_core::MemoriaEngine;
+use memoria_core::quota::{
+    KIND_BACKUP, KIND_SEARCH, KIND_WRITE, QuotaError, check_quota_with, current_usage, quota_limit,
+    quota_window,
+};
 
 fn temp_engine(tag: &str) -> (MemoriaEngine, std::path::PathBuf) {
     let dir = std::env::temp_dir().join(format!("memoria_quota_{}_{}", std::process::id(), tag));

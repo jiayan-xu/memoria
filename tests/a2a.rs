@@ -19,23 +19,34 @@ fn check_ns_access_no_substring_leak() {
         role: "agent".into(),
     };
     // 自己的 ns 可访问
-    assert!(auth::check_ns_access(&agent, "agent/accounting"),
-        "自己的 ns 应可访问");
+    assert!(
+        auth::check_ns_access(&agent, "agent/accounting"),
+        "自己的 ns 应可访问"
+    );
     // 含子串但不同的 ns 不可访问
-    assert!(!auth::check_ns_access(&agent, "agent/accounting-admin"),
-        "不同的 ns（含子串）不应通过 check_ns_access");
-    assert!(!auth::check_ns_access(&agent, "agent/admin"),
-        "无关的 admin ns 不应通过 check_ns_access");
-    assert!(!auth::check_ns_access(&agent, "agent/myadmin"),
-        "ns 名含 admin 子串但非授权 ns 不应放行");
+    assert!(
+        !auth::check_ns_access(&agent, "agent/accounting-admin"),
+        "不同的 ns（含子串）不应通过 check_ns_access"
+    );
+    assert!(
+        !auth::check_ns_access(&agent, "agent/admin"),
+        "无关的 admin ns 不应通过 check_ns_access"
+    );
+    assert!(
+        !auth::check_ns_access(&agent, "agent/myadmin"),
+        "ns 名含 admin 子串但非授权 ns 不应放行"
+    );
 }
 
 #[test]
 fn a2a_to_format_rejects_injections() {
     // 模拟 a2a_send 的 to 参数格式校验（与 mcp_server 同款规则）
     let is_valid = |s: &str| -> bool {
-        if s.is_empty() || s.len() > 64 { return false; }
-        s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        if s.is_empty() || s.len() > 64 {
+            return false;
+        }
+        s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
     };
 
     // 合法

@@ -16,7 +16,10 @@ fn watch_dirs() -> Vec<String> {
     if env.is_empty() {
         Vec::new()
     } else {
-        env.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()
+        env.split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect()
     }
 }
 
@@ -54,7 +57,9 @@ pub async fn watch_sessions_loop(pool: SqlitePool) {
                 }
             }
             off
-        }).await.unwrap_or_default();
+        })
+        .await
+        .unwrap_or_default();
         offsets.extend(init_offsets);
     }
 
@@ -67,8 +72,12 @@ pub async fn watch_sessions_loop(pool: SqlitePool) {
         let offsets_clone = offsets.clone();
         match tokio::task::spawn_blocking(move || {
             poll_once_blocking(&pool_clone, &dirs_clone, &mut offsets_clone.clone())
-        }).await {
-            Ok(new_offsets) => { offsets = new_offsets; }
+        })
+        .await
+        {
+            Ok(new_offsets) => {
+                offsets = new_offsets;
+            }
             Err(e) => eprintln!("[SessionWatcher] poll task panicked: {}", e),
         }
     }
@@ -107,7 +116,8 @@ fn poll_once_blocking(
                 Err(_) => continue,
             };
             // 微信网关等频繁创建新文件：创建不足 30 秒的不处理
-            let elapsed = meta.modified()
+            let elapsed = meta
+                .modified()
                 .ok()
                 .and_then(|t| t.elapsed().ok())
                 .unwrap_or_default();
@@ -161,11 +171,17 @@ fn read_new_lines(path: &Path, offset: u64) -> Result<Vec<String>, String> {
         .open(path)
         .map_err(|e| format!("open: {}", e))?;
     let mut reader = BufReader::new(file);
-    reader.seek(SeekFrom::Start(offset)).map_err(|e| format!("seek: {}", e))?;
+    reader
+        .seek(SeekFrom::Start(offset))
+        .map_err(|e| format!("seek: {}", e))?;
 
     let mut lines = Vec::new();
     let mut buf = String::new();
-    while reader.read_line(&mut buf).map_err(|e| format!("read: {}", e))? > 0 {
+    while reader
+        .read_line(&mut buf)
+        .map_err(|e| format!("read: {}", e))?
+        > 0
+    {
         let trimmed = buf.trim().to_string();
         if !trimmed.is_empty() {
             lines.push(trimmed);
@@ -182,7 +198,10 @@ fn extract_dialog_text(line: &str) -> Option<String> {
         // 只提取 user 角色的内容
         let role = val.get("role").and_then(|r| r.as_str()).unwrap_or("");
         if role == "user" || role == "human" {
-            return val.get("content").and_then(|c| c.as_str()).map(|s| s.to_string());
+            return val
+                .get("content")
+                .and_then(|c| c.as_str())
+                .map(|s| s.to_string());
         }
     }
     None

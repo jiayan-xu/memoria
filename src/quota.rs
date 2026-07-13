@@ -78,7 +78,8 @@ pub fn retry_after_sec(kind: &str) -> u64 {
     match kind {
         KIND_WRITE => {
             // 距次日 00:00
-            let sec_of_day = now.hour() as u64 * 3600 + now.minute() as u64 * 60 + now.second() as u64;
+            let sec_of_day =
+                now.hour() as u64 * 3600 + now.minute() as u64 * 60 + now.second() as u64;
             (24 * 3600 - sec_of_day) % (24 * 3600)
         }
         KIND_SEARCH => {

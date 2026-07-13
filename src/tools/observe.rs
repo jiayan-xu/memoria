@@ -26,7 +26,8 @@ pub fn observe(
          recall_count, created_at, tier, importance, decay_factor)
          VALUES (?, ?, ?, ?, 'observation', 0.5, 0, ?, 'warm', 2, 1.0)",
         rusqlite::params![mem_id, namespace, source, dialog, now],
-    ).map_err(|e| format!("insert: {}", e))?;
+    )
+    .map_err(|e| format!("insert: {}", e))?;
 
     Ok(mem_id)
 }

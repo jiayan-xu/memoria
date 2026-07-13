@@ -27,8 +27,9 @@ pub fn init_schema(pool: &SqlitePool) -> Result<(), String> {
     conn.execute_batch(
         "PRAGMA journal_mode=WAL;
          PRAGMA foreign_keys=ON;
-         PRAGMA busy_timeout=5000;"
-    ).map_err(|e| format!("pragma: {}", e))?;
+         PRAGMA busy_timeout=5000;",
+    )
+    .map_err(|e| format!("pragma: {}", e))?;
     Ok(())
 }
 
@@ -268,10 +269,8 @@ pub fn migrate_superseded_by(pool: &SqlitePool) -> Result<(), String> {
         .unwrap_or(0);
 
     if has_column == 0 {
-        conn.execute_batch(
-            "ALTER TABLE memories ADD COLUMN superseded_by TEXT;",
-        )
-        .map_err(|e| format!("add superseded_by: {}", e))?;
+        conn.execute_batch("ALTER TABLE memories ADD COLUMN superseded_by TEXT;")
+            .map_err(|e| format!("add superseded_by: {}", e))?;
         println!("[Memoria] Migration: added superseded_by column to memories");
     }
 
@@ -337,7 +336,9 @@ pub fn migrate_dream_state_ns(pool: &SqlitePool) -> Result<(), String> {
              DROP TABLE _dream_state_old;",
         )
         .map_err(|e| format!("migrate dream_state: {}", e))?;
-        println!("[Memoria] Migration: rebuilt dream_state with (phase, namespace) composite PK (preserved old rows)");
+        println!(
+            "[Memoria] Migration: rebuilt dream_state with (phase, namespace) composite PK (preserved old rows)"
+        );
     }
     Ok(())
 }
@@ -351,7 +352,10 @@ pub fn migrate_temporal(pool: &SqlitePool) -> Result<(), String> {
         for col in ["valid_from", "valid_to"] {
             let has: i64 = conn
                 .query_row(
-                    &format!("SELECT COUNT(*) FROM pragma_table_info('{}') WHERE name = '{}'", table, col),
+                    &format!(
+                        "SELECT COUNT(*) FROM pragma_table_info('{}') WHERE name = '{}'",
+                        table, col
+                    ),
                     [],
                     |r| r.get(0),
                 )
@@ -364,11 +368,8 @@ pub fn migrate_temporal(pool: &SqlitePool) -> Result<(), String> {
                     ))
                     .map_err(|e| format!("add {}.{}: {}", table, col, e))?;
                 } else {
-                    conn.execute_batch(&format!(
-                        "ALTER TABLE {} ADD COLUMN valid_to TEXT;",
-                        table
-                    ))
-                    .map_err(|e| format!("add {}.{}: {}", table, col, e))?;
+                    conn.execute_batch(&format!("ALTER TABLE {} ADD COLUMN valid_to TEXT;", table))
+                        .map_err(|e| format!("add {}.{}: {}", table, col, e))?;
                 }
                 println!("[Memoria] Migration: added {}.{} column", table, col);
             }

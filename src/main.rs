@@ -11,11 +11,11 @@
 mod mcp_server;
 mod permissions;
 
-use memoria_core::{auth, backup, health, storage, vector::HnswIndex, web_api};
+use chrono::Datelike;
 use mcp_server::AppState;
+use memoria_core::{auth, backup, health, storage, vector::HnswIndex, web_api};
 use std::sync::Arc;
 use tower_http::services::ServeDir;
-use chrono::Datelike;
 
 /// 联调：tracing 底板（与 agent-core 对齐）。
 /// 日志级别：AGENT_CORE_LOG > RUST_LOG > 默认 info。
@@ -65,8 +65,8 @@ fn main() {
     init_tracing();
     let runtime = build_runtime();
     // P0-4 单写者守卫：启动早期加锁，防止两个 memoria-server 实例并发写同一数据库（双写损坏）。
-    let db_path_for_lock = std::env::var("MEMORIA_DB_PATH")
-        .unwrap_or_else(|_| "data/memoria.db".to_string());
+    let db_path_for_lock =
+        std::env::var("MEMORIA_DB_PATH").unwrap_or_else(|_| "data/memoria.db".to_string());
     let lock_path = single_writer_lock_path(&db_path_for_lock);
     let _single_writer_lock = match acquire_single_writer_lock(&db_path_for_lock) {
         Ok(f) => f,
@@ -393,7 +393,11 @@ pub fn single_writer_lock_path(db_path: &str) -> std::path::PathBuf {
 /// 若已有存活实例持有锁，则返回 Err 拒绝启动，避免双写同一数据库。
 pub fn acquire_single_writer_lock(db_path: &str) -> Result<std::fs::File, String> {
     let lock_path = single_writer_lock_path(db_path);
-    match std::fs::OpenOptions::new().write(true).create_new(true).open(&lock_path) {
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&lock_path)
+    {
         Ok(mut f) => {
             write_pid(&mut f)?;
             Ok(f)
@@ -404,15 +408,23 @@ pub fn acquire_single_writer_lock(db_path: &str) -> Result<std::fs::File, String
                     return Err(format!(
                         "Memoria 已在运行（pid {}）。拒绝启动第二个写者以避免双写同一数据库。\
                         如需强制，请先停止旧进程或删除锁文件：{}",
-                        old_pid, lock_path.display()
+                        old_pid,
+                        lock_path.display()
                     ));
                 }
                 // 残留锁（旧进程已退出）：接管
                 let _ = std::fs::remove_file(&lock_path);
-                match std::fs::OpenOptions::new().write(true).create_new(true).open(&lock_path) {
+                match std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&lock_path)
+                {
                     Ok(mut f) => {
                         write_pid(&mut f)?;
-                        eprintln!("[Memoria][WARN] 检测到残留锁文件（pid {} 已退出），已接管。", old_pid);
+                        eprintln!(
+                            "[Memoria][WARN] 检测到残留锁文件（pid {} 已退出），已接管。",
+                            old_pid
+                        );
                         Ok(f)
                     }
                     Err(e2) => Err(format!("无法接管锁文件 {}: {}", lock_path.display(), e2)),
@@ -420,7 +432,10 @@ pub fn acquire_single_writer_lock(db_path: &str) -> Result<std::fs::File, String
             } else {
                 // 无法解析旧 PID：强制重建
                 let _ = std::fs::remove_file(&lock_path);
-                let mut f = std::fs::OpenOptions::new().write(true).create_new(true).open(&lock_path)
+                let mut f = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&lock_path)
                     .map_err(|e| format!("无法创建锁文件 {}: {}", lock_path.display(), e))?;
                 write_pid(&mut f)?;
                 Ok(f)
@@ -438,7 +453,11 @@ fn write_pid(f: &mut std::fs::File) -> Result<(), String> {
 }
 
 fn read_pid(lock_path: &std::path::Path) -> Option<u32> {
-    std::fs::read_to_string(lock_path).ok()?.trim().parse::<u32>().ok()
+    std::fs::read_to_string(lock_path)
+        .ok()?
+        .trim()
+        .parse::<u32>()
+        .ok()
 }
 
 #[cfg(unix)]
@@ -503,10 +522,12 @@ mod tests {
         let f1 = acquire_single_writer_lock(&db_s).expect("first writer should acquire lock");
         // 第二个写者持有相同（存活）PID，应被拒绝
         let res = acquire_single_writer_lock(&db_s);
-        assert!(res.is_err(), "second writer must be refused while first is alive");
+        assert!(
+            res.is_err(),
+            "second writer must be refused while first is alive"
+        );
         drop(f1);
         let _ = std::fs::remove_file(single_writer_lock_path(&db_s));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
-

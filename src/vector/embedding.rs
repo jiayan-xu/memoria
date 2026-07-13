@@ -37,7 +37,10 @@ impl QueryCache {
 
     /// Retrieve cached query vector.
     pub fn get(&self, text: &str) -> Option<Vec<f32>> {
-        self.cache.lock().ok().and_then(|mut c| c.get(text).cloned())
+        self.cache
+            .lock()
+            .ok()
+            .and_then(|mut c| c.get(text).cloned())
     }
 
     pub fn len(&self) -> usize {

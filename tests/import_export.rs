@@ -1,6 +1,6 @@
 //! P2-4 导入 / 导出 / 迁移 验收测试
-use memoria_core::tools::imp_exp::{build_migration_manifest, export_ns, import_ns, OnConflict};
 use memoria_core::MemoriaEngine;
+use memoria_core::tools::imp_exp::{OnConflict, build_migration_manifest, export_ns, import_ns};
 use rusqlite::params;
 use std::path::PathBuf;
 
@@ -52,11 +52,41 @@ fn seed_acme(conn: &rusqlite::Connection) {
 }
 
 fn count_all(conn: &rusqlite::Connection, ns: &str) -> (u64, u64, u64, u64, u64) {
-    let m: u64 = conn.query_row("SELECT COUNT(*) FROM memories WHERE namespace=?1", [ns], |r| r.get(0)).unwrap();
-    let e: u64 = conn.query_row("SELECT COUNT(*) FROM entities WHERE namespace=?1", [ns], |r| r.get(0)).unwrap();
-    let em: u64 = conn.query_row("SELECT COUNT(*) FROM entity_mentions WHERE namespace=?1", [ns], |r| r.get(0)).unwrap();
-    let ee: u64 = conn.query_row("SELECT COUNT(*) FROM entity_edges WHERE namespace=?1", [ns], |r| r.get(0)).unwrap();
-    let mr: u64 = conn.query_row("SELECT COUNT(*) FROM memory_relations WHERE namespace=?1", [ns], |r| r.get(0)).unwrap();
+    let m: u64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM memories WHERE namespace=?1",
+            [ns],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let e: u64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM entities WHERE namespace=?1",
+            [ns],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let em: u64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM entity_mentions WHERE namespace=?1",
+            [ns],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let ee: u64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM entity_edges WHERE namespace=?1",
+            [ns],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let mr: u64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM memory_relations WHERE namespace=?1",
+            [ns],
+            |r| r.get(0),
+        )
+        .unwrap();
     (m, e, em, ee, mr)
 }
 
@@ -73,7 +103,10 @@ fn export_import_round_trip() {
     let (e2, _db2) = temp_engine("rt2");
     let r = import_ns(&e2.pool, "acme", &jsonl, OnConflict::Ignore).unwrap();
     if !r.errors.is_empty() || r.inserted != 6 {
-        panic!("ROUND-TRIP report: inserted={} ignored={} errors={:?} per_table={:?}", r.inserted, r.ignored, r.errors, r.per_table);
+        panic!(
+            "ROUND-TRIP report: inserted={} ignored={} errors={:?} per_table={:?}",
+            r.inserted, r.ignored, r.errors, r.per_table
+        );
     }
     assert_eq!(r.ignored, 0);
 
@@ -101,7 +134,16 @@ fn streaming_chunked_no_oom_and_restores() {
     let (e2, _db2) = temp_engine("stream2");
     let r = import_ns(&e2.pool, "acme", &jsonl, OnConflict::Ignore).unwrap();
     assert_eq!(r.inserted, n as u64);
-    let cnt: u64 = e2.pool.get().unwrap().query_row("SELECT COUNT(*) FROM memories WHERE namespace='acme'", [], |r| r.get(0)).unwrap();
+    let cnt: u64 = e2
+        .pool
+        .get()
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM memories WHERE namespace='acme'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
     assert_eq!(cnt, n as u64);
 }
 
@@ -126,14 +168,24 @@ fn migration_manifest_has_checksums() {
     let (e1, db1) = temp_engine("manifest1");
     seed_acme(&e1.pool.get().unwrap());
     // 确保数据落盘
-    e1.pool.get().unwrap().execute_batch("PRAGMA wal_checkpoint(FULL)").unwrap();
-
-    let manifest = build_migration_manifest(&e1.pool, db1.to_str().unwrap(), "nonexistent_hnsw_path")
+    e1.pool
+        .get()
+        .unwrap()
+        .execute_batch("PRAGMA wal_checkpoint(FULL)")
         .unwrap();
+
+    let manifest =
+        build_migration_manifest(&e1.pool, db1.to_str().unwrap(), "nonexistent_hnsw_path").unwrap();
     assert_eq!(manifest["memoria_migration_bundle"], 1);
-    assert!(!manifest["db"]["sha256"].as_str().unwrap().is_empty(), "DB 校验和应非空");
+    assert!(
+        !manifest["db"]["sha256"].as_str().unwrap().is_empty(),
+        "DB 校验和应非空"
+    );
     assert!(manifest["db"]["size_bytes"].as_u64().unwrap() > 0);
-    assert!(manifest["hnsw"]["sha256"].as_str().unwrap().is_empty(), "不存在的 HNSW 校验和为空");
+    assert!(
+        manifest["hnsw"]["sha256"].as_str().unwrap().is_empty(),
+        "不存在的 HNSW 校验和为空"
+    );
     // 全表行数存在
     assert_eq!(manifest["row_counts"]["memories"], 2);
     assert_eq!(manifest["row_counts"]["entities"], 1);

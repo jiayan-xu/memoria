@@ -2,7 +2,7 @@
 //!
 //! 替代 lib.rs hybrid_search 和 mcp_server.rs 中各自维护的搜索逻辑。
 
-use crate::search::{self, SignalResult, FusedResult};
+use crate::search::{self, FusedResult, SignalResult};
 use crate::storage::SqlitePool;
 use crate::vector::{HnswIndex, QueryCache};
 
@@ -25,29 +25,51 @@ pub fn hybrid_search(
 
     // S1: Keyword (FTS5 + LIKE)
     if let Ok(kw) = search::keyword::keyword_search(pool, query, namespace, fts_limit) {
-        if !kw.is_empty() { signals.push(kw); weights.push(1.0); }
+        if !kw.is_empty() {
+            signals.push(kw);
+            weights.push(1.0);
+        }
     }
 
     // S2: Semantic (HNSW vector)
     if let (Some(hnsw), Some(qc)) = (hnsw, query_cache) {
-        if let Ok(sem) = search::semantic::semantic_search(query, namespace, fts_limit, Some(hnsw), Some(qc), Some(pool)) {
-            if !sem.is_empty() { signals.push(sem); weights.push(1.0); }
+        if let Ok(sem) = search::semantic::semantic_search(
+            query,
+            namespace,
+            fts_limit,
+            Some(hnsw),
+            Some(qc),
+            Some(pool),
+        ) {
+            if !sem.is_empty() {
+                signals.push(sem);
+                weights.push(1.0);
+            }
         }
     }
 
     // S3: Temporal (recency bias)
     if let Ok(temp) = search::temporal::temporal_search(pool, namespace, fts_limit) {
-        if !temp.is_empty() { signals.push(temp); weights.push(1.0); }
+        if !temp.is_empty() {
+            signals.push(temp);
+            weights.push(1.0);
+        }
     }
 
     // S4: Importance (recall count + decay)
     if let Ok(imp) = search::importance::importance_search(pool, namespace, fts_limit) {
-        if !imp.is_empty() { signals.push(imp); weights.push(1.0); }
+        if !imp.is_empty() {
+            signals.push(imp);
+            weights.push(1.0);
+        }
     }
 
     // S5: Category (query intent match)
     if let Ok(cat) = search::importance::category_search(pool, query, namespace, max_results) {
-        if !cat.is_empty() { signals.push(cat); weights.push(0.5); }
+        if !cat.is_empty() {
+            signals.push(cat);
+            weights.push(0.5);
+        }
     }
 
     let mut fused = if signals.is_empty() {
@@ -63,7 +85,8 @@ pub fn hybrid_search(
 
     // Dedup by memory_id
     let mut seen = std::collections::HashSet::new();
-    let mut unique: Vec<FusedResult> = fused.into_iter()
+    let mut unique: Vec<FusedResult> = fused
+        .into_iter()
         .filter(|r| seen.insert(r.memory_id.clone()))
         .collect();
 
@@ -79,11 +102,14 @@ pub fn hybrid_search(
                     ph
                 );
                 if let Ok(mut stmt) = conn.prepare(&sql) {
-                    let valid: std::collections::HashMap<String, (Option<String>, Option<String>)> = stmt
-                        .query_map(rusqlite::params_from_iter(ids.iter()), |row| {
+                    let valid: std::collections::HashMap<String, (Option<String>, Option<String>)> =
+                        stmt.query_map(rusqlite::params_from_iter(ids.iter()), |row| {
                             Ok((
                                 row.get::<_, String>(0)?,
-                                (row.get::<_, Option<String>>(1)?, row.get::<_, Option<String>>(2)?),
+                                (
+                                    row.get::<_, Option<String>>(1)?,
+                                    row.get::<_, Option<String>>(2)?,
+                                ),
                             ))
                         })
                         .map(|rows| rows.flatten().collect())

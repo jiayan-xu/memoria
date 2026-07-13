@@ -1,5 +1,8 @@
-pub mod sqlite;
 pub mod fts5;
 pub mod models;
+pub mod sqlite;
 
-pub use sqlite::{create_pool, init_schema, init_core_tables, wal_checkpoint, migrate_superseded_by, migrate_user_prefs_namespace, migrate_dream_state_ns, migrate_temporal, SqlitePool};
+pub use sqlite::{
+    SqlitePool, create_pool, init_core_tables, init_schema, migrate_dream_state_ns,
+    migrate_superseded_by, migrate_temporal, migrate_user_prefs_namespace, wal_checkpoint,
+};

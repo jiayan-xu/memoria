@@ -9,7 +9,7 @@
 //! 语义通道（近义 supersede）需运行时 embedding 后端，属手动评测范畴。
 
 use memoria_core::search::hybrid::hybrid_search;
-use memoria_core::storage::{create_pool, init_core_tables, init_schema, SqlitePool};
+use memoria_core::storage::{SqlitePool, create_pool, init_core_tables, init_schema};
 use memoria_core::tools::remember::remember;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -24,7 +24,10 @@ fn memory_eval() {
     let cases_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/cases");
     let corpus: Vec<Value> = read_json_array(&cases_dir.join("corpus.json"));
     let cases: Vec<Value> = read_json_array(&cases_dir.join("cases.json"));
-    assert!(!corpus.is_empty() && !cases.is_empty(), "eval cases 不能为空");
+    assert!(
+        !corpus.is_empty() && !cases.is_empty(),
+        "eval cases 不能为空"
+    );
 
     // fixture DB（临时文件，不入库）
     let db = std::env::temp_dir().join(format!("memoria_eval_{}.db", std::process::id()));
@@ -41,8 +44,10 @@ fn memory_eval() {
         let importance = item["importance"].as_i64().unwrap_or(3);
         let ns = item["ns"].as_str().unwrap_or("agent/default");
         let tags = item["tags"].as_str().unwrap_or("[]");
-        let id = remember(&pool, content, category, importance, "eval", ns, tags, None, None)
-            .unwrap_or_else(|e| panic!("remember failed for '{}': {}", content, e));
+        let id = remember(
+            &pool, content, category, importance, "eval", ns, tags, None, None,
+        )
+        .unwrap_or_else(|e| panic!("remember failed for '{}': {}", content, e));
         // 应用时序偏移（控制 temporal 信号）
         if let Some(off) = item["created_offset_days"].as_i64() {
             if off > 0 {
@@ -71,15 +76,26 @@ fn memory_eval() {
         let ctype = c["type"].as_str().unwrap_or("");
         let expect: Vec<usize> = c["expect_indices"]
             .as_array()
-            .map(|a| a.iter().filter_map(|v| v.as_u64().map(|x| x as usize)).collect())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_u64().map(|x| x as usize))
+                    .collect()
+            })
             .unwrap_or_default();
         let must_not: Vec<usize> = c["must_not_indices"]
             .as_array()
-            .map(|a| a.iter().filter_map(|v| v.as_u64().map(|x| x as usize)).collect())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_u64().map(|x| x as usize))
+                    .collect()
+            })
             .unwrap_or_default();
         let dedup_pair: Option<(usize, usize)> = c["dedup_pair"].as_array().and_then(|a| {
             if a.len() == 2 {
-                Some((a[0].as_u64().unwrap_or(0) as usize, a[1].as_u64().unwrap_or(0) as usize))
+                Some((
+                    a[0].as_u64().unwrap_or(0) as usize,
+                    a[1].as_u64().unwrap_or(0) as usize,
+                ))
             } else {
                 None
             }

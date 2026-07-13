@@ -18,11 +18,25 @@ use sha2::{Digest, Sha256};
 
 /// 审计日志脱敏：敏感字段名片段（不区分大小写匹配）
 const SENSITIVE_KEYS: &[&str] = &[
-    "api_key", "api-key", "apikey", "token", "secret",
-    "password", "passwd", "credential", "auth",
-    "authorization", "bearer", "access_key", "accesskey",
-    "private_key", "privatekey", "ssl_key", "ssh_key",
-    "admin_key", "adminkey",
+    "api_key",
+    "api-key",
+    "apikey",
+    "token",
+    "secret",
+    "password",
+    "passwd",
+    "credential",
+    "auth",
+    "authorization",
+    "bearer",
+    "access_key",
+    "accesskey",
+    "private_key",
+    "privatekey",
+    "ssl_key",
+    "ssh_key",
+    "admin_key",
+    "adminkey",
 ];
 
 /// Agent 名牌（注册后返回给 Agent）
@@ -31,7 +45,7 @@ pub struct AgentBadge {
     pub agent_id: String,
     pub display_name: String,
     pub namespace: String,
-    pub badge_token: String,      // 原始 token（仅注册时返回一次）
+    pub badge_token: String, // 原始 token（仅注册时返回一次）
     pub permission: String,
     pub allowed_skills: Vec<String>,
     pub expires_at: String,
@@ -63,17 +77,23 @@ pub fn register_agent(
     };
 
     // 生成随机 token（使用时间戳 + agent_id + 随机数）
-    let raw_token = format!("mem_{}_{}_{}", agent_id, chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0), {
-        let mut buf = [0u8; 8];
-        getrandom::getrandom(&mut buf).unwrap_or_default();
-        u64::from_le_bytes(buf)
-    });
+    let raw_token = format!(
+        "mem_{}_{}_{}",
+        agent_id,
+        chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0),
+        {
+            let mut buf = [0u8; 8];
+            getrandom::getrandom(&mut buf).unwrap_or_default();
+            u64::from_le_bytes(buf)
+        }
+    );
     let mut hasher = Sha256::new();
     hasher.update(raw_token.as_bytes());
     let badge_token = format!("{:x}", hasher.finalize());
 
     let expires = (chrono::Utc::now() + chrono::Duration::days(365))
-        .format("%Y-%m-%dT%H:%M:%S").to_string();
+        .format("%Y-%m-%dT%H:%M:%S")
+        .to_string();
 
     conn.execute(
         "INSERT OR IGNORE INTO agent_registry
@@ -108,7 +128,7 @@ pub fn register_agent(
         agent_id: agent_id.to_string(),
         display_name: display_name.to_string(),
         namespace: namespace.clone(),
-        badge_token,  // SHA-256 hash
+        badge_token, // SHA-256 hash
         permission: permission.to_string(),
         allowed_skills: vec![],
         expires_at: expires,
@@ -151,7 +171,8 @@ pub fn register_user(
     let badge_token = format!("{:x}", hasher.finalize());
 
     let expires = (chrono::Utc::now() + chrono::Duration::days(365))
-        .format("%Y-%m-%dT%H:%M:%S").to_string();
+        .format("%Y-%m-%dT%H:%M:%S")
+        .to_string();
 
     conn.execute(
         "INSERT INTO agent_registry
@@ -174,11 +195,7 @@ pub fn register_user(
 /// 个人账号登录：校验 `user_id` + `password`，成功返回该账号的 `badge_token`
 /// （= `SHA256(password || user_id)`）与命名空间，供客户端后续作为 `x-user-key` 使用。
 /// 口令错误或账号不存在均返回统一错误（不区分，防账号枚举）。
-pub fn login_user(
-    pool: &SqlitePool,
-    user_id: &str,
-    password: &str,
-) -> Result<AgentBadge, String> {
+pub fn login_user(pool: &SqlitePool, user_id: &str, password: &str) -> Result<AgentBadge, String> {
     let conn = pool.get().map_err(|e| format!("pool: {}", e))?;
 
     let row = conn.query_row(
@@ -237,7 +254,7 @@ pub fn authenticate(
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
             ))
-        }
+        },
     );
 
     match row {
@@ -245,13 +262,18 @@ pub fn authenticate(
             if !ct_eq(&stored_token, badge_token) {
                 return Err("invalid badge token".to_string());
             }
-            let allowed_ns: Vec<String> = ns_list.split(',')
+            let allowed_ns: Vec<String> = ns_list
+                .split(',')
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
                 .collect();
             Ok(AuthResult {
                 agent_id: agent_id.to_string(),
-                allowed_ns: if permission == "admin" { vec!["*".to_string()] } else { allowed_ns },
+                allowed_ns: if permission == "admin" {
+                    vec!["*".to_string()]
+                } else {
+                    allowed_ns
+                },
                 role: permission,
             })
         }
@@ -283,8 +305,12 @@ pub fn ct_eq(a: &str, b: &str) -> bool {
 /// 例：授权 `org/公司/div/工程线` 可覆盖其下 `dept/工程部/proj/P1` 等全部后代；
 ///     部门级工具 `dept/工程部` 又对其下属 `proj/P1` 可见（共享子树）。
 pub fn check_ns_access(auth: &AuthResult, namespace: &str) -> bool {
-    if auth.role == "admin" { return true; }
-    if auth.allowed_ns.contains(&"*".to_string()) { return true; }
+    if auth.role == "admin" {
+        return true;
+    }
+    if auth.allowed_ns.contains(&"*".to_string()) {
+        return true;
+    }
     auth.allowed_ns.iter().any(|ns| {
         *ns == namespace
             || namespace.starts_with(&format!("{}/", ns))
@@ -331,7 +357,9 @@ pub fn sanitize_params(params: &str) -> String {
                 }
                 // 定位到值结束（逗号/引号/空格/}）
                 let end_val = result[end_key..]
-                    .find(|c: char| c == ',' || c == '}' || c == ')' || c == ' ' || c == '\n' || c == '\r')
+                    .find(|c: char| {
+                        c == ',' || c == '}' || c == ')' || c == ' ' || c == '\n' || c == '\r'
+                    })
                     .map(|e| end_key + e)
                     .unwrap_or(result.len());
                 let val = result[end_key..end_val].to_string();
@@ -394,14 +422,16 @@ pub fn audit_log(pool: &SqlitePool, agent_id: &str, tool: &str, params: &str, al
                     params TEXT,
                     allowed INTEGER DEFAULT 1,
                     timestamp TEXT
-                )", week_table
+                )",
+                week_table
             ),
             [],
         );
         let _ = conn.execute(
             &format!(
                 "INSERT INTO {} (agent_id, tool, params, allowed, timestamp)
-                 VALUES (?, ?, ?, ?, datetime('now'))", week_table
+                 VALUES (?, ?, ?, ?, datetime('now'))",
+                week_table
             ),
             rusqlite::params![agent_id, tool, sanitized, if allowed { 1 } else { 0 }],
         );
@@ -456,8 +486,9 @@ pub fn init_auth_tables(pool: &SqlitePool) -> Result<(), String> {
             installed_by TEXT DEFAULT '',
             is_active INTEGER DEFAULT 1,
             PRIMARY KEY (agent_id, skill_name)
-        );"
-    ).map_err(|e| format!("create tables: {}", e))?;
+        );",
+    )
+    .map_err(|e| format!("create tables: {}", e))?;
 
     // 创建当周审计表
     let week_table = format!("audit_log_{}", iso_week());
@@ -470,14 +501,19 @@ pub fn init_auth_tables(pool: &SqlitePool) -> Result<(), String> {
                 params TEXT,
                 allowed INTEGER DEFAULT 1,
                 timestamp TEXT
-            )", week_table
+            )",
+            week_table
         ),
         [],
-    ).map_err(|e| format!("create week table: {}", e))?;
+    )
+    .map_err(|e| format!("create week table: {}", e))?;
 
     // 创建索引（存在则跳过）
     let _ = conn.execute(
-        &format!("CREATE INDEX IF NOT EXISTS idx_{}_time ON {}(timestamp DESC)", week_table, week_table),
+        &format!(
+            "CREATE INDEX IF NOT EXISTS idx_{}_time ON {}(timestamp DESC)",
+            week_table, week_table
+        ),
         [],
     );
 

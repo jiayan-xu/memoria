@@ -2,9 +2,9 @@
 //!
 //! score(item) = sum( w_m / (K + rank_m) ) for m in {keyword, semantic, temporal, importance, category}
 
-use std::collections::HashMap;
 use crate::search::keyword::SignalResult;
 use crate::storage::SqlitePool;
+use std::collections::HashMap;
 
 /// RRF weights (default, can be overridden by intent).
 pub struct RrfWeights {
@@ -40,11 +40,7 @@ pub struct FusedResult {
 }
 
 /// Merge multiple ranked signal lists using RRF.
-pub fn rrf_merge(
-    signals: &[Vec<SignalResult>],
-    weights: &[f64],
-    k: f64,
-) -> Vec<FusedResult> {
+pub fn rrf_merge(signals: &[Vec<SignalResult>], weights: &[f64], k: f64) -> Vec<FusedResult> {
     let mut score_map: HashMap<String, (f64, String, String, Vec<(String, f64)>)> = HashMap::new();
 
     for (signal_idx, results) in signals.iter().enumerate() {
@@ -53,7 +49,12 @@ pub fn rrf_merge(
             let rrf = weight / (k + rank as f64 + 1.0);
             let entry = score_map.entry(result.memory_id.clone());
             let (current_score, _, _, sigs) = entry.or_insert_with(|| {
-                (0.0, result.content.clone(), result.source.clone(), Vec::new())
+                (
+                    0.0,
+                    result.content.clone(),
+                    result.source.clone(),
+                    Vec::new(),
+                )
             });
             *current_score += rrf;
             // 记录贡献通道（粗粒度），供评测的通道贡献度量使用
@@ -66,17 +67,24 @@ pub fn rrf_merge(
         }
     }
 
-    let mut fused: Vec<FusedResult> = score_map.into_iter().map(|(memory_id, (rrf_score, content, source, signal_scores))| {
-        FusedResult {
-            memory_id,
-            content,
-            rrf_score,
-            source,
-            signal_scores,
-        }
-    }).collect();
+    let mut fused: Vec<FusedResult> = score_map
+        .into_iter()
+        .map(
+            |(memory_id, (rrf_score, content, source, signal_scores))| FusedResult {
+                memory_id,
+                content,
+                rrf_score,
+                source,
+                signal_scores,
+            },
+        )
+        .collect();
 
-    fused.sort_by(|a, b| b.rrf_score.partial_cmp(&a.rrf_score).unwrap_or(std::cmp::Ordering::Equal));
+    fused.sort_by(|a, b| {
+        b.rrf_score
+            .partial_cmp(&a.rrf_score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     fused
 }
 
@@ -110,8 +118,8 @@ pub fn graph_expand(
 
     let conn = pool.get().map_err(|e| format!("pool: {}", e))?;
     let mut expanded = Vec::new();
-    let mut seen_ids: std::collections::HashSet<String> = results.iter()
-        .map(|r| r.memory_id.clone()).collect();
+    let mut seen_ids: std::collections::HashSet<String> =
+        results.iter().map(|r| r.memory_id.clone()).collect();
 
     for result in results.iter().take(5) {
         // Bidirectional graph expansion with content from memories table
@@ -127,13 +135,16 @@ pub fn graph_expand(
             LEFT JOIN memories m ON r.neighbor_id = m.id
             LIMIT 10";
         if let Ok(mut stmt) = conn.prepare(hop_sql) {
-                if let Ok(rows) = stmt.query_map(rusqlite::params![result.memory_id, namespace, result.memory_id, namespace], |row| {
-                let target_id: String = row.get(0)?;
-                let weight: f64 = row.get(1)?;
-                let rel_type: String = row.get(2)?;
-                let content: String = row.get::<_, Option<String>>(3)?.unwrap_or_default();
-                Ok((target_id, weight, rel_type, content))
-            }) {
+            if let Ok(rows) = stmt.query_map(
+                rusqlite::params![result.memory_id, namespace, result.memory_id, namespace],
+                |row| {
+                    let target_id: String = row.get(0)?;
+                    let weight: f64 = row.get(1)?;
+                    let rel_type: String = row.get(2)?;
+                    let content: String = row.get::<_, Option<String>>(3)?.unwrap_or_default();
+                    Ok((target_id, weight, rel_type, content))
+                },
+            ) {
                 for row in rows.flatten() {
                     let (target_id, weight, _rel_type, content) = row;
                     if seen_ids.insert(target_id.clone()) {

@@ -6,7 +6,7 @@
 //! - 启动时从本表重建 HNSW，使近义去重在重启后依然可靠（不再依赖进程内 QueryCache 与 .bin 快取）。
 
 use crate::storage::SqlitePool;
-use crate::vector::{HnswIndex, VectorEntry, DIM};
+use crate::vector::{DIM, HnswIndex, VectorEntry};
 
 /// 将 `Vec<f32>` 编码为 little-endian BLOB。
 pub fn encode_vector(v: &[f32]) -> Vec<u8> {
@@ -39,7 +39,12 @@ pub fn get_stored_vector(pool: &SqlitePool, id: &str) -> Option<Vec<f32>> {
 }
 
 /// 写入/覆盖某记忆的持久向量（INSERT OR REPLACE）。
-pub fn put_stored_vector(pool: &SqlitePool, id: &str, namespace: &str, vector: &[f32]) -> Result<(), String> {
+pub fn put_stored_vector(
+    pool: &SqlitePool,
+    id: &str,
+    namespace: &str,
+    vector: &[f32],
+) -> Result<(), String> {
     let conn = pool.get().map_err(|e| format!("pool: {}", e))?;
     conn.execute(
         "INSERT OR REPLACE INTO memory_vectors (id, namespace, vector) VALUES (?, ?, ?)",
@@ -70,7 +75,9 @@ pub fn rebuild_hnsw_from_store(pool: &SqlitePool, hnsw: &HnswIndex) -> Result<us
         .prepare("SELECT id, vector FROM memory_vectors")
         .map_err(|e| format!("prepare: {}", e))?;
     let rows = stmt
-        .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?)))
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+        })
         .map_err(|e| format!("query: {}", e))?;
 
     let mut entries: Vec<VectorEntry> = Vec::new();

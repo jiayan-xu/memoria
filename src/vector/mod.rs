@@ -1,6 +1,6 @@
-pub mod hnsw;
 pub mod embedding;
+pub mod hnsw;
 pub mod persist;
 
-pub use hnsw::{HnswIndex, VectorEntry, DIM};
 pub use embedding::QueryCache;
+pub use hnsw::{DIM, HnswIndex, VectorEntry};

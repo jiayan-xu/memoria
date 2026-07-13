@@ -10,7 +10,7 @@
 //!   `hnsw_vectors_<ts>.bin`；迁移包 = 二者 + 本 manifest（可选再附一份 `memory_export` JSONL）。
 
 use crate::storage::SqlitePool;
-use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 use rusqlite::params;
 use rusqlite::params_from_iter;
 use rusqlite::types::Value as SqlValue;
@@ -49,14 +49,125 @@ struct TableSpec {
 }
 
 const TABLES: &[TableSpec] = &[
-    TableSpec { name: "memories", columns: &["id","namespace","source","content","category","confidence","recall_count","last_recalled","created_at","promoted_at","tier","evidence","importance","decay_factor","tags","valid_from","valid_to"], ns_col: "namespace", blob_col: None },
-    TableSpec { name: "user_prefs", columns: &["key","value","evidence","confidence","updated_at","namespace"], ns_col: "namespace", blob_col: None },
-    TableSpec { name: "decisions", columns: &["id","namespace","topic","decision","rationale","context","session_id","created_at"], ns_col: "namespace", blob_col: None },
-    TableSpec { name: "memory_relations", columns: &["id","namespace","source_id","target_id","relation_type","weight","evidence","created_at","valid_from","valid_to"], ns_col: "namespace", blob_col: None },
-    TableSpec { name: "memory_vectors", columns: &["id","namespace","vector","updated_at"], ns_col: "namespace", blob_col: Some("vector") },
-    TableSpec { name: "entities", columns: &["id","namespace","entity_type","name","aliases","summary","created_at"], ns_col: "namespace", blob_col: None },
-    TableSpec { name: "entity_mentions", columns: &["id","entity_id","memory_id","context","namespace","created_at"], ns_col: "namespace", blob_col: None },
-    TableSpec { name: "entity_edges", columns: &["id","namespace","source_entity_id","target_entity_id","relation_type","weight","evidence","created_at","valid_from","valid_to"], ns_col: "namespace", blob_col: None },
+    TableSpec {
+        name: "memories",
+        columns: &[
+            "id",
+            "namespace",
+            "source",
+            "content",
+            "category",
+            "confidence",
+            "recall_count",
+            "last_recalled",
+            "created_at",
+            "promoted_at",
+            "tier",
+            "evidence",
+            "importance",
+            "decay_factor",
+            "tags",
+            "valid_from",
+            "valid_to",
+        ],
+        ns_col: "namespace",
+        blob_col: None,
+    },
+    TableSpec {
+        name: "user_prefs",
+        columns: &[
+            "key",
+            "value",
+            "evidence",
+            "confidence",
+            "updated_at",
+            "namespace",
+        ],
+        ns_col: "namespace",
+        blob_col: None,
+    },
+    TableSpec {
+        name: "decisions",
+        columns: &[
+            "id",
+            "namespace",
+            "topic",
+            "decision",
+            "rationale",
+            "context",
+            "session_id",
+            "created_at",
+        ],
+        ns_col: "namespace",
+        blob_col: None,
+    },
+    TableSpec {
+        name: "memory_relations",
+        columns: &[
+            "id",
+            "namespace",
+            "source_id",
+            "target_id",
+            "relation_type",
+            "weight",
+            "evidence",
+            "created_at",
+            "valid_from",
+            "valid_to",
+        ],
+        ns_col: "namespace",
+        blob_col: None,
+    },
+    TableSpec {
+        name: "memory_vectors",
+        columns: &["id", "namespace", "vector", "updated_at"],
+        ns_col: "namespace",
+        blob_col: Some("vector"),
+    },
+    TableSpec {
+        name: "entities",
+        columns: &[
+            "id",
+            "namespace",
+            "entity_type",
+            "name",
+            "aliases",
+            "summary",
+            "created_at",
+        ],
+        ns_col: "namespace",
+        blob_col: None,
+    },
+    TableSpec {
+        name: "entity_mentions",
+        columns: &[
+            "id",
+            "entity_id",
+            "memory_id",
+            "context",
+            "namespace",
+            "created_at",
+        ],
+        ns_col: "namespace",
+        blob_col: None,
+    },
+    TableSpec {
+        name: "entity_edges",
+        columns: &[
+            "id",
+            "namespace",
+            "source_entity_id",
+            "target_entity_id",
+            "relation_type",
+            "weight",
+            "evidence",
+            "created_at",
+            "valid_from",
+            "valid_to",
+        ],
+        ns_col: "namespace",
+        blob_col: None,
+    },
 ];
 
 /// 导出某命名空间为 JSONL 字符串（流式分块，防 OOM）。
@@ -80,7 +191,10 @@ pub fn export_ns(pool: &SqlitePool, ns: &str, include_vectors: bool) -> Result<S
         }
         let c: u64 = conn
             .query_row(
-                &format!("SELECT COUNT(*) FROM {} WHERE {} = ?1", spec.name, spec.ns_col),
+                &format!(
+                    "SELECT COUNT(*) FROM {} WHERE {} = ?1",
+                    spec.name, spec.ns_col
+                ),
                 params![ns],
                 |r| r.get(0),
             )
@@ -180,16 +294,15 @@ pub fn import_ns(
         if line.is_empty() {
             continue;
         }
-        let val: serde_json::Value =
-            match serde_json::from_str(line) {
-                Ok(v) => v,
-                Err(e) => {
-                    report
-                        .errors
-                        .push(format!("line {} parse error: {}", i + 2, e));
-                    continue;
-                }
-            };
+        let val: serde_json::Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(e) => {
+                report
+                    .errors
+                    .push(format!("line {} parse error: {}", i + 2, e));
+                continue;
+            }
+        };
         let table = match val.get("table").and_then(|v| v.as_str()) {
             Some(t) => t,
             None => {
@@ -228,19 +341,24 @@ pub fn import_ns(
         let values = json_row_to_values(spec, row);
         let cols_csv = spec.columns.join(",");
         let ph = vec!["?"; spec.columns.len()].join(",");
-        let sql = format!(
-            "{} INTO {} ({}) VALUES ({})",
-            verb, spec.name, cols_csv, ph
-        );
+        let sql = format!("{} INTO {} ({}) VALUES ({})", verb, spec.name, cols_csv, ph);
         match conn.execute(&sql, params_from_iter(values.into_iter())) {
             Ok(n) => {
                 // n=0 表示 INSERT OR IGNORE 命中 PK 冲突（已存在）→ ignored
                 if n == 0 {
                     report.ignored += 1;
-                    report.per_table.entry(table.to_string()).or_insert((0, 0)).1 += 1;
+                    report
+                        .per_table
+                        .entry(table.to_string())
+                        .or_insert((0, 0))
+                        .1 += 1;
                 } else {
                     report.inserted += 1;
-                    report.per_table.entry(table.to_string()).or_insert((0, 0)).0 += 1;
+                    report
+                        .per_table
+                        .entry(table.to_string())
+                        .or_insert((0, 0))
+                        .0 += 1;
                 }
             }
             Err(e) => {
@@ -258,8 +376,7 @@ pub fn import_ns(
 /// 计算文件 sha256（流式分块读取，支持大文件）
 pub fn compute_sha256(path: &str) -> Result<String, String> {
     use std::io::Read;
-    let mut f =
-        std::fs::File::open(path).map_err(|e| format!("open {}: {}", path, e))?;
+    let mut f = std::fs::File::open(path).map_err(|e| format!("open {}: {}", path, e))?;
     let mut hasher = Sha256::new();
     let mut buf = [0u8; 65536];
     loop {
@@ -288,7 +405,9 @@ pub fn build_migration_manifest(
     let mut counts = serde_json::Map::new();
     for spec in TABLES {
         let c: u64 = conn
-            .query_row(&format!("SELECT COUNT(*) FROM {}", spec.name), [], |r| r.get(0))
+            .query_row(&format!("SELECT COUNT(*) FROM {}", spec.name), [], |r| {
+                r.get(0)
+            })
             .unwrap_or(0);
         counts.insert(spec.name.to_string(), serde_json::json!(c));
     }
@@ -321,10 +440,7 @@ pub fn build_migration_manifest(
 // ── 内部辅助 ──
 
 /// 把一行读出为 JSON（`Value::Integer/Real/Text/Null`，BLOB 列 base64）
-fn row_to_json(
-    r: &rusqlite::Row,
-    spec: &TableSpec,
-) -> Result<serde_json::Value, rusqlite::Error> {
+fn row_to_json(r: &rusqlite::Row, spec: &TableSpec) -> Result<serde_json::Value, rusqlite::Error> {
     let mut obj = serde_json::Map::new();
     for (i, col) in spec.columns.iter().enumerate() {
         let v: SqlValue = r.get(i)?;

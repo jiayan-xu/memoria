@@ -3,13 +3,13 @@
 //! 独立模块，由 main.rs 调用 build_app() 启动。
 
 use axum::{
+    Json, Router,
     extract::State,
     http::{HeaderMap, StatusCode},
     routing::{get, post},
-    Json, Router,
 };
-use std::sync::Arc;
 use chrono;
+use std::sync::Arc;
 
 use memoria_core::auth::{self, AuthResult};
 use memoria_core::search;
@@ -61,11 +61,26 @@ async fn health_check_full(
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     // P0-2 统一 require_admin：admin 角色（X-Agent-Id/Key）或 x-admin-key 兜底，与 P0-1 一致
-    let agent_id = headers.get("x-agent-id").and_then(|v| v.to_str().ok()).unwrap_or("");
-    let agent_key = headers.get("x-agent-key").and_then(|v| v.to_str().ok()).unwrap_or("");
-    let legacy_key = headers.get("x-admin-key").and_then(|v| v.to_str().ok()).unwrap_or("");
-    let auth_result = auth::authenticate(&state.auth_pool, agent_id, agent_key)
-        .unwrap_or_else(|_| auth::AuthResult { agent_id: String::new(), allowed_ns: Vec::new(), role: String::new() });
+    let agent_id = headers
+        .get("x-agent-id")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let agent_key = headers
+        .get("x-agent-key")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let legacy_key = headers
+        .get("x-admin-key")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let auth_result =
+        auth::authenticate(&state.auth_pool, agent_id, agent_key).unwrap_or_else(|_| {
+            auth::AuthResult {
+                agent_id: String::new(),
+                allowed_ns: Vec::new(),
+                role: String::new(),
+            }
+        });
     if !crate::permissions::require_admin(&auth_result, legacy_key, &state.admin_key) {
         return Err(StatusCode::FORBIDDEN);
     }
@@ -78,7 +93,9 @@ async fn health_check_full(
             &st.db_path,
             &st.hnsw_status,
         )
-    }).await.unwrap_or_else(|_| memoria_core::health::HealthReport {
+    })
+    .await
+    .unwrap_or_else(|_| memoria_core::health::HealthReport {
         overall: "fail".to_string(),
         hard_checks: vec![],
         soft_checks: vec![],
@@ -102,14 +119,23 @@ async fn handle_mcp(
 ) -> Json<serde_json::Value> {
     let method = body.get("method").and_then(|m| m.as_str()).unwrap_or("");
     let id = body.get("id").cloned().unwrap_or(serde_json::Value::Null);
-    let params = body.get("params").and_then(|p| p.as_object()).cloned().unwrap_or_default();
+    let params = body
+        .get("params")
+        .and_then(|p| p.as_object())
+        .cloned()
+        .unwrap_or_default();
 
-    let agent_id = headers.get("x-agent-id")
-        .and_then(|v| v.to_str().ok()).unwrap_or("anonymous");
-    let agent_key = headers.get("x-agent-key")
-        .and_then(|v| v.to_str().ok()).unwrap_or("");
+    let agent_id = headers
+        .get("x-agent-id")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("anonymous");
+    let agent_key = headers
+        .get("x-agent-key")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
     // 联调：入站 x-trace-id（agent-core 转发），接入统一 trace 链
-    let trace_id = headers.get("x-trace-id")
+    let trace_id = headers
+        .get("x-trace-id")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("none")
         .to_string();
@@ -118,17 +144,23 @@ async fn handle_mcp(
         "initialize" => {
             // MCP 协议版本协商：回显客户端请求的版本（memoria-core 仅用基础 tools 能力，
             // 任何版本均兼容），缺省回退到广泛支持的 2024-11-05，避免客户端因版本过新拒绝握手。
-            let requested = params.get("protocolVersion")
+            let requested = params
+                .get("protocolVersion")
                 .and_then(|v| v.as_str())
                 .unwrap_or("2024-11-05");
-            rpc_ok(&id, serde_json::json!({
-                "protocolVersion": requested,
-                "serverInfo": {"name": "memoria", "version": "0.2.0"},
-                "capabilities": {"tools": {}},
-            }))
+            rpc_ok(
+                &id,
+                serde_json::json!({
+                    "protocolVersion": requested,
+                    "serverInfo": {"name": "memoria", "version": "0.2.0"},
+                    "capabilities": {"tools": {}},
+                }),
+            )
         }
         "tools/list" => rpc_ok(&id, serde_json::json!({"tools": tools_list()})),
-        "tools/call" => handle_tool_call(&state, &params, &id, agent_id, agent_key, &trace_id).await,
+        "tools/call" => {
+            handle_tool_call(&state, &params, &id, agent_id, agent_key, &trace_id).await
+        }
         _ => rpc_error(&id, -32601, &format!("Method not found: {}", method)),
     };
     Json(result)
@@ -152,77 +184,137 @@ pub fn tools_list() -> Vec<serde_json::Value> {
     };
 
     let mut tools = vec![
-        tool("memory_search", "搜索记忆", serde_json::json!({
-            "query": {"type": "string", "description": "搜索关键词（必填）"},
-            "max_results": {"type": "number", "description": "最大返回结果数", "default": 5},
-            "tags": {"type": "string", "description": "标签过滤，JSON 数组字符串如 [\"a\",\"b\"]"},
-            "as_of": {"type": "string", "description": "P1-5 时序真值：仅返回该 ISO-8601 时刻有效的记忆；不传则默认 now，自动过滤已失效"}
-        })),
-        tool("memory_search_v2", "多信号融合搜索", serde_json::json!({
-            "query": {"type": "string", "description": "搜索关键词（必填）"},
-            "max_results": {"type": "number", "description": "最大返回结果数", "default": 5},
-            "tags": {"type": "string", "description": "标签过滤，JSON 数组字符串"},
-            "as_of": {"type": "string", "description": "P1-5 时序真值：仅返回该 ISO-8601 时刻有效的记忆；不传则默认 now，自动过滤已失效"}
-        })),
-        tool("memory_remember", "记录一条记忆", serde_json::json!({
-            "content": {"type": "string", "description": "记忆内容（必填）"},
-            "category": {"type": "string", "description": "类别，默认 fact"},
-            "importance": {"type": "number", "description": "重要度 1-5，默认 3"},
-            "source": {"type": "string", "description": "来源，默认 mcp"},
-            "tags": {"type": "string", "description": "标签 JSON 数组字符串"},
-            "valid_from": {"type": "string", "description": "P1-5 时序真值：记忆生效起点 ISO-8601（默认插入时刻）"},
-            "valid_to": {"type": "string", "description": "P1-5 时序真值：记忆失效点 ISO-8601（默认 NULL，长期有效）"}
-        })),
-        tool("memory_observe", "记录观察（低优先级）", serde_json::json!({
-            "dialog": {"type": "string", "description": "对话/观察内容"},
-            "role": {"type": "string", "description": "角色，默认 user"},
-            "source": {"type": "string", "description": "来源，默认 mcp"},
-            "session_id": {"type": "string", "description": "会话 ID"}
-        })),
-        tool("memory_quota_status", "查询本命名空间当前配额用量与上限（P2-2 滥用防护；写入=日限额，搜索=分钟限额，备份=小时限额）", serde_json::json!({
-            "namespace": {"type": "string", "description": "命名空间，默认 default"}
-        })),
-        tool("register_agent", "注册Agent（需要Admin key）", serde_json::json!({
-            "agent_id": {"type": "string", "description": "新 Agent ID"},
-            "display_name": {"type": "string", "description": "显示名"},
-            "admin_key": {"type": "string", "description": "Admin Key"},
-            "namespace": {"type": "string", "description": "命名空间"}
-        })),
-        tool("register_user", "注册个人登录账号（本地账密）：user_id + password，命名空间默认 agent/{user_id}（可选 namespace 覆盖）", serde_json::json!({
-            "user_id": {"type": "string", "description": "登录用户名（唯一）"},
-            "display_name": {"type": "string", "description": "显示名"},
-            "password": {"type": "string", "description": "登录口令"},
-            "namespace": {"type": "string", "description": "可选：命名空间覆盖（逗号分隔多个）"}
-        })),
-        tool("login_user", "个人账号登录：校验 user_id + password，成功回传 badge_token 供客户端后续鉴权", serde_json::json!({
-            "user_id": {"type": "string", "description": "登录用户名"},
-            "password": {"type": "string", "description": "登录口令"}
-        })),
-        tool("import_install_memories", "迁移记忆命名空间（需 Admin key）：把 from_ns 下记忆整体移到 to_ns（换设备/登录后归并旧记忆）。id=内容哈希与 ns 无关，故仅改 namespace，无需重建索引。", serde_json::json!({
-            "from_ns": {"type": "string", "description": "源命名空间"},
-            "to_ns": {"type": "string", "description": "目标命名空间"},
-            "admin_key": {"type": "string", "description": "Admin Key"}
-        })),
-        tool("get_allowed_ns", "返回当前调用者自身的命名空间授权列表（供 agent-core 按项目过滤 MCP 工具）", serde_json::json!({})),
-        tool("audit_query", "查询审计日志", serde_json::json!({
-            "limit": {"type": "number", "description": "返回条数，默认 50"}
-        })),
+        tool(
+            "memory_search",
+            "搜索记忆",
+            serde_json::json!({
+                "query": {"type": "string", "description": "搜索关键词（必填）"},
+                "max_results": {"type": "number", "description": "最大返回结果数", "default": 5},
+                "tags": {"type": "string", "description": "标签过滤，JSON 数组字符串如 [\"a\",\"b\"]"},
+                "as_of": {"type": "string", "description": "P1-5 时序真值：仅返回该 ISO-8601 时刻有效的记忆；不传则默认 now，自动过滤已失效"}
+            }),
+        ),
+        tool(
+            "memory_search_v2",
+            "多信号融合搜索",
+            serde_json::json!({
+                "query": {"type": "string", "description": "搜索关键词（必填）"},
+                "max_results": {"type": "number", "description": "最大返回结果数", "default": 5},
+                "tags": {"type": "string", "description": "标签过滤，JSON 数组字符串"},
+                "as_of": {"type": "string", "description": "P1-5 时序真值：仅返回该 ISO-8601 时刻有效的记忆；不传则默认 now，自动过滤已失效"}
+            }),
+        ),
+        tool(
+            "memory_remember",
+            "记录一条记忆",
+            serde_json::json!({
+                "content": {"type": "string", "description": "记忆内容（必填）"},
+                "category": {"type": "string", "description": "类别，默认 fact"},
+                "importance": {"type": "number", "description": "重要度 1-5，默认 3"},
+                "source": {"type": "string", "description": "来源，默认 mcp"},
+                "tags": {"type": "string", "description": "标签 JSON 数组字符串"},
+                "valid_from": {"type": "string", "description": "P1-5 时序真值：记忆生效起点 ISO-8601（默认插入时刻）"},
+                "valid_to": {"type": "string", "description": "P1-5 时序真值：记忆失效点 ISO-8601（默认 NULL，长期有效）"}
+            }),
+        ),
+        tool(
+            "memory_observe",
+            "记录观察（低优先级）",
+            serde_json::json!({
+                "dialog": {"type": "string", "description": "对话/观察内容"},
+                "role": {"type": "string", "description": "角色，默认 user"},
+                "source": {"type": "string", "description": "来源，默认 mcp"},
+                "session_id": {"type": "string", "description": "会话 ID"}
+            }),
+        ),
+        tool(
+            "memory_quota_status",
+            "查询本命名空间当前配额用量与上限（P2-2 滥用防护；写入=日限额，搜索=分钟限额，备份=小时限额）",
+            serde_json::json!({
+                "namespace": {"type": "string", "description": "命名空间，默认 default"}
+            }),
+        ),
+        tool(
+            "register_agent",
+            "注册Agent（需要Admin key）",
+            serde_json::json!({
+                "agent_id": {"type": "string", "description": "新 Agent ID"},
+                "display_name": {"type": "string", "description": "显示名"},
+                "admin_key": {"type": "string", "description": "Admin Key"},
+                "namespace": {"type": "string", "description": "命名空间"}
+            }),
+        ),
+        tool(
+            "register_user",
+            "注册个人登录账号（本地账密）：user_id + password，命名空间默认 agent/{user_id}（可选 namespace 覆盖）",
+            serde_json::json!({
+                "user_id": {"type": "string", "description": "登录用户名（唯一）"},
+                "display_name": {"type": "string", "description": "显示名"},
+                "password": {"type": "string", "description": "登录口令"},
+                "namespace": {"type": "string", "description": "可选：命名空间覆盖（逗号分隔多个）"}
+            }),
+        ),
+        tool(
+            "login_user",
+            "个人账号登录：校验 user_id + password，成功回传 badge_token 供客户端后续鉴权",
+            serde_json::json!({
+                "user_id": {"type": "string", "description": "登录用户名"},
+                "password": {"type": "string", "description": "登录口令"}
+            }),
+        ),
+        tool(
+            "import_install_memories",
+            "迁移记忆命名空间（需 Admin key）：把 from_ns 下记忆整体移到 to_ns（换设备/登录后归并旧记忆）。id=内容哈希与 ns 无关，故仅改 namespace，无需重建索引。",
+            serde_json::json!({
+                "from_ns": {"type": "string", "description": "源命名空间"},
+                "to_ns": {"type": "string", "description": "目标命名空间"},
+                "admin_key": {"type": "string", "description": "Admin Key"}
+            }),
+        ),
+        tool(
+            "get_allowed_ns",
+            "返回当前调用者自身的命名空间授权列表（供 agent-core 按项目过滤 MCP 工具）",
+            serde_json::json!({}),
+        ),
+        tool(
+            "audit_query",
+            "查询审计日志",
+            serde_json::json!({
+                "limit": {"type": "number", "description": "返回条数，默认 50"}
+            }),
+        ),
         tool("db_stats", "数据库统计", serde_json::json!({})),
-        tool("a2a_send", "向另一个Agent发送消息", serde_json::json!({
-            "to": {"type": "string", "description": "目标 Agent ID（必填）"},
-            "subject": {"type": "string", "description": "主题"},
-            "body": {"type": "string", "description": "正文"}
-        })),
-        tool("a2a_recv", "接收发给自己的消息", serde_json::json!({
-            "limit": {"type": "number", "description": "返回条数，默认 10"}
-        })),
-        tool("agent_list", "列出已注册的Agent（需要Admin key）", serde_json::json!({
-            "admin_key": {"type": "string", "description": "Admin Key"}
-        })),
-        tool("agent_revoke", "撤销Agent令牌（需要Admin key）", serde_json::json!({
-            "agent_id": {"type": "string", "description": "目标 Agent ID（必填）"},
-            "admin_key": {"type": "string", "description": "Admin Key"}
-        })),
+        tool(
+            "a2a_send",
+            "向另一个Agent发送消息",
+            serde_json::json!({
+                "to": {"type": "string", "description": "目标 Agent ID（必填）"},
+                "subject": {"type": "string", "description": "主题"},
+                "body": {"type": "string", "description": "正文"}
+            }),
+        ),
+        tool(
+            "a2a_recv",
+            "接收发给自己的消息",
+            serde_json::json!({
+                "limit": {"type": "number", "description": "返回条数，默认 10"}
+            }),
+        ),
+        tool(
+            "agent_list",
+            "列出已注册的Agent（需要Admin key）",
+            serde_json::json!({
+                "admin_key": {"type": "string", "description": "Admin Key"}
+            }),
+        ),
+        tool(
+            "agent_revoke",
+            "撤销Agent令牌（需要Admin key）",
+            serde_json::json!({
+                "agent_id": {"type": "string", "description": "目标 Agent ID（必填）"},
+                "admin_key": {"type": "string", "description": "Admin Key"}
+            }),
+        ),
     ];
     // Bridge 转发工具
     for name in BRIDGE_TOOLS {
@@ -238,49 +330,93 @@ pub fn tools_list() -> Vec<serde_json::Value> {
         tools.push(tool(name, desc, serde_json::json!({})));
     }
     // Skill Market 工具
-    tools.push(tool("skill_market_search", "搜索技能市场中的可用技能", serde_json::json!({
-        "query": {"type": "string", "description": "搜索关键词"},
-        "category": {"type": "string", "description": "技能分类"},
-        "max_results": {"type": "number", "description": "最大结果数，默认 10"}
-    })));
-    tools.push(tool("skill_market_info", "查看技能详细信息", serde_json::json!({
-        "name": {"type": "string", "description": "技能名（必填）"}
-    })));
-    tools.push(tool("skill_market_publish", "发布技能到市场（需要Admin key或同namespace）", serde_json::json!({
-        "name": {"type": "string", "description": "技能名（必填）"},
-        "admin_key": {"type": "string", "description": "Admin Key"},
-        "visibility": {"type": "string", "description": "可见性 public/tenant/<ns>"},
-        "description": {"type": "string", "description": "描述"},
-        "version": {"type": "string", "description": "版本，默认 1.0.0"},
-        "author": {"type": "string", "description": "作者"},
-        "category": {"type": "string", "description": "分类，默认 general"},
-        "steps": {"type": "string", "description": "步骤 JSON 数组字符串"},
-        "dependencies": {"type": "string", "description": "依赖 JSON 数组字符串"},
-        "source": {"type": "string", "description": "来源，默认 manual"}
-    })));
-    tools.push(tool("skill_market_install", "安装技能到指定Agent（需要Admin key或同namespace管理权）", serde_json::json!({
-        "skill_name": {"type": "string", "description": "技能名（必填）"},
-        "target_agent": {"type": "string", "description": "目标 Agent ID（必填）"},
-        "admin_key": {"type": "string", "description": "Admin Key"}
-    })));
-    tools.push(tool("skill_market_list_installed", "查询指定Agent已安装的技能列表", serde_json::json!({
-        "agent_id": {"type": "string", "description": "Agent ID（必填）"}
-    })));
+    tools.push(tool(
+        "skill_market_search",
+        "搜索技能市场中的可用技能",
+        serde_json::json!({
+            "query": {"type": "string", "description": "搜索关键词"},
+            "category": {"type": "string", "description": "技能分类"},
+            "max_results": {"type": "number", "description": "最大结果数，默认 10"}
+        }),
+    ));
+    tools.push(tool(
+        "skill_market_info",
+        "查看技能详细信息",
+        serde_json::json!({
+            "name": {"type": "string", "description": "技能名（必填）"}
+        }),
+    ));
+    tools.push(tool(
+        "skill_market_publish",
+        "发布技能到市场（需要Admin key或同namespace）",
+        serde_json::json!({
+            "name": {"type": "string", "description": "技能名（必填）"},
+            "admin_key": {"type": "string", "description": "Admin Key"},
+            "visibility": {"type": "string", "description": "可见性 public/tenant/<ns>"},
+            "description": {"type": "string", "description": "描述"},
+            "version": {"type": "string", "description": "版本，默认 1.0.0"},
+            "author": {"type": "string", "description": "作者"},
+            "category": {"type": "string", "description": "分类，默认 general"},
+            "steps": {"type": "string", "description": "步骤 JSON 数组字符串"},
+            "dependencies": {"type": "string", "description": "依赖 JSON 数组字符串"},
+            "source": {"type": "string", "description": "来源，默认 manual"}
+        }),
+    ));
+    tools.push(tool(
+        "skill_market_install",
+        "安装技能到指定Agent（需要Admin key或同namespace管理权）",
+        serde_json::json!({
+            "skill_name": {"type": "string", "description": "技能名（必填）"},
+            "target_agent": {"type": "string", "description": "目标 Agent ID（必填）"},
+            "admin_key": {"type": "string", "description": "Admin Key"}
+        }),
+    ));
+    tools.push(tool(
+        "skill_market_list_installed",
+        "查询指定Agent已安装的技能列表",
+        serde_json::json!({
+            "agent_id": {"type": "string", "description": "Agent ID（必填）"}
+        }),
+    ));
     // Phase 3 工具（decay/graph/prefs）
-    tools.push(tool("memory_decay", "运行衰减循环（降低旧记忆权重）", serde_json::json!({})));
-    tools.push(tool("memory_graph", "构建记忆关系图", serde_json::json!({
-        "batch_size": {"type": "number", "description": "批大小，默认 50"}
-    })));
+    tools.push(tool(
+        "memory_decay",
+        "运行衰减循环（降低旧记忆权重）",
+        serde_json::json!({}),
+    ));
+    tools.push(tool(
+        "memory_graph",
+        "构建记忆关系图",
+        serde_json::json!({
+            "batch_size": {"type": "number", "description": "批大小，默认 50"}
+        }),
+    ));
     tools.push(tool("memory_user_prefs", "获取用户偏好设置（按 ns 聚合，hard_rule 优先；写入走 memory_remember，category=preference，tags∈pref|hard_rule|style）", serde_json::json!({
         "tag": {"type": "string", "description": "可选：仅返回指定类型偏好 hard_rule|pref|style"}
     })));
-    tools.push(tool("memory_recent_decisions", "获取最近的决策记录", serde_json::json!({
-        "limit": {"type": "number", "description": "返回条数，默认 10"}
-    })));
+    tools.push(tool(
+        "memory_recent_decisions",
+        "获取最近的决策记录",
+        serde_json::json!({
+            "limit": {"type": "number", "description": "返回条数，默认 10"}
+        }),
+    ));
     // P0 工具（backup/health/dedup）
-    tools.push(tool("memory_backup", "手动触发数据库备份（GFS 轮转）", serde_json::json!({})));
-    tools.push(tool("memory_backup_list", "列出所有备份文件", serde_json::json!({})));
-    tools.push(tool("memory_health", "完整健康检查报告", serde_json::json!({})));
+    tools.push(tool(
+        "memory_backup",
+        "手动触发数据库备份（GFS 轮转）",
+        serde_json::json!({}),
+    ));
+    tools.push(tool(
+        "memory_backup_list",
+        "列出所有备份文件",
+        serde_json::json!({}),
+    ));
+    tools.push(tool(
+        "memory_health",
+        "完整健康检查报告",
+        serde_json::json!({}),
+    ));
     // ── P2-4 导入导出与迁移 ──
     tools.push(tool("memory_export", "导出某命名空间的记忆/实体为流式 JSONL（认证后；大库分块防 OOM）", serde_json::json!({
         "namespace": {"type": "string", "description": "命名空间，默认 default"},
@@ -291,15 +427,27 @@ pub fn tools_list() -> Vec<serde_json::Value> {
         "jsonl": {"type": "string", "description": "memory_export 产出的 JSONL 文本"},
         "on_conflict": {"type": "string", "description": "ignore（默认，跳过已存在）或 replace（覆盖）"}
     })));
-    tools.push(tool("memory_migration_manifest", "生成跨机迁移包清单：DB + HNSW 的 sha256 校验和与全表行数（admin；与 GFS 备份格式统一）", serde_json::json!({})));
-    tools.push(tool("memory_dedup_chain", "查询某条记忆的 superseded 链", serde_json::json!({
-        "memory_id": {"type": "string", "description": "记忆 ID（必填）"}
-    })));
-    tools.push(tool("memory_merge", "手动合并两条近义记忆（需 Admin key）", serde_json::json!({
-        "keep_id": {"type": "string", "description": "保留的记忆 ID（必填）"},
-        "merge_id": {"type": "string", "description": "被合并的记忆 ID（必填）"},
-        "admin_key": {"type": "string", "description": "Admin Key"}
-    })));
+    tools.push(tool(
+        "memory_migration_manifest",
+        "生成跨机迁移包清单：DB + HNSW 的 sha256 校验和与全表行数（admin；与 GFS 备份格式统一）",
+        serde_json::json!({}),
+    ));
+    tools.push(tool(
+        "memory_dedup_chain",
+        "查询某条记忆的 superseded 链",
+        serde_json::json!({
+            "memory_id": {"type": "string", "description": "记忆 ID（必填）"}
+        }),
+    ));
+    tools.push(tool(
+        "memory_merge",
+        "手动合并两条近义记忆（需 Admin key）",
+        serde_json::json!({
+            "keep_id": {"type": "string", "description": "保留的记忆 ID（必填）"},
+            "merge_id": {"type": "string", "description": "被合并的记忆 ID（必填）"},
+            "admin_key": {"type": "string", "description": "Admin Key"}
+        }),
+    ));
     // ── 暗知识层 A1：夜间巩固哑工具（认知在 agent-core，此处只做纯 SQL）──
     tools.push(tool("memory_fetch_unconsolidated", "取本命名空间中 created_at > since 的未巩固观察记录（供 agent-core 夜间巩固提炼；纯读取）", serde_json::json!({
         "namespace": {"type": "string", "description": "命名空间，默认 default"},
@@ -358,7 +506,10 @@ fn rpc_ok(id: &serde_json::Value, result: serde_json::Value) -> serde_json::Valu
 }
 
 fn rpc_ok_text(id: &serde_json::Value, text: &str) -> serde_json::Value {
-    rpc_ok(id, serde_json::json!({"content": [{"type": "text", "text": text}]}))
+    rpc_ok(
+        id,
+        serde_json::json!({"content": [{"type": "text", "text": text}]}),
+    )
 }
 
 fn rpc_error(id: &serde_json::Value, code: i32, msg: &str) -> serde_json::Value {
@@ -379,7 +530,11 @@ async fn handle_tool_call(
     // 联调：mcp.request span（与 agent-core http.request span 对接 x-trace-id 链）
     let span = tracing::info_span!("mcp.request", trace_id = %trace_id, tool = %tool, agent_id = %agent_id);
     let _guard = span.enter();
-    let args = params.get("arguments").and_then(|v| v.as_object()).cloned().unwrap_or_default();
+    let args = params
+        .get("arguments")
+        .and_then(|v| v.as_object())
+        .cloned()
+        .unwrap_or_default();
     let empty_args = serde_json::Map::new();
     let safe_args = if args.is_empty() { &empty_args } else { &args };
 
@@ -390,8 +545,18 @@ async fn handle_tool_call(
     let auth = match auth_result {
         Some(a) => a,
         None => {
-            spawn_audit(state, agent_id, tool, &serde_json::to_string(&args).unwrap_or_else(|_| format!("{:?}", args)), false);
-            return rpc_error(id, -32001, "Authentication failed. Send X-Agent-Id and X-Agent-Key headers.");
+            spawn_audit(
+                state,
+                agent_id,
+                tool,
+                &serde_json::to_string(&args).unwrap_or_else(|_| format!("{:?}", args)),
+                false,
+            );
+            return rpc_error(
+                id,
+                -32001,
+                "Authentication failed. Send X-Agent-Id and X-Agent-Key headers.",
+            );
         }
     };
 
@@ -400,14 +565,30 @@ async fn handle_tool_call(
         let text = serde_json::json!({
             "agent_id": auth.agent_id,
             "allowed_ns": auth.allowed_ns,
-        }).to_string();
-        spawn_audit(state, agent_id, tool, &format!("agent_id={}", auth.agent_id), true);
+        })
+        .to_string();
+        spawn_audit(
+            state,
+            agent_id,
+            tool,
+            &format!("agent_id={}", auth.agent_id),
+            true,
+        );
         return rpc_ok_text(id, &text);
     }
 
-    let ns = safe_args.get("namespace").and_then(|v| v.as_str()).unwrap_or("default");
+    let ns = safe_args
+        .get("namespace")
+        .and_then(|v| v.as_str())
+        .unwrap_or("default");
     if !auth::check_ns_access(&auth, ns) {
-        spawn_audit(state, agent_id, tool, &serde_json::to_string(&args).unwrap_or_else(|_| format!("{:?}", args)), false);
+        spawn_audit(
+            state,
+            agent_id,
+            tool,
+            &serde_json::to_string(&args).unwrap_or_else(|_| format!("{:?}", args)),
+            false,
+        );
         return rpc_error(id, -32002, &format!("Namespace '{}' not authorized.", ns));
     }
 
@@ -415,7 +596,13 @@ async fn handle_tool_call(
     if BRIDGE_TOOLS.contains(&tool) {
         let text = forward_to_bridge(state, tool, safe_args).await;
         let allowed = !text.contains(r#""error""#);
-        spawn_audit(state, agent_id, tool, &serde_json::to_string(&args).unwrap_or_else(|_| format!("{:?}", args)), allowed);
+        spawn_audit(
+            state,
+            agent_id,
+            tool,
+            &serde_json::to_string(&args).unwrap_or_else(|_| format!("{:?}", args)),
+            allowed,
+        );
         return rpc_ok_text(id, &text);
     }
 
@@ -437,9 +624,17 @@ async fn handle_tool_call(
         // `Object({"api_key": String("...")})` 会让 sanitize_params 走非 JSON 分支，
         // 其 value 提取在 `:` 后第一个空格截断 → 只把空格打码、真实密钥明文落库。
         // 改成 JSON 后走 sanitize_json_value 分支，按值正确打码（secret 卫生）。
-        spawn_audit(&st, &agent_id_owned, &tool_owned, &serde_json::to_string(&args_owned).unwrap_or_else(|_| format!("{:?}", args_owned)), allowed);
+        spawn_audit(
+            &st,
+            &agent_id_owned,
+            &tool_owned,
+            &serde_json::to_string(&args_owned).unwrap_or_else(|_| format!("{:?}", args_owned)),
+            allowed,
+        );
         text
-    }).await {
+    })
+    .await
+    {
         Ok(t) => t,
         Err(_) => "{\"error\":\"dispatch task panicked\"}".to_string(),
     };
@@ -448,7 +643,11 @@ async fn handle_tool_call(
 }
 
 /// 鉴权（同步 SQLite 查询隔离到阻塞线程池，不占 async worker）
-async fn authenticate_async(state: &Arc<AppState>, agent_id: &str, agent_key: &str) -> Option<auth::AuthResult> {
+async fn authenticate_async(
+    state: &Arc<AppState>,
+    agent_id: &str,
+    agent_key: &str,
+) -> Option<auth::AuthResult> {
     let st = state.clone();
     let a = agent_id.to_string();
     let k = agent_key.to_string();
@@ -474,11 +673,15 @@ fn spawn_audit(state: &Arc<AppState>, agent_id: &str, tool: &str, params: &str, 
 fn dream_cooldown(phase: &str) -> u64 {
     let key = format!("MEMORIA_DREAM_COOLDOWN_{}", phase.to_uppercase());
     if let Ok(v) = std::env::var(&key) {
-        if let Ok(secs) = v.parse::<u64>() { return secs; }
+        if let Ok(secs) = v.parse::<u64>() {
+            return secs;
+        }
     }
     // 兜底（未设环境变量时）
     if let Ok(v) = std::env::var("MEMORIA_DREAM_COOLDOWN_DEFAULT") {
-        if let Ok(secs) = v.parse::<u64>() { return secs; }
+        if let Ok(secs) = v.parse::<u64>() {
+            return secs;
+        }
     }
     match phase {
         "decay" => 60,
@@ -496,7 +699,8 @@ fn quota_error_json(kind: &str, limit: u64, retry_after_sec: u64) -> String {
         "kind": kind,
         "limit": limit,
         "retry_after_sec": retry_after_sec,
-    })).unwrap_or_default()
+    }))
+    .unwrap_or_default()
 }
 
 /// P2-2：配额闸门。写/搜对 admin 豁免（避免运维自锁）；备份本身已 admin 门禁，
@@ -517,20 +721,31 @@ fn dispatch(
     args: &serde_json::Map<String, serde_json::Value>,
     _auth: &AuthResult,
 ) -> String {
-    let ns = args.get("namespace").and_then(|v| v.as_str()).unwrap_or("default");
+    let ns = args
+        .get("namespace")
+        .and_then(|v| v.as_str())
+        .unwrap_or("default");
 
     match tool {
         "memory_search" | "memory_search_v2" => {
             // P2-2 配额：搜索 QPS（admin 豁免）
-            if let Some(err) = quota_gate(state, ns, memoria_core::quota::KIND_SEARCH, &_auth.role) {
+            if let Some(err) = quota_gate(state, ns, memoria_core::quota::KIND_SEARCH, &_auth.role)
+            {
                 return err;
             }
             let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
-            let max_results = args.get("max_results").and_then(|v| v.as_u64()).unwrap_or(5) as u32;
+            let max_results = args
+                .get("max_results")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(5) as u32;
             let tags_filter: Option<Vec<String>> = args.get("tags").and_then(|v| {
                 // tags 可以是 JSON 数组 ["a","b"] 或 JSON 字符串 "[\"a\",\"b\"]"
                 if let Some(arr) = v.as_array() {
-                    Some(arr.iter().filter_map(|t| t.as_str().map(String::from)).collect())
+                    Some(
+                        arr.iter()
+                            .filter_map(|t| t.as_str().map(String::from))
+                            .collect(),
+                    )
                 } else if let Some(s) = v.as_str() {
                     // 尝试作为 JSON 数组字符串解析
                     Some(serde_json::from_str::<Vec<String>>(s).unwrap_or_default())
@@ -543,21 +758,30 @@ fn dispatch(
             // 生产路径传入 hnsw/query_cache（运行时语义通道可用）；CI 评测无 embedding 后端时传 None。
             // P1-5: as_of 时序真值（默认 now → 自动过滤已失效记忆）。
             let now_str = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S").to_string();
-            let as_of: Option<&str> = args.get("as_of").and_then(|v| v.as_str())
+            let as_of: Option<&str> = args
+                .get("as_of")
+                .and_then(|v| v.as_str())
                 .or(Some(&now_str));
             let fused = search::hybrid::hybrid_search(
-                &state.pool, query, ns, max_results,
-                Some(&state.hnsw), Some(&state.query_cache), as_of,
-            ).unwrap_or_default();
+                &state.pool,
+                query,
+                ns,
+                max_results,
+                Some(&state.hnsw),
+                Some(&state.query_cache),
+                as_of,
+            )
+            .unwrap_or_default();
 
             // Tags 过滤（如果有）
             let filtered: Vec<search::rrf::FusedResult> = if let Some(ref tags) = tags_filter {
                 if tags.is_empty() {
                     fused
                 } else {
-                    fused.into_iter().filter(|r| {
-                        matches_memory_tags(&state.pool, &r.memory_id, tags)
-                    }).collect()
+                    fused
+                        .into_iter()
+                        .filter(|r| matches_memory_tags(&state.pool, &r.memory_id, tags))
+                        .collect()
                 }
             } else {
                 fused
@@ -567,14 +791,17 @@ fn dispatch(
                 serde_json::json!({"memory_id": r.memory_id, "content": truncate(&r.content, 2000), "rrf_score": r.rrf_score, "source": r.source})
             }).collect();
             serde_json::to_string(&serde_json::json!({"status":"ok","total_results":filtered.len(),"results":results})).unwrap_or_default()
-        },
+        }
         "memory_remember" => {
             // P2-2 配额：写入限流（admin 豁免）
             if let Some(err) = quota_gate(state, ns, memoria_core::quota::KIND_WRITE, &_auth.role) {
                 return err;
             }
             let content = args.get("content").and_then(|v| v.as_str()).unwrap_or("");
-            let cat = args.get("category").and_then(|v| v.as_str()).unwrap_or("fact");
+            let cat = args
+                .get("category")
+                .and_then(|v| v.as_str())
+                .unwrap_or("fact");
             let imp = args.get("importance").and_then(|v| v.as_i64()).unwrap_or(3);
             let src = args.get("source").and_then(|v| v.as_str()).unwrap_or("mcp");
             // tags: 支持 JSON 数组 ["a","b"] 或 JSON 字符串 "[\"a\",\"b\"]"
@@ -582,7 +809,11 @@ fn dispatch(
                 serde_json::to_string(arr).unwrap_or_else(|_| "[]".to_string())
             } else if let Some(s) = args.get("tags").and_then(|v| v.as_str()) {
                 // 已经是 JSON 字符串，确保格式正确
-                if s.is_empty() || s == "[]" { "[]".to_string() } else { s.to_string() }
+                if s.is_empty() || s == "[]" {
+                    "[]".to_string()
+                } else {
+                    s.to_string()
+                }
             } else {
                 "[]".to_string()
             };
@@ -591,25 +822,48 @@ fn dispatch(
             let valid_to = args.get("valid_to").and_then(|v| v.as_str());
             // P0: 带近义重复检测的 remember
             match tools::remember::remember_with_dedup(
-                &state.pool, content, cat, imp, src, ns, &tags,
-                Some(&state.hnsw), Some(&state.query_cache), valid_from, valid_to,
+                &state.pool,
+                content,
+                cat,
+                imp,
+                src,
+                ns,
+                &tags,
+                Some(&state.hnsw),
+                Some(&state.query_cache),
+                valid_from,
+                valid_to,
             ) {
                 Ok(result) => {
                     if result.action == "superseded_near_dup" && !result.superseded_ids.is_empty() {
-                        let pairs: Vec<String> = result.superseded_ids.iter().zip(result.similarities.iter())
-                            .map(|(id, sim)| format!("{{\"id\":\"{}\",\"similarity\":{}}}", id, (sim * 100.0).round() / 100.0))
+                        let pairs: Vec<String> = result
+                            .superseded_ids
+                            .iter()
+                            .zip(result.similarities.iter())
+                            .map(|(id, sim)| {
+                                format!(
+                                    "{{\"id\":\"{}\",\"similarity\":{}}}",
+                                    id,
+                                    (sim * 100.0).round() / 100.0
+                                )
+                            })
                             .collect();
                         format!(
                             r#"{{"status":"remembered","id":"{}","action":"{}","superseded":[{}]}}"#,
-                            result.id, result.action, pairs.join(",")
+                            result.id,
+                            result.action,
+                            pairs.join(",")
                         )
                     } else {
-                        format!(r#"{{"status":"remembered","id":"{}","action":"{}"}}"#, result.id, result.action)
+                        format!(
+                            r#"{{"status":"remembered","id":"{}","action":"{}"}}"#,
+                            result.id, result.action
+                        )
                     }
-                },
+                }
                 Err(e) => format!(r#"{{"status":"error","message":"{}"}}"#, e),
             }
-        },
+        }
         "memory_observe" => {
             // P2-2 配额：写入限流（admin 豁免）
             if let Some(err) = quota_gate(state, ns, memoria_core::quota::KIND_WRITE, &_auth.role) {
@@ -618,15 +872,18 @@ fn dispatch(
             let dialog = args.get("dialog").and_then(|v| v.as_str()).unwrap_or("");
             let role = args.get("role").and_then(|v| v.as_str()).unwrap_or("user");
             let src = args.get("source").and_then(|v| v.as_str()).unwrap_or("mcp");
-            let sid = args.get("session_id").and_then(|v| v.as_str()).unwrap_or("");
+            let sid = args
+                .get("session_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             match tools::observe::observe(&state.pool, dialog, role, src, sid, ns) {
                 Ok(id) => format!(r#"{{"status":"observed","id":"{}"}}"#, id),
                 Err(e) => format!(r#"{{"status":"error","message":"{}"}}"#, e),
             }
-        },
+        }
         "memory_quota_status" => {
             // P2-2：返回本 ns 当前配额用量与上限（写入=日、搜索=分钟、备份=小时）
-            use memoria_core::quota::{KIND_WRITE, KIND_SEARCH, KIND_BACKUP};
+            use memoria_core::quota::{KIND_BACKUP, KIND_SEARCH, KIND_WRITE};
             let kinds: [(&str, &str, &str); 3] = [
                 ("write", KIND_WRITE, "MEMORIA_QUOTA_WRITES_PER_DAY"),
                 ("search", KIND_SEARCH, "MEMORIA_QUOTA_SEARCHES_PER_MIN"),
@@ -636,39 +893,52 @@ fn dispatch(
             for (label, k, env_key) in &kinds {
                 let window = memoria_core::quota::quota_window(k);
                 let limit: serde_json::Value = std::env::var(env_key)
-                    .ok().and_then(|v| v.parse::<u64>().ok())
+                    .ok()
+                    .and_then(|v| v.parse::<u64>().ok())
                     .map(|n| serde_json::json!(n))
                     .unwrap_or_else(|| serde_json::json!(memoria_core::quota::quota_limit(k)));
                 let used = memoria_core::quota::current_usage(&state.pool, ns, k);
-                quotas.insert(label.to_string(), serde_json::json!({
-                    "window": window,
-                    "limit": limit,
-                    "used": used,
-                }));
+                quotas.insert(
+                    label.to_string(),
+                    serde_json::json!({
+                        "window": window,
+                        "limit": limit,
+                        "used": used,
+                    }),
+                );
             }
             serde_json::to_string(&serde_json::json!({
                 "status": "ok",
                 "namespace": ns,
                 "quotas": quotas,
-            })).unwrap_or_default()
-        },
+            }))
+            .unwrap_or_default()
+        }
         "memory_export" => {
             // P2-4：导出本 ns 记忆/实体为流式 JSONL（权限矩阵已按 NamespaceArg 校验 ns 归属）
-            let include_vectors = args.get("include_vectors").and_then(|v| v.as_bool()).unwrap_or(false);
+            let include_vectors = args
+                .get("include_vectors")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
             match memoria_core::tools::imp_exp::export_ns(&state.pool, ns, include_vectors) {
                 Ok(jsonl) => serde_json::to_string(&serde_json::json!({
                     "status": "ok",
                     "namespace": ns,
                     "bytes": jsonl.len(),
                     "export": jsonl,
-                })).unwrap_or_default(),
+                }))
+                .unwrap_or_default(),
                 Err(e) => format!(r#"{{"status":"error","message":"{}"}}"#, e),
             }
-        },
+        }
         "memory_import" => {
             // P2-4：从 JSONL 导入到本 ns（INSERT OR IGNORE 幂等；内部校验每行 ns 一致）
             let jsonl = args.get("jsonl").and_then(|v| v.as_str()).unwrap_or("");
-            let on_conflict = match args.get("on_conflict").and_then(|v| v.as_str()).unwrap_or("ignore") {
+            let on_conflict = match args
+                .get("on_conflict")
+                .and_then(|v| v.as_str())
+                .unwrap_or("ignore")
+            {
                 "replace" => memoria_core::tools::imp_exp::OnConflict::Replace,
                 _ => memoria_core::tools::imp_exp::OnConflict::Ignore,
             };
@@ -682,38 +952,58 @@ fn dispatch(
                     "inserted": report.inserted,
                     "ignored": report.ignored,
                     "errors": report.errors,
-                })).unwrap_or_default(),
+                }))
+                .unwrap_or_default(),
                 Err(e) => format!(r#"{{"status":"error","message":"{}"}}"#, e),
             }
-        },
+        }
         "memory_migration_manifest" => {
             // P2-4：迁移包清单（admin 专属，暴露全库行数 + DB/HNSW 校验和）
             if _auth.role != "admin" {
                 return r#"{"status":"error","message":"admin required"}"#.to_string();
             }
-            match memoria_core::tools::imp_exp::build_migration_manifest(&state.pool, &state.db_path, &state.vec_index_path) {
-                Ok(manifest) => serde_json::to_string(&serde_json::json!({"status":"ok","manifest":manifest})).unwrap_or_default(),
+            match memoria_core::tools::imp_exp::build_migration_manifest(
+                &state.pool,
+                &state.db_path,
+                &state.vec_index_path,
+            ) {
+                Ok(manifest) => {
+                    serde_json::to_string(&serde_json::json!({"status":"ok","manifest":manifest}))
+                        .unwrap_or_default()
+                }
                 Err(e) => format!(r#"{{"status":"error","message":"{}"}}"#, e),
             }
-        },
+        }
         "register_agent" => {
             let new_id = args.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
-            let display_name = args.get("display_name").and_then(|v| v.as_str()).unwrap_or(new_id);
+            let display_name = args
+                .get("display_name")
+                .and_then(|v| v.as_str())
+                .unwrap_or(new_id);
             let admin_key = args.get("admin_key").and_then(|v| v.as_str()).unwrap_or("");
             // P0-1：统一 admin 门禁（角色优先 + body key 兜底）
             if !crate::permissions::require_admin(&_auth, admin_key, &state.admin_key) {
                 return r#"{"status":"error","message":"admin required"}"#.to_string();
             }
             let default_ns = format!("agent/{}", new_id);
-            let ns = args.get("namespace").and_then(|v| v.as_str()).unwrap_or(&default_ns);
+            let ns = args
+                .get("namespace")
+                .and_then(|v| v.as_str())
+                .unwrap_or(&default_ns);
             match auth::register_agent(&state.auth_pool, new_id, display_name, &[ns], "user") {
-                Ok(badge) => serde_json::to_string(&serde_json::json!({"status":"registered","badge":badge})).unwrap_or_default(),
+                Ok(badge) => {
+                    serde_json::to_string(&serde_json::json!({"status":"registered","badge":badge}))
+                        .unwrap_or_default()
+                }
                 Err(e) => format!(r#"{{"status":"error","message":"{}"}}"#, e),
             }
-        },
+        }
         "register_user" => {
             let user_id = args.get("user_id").and_then(|v| v.as_str()).unwrap_or("");
-            let display_name = args.get("display_name").and_then(|v| v.as_str()).unwrap_or(user_id);
+            let display_name = args
+                .get("display_name")
+                .and_then(|v| v.as_str())
+                .unwrap_or(user_id);
             let password = args.get("password").and_then(|v| v.as_str()).unwrap_or("");
             if user_id.is_empty() || password.is_empty() {
                 return r#"{"status":"error","message":"user_id 与 password 必填"}"#.to_string();
@@ -723,15 +1013,22 @@ fn dispatch(
                 return r#"{"status":"error","message":"口令至少 6 位"}"#.to_string();
             }
             let ns_override = args.get("namespace").and_then(|v| v.as_str());
-            match auth::register_user(&state.auth_pool, user_id, display_name, password, ns_override) {
+            match auth::register_user(
+                &state.auth_pool,
+                user_id,
+                display_name,
+                password,
+                ns_override,
+            ) {
                 Ok(badge) => serde_json::to_string(&serde_json::json!({
                     "status": "registered",
                     "agent_id": badge.agent_id,
                     "namespace": badge.namespace
-                })).unwrap_or_default(),
+                }))
+                .unwrap_or_default(),
                 Err(e) => format!(r#"{{"status":"error","message":"{}"}}"#, e),
             }
-        },
+        }
         "login_user" => {
             let user_id = args.get("user_id").and_then(|v| v.as_str()).unwrap_or("");
             let password = args.get("password").and_then(|v| v.as_str()).unwrap_or("");
@@ -745,10 +1042,11 @@ fn dispatch(
                     "display_name": badge.display_name,
                     "namespace": badge.namespace,
                     "badge_token": badge.badge_token
-                })).unwrap_or_default(),
+                }))
+                .unwrap_or_default(),
                 Err(e) => format!(r#"{{"status":"error","message":"{}"}}"#, e),
             }
-        },
+        }
         "import_install_memories" => {
             let from_ns = args.get("from_ns").and_then(|v| v.as_str()).unwrap_or("");
             let to_ns = args.get("to_ns").and_then(|v| v.as_str()).unwrap_or("");
@@ -758,26 +1056,33 @@ fn dispatch(
                 return r#"{"status":"error","message":"admin required"}"#.to_string();
             }
             if from_ns.is_empty() || to_ns.is_empty() || from_ns == to_ns {
-                return r#"{"status":"error","message":"from_ns / to_ns 必填且不能相同"}"#.to_string();
+                return r#"{"status":"error","message":"from_ns / to_ns 必填且不能相同"}"#
+                    .to_string();
             }
             match state.pool.get() {
                 Ok(conn) => {
                     // 迁移仅改 namespace 列：memory id = SHA256(content) 与 ns 无关，
                     // 全局唯一 PK；HNSW 按 id 索引、FTS 索引 content，均不含 ns，
                     // 故移动 ns 后向量/全文索引仍指向同一条记忆，无需重建。
-                    let n1 = conn.execute(
-                        "UPDATE memories SET namespace=?1 WHERE namespace=?2",
-                        rusqlite::params![to_ns, from_ns],
-                    ).unwrap_or(0);
-                    let n2 = conn.execute(
-                        "UPDATE memory_relations SET namespace=?1 WHERE namespace=?2",
-                        rusqlite::params![to_ns, from_ns],
-                    ).unwrap_or(0);
+                    let n1 = conn
+                        .execute(
+                            "UPDATE memories SET namespace=?1 WHERE namespace=?2",
+                            rusqlite::params![to_ns, from_ns],
+                        )
+                        .unwrap_or(0);
+                    let n2 = conn
+                        .execute(
+                            "UPDATE memory_relations SET namespace=?1 WHERE namespace=?2",
+                            rusqlite::params![to_ns, from_ns],
+                        )
+                        .unwrap_or(0);
                     // user_prefs（B3 已加 namespace 列）一并迁移；若无该列则忽略。
-                    let n3 = conn.execute(
-                        "UPDATE user_prefs SET namespace=?1 WHERE namespace=?2",
-                        rusqlite::params![to_ns, from_ns],
-                    ).unwrap_or(0);
+                    let n3 = conn
+                        .execute(
+                            "UPDATE user_prefs SET namespace=?1 WHERE namespace=?2",
+                            rusqlite::params![to_ns, from_ns],
+                        )
+                        .unwrap_or(0);
                     format!(
                         r#"{{"status":"ok","memories_moved":{},"relations_moved":{},"prefs_moved":{}}}"#,
                         n1, n2, n3
@@ -785,7 +1090,7 @@ fn dispatch(
                 }
                 Err(e) => format!(r#"{{"status":"error","message":"pool: {}"}}"#, e),
             }
-        },
+        }
         "audit_query" => {
             let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as u32;
             match state.auth_pool.get() {
@@ -797,15 +1102,28 @@ fn dispatch(
                             .map(|rows| rows.filter_map(|r| r.ok()).collect()))
                         .unwrap_or_default();
                     if tables.is_empty() {
-                        return serde_json::to_string(&serde_json::json!({"status":"ok","logs":[]})).unwrap_or_default();
+                        return serde_json::to_string(
+                            &serde_json::json!({"status":"ok","logs":[]}),
+                        )
+                        .unwrap_or_default();
                     }
-                    let union_sql: String = tables.iter()
-                        .map(|t| format!("SELECT agent_id, tool, params, allowed, timestamp FROM {}", t))
+                    let union_sql: String = tables
+                        .iter()
+                        .map(|t| {
+                            format!(
+                                "SELECT agent_id, tool, params, allowed, timestamp FROM {}",
+                                t
+                            )
+                        })
                         .collect::<Vec<_>>()
                         .join(" UNION ALL ");
-                    let full_sql = format!("SELECT * FROM ({}) AS all_logs ORDER BY timestamp DESC LIMIT ?", union_sql);
+                    let full_sql = format!(
+                        "SELECT * FROM ({}) AS all_logs ORDER BY timestamp DESC LIMIT ?",
+                        union_sql
+                    );
                     let mut stmt = match conn.prepare(&full_sql) {
-                        Ok(s) => s, Err(e) => return format!(r#"{{"error":"{}"}}"#, e),
+                        Ok(s) => s,
+                        Err(e) => return format!(r#"{{"error":"{}"}}"#, e),
                     };
                     let rows = stmt.query_map(rusqlite::params![limit], |row| {
                         Ok(serde_json::json!({"agent_id":row.get::<_,String>(0)?,"tool":row.get::<_,String>(1)?,"params":row.get::<_,String>(2)?,"allowed":row.get::<_,i32>(3)?,"timestamp":row.get::<_,String>(4)?}))
@@ -814,11 +1132,12 @@ fn dispatch(
                         Ok(r) => r.flatten().collect(),
                         Err(_) => vec![],
                     };
-                    serde_json::to_string(&serde_json::json!({"status":"ok","logs":items})).unwrap_or_default()
-                },
+                    serde_json::to_string(&serde_json::json!({"status":"ok","logs":items}))
+                        .unwrap_or_default()
+                }
                 Err(e) => format!(r#"{{"error":"{}"}}"#, e),
             }
-        },
+        }
         "db_stats" => {
             // P0-1 修复：全库统计含 agent_registry / 审计总数 / HNSW 向量数，需 admin 门禁
             let ak = args.get("admin_key").and_then(|v| v.as_str()).unwrap_or("");
@@ -826,50 +1145,114 @@ fn dispatch(
                 return r#"{"status":"error","message":"admin required"}"#.to_string();
             }
             let conn = match state.pool.get() {
-                Ok(c) => c, Err(e) => return format!(r#"{{"error":"{}"}}"#, e),
+                Ok(c) => c,
+                Err(e) => return format!(r#"{{"error":"{}"}}"#, e),
             };
             let auth_conn = match state.auth_pool.get() {
-                Ok(c) => c, Err(e) => return format!(r#"{{"error":"{}"}}"#, e),
+                Ok(c) => c,
+                Err(e) => return format!(r#"{{"error":"{}"}}"#, e),
             };
-            let tables = ["memories","messages","sessions","decisions","user_prefs",
-                          "memory_relations","decay_log","dream_state"];
+            let tables = [
+                "memories",
+                "messages",
+                "sessions",
+                "decisions",
+                "user_prefs",
+                "memory_relations",
+                "decay_log",
+                "dream_state",
+            ];
             let auth_tables = ["agent_registry"];
             let mut m = serde_json::Map::new();
             for t in &tables {
-                let c: i64 = conn.query_row(&format!("SELECT COUNT(*) FROM {}", t),[],|r|r.get(0)).unwrap_or(0);
+                let c: i64 = conn
+                    .query_row(&format!("SELECT COUNT(*) FROM {}", t), [], |r| r.get(0))
+                    .unwrap_or(0);
                 m.insert(t.to_string(), serde_json::Value::Number(c.into()));
             }
             for t in &auth_tables {
-                let c: i64 = auth_conn.query_row(&format!("SELECT COUNT(*) FROM {}", t),[],|r|r.get(0)).unwrap_or(0);
+                let c: i64 = auth_conn
+                    .query_row(&format!("SELECT COUNT(*) FROM {}", t), [], |r| r.get(0))
+                    .unwrap_or(0);
                 m.insert(t.to_string(), serde_json::Value::Number(c.into()));
             }
             // 审计总行数（跨分区）
             let audit_count: i64 = auth_conn
-                .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'audit_log_%'")
+                .prepare(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'audit_log_%'",
+                )
                 .and_then(|mut stmt| {
-                    let tables: Vec<String> = stmt.query_map([], |row| row.get::<_, String>(0))
-                        .map(|rows| rows.filter_map(|r| r.ok()).collect()).unwrap_or_default();
+                    let tables: Vec<String> = stmt
+                        .query_map([], |row| row.get::<_, String>(0))
+                        .map(|rows| rows.filter_map(|r| r.ok()).collect())
+                        .unwrap_or_default();
                     let mut total: i64 = 0;
                     for t in tables {
-                        if let Ok(c) = auth_conn.query_row(&format!("SELECT COUNT(*) FROM {}", t), [], |r| r.get::<_, i64>(0)) {
+                        if let Ok(c) =
+                            auth_conn.query_row(&format!("SELECT COUNT(*) FROM {}", t), [], |r| {
+                                r.get::<_, i64>(0)
+                            })
+                        {
                             total += c;
                         }
                     }
                     Ok(total)
                 })
                 .unwrap_or(0);
-            m.insert("audit_log_total".to_string(), serde_json::Value::Number(audit_count.into()));
-            m.insert("hnsw_vectors".to_string(), serde_json::Value::Number((state.hnsw.len() as i64).into()));
+            m.insert(
+                "audit_log_total".to_string(),
+                serde_json::Value::Number(audit_count.into()),
+            );
+            m.insert(
+                "hnsw_vectors".to_string(),
+                serde_json::Value::Number((state.hnsw.len() as i64).into()),
+            );
             serde_json::to_string(&serde_json::json!({"status":"ok","stats":m})).unwrap_or_default()
-        },
+        }
         "a2a_send" => {
             let to = args.get("to").and_then(|v| v.as_str()).unwrap_or("");
             let subject = args.get("subject").and_then(|v| v.as_str()).unwrap_or("");
             let body = args.get("body").and_then(|v| v.as_str()).unwrap_or("");
-            if to.is_empty() { return format!(r#"{{"status":"error","message":"missing 'to'"}}"#); }
+            // PFAiX 协作收件箱（A2A）：结构化信封支持。
+            // 优先使用调用方直接传入的 content（JSON 字符串，审批流即如此）或 envelope（JSON 对象），
+            // 兼容旧版 subject/body 文本格式。修复 latent bug：旧实现忽略 content 参数，
+            // 导致审批流发送的 JSON 信封被丢弃为 "[ ] "。
+            let raw_content = match args.get("content") {
+                Some(serde_json::Value::String(s)) => s.clone(),
+                Some(other) => serde_json::to_string(other)
+                    .unwrap_or_else(|_| format!("[{}] {}", subject, body)),
+                None => {
+                    if let Some(env) = args.get("envelope") {
+                        serde_json::to_string(env)
+                            .unwrap_or_else(|_| format!("[{}] {}", subject, body))
+                    } else {
+                        format!("[{}] {}", subject, body)
+                    }
+                }
+            };
+            // 审计摘要：优先取信封里的 subject，否则用旧 subject
+            let audit_subject = if let Some(serde_json::Value::String(s)) = args.get("content") {
+                serde_json::from_str::<serde_json::Value>(s)
+                    .ok()
+                    .and_then(|v| {
+                        v.get("subject")
+                            .and_then(|x| x.as_str())
+                            .map(|x| x.to_string())
+                    })
+                    .unwrap_or_else(|| subject.to_string())
+            } else {
+                subject.to_string()
+            };
+            if to.is_empty() {
+                return format!(r#"{{"status":"error","message":"missing 'to'"}}"#);
+            }
             // P1-6：to 格式校验 — 仅允许字母数字连字符（agent-id 格式），
             // 拒绝含 ".." ".." "/" 等路径遍历/注入字符。
-            if !to.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') || to.len() > 64 {
+            if !to
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+                || to.len() > 64
+            {
                 return r#"{"status":"error","message":"invalid 'to' format: agent-id only, max 64 chars"}"#.to_string();
             }
             // P0-M1 修复：校验目标 Agent 的命名空间属于调用者授权范围，
@@ -878,7 +1261,9 @@ fn dispatch(
             let target_ns = format!("agent/{}", to);
             let self_msg = to == _auth.agent_id;
             if !self_msg && !auth::check_ns_access(_auth, &target_ns) {
-                return format!(r#"{{"status":"error","message":"无权向该 Agent 发送消息（超出命名空间授权范围）"}}"#);
+                return format!(
+                    r#"{{"status":"error","message":"无权向该 Agent 发送消息（超出命名空间授权范围）"}}"#
+                );
             }
             match state.pool.get() {
                 Ok(conn) => {
@@ -887,40 +1272,50 @@ fn dispatch(
                          VALUES (?, ?, ?, ?, 'a2a_message', 1.0, datetime('now'), 'hot', 2)",
                         rusqlite::params![format!("a2a_{}", uuid::Uuid::new_v4()), format!("agent/{}", to),
                                           format!("agent:{}", _auth.agent_id),
-                                          format!("[{}] {}", subject, body)],
+                                          raw_content.clone()],
                     );
                     // P1-6：a2a_send 审计（记录目标 agent + subject 摘要）
-                    auth::audit_log(&state.auth_pool, &_auth.agent_id, "a2a_send",
-                        &format!("to={},subject={:.40}", to, subject), true);
+                    auth::audit_log(
+                        &state.auth_pool,
+                        &_auth.agent_id,
+                        "a2a_send",
+                        &format!("to={},subject={:.40}", to, audit_subject),
+                        true,
+                    );
                     format!(r#"{{"status":"sent","to":"{}"}}"#, to)
-                },
+                }
                 Err(e) => format!(r#"{{"status":"error","message":"{}"}}"#, e),
             }
-        },
+        }
         "a2a_recv" => {
             let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(10) as u32;
             match state.pool.get() {
                 Ok(conn) => {
                     let result = (|| -> Result<String, String> {
-                        let mut stmt = conn.prepare(
-                            "SELECT id, source, content, created_at FROM memories
+                        let mut stmt = conn
+                            .prepare(
+                                "SELECT id, source, content, created_at FROM memories
                              WHERE namespace = ? AND category = 'a2a_message'
-                             ORDER BY created_at DESC LIMIT ?"
-                        ).map_err(|e| format!("prepare: {}", e))?;
+                             ORDER BY created_at DESC LIMIT ?",
+                            )
+                            .map_err(|e| format!("prepare: {}", e))?;
                         let rows: Vec<serde_json::Value> = stmt.query_map(
                             rusqlite::params![format!("agent/{}", _auth.agent_id), limit],
                             |row| Ok(serde_json::json!({"id":row.get::<_,String>(0)?,"from":row.get::<_,String>(1)?,"content":row.get::<_,String>(2)?,"time":row.get::<_,String>(3)?}))
                         ).map_err(|e| format!("query: {}", e))?.flatten().collect();
-                        Ok(serde_json::to_string(&serde_json::json!({"status":"ok","messages":rows})).unwrap_or_default())
+                        Ok(serde_json::to_string(
+                            &serde_json::json!({"status":"ok","messages":rows}),
+                        )
+                        .unwrap_or_default())
                     })();
                     match result {
                         Ok(s) => s,
                         Err(e) => format!(r#"{{"status":"error","message":"{}"}}"#, e),
                     }
-                },
+                }
                 Err(e) => format!(r#"{{"status":"error","message":"{}"}}"#, e),
             }
-        },
+        }
         "agent_list" => {
             let admin_key = args.get("admin_key").and_then(|v| v.as_str()).unwrap_or("");
             // P0-1：统一 admin 门禁（角色优先 + body key 兜底）
@@ -938,19 +1333,26 @@ fn dispatch(
                             "namespace":row.get::<_,String>(2)?,"permission":row.get::<_,String>(3)?,
                             "registered_at":row.get::<_,String>(4)?
                         }))).map_err(|e| format!("query: {}", e))?.flatten().collect();
-                        Ok(serde_json::to_string(&serde_json::json!({"status":"ok","agents":rows})).unwrap_or_default())
+                        Ok(
+                            serde_json::to_string(
+                                &serde_json::json!({"status":"ok","agents":rows}),
+                            )
+                            .unwrap_or_default(),
+                        )
                     })();
                     match result {
                         Ok(s) => s,
                         Err(e) => format!(r#"{{"status":"error","message":"{}"}}"#, e),
                     }
-                },
+                }
                 Err(e) => format!(r#"{{"status":"error","message":"{}"}}"#, e),
             }
-        },
+        }
         "agent_revoke" => {
             let target = args.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
-            if target.is_empty() { return format!(r#"{{"status":"error","message":"missing agent_id"}}"#); }
+            if target.is_empty() {
+                return format!(r#"{{"status":"error","message":"missing agent_id"}}"#);
+            }
             // 只有 admin 可以吊销 agent
             let admin_key = args.get("admin_key").and_then(|v| v.as_str()).unwrap_or("");
             // P0-1：统一 admin 门禁（角色优先 + body key 兜底）
@@ -959,18 +1361,32 @@ fn dispatch(
             }
             match state.auth_pool.get() {
                 Ok(conn) => {
-                    let n = conn.execute("DELETE FROM agent_registry WHERE agent_id = ?", rusqlite::params![target])
+                    let n = conn
+                        .execute(
+                            "DELETE FROM agent_registry WHERE agent_id = ?",
+                            rusqlite::params![target],
+                        )
                         .unwrap_or(0);
-                    format!(r#"{{"status":"revoked","agent_id":"{}","deleted":{}}}"#, target, n)
-                },
+                    format!(
+                        r#"{{"status":"revoked","agent_id":"{}","deleted":{}}}"#,
+                        target, n
+                    )
+                }
                 Err(e) => format!(r#"{{"status":"error","message":"{}"}}"#, e),
             }
-        },
+        }
         "skill_market_search" => {
             let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
             let category = args.get("category").and_then(|v| v.as_str()).unwrap_or("");
-            let max_results = args.get("max_results").and_then(|v| v.as_u64()).unwrap_or(10) as u32;
-            let caller_ns = _auth.allowed_ns.first().map(|s| s.as_str()).unwrap_or("default");
+            let max_results = args
+                .get("max_results")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(10) as u32;
+            let caller_ns = _auth
+                .allowed_ns
+                .first()
+                .map(|s| s.as_str())
+                .unwrap_or("default");
             match state.auth_pool.get() {
                 Ok(conn) => {
                     let like = format!("%{}%", query);
@@ -1005,14 +1421,17 @@ fn dispatch(
                             }
                         }
                     }
-                    serde_json::to_string(&serde_json::json!({"status":"ok","results":rows})).unwrap_or_default()
-                },
+                    serde_json::to_string(&serde_json::json!({"status":"ok","results":rows}))
+                        .unwrap_or_default()
+                }
                 Err(e) => format!(r#"{{"status":"error","message":"{}"}}"#, e),
             }
-        },
+        }
         "skill_market_info" => {
             let name = args.get("name").and_then(|v| v.as_str()).unwrap_or("");
-            if name.is_empty() { return r#"{"status":"error","message":"missing name"}"#.to_string(); }
+            if name.is_empty() {
+                return r#"{"status":"error","message":"missing name"}"#.to_string();
+            }
             match state.auth_pool.get() {
                 Ok(conn) => {
                     let row = conn.query_row(
@@ -1029,25 +1448,54 @@ fn dispatch(
                             "source": row.get::<_,String>(11)?, "published_at": row.get::<_,String>(12)?}))
                     );
                     match row {
-                        Ok(skill) => serde_json::to_string(&serde_json::json!({"status":"ok","skill":skill})).unwrap_or_default(),
-                        Err(_) => format!(r#"{{"status":"error","message":"skill '{}' not found"}}"#, name),
+                        Ok(skill) => {
+                            serde_json::to_string(&serde_json::json!({"status":"ok","skill":skill}))
+                                .unwrap_or_default()
+                        }
+                        Err(_) => format!(
+                            r#"{{"status":"error","message":"skill '{}' not found"}}"#,
+                            name
+                        ),
                     }
-                },
+                }
                 Err(e) => format!(r#"{{"status":"error","message":"{}"}}"#, e),
             }
-        },
+        }
         "skill_market_publish" => {
             let name = args.get("name").and_then(|v| v.as_str()).unwrap_or("");
-            if name.is_empty() { return r#"{"status":"error","message":"missing name"}"#.to_string(); }
+            if name.is_empty() {
+                return r#"{"status":"error","message":"missing name"}"#.to_string();
+            }
             let admin_key = args.get("admin_key").and_then(|v| v.as_str()).unwrap_or("");
-            let visibility = args.get("visibility").and_then(|v| v.as_str()).unwrap_or("public");
-            let description = args.get("description").and_then(|v| v.as_str()).unwrap_or("");
-            let version = args.get("version").and_then(|v| v.as_str()).unwrap_or("1.0.0");
+            let visibility = args
+                .get("visibility")
+                .and_then(|v| v.as_str())
+                .unwrap_or("public");
+            let description = args
+                .get("description")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let version = args
+                .get("version")
+                .and_then(|v| v.as_str())
+                .unwrap_or("1.0.0");
             let author = args.get("author").and_then(|v| v.as_str()).unwrap_or("");
-            let category = args.get("category").and_then(|v| v.as_str()).unwrap_or("general");
-            let steps = args.get("steps").map(|v| v.to_string()).unwrap_or_else(|| "[]".to_string());
-            let dependencies = args.get("dependencies").map(|v| v.to_string()).unwrap_or_else(|| "[]".to_string());
-            let source = args.get("source").and_then(|v| v.as_str()).unwrap_or("manual");
+            let category = args
+                .get("category")
+                .and_then(|v| v.as_str())
+                .unwrap_or("general");
+            let steps = args
+                .get("steps")
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "[]".to_string());
+            let dependencies = args
+                .get("dependencies")
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "[]".to_string());
+            let source = args
+                .get("source")
+                .and_then(|v| v.as_str())
+                .unwrap_or("manual");
 
             // 权限检查：admin_key 或 require_admin（精确角色，非子串）
             if !auth::ct_eq(admin_key, &state.admin_key) && _auth.role != "admin" {
@@ -1075,29 +1523,46 @@ fn dispatch(
                         rusqlite::params![name, description, version, author, category, visibility,
                                           steps, dependencies, source, now, now, _auth.agent_id],
                     ).ok();
-                    format!(r#"{{"status":"published","name":"{}","visibility":"{}"}}"#, name, visibility)
-                },
+                    format!(
+                        r#"{{"status":"published","name":"{}","visibility":"{}"}}"#,
+                        name, visibility
+                    )
+                }
                 Err(e) => format!(r#"{{"status":"error","message":"{}"}}"#, e),
             };
             // P1-6：publish 审计（记录 name + visibility）
             if publish_result.contains("\"status\":\"published\"") {
-                auth::audit_log(&state.auth_pool, &_auth.agent_id, "skill_market_publish",
-                    &format!("name={},visibility={}", name, visibility), true);
+                auth::audit_log(
+                    &state.auth_pool,
+                    &_auth.agent_id,
+                    "skill_market_publish",
+                    &format!("name={},visibility={}", name, visibility),
+                    true,
+                );
             }
             return publish_result;
-        },
+        }
         "skill_market_install" => {
-            let skill_name = args.get("skill_name").and_then(|v| v.as_str()).unwrap_or("");
-            let target_agent = args.get("target_agent").and_then(|v| v.as_str()).unwrap_or("");
+            let skill_name = args
+                .get("skill_name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let target_agent = args
+                .get("target_agent")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             let admin_key = args.get("admin_key").and_then(|v| v.as_str()).unwrap_or("");
             if skill_name.is_empty() || target_agent.is_empty() {
-                return r#"{"status":"error","message":"missing skill_name or target_agent"}"#.to_string();
+                return r#"{"status":"error","message":"missing skill_name or target_agent"}"#
+                    .to_string();
             }
 
             // 权限检查：admin_key 或 同 namespace
             if !auth::ct_eq(admin_key, &state.admin_key) {
                 // 非 admin：只能给同 namespace 的 Agent 安装（使用精确角色判定，非子串）
-                if _auth.role != "admin" && !auth::check_ns_access(_auth, &format!("agent/{}", target_agent)) {
+                if _auth.role != "admin"
+                    && !auth::check_ns_access(_auth, &format!("agent/{}", target_agent))
+                {
                     return r#"{"status":"error","message":"no permission to install on this agent"}"#.to_string();
                 }
             }
@@ -1111,22 +1576,35 @@ fn dispatch(
                         rusqlite::params![target_agent, skill_name, now, _auth.agent_id],
                     ).ok();
                     // 增加 install_count
-                    conn.execute("UPDATE skill_catalog SET install_count = install_count + 1 WHERE name = ?",
-                        rusqlite::params![skill_name]).ok();
-                    format!(r#"{{"status":"installed","skill":"{}","target_agent":"{}"}}"#, skill_name, target_agent)
-                },
+                    conn.execute(
+                        "UPDATE skill_catalog SET install_count = install_count + 1 WHERE name = ?",
+                        rusqlite::params![skill_name],
+                    )
+                    .ok();
+                    format!(
+                        r#"{{"status":"installed","skill":"{}","target_agent":"{}"}}"#,
+                        skill_name, target_agent
+                    )
+                }
                 Err(e) => format!(r#"{{"status":"error","message":"{}"}}"#, e),
             };
             // P1-6：install 审计（记录 skill_name + target_agent）
             if install_result.contains("\"status\":\"installed\"") {
-                auth::audit_log(&state.auth_pool, &_auth.agent_id, "skill_market_install",
-                    &format!("skill={},target={}", skill_name, target_agent), true);
+                auth::audit_log(
+                    &state.auth_pool,
+                    &_auth.agent_id,
+                    "skill_market_install",
+                    &format!("skill={},target={}", skill_name, target_agent),
+                    true,
+                );
             }
             return install_result;
-        },
+        }
         "skill_market_list_installed" => {
             let agent_id = args.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
-            if agent_id.is_empty() { return r#"{"status":"error","message":"missing agent_id"}"#.to_string(); }
+            if agent_id.is_empty() {
+                return r#"{"status":"error","message":"missing agent_id"}"#.to_string();
+            }
             // P0-1 修复：NS 隔离 —— 仅自身（同 agent）或授权命名空间内的 agent 可查，
             // 防任意已认证 agent 查他人已装技能清单（信息泄露）。
             if _auth.role != "admin" && agent_id != _auth.agent_id.as_str() {
@@ -1140,55 +1618,66 @@ fn dispatch(
                     let mut rows: Vec<serde_json::Value> = Vec::new();
                     if let Ok(mut stmt) = conn.prepare(
                         "SELECT skill_name, installed_at, installed_by FROM agent_skill_whitelist
-                         WHERE agent_id = ? AND is_active = 1 ORDER BY installed_at DESC"
+                         WHERE agent_id = ? AND is_active = 1 ORDER BY installed_at DESC",
                     ) {
                         if let Ok(iter) = stmt.query_map(rusqlite::params![agent_id], |row| {
                             Ok(serde_json::json!({"skill_name": row.get::<_,String>(0)?,
                                 "installed_at": row.get::<_,String>(1)?,
                                 "installed_by": row.get::<_,String>(2)?}))
                         }) {
-                            for r in iter.flatten() { rows.push(r); }
+                            for r in iter.flatten() {
+                                rows.push(r);
+                            }
                         }
                     }
-                    serde_json::to_string(&serde_json::json!({"status":"ok","skills":rows})).unwrap_or_default()
-                },
+                    serde_json::to_string(&serde_json::json!({"status":"ok","skills":rows}))
+                        .unwrap_or_default()
+                }
                 Err(e) => format!(r#"{{"status":"error","message":"{}"}}"#, e),
             }
-        },
+        }
         // ── Phase 3 工具 ──
-        "memory_decay" => {
-            match tools::decay::run_decay(&state.pool, ns) {
-                Ok((processed, cold)) => format!(r#"{{"status":"ok","processed":{},"cold":{}}}"#, processed, cold),
-                Err(e) => format!(r#"{{"status":"error","message":"{}"}}"#, e),
-            }
+        "memory_decay" => match tools::decay::run_decay(&state.pool, ns) {
+            Ok((processed, cold)) => format!(
+                r#"{{"status":"ok","processed":{},"cold":{}}}"#,
+                processed, cold
+            ),
+            Err(e) => format!(r#"{{"status":"error","message":"{}"}}"#, e),
         },
-        "memory_graph" => {
-            match tools::graph::build_graph(&state.pool, ns, 50) {
-                Ok((nodes, edges)) => format!(r#"{{"status":"ok","nodes":{},"edges":{}}}"#, nodes, edges),
-                Err(e) => format!(r#"{{"status":"error","message":"{}"}}"#, e),
+        "memory_graph" => match tools::graph::build_graph(&state.pool, ns, 50) {
+            Ok((nodes, edges)) => {
+                format!(r#"{{"status":"ok","nodes":{},"edges":{}}}"#, nodes, edges)
             }
+            Err(e) => format!(r#"{{"status":"error","message":"{}"}}"#, e),
         },
         "memory_user_prefs" => {
             // 可选 tag 过滤（hard_rule|pref|style），默认返回全部偏好
-            let tag_filter = args.get("tag").and_then(|v| v.as_str()).map(|s| s.to_string());
+            let tag_filter = args
+                .get("tag")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
             match tools::prefs::user_prefs(&state.pool, &ns) {
                 Ok(prefs) => {
-                    let items: Vec<serde_json::Value> = prefs.into_iter()
+                    let items: Vec<serde_json::Value> = prefs
+                        .into_iter()
                         .filter(|p| tag_filter.as_ref().map_or(true, |t| &p.tag == t))
-                        .map(|p| serde_json::json!({
-                            "key": p.key,
-                            "value": p.value,
-                            "importance": p.importance,
-                            "tag": p.tag,
-                            "confidence": p.confidence,
-                            "created_at": p.created_at,
-                        }))
+                        .map(|p| {
+                            serde_json::json!({
+                                "key": p.key,
+                                "value": p.value,
+                                "importance": p.importance,
+                                "tag": p.tag,
+                                "confidence": p.confidence,
+                                "created_at": p.created_at,
+                            })
+                        })
                         .collect();
-                    serde_json::to_string(&serde_json::json!({"status":"ok","prefs":items})).unwrap_or_default()
-                },
+                    serde_json::to_string(&serde_json::json!({"status":"ok","prefs":items}))
+                        .unwrap_or_default()
+                }
                 Err(e) => format!(r#"{{"status":"error","message":"{}"}}"#, e),
             }
-        },
+        }
         "memory_recent_decisions" => {
             let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(10) as u32;
             match tools::prefs::recent_decisions(&state.pool, ns, limit) {
@@ -1196,11 +1685,12 @@ fn dispatch(
                     let items: Vec<serde_json::Value> = decisions.into_iter().map(|(id, content, ts)| {
                         serde_json::json!({"id": id, "content": content, "time": ts})
                     }).collect();
-                    serde_json::to_string(&serde_json::json!({"status":"ok","decisions":items})).unwrap_or_default()
-                },
+                    serde_json::to_string(&serde_json::json!({"status":"ok","decisions":items}))
+                        .unwrap_or_default()
+                }
                 Err(e) => format!(r#"{{"status":"error","message":"{}"}}"#, e),
             }
-        },
+        }
         // ── P0 工具：备份 / 健康 / 去重 ──
         "memory_backup" => {
             // P2-5 修复：备份类操作需 admin 门禁
@@ -1209,21 +1699,28 @@ fn dispatch(
                 return r#"{"status":"error","message":"admin key required"}"#.to_string();
             }
             // P2-2 备份配额（对所有人生效，含 admin；限制备份频率、防备份风暴）
-            if let Some(err) = quota_gate(state, ns, memoria_core::quota::KIND_BACKUP, &_auth.role) {
+            if let Some(err) = quota_gate(state, ns, memoria_core::quota::KIND_BACKUP, &_auth.role)
+            {
                 return err;
             }
             // 手动触发备份
             match memoria_core::backup::perform_backup(
-                &state.pool, &state.db_path, &state.backup_dir,
+                &state.pool,
+                &state.db_path,
+                &state.backup_dir,
                 Some(&state.vec_index_path),
             ) {
                 Ok(r) => format!(
                     r#"{{"status":"ok","backup_path":"{}","size_mb":{},"integrity_ok":{},"rotation_deleted":{},"tier":"{}"}}"#,
-                    r.backup_path, r.db_size_bytes / 1048576, r.integrity_ok, r.rotation_deleted, r.tier
+                    r.backup_path,
+                    r.db_size_bytes / 1048576,
+                    r.integrity_ok,
+                    r.rotation_deleted,
+                    r.tier
                 ),
                 Err(e) => format!(r#"{{"status":"error","message":"{}"}}"#, e),
             }
-        },
+        }
         "memory_backup_list" => {
             // P2-5 修复：备份类操作需 admin 门禁
             let ak = args.get("admin_key").and_then(|v| v.as_str()).unwrap_or("");
@@ -1231,10 +1728,11 @@ fn dispatch(
                 return r#"{"status":"error","message":"admin key required"}"#.to_string();
             }
             match memoria_core::backup::list_backups(&state.backup_dir) {
-                Ok(v) => serde_json::to_string(&serde_json::json!({"status":"ok","backups":v})).unwrap_or_default(),
+                Ok(v) => serde_json::to_string(&serde_json::json!({"status":"ok","backups":v}))
+                    .unwrap_or_default(),
                 Err(e) => format!(r#"{{"status":"error","message":"{}"}}"#, e),
             }
-        },
+        }
         "memory_health" => {
             // P2-5 修复：备份类操作需 admin 门禁
             let ak = args.get("admin_key").and_then(|v| v.as_str()).unwrap_or("");
@@ -1242,10 +1740,15 @@ fn dispatch(
                 return r#"{"status":"error","message":"admin key required"}"#.to_string();
             }
             let report = memoria_core::health::run_health_check(
-                &state.pool, &state.auth_pool, &state.hnsw, &state.db_path, &state.hnsw_status,
+                &state.pool,
+                &state.auth_pool,
+                &state.hnsw,
+                &state.db_path,
+                &state.hnsw_status,
             );
-            serde_json::to_string(&serde_json::json!({"status":"ok","report":report})).unwrap_or_default()
-        },
+            serde_json::to_string(&serde_json::json!({"status":"ok","report":report}))
+                .unwrap_or_default()
+        }
         "memory_dedup_chain" => {
             let memory_id = args.get("memory_id").and_then(|v| v.as_str()).unwrap_or("");
             if memory_id.is_empty() {
@@ -1253,21 +1756,26 @@ fn dispatch(
             }
             // P1-2 修复：校验该记忆所属 NS 对调用者可见（防跨 NS 读取 superseded 链 / IDOR）
             let mem_ns: String = match state.pool.get() {
-                Ok(conn) => conn.query_row(
-                    "SELECT namespace FROM memories WHERE id = ?1",
-                    rusqlite::params![memory_id],
-                    |r| r.get::<_, String>(0),
-                ).unwrap_or_default(),
+                Ok(conn) => conn
+                    .query_row(
+                        "SELECT namespace FROM memories WHERE id = ?1",
+                        rusqlite::params![memory_id],
+                        |r| r.get::<_, String>(0),
+                    )
+                    .unwrap_or_default(),
                 Err(_) => return r#"{"status":"error","message":"db error"}"#.to_string(),
             };
             if !auth::check_ns_access(_auth, &mem_ns) {
                 return r#"{"status":"error","message":"namespace not authorized"}"#.to_string();
             }
             match tools::remember::get_supersession_chain(&state.pool, memory_id) {
-                Ok(chain) => serde_json::to_string(&serde_json::json!({"status":"ok","superseded":chain})).unwrap_or_default(),
+                Ok(chain) => {
+                    serde_json::to_string(&serde_json::json!({"status":"ok","superseded":chain}))
+                        .unwrap_or_default()
+                }
                 Err(e) => format!(r#"{{"status":"error","message":"{}"}}"#, e),
             }
-        },
+        }
         "memory_merge" => {
             let admin_key_val = args.get("admin_key").and_then(|v| v.as_str()).unwrap_or("");
             // P0-1：统一 admin 门禁（角色优先 + body key 兜底）
@@ -1280,16 +1788,23 @@ fn dispatch(
                 return r#"{"status":"error","message":"missing keep_id or merge_id"}"#.to_string();
             }
             match tools::remember::merge_memories(&state.pool, keep_id, merge_id) {
-                Ok(()) => format!(r#"{{"status":"merged","keep":"{}","merged":"{}"}}"#, keep_id, merge_id),
+                Ok(()) => format!(
+                    r#"{{"status":"merged","keep":"{}","merged":"{}"}}"#,
+                    keep_id, merge_id
+                ),
                 Err(e) => format!(r#"{{"status":"error","message":"{}"}}"#, e),
             }
-        },
+        }
         // ── 暗知识层 A1：夜间巩固哑工具（ns 门控已在 handle_tool_call 完成）──
         "memory_fetch_unconsolidated" => {
-            let since = args.get("since").and_then(|v| v.as_str()).unwrap_or("1970-01-01");
+            let since = args
+                .get("since")
+                .and_then(|v| v.as_str())
+                .unwrap_or("1970-01-01");
             let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(200) as i64;
             let conn = match state.pool.get() {
-                Ok(c) => c, Err(e) => return format!(r#"{{"error":"pool: {}"}}"#, e),
+                Ok(c) => c,
+                Err(e) => return format!(r#"{{"error":"pool: {}"}}"#, e),
             };
             let mut stmt = match conn.prepare(
                 "SELECT id, content, category, created_at FROM memories
@@ -1297,7 +1812,8 @@ fn dispatch(
                    AND (category = 'observation' OR category IS NULL)
                  ORDER BY created_at ASC LIMIT ?3",
             ) {
-                Ok(s) => s, Err(e) => return format!(r#"{{"error":"{}"}}"#, e),
+                Ok(s) => s,
+                Err(e) => return format!(r#"{{"error":"{}"}}"#, e),
             };
             let rows = stmt.query_map(rusqlite::params![ns, since, limit], |r| {
                 Ok(serde_json::json!({
@@ -1311,23 +1827,32 @@ fn dispatch(
                 Ok(r) => r.flatten().collect(),
                 Err(e) => return format!(r#"{{"error":"{}"}}"#, e),
             };
-            serde_json::to_string(&serde_json::json!({"status":"ok","count":items.len(),"items":items})).unwrap_or_default()
-        },
+            serde_json::to_string(
+                &serde_json::json!({"status":"ok","count":items.len(),"items":items}),
+            )
+            .unwrap_or_default()
+        }
         "dream_state_get" => {
-            let phase = args.get("phase").and_then(|v| v.as_str()).unwrap_or("consolidate");
+            let phase = args
+                .get("phase")
+                .and_then(|v| v.as_str())
+                .unwrap_or("consolidate");
             let conn = match state.pool.get() {
-                Ok(c) => c, Err(e) => return format!(r#"{{"error":"pool: {}"}}"#, e),
+                Ok(c) => c,
+                Err(e) => return format!(r#"{{"error":"pool: {}"}}"#, e),
             };
             let row = conn.query_row(
                 "SELECT last_run, cursor_ts, runs, items_out FROM dream_state
                  WHERE phase = ?1 AND namespace = ?2",
                 rusqlite::params![phase, ns],
-                |r| Ok((
-                    r.get::<_, Option<String>>(0)?,
-                    r.get::<_, Option<String>>(1)?,
-                    r.get::<_, i64>(2)?,
-                    r.get::<_, i64>(3)?,
-                )),
+                |r| {
+                    Ok((
+                        r.get::<_, Option<String>>(0)?,
+                        r.get::<_, Option<String>>(1)?,
+                        r.get::<_, i64>(2)?,
+                        r.get::<_, i64>(3)?,
+                    ))
+                },
             );
             match row {
                 Ok((last_run, cursor_ts, runs, items_out)) => serde_json::to_string(&serde_json::json!({
@@ -1343,20 +1868,28 @@ fn dispatch(
                 })).unwrap_or_default(),
                 Err(e) => format!(r#"{{"error":"{}"}}"#, e),
             }
-        },
+        }
         "dream_state_update" => {
-            let phase = args.get("phase").and_then(|v| v.as_str()).unwrap_or("consolidate");
+            let phase = args
+                .get("phase")
+                .and_then(|v| v.as_str())
+                .unwrap_or("consolidate");
             let cursor_ts = args.get("cursor_ts").and_then(|v| v.as_str()).unwrap_or("");
             let items_out = args.get("items_out").and_then(|v| v.as_u64()).unwrap_or(0) as i64;
-            let sessions = args.get("sessions_processed").and_then(|v| v.as_u64()).unwrap_or(0) as i64;
+            let sessions = args
+                .get("sessions_processed")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as i64;
 
             // P1-4 一：cursor_ts 非空校验（防止游标回退到 epoch）
             if cursor_ts.is_empty() {
-                return r#"{"status":"error","message":"cursor_ts must be non-empty ISO-8601"}"#.to_string();
+                return r#"{"status":"error","message":"cursor_ts must be non-empty ISO-8601"}"#
+                    .to_string();
             }
 
             let conn = match state.pool.get() {
-                Ok(c) => c, Err(e) => return format!(r#"{{"error":"pool: {}"}}"#, e),
+                Ok(c) => c,
+                Err(e) => return format!(r#"{{"error":"pool: {}"}}"#, e),
             };
 
             // P1-4 二：cursor_ts 必须是前进的（比现有游标新）
@@ -1370,7 +1903,10 @@ fn dispatch(
                 .flatten();
             if let Some(ref prev) = current_cursor {
                 if cursor_ts <= prev.as_str() {
-                    return format!(r#"{{"status":"error","message":"cursor_ts must advance: new '{}' not newer than previous '{}'"}}"#, cursor_ts, prev);
+                    return format!(
+                        r#"{{"status":"error","message":"cursor_ts must advance: new '{}' not newer than previous '{}'"}}"#,
+                        cursor_ts, prev
+                    );
                 }
             }
 
@@ -1385,7 +1921,10 @@ fn dispatch(
                 )
                 .unwrap_or(true); // 首跑无记录 = 放行
             if !ok_to_proceed {
-                return format!(r#"{{"status":"error","message":"rate limited: phase '{}' for ns '{}' requires {}s cooldown"}}"#, phase, ns, cooldown_secs);
+                return format!(
+                    r#"{{"status":"error","message":"rate limited: phase '{}' for ns '{}' requires {}s cooldown"}}"#,
+                    phase, ns, cooldown_secs
+                );
             }
 
             // P1-4 四：推进游标（含 sessions_processed 累加）
@@ -1406,19 +1945,25 @@ fn dispatch(
                 })).unwrap_or_default(),
                 Err(e) => format!(r#"{{"status":"error","message":"{}"}}"#, e),
             }
-        },
+        }
         // ── 知识图谱 B：实体工具 ──
         "entity_upsert" => {
             let default_id = uuid::Uuid::new_v4().to_string();
-            let entity_id = args.get("entity_id").and_then(|v| v.as_str())
+            let entity_id = args
+                .get("entity_id")
+                .and_then(|v| v.as_str())
                 .unwrap_or(&default_id)
                 .to_string();
-            let entity_type = args.get("entity_type").and_then(|v| v.as_str()).unwrap_or("other");
+            let entity_type = args
+                .get("entity_type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("other");
             let name = args.get("name").and_then(|v| v.as_str()).unwrap_or("");
             let aliases = args.get("aliases").and_then(|v| v.as_str()).unwrap_or("[]");
             let summary = args.get("summary").and_then(|v| v.as_str()).unwrap_or("");
             let conn = match state.pool.get() {
-                Ok(c) => c, Err(e) => return format!(r#"{{"error":"pool: {}"}}"#, e),
+                Ok(c) => c,
+                Err(e) => return format!(r#"{{"error":"pool: {}"}}"#, e),
             };
             match conn.execute(
                 "INSERT INTO entities(id, namespace, entity_type, name, aliases, summary)
@@ -1427,16 +1972,20 @@ fn dispatch(
                    name=excluded.name, aliases=excluded.aliases, summary=excluded.summary",
                 rusqlite::params![entity_id, ns, entity_type, name, aliases, summary],
             ) {
-                Ok(_) => serde_json::to_string(&serde_json::json!({"status":"ok","entity_id":entity_id})).unwrap_or_default(),
+                Ok(_) => {
+                    serde_json::to_string(&serde_json::json!({"status":"ok","entity_id":entity_id}))
+                        .unwrap_or_default()
+                }
                 Err(e) => format!(r#"{{"status":"error","message":"{}"}}"#, e),
             }
-        },
+        }
         "entity_add_mention" => {
             let entity_id = args.get("entity_id").and_then(|v| v.as_str()).unwrap_or("");
             let memory_id = args.get("memory_id").and_then(|v| v.as_str()).unwrap_or("");
             let context = args.get("context").and_then(|v| v.as_str()).unwrap_or("");
             let conn = match state.pool.get() {
-                Ok(c) => c, Err(e) => return format!(r#"{{"error":"pool: {}"}}"#, e),
+                Ok(c) => c,
+                Err(e) => return format!(r#"{{"error":"pool: {}"}}"#, e),
             };
             match conn.execute(
                 "INSERT INTO entity_mentions(entity_id, memory_id, context, namespace) VALUES(?1, ?2, ?3, ?4)",
@@ -1445,16 +1994,26 @@ fn dispatch(
                 Ok(_) => serde_json::to_string(&serde_json::json!({"status":"ok"})).unwrap_or_default(),
                 Err(e) => format!(r#"{{"status":"error","message":"{}"}}"#, e),
             }
-        },
+        }
         "entity_add_edge" => {
-            let source = args.get("source_entity_id").and_then(|v| v.as_str()).unwrap_or("");
-            let target = args.get("target_entity_id").and_then(|v| v.as_str()).unwrap_or("");
-            let rtype = args.get("relation_type").and_then(|v| v.as_str()).unwrap_or("related_to");
+            let source = args
+                .get("source_entity_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let target = args
+                .get("target_entity_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let rtype = args
+                .get("relation_type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("related_to");
             // P2-3：关系类型受控枚举，拒绝未知类型（防止关系爆炸/垃圾关系污染图谱）
             if !memoria_core::tools::graph::is_valid_relation_type(rtype) {
                 return format!(
                     r#"{{"status":"error","message":"invalid relation_type '{}'. allowed: {}"}}"#,
-                    rtype, memoria_core::tools::graph::relation_type_list()
+                    rtype,
+                    memoria_core::tools::graph::relation_type_list()
                 );
             }
             let weight = args.get("weight").and_then(|v| v.as_f64()).unwrap_or(1.0);
@@ -1463,7 +2022,8 @@ fn dispatch(
             let valid_from = args.get("valid_from").and_then(|v| v.as_str());
             let valid_to = args.get("valid_to").and_then(|v| v.as_str());
             let conn = match state.pool.get() {
-                Ok(c) => c, Err(e) => return format!(r#"{{"error":"pool: {}"}}"#, e),
+                Ok(c) => c,
+                Err(e) => return format!(r#"{{"error":"pool: {}"}}"#, e),
             };
             match conn.execute(
                 "INSERT INTO entity_edges(namespace, source_entity_id, target_entity_id, relation_type, weight, evidence, valid_from, valid_to)
@@ -1475,25 +2035,41 @@ fn dispatch(
                 Ok(_) => serde_json::to_string(&serde_json::json!({"status":"ok"})).unwrap_or_default(),
                 Err(e) => format!(r#"{{"status":"error","message":"{}"}}"#, e),
             }
-        },
+        }
         "entity_search" => {
             let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
             let ent_type = args.get("entity_type").and_then(|v| v.as_str());
-            let max_results = args.get("max_results").and_then(|v| v.as_u64()).unwrap_or(20) as i64;
+            let max_results = args
+                .get("max_results")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(20) as i64;
             // P2-3：核心搜索逻辑下放到 tools::graph::search_entities（可测；含 mention context 搜索 + mentions_count）
-            match memoria_core::tools::graph::search_entities(&state.pool, ns, query, ent_type, max_results) {
-                Ok(rows) => serde_json::to_string(&serde_json::json!({"status":"ok","count":rows.len(),"entities":rows})).unwrap_or_default(),
+            match memoria_core::tools::graph::search_entities(
+                &state.pool,
+                ns,
+                query,
+                ent_type,
+                max_results,
+            ) {
+                Ok(rows) => serde_json::to_string(
+                    &serde_json::json!({"status":"ok","count":rows.len(),"entities":rows}),
+                )
+                .unwrap_or_default(),
                 Err(e) => format!(r#"{{"status":"error","message":"{}"}}"#, e),
             }
-        },
+        }
         _ => format!(r#"{{"error":"Unknown tool: {}"}}"#, tool),
     }
 }
 
 fn truncate(s: &str, max_len: usize) -> String {
-    if s.len() <= max_len { return s.to_string(); }
+    if s.len() <= max_len {
+        return s.to_string();
+    }
     let mut end = max_len;
-    while !s.is_char_boundary(end) { end -= 1; }
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
     format!("{}…", &s[..end])
 }
 
@@ -1513,24 +2089,25 @@ async fn forward_to_bridge(
         }
     });
 
-    match state.http_client
+    match state
+        .http_client
         .post(&state.bridge_url)
         .json(&body)
         .timeout(std::time::Duration::from_secs(120))
         .send()
         .await
     {
-        Ok(resp) => {
-            match resp.json::<serde_json::Value>().await {
-                Ok(val) => {
-                    val.get("result")
-                        .and_then(|r| serde_json::to_string(r).ok())
-                        .unwrap_or_else(|| r#"{"error":"empty bridge response"}"#.to_string())
-                }
-                Err(e) => format!(r#"{{"error":"bridge parse: {}"}}"#, e),
-            }
-        }
-        Err(e) => format!(r#"{{"error":"bridge unreachable ({}): {}"}}"#, state.bridge_url, e),
+        Ok(resp) => match resp.json::<serde_json::Value>().await {
+            Ok(val) => val
+                .get("result")
+                .and_then(|r| serde_json::to_string(r).ok())
+                .unwrap_or_else(|| r#"{"error":"empty bridge response"}"#.to_string()),
+            Err(e) => format!(r#"{{"error":"bridge parse: {}"}}"#, e),
+        },
+        Err(e) => format!(
+            r#"{{"error":"bridge unreachable ({}): {}"}}"#,
+            state.bridge_url, e
+        ),
     }
 }
 
@@ -1549,10 +2126,11 @@ fn matches_memory_tags(pool: &storage::SqlitePool, memory_id: &str, tags: &[Stri
         |row| row.get::<_, String>(0),
     ) {
         Ok(t) => t,
-        Err(_) => return false,  // 无标签记录→不匹配（P2-4 安全加固）
+        Err(_) => return false, // 无标签记录→不匹配（P2-4 安全加固）
     };
     // tags 存为 JSON 数组 ["a","b"]，检查每个请求标签是否在其中
-    tags.iter().all(|tag| tags_str.contains(&format!("\"{}\"", tag)))
+    tags.iter()
+        .all(|tag| tags_str.contains(&format!("\"{}\"", tag)))
 }
 
 #[cfg(test)]
@@ -1598,7 +2176,10 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let mut headers = axum::http::HeaderMap::new();
-            headers.insert("x-admin-key", axum::http::HeaderValue::from_static("test-admin-key"));
+            headers.insert(
+                "x-admin-key",
+                axum::http::HeaderValue::from_static("test-admin-key"),
+            );
             let res = health_check_full(axum::extract::State(state), headers).await;
             assert!(res.is_ok(), "valid admin key must allow /health/full");
         });

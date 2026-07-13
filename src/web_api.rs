@@ -3,16 +3,16 @@
 //! 与 React SPA (web/ 目录) 直接对接，JSON 结构与旧版 Python 保持一致。
 
 use axum::{
+    Json, Router,
     extract::{Extension, Path, Query, Request, State},
     http::StatusCode,
     middleware::{self, Next},
     response::Response,
     routing::get,
-    Json, Router,
 };
 use serde::Deserialize;
+use serde_json::{Value, json};
 use std::sync::Arc;
-use serde_json::{json, Value};
 
 use crate::auth::{self, AuthResult};
 use crate::storage::SqlitePool;
@@ -29,11 +29,13 @@ async fn auth_middleware(
     mut request: Request,
     next: Next,
 ) -> Result<Response, StatusCode> {
-    let agent_id = request.headers()
+    let agent_id = request
+        .headers()
         .get("X-Agent-Id")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-    let badge_token = request.headers()
+    let badge_token = request
+        .headers()
         .get("X-Agent-Key")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
@@ -59,10 +61,15 @@ pub fn build_web_api_routes(state: Arc<WebApiState>) -> Router {
         .route("/api/memories", get(api_list_memories))
         .route(
             "/api/memories/{id}",
-            get(api_get_memory).put(api_update_memory).delete(api_delete_memory),
+            get(api_get_memory)
+                .put(api_update_memory)
+                .delete(api_delete_memory),
         )
         .route("/api/relations", get(api_list_relations))
-        .layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth_middleware,
+        ))
         .with_state(state)
 }
 
@@ -81,7 +88,10 @@ async fn api_stats(
     if !auth::check_ns_access(&auth, ns) {
         return Err(StatusCode::FORBIDDEN);
     }
-    let conn = state.pool.get().map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+    let conn = state
+        .pool
+        .get()
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
 
     let sessions: i64 = conn
         .query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0))
@@ -90,13 +100,25 @@ async fn api_stats(
         .query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0))
         .unwrap_or(0);
     let hot: i64 = conn
-        .query_row("SELECT COUNT(*) FROM memories WHERE tier='hot' AND namespace=?1", [ns], |r| r.get(0))
+        .query_row(
+            "SELECT COUNT(*) FROM memories WHERE tier='hot' AND namespace=?1",
+            [ns],
+            |r| r.get(0),
+        )
         .unwrap_or(0);
     let warm: i64 = conn
-        .query_row("SELECT COUNT(*) FROM memories WHERE tier='warm' AND namespace=?1", [ns], |r| r.get(0))
+        .query_row(
+            "SELECT COUNT(*) FROM memories WHERE tier='warm' AND namespace=?1",
+            [ns],
+            |r| r.get(0),
+        )
         .unwrap_or(0);
     let cold: i64 = conn
-        .query_row("SELECT COUNT(*) FROM memories WHERE tier='cold' AND namespace=?1", [ns], |r| r.get(0))
+        .query_row(
+            "SELECT COUNT(*) FROM memories WHERE tier='cold' AND namespace=?1",
+            [ns],
+            |r| r.get(0),
+        )
         .unwrap_or(0);
     let decisions: i64 = conn
         .query_row("SELECT COUNT(*) FROM decisions", [], |r| r.get(0))
@@ -105,9 +127,10 @@ async fn api_stats(
         .query_row("SELECT COUNT(*) FROM memory_relations", [], |r| r.get(0))
         .unwrap_or(0);
 
-    let db_size: f64 = std::fs::metadata(
-        std::env::var("MEMORIA_DB_PATH").unwrap_or_else(|_| String::new())
-    ).map(|m| m.len() as f64 / 1048576.0).unwrap_or(0.0);
+    let db_size: f64 =
+        std::fs::metadata(std::env::var("MEMORIA_DB_PATH").unwrap_or_else(|_| String::new()))
+            .map(|m| m.len() as f64 / 1048576.0)
+            .unwrap_or(0.0);
 
     Ok(Json(json!({
         "sessions": sessions,
@@ -140,7 +163,10 @@ async fn api_graph(
     if !auth::check_ns_access(&auth, ns) {
         return Err(StatusCode::FORBIDDEN);
     }
-    let conn = state.pool.get().map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+    let conn = state
+        .pool
+        .get()
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
 
     // 读取 memories
     let mut stmt = conn.prepare(
@@ -153,15 +179,17 @@ async fn api_graph(
     let mut nodes = Vec::new();
     let mut node_data = Vec::new();
 
-    let rows = stmt.query_map([ns], |r| {
-        let id: String = r.get(0)?;
-        let content: String = r.get(1)?;
-        let category: String = r.get(2)?;
-        let tier: String = r.get(3)?;
-        let decay: f64 = r.get::<_, f64>(7).unwrap_or(1.0);
-        let importance: i32 = r.get::<_, i32>(8).unwrap_or(3);
-        Ok((id, content, category, tier, decay, importance))
-    }).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let rows = stmt
+        .query_map([ns], |r| {
+            let id: String = r.get(0)?;
+            let content: String = r.get(1)?;
+            let category: String = r.get(2)?;
+            let tier: String = r.get(3)?;
+            let decay: f64 = r.get::<_, f64>(7).unwrap_or(1.0);
+            let importance: i32 = r.get::<_, i32>(8).unwrap_or(3);
+            Ok((id, content, category, tier, decay, importance))
+        })
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     for row in rows {
         if let Ok((id, content, category, tier, decay, importance)) = row {
@@ -213,7 +241,7 @@ async fn api_graph(
         for i in 0..chars.len().saturating_sub(1) {
             if chars[i] >= '\u{4e00}' && chars[i] <= '\u{9fff}' {
                 for len in 2..=4.min(chars.len() - i) {
-                    let w: String = chars[i..i+len].iter().collect();
+                    let w: String = chars[i..i + len].iter().collect();
                     if w.chars().all(|c| c >= '\u{4e00}' && c <= '\u{9fff}') {
                         words.push(w);
                     }
@@ -225,20 +253,25 @@ async fn api_graph(
         words
     }
 
-    let kw_map: Vec<(String, Vec<String>)> = node_data.iter()
+    let kw_map: Vec<(String, Vec<String>)> = node_data
+        .iter()
         .map(|(id, content)| (id.clone(), extract_keywords(content)))
         .collect();
 
     let mut edges = Vec::new();
     for i in 0..kw_map.len() {
-        for j in (i+1)..kw_map.len() {
+        for j in (i + 1)..kw_map.len() {
             let kwi = &kw_map[i].1;
             let kwj = &kw_map[j].1;
-            if kwi.is_empty() || kwj.is_empty() { continue; }
+            if kwi.is_empty() || kwj.is_empty() {
+                continue;
+            }
 
             let intersection: usize = kwi.iter().filter(|w| kwj.contains(w)).count();
             let union: usize = kwi.len() + kwj.len() - intersection;
-            if union == 0 { continue; }
+            if union == 0 {
+                continue;
+            }
 
             let jaccard = intersection as f64 / union as f64;
             if jaccard >= 0.25 {
@@ -252,15 +285,26 @@ async fn api_graph(
         }
     }
     edges.sort_by(|a, b| {
-        b.get("value").and_then(|v| v.as_f64()).unwrap_or(0.0)
+        b.get("value")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0)
             .partial_cmp(&a.get("value").and_then(|v| v.as_f64()).unwrap_or(0.0))
             .unwrap_or(std::cmp::Ordering::Equal)
     });
     edges.truncate(300);
 
-    let hot_count = nodes.iter().filter(|n| n.get("group").and_then(|g| g.as_str()) == Some("hot")).count();
-    let warm_count = nodes.iter().filter(|n| n.get("group").and_then(|g| g.as_str()) == Some("warm")).count();
-    let cold_count = nodes.iter().filter(|n| n.get("group").and_then(|g| g.as_str()) == Some("cold")).count();
+    let hot_count = nodes
+        .iter()
+        .filter(|n| n.get("group").and_then(|g| g.as_str()) == Some("hot"))
+        .count();
+    let warm_count = nodes
+        .iter()
+        .filter(|n| n.get("group").and_then(|g| g.as_str()) == Some("warm"))
+        .count();
+    let cold_count = nodes
+        .iter()
+        .filter(|n| n.get("group").and_then(|g| g.as_str()) == Some("cold"))
+        .count();
 
     Ok(Json(json!({
         "nodes": nodes,
@@ -288,7 +332,10 @@ async fn api_decay_timeline(
     Query(q): Query<DecayQuery>,
 ) -> Result<Json<Vec<Value>>, StatusCode> {
     let _ns = q.namespace.as_deref().unwrap_or("default");
-    let conn = state.pool.get().map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+    let conn = state
+        .pool
+        .get()
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
 
     // P1-1 修复：NS 过滤。admin/通配看全部；否则仅返回可访问 NS 的记忆衰减历史
     // （decay_log 无 namespace 列，需 JOIN memories）
@@ -296,17 +343,21 @@ async fn api_decay_timeline(
     let (sql, params): (String, Vec<String>) = if is_admin {
         (
             "SELECT memory_id, old_tier, new_tier, old_decay, new_decay, reason, logged_at
-             FROM decay_log ORDER BY logged_at DESC LIMIT 500".to_string(),
+             FROM decay_log ORDER BY logged_at DESC LIMIT 500"
+                .to_string(),
             vec![],
         )
     } else if auth.allowed_ns.is_empty() {
         (
             "SELECT memory_id, old_tier, new_tier, old_decay, new_decay, reason, logged_at
-             FROM decay_log WHERE 0=1".to_string(),
+             FROM decay_log WHERE 0=1"
+                .to_string(),
             vec![],
         )
     } else {
-        let placeholders: Vec<String> = (1..=auth.allowed_ns.len()).map(|i| format!("?{}", i)).collect();
+        let placeholders: Vec<String> = (1..=auth.allowed_ns.len())
+            .map(|i| format!("?{}", i))
+            .collect();
         (
             format!(
                 "SELECT dl.memory_id, dl.old_tier, dl.new_tier, dl.old_decay, dl.new_decay, dl.reason, dl.logged_at
@@ -318,21 +369,28 @@ async fn api_decay_timeline(
         )
     };
 
-    let mut stmt = conn.prepare(&sql).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let param_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p as &dyn rusqlite::types::ToSql).collect();
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let param_refs: Vec<&dyn rusqlite::types::ToSql> = params
+        .iter()
+        .map(|p| p as &dyn rusqlite::types::ToSql)
+        .collect();
 
     let mut results = Vec::new();
-    let rows = stmt.query_map(param_refs.as_slice(), |r| {
-        Ok((
-            r.get::<_, String>(0)?,
-            r.get::<_, String>(1)?,
-            r.get::<_, String>(2)?,
-            r.get::<_, f64>(3).unwrap_or(0.5),
-            r.get::<_, f64>(4).unwrap_or(0.5),
-            r.get::<_, String>(5)?,
-            r.get::<_, String>(6)?,
-        ))
-    }).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let rows = stmt
+        .query_map(param_refs.as_slice(), |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, f64>(3).unwrap_or(0.5),
+                r.get::<_, f64>(4).unwrap_or(0.5),
+                r.get::<_, String>(5)?,
+                r.get::<_, String>(6)?,
+            ))
+        })
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     for row in rows {
         if let Ok((mid, old_tier, new_tier, old_decay, new_decay, reason, date)) = row {
@@ -373,7 +431,10 @@ async fn api_list_memories(
     }
     let limit = q.limit.unwrap_or(50).min(500);
     let offset = q.offset.unwrap_or(0);
-    let conn = state.pool.get().map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+    let conn = state
+        .pool
+        .get()
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
 
     let mut sql = "SELECT id, content, category, tier, importance, decay_factor, recall_count, created_at, namespace FROM memories WHERE namespace = ?1".to_string();
     let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(ns.to_string())];
@@ -405,35 +466,46 @@ async fn api_list_memories(
     sql.push_str(&offset_idx.to_string());
     params.push(Box::new(offset));
 
-    let mut stmt = conn.prepare(&sql).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     let param_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
-    let rows = stmt.query_map(param_refs.as_slice(), |r| {
-        let id: String = r.get(0)?;
-        let content: String = r.get(1)?;
-        let category: String = r.get(2)?;
-        let tier: String = r.get(3)?;
-        let importance: i32 = r.get::<_, i32>(4).unwrap_or(3);
-        let decay: f64 = r.get::<_, f64>(5).unwrap_or(1.0);
-        let recall: i32 = r.get::<_, i32>(6).unwrap_or(0);
-        let created: String = r.get::<_, String>(7).unwrap_or_default();
-        let ns_val: String = r.get::<_, String>(8).unwrap_or_default();
-        Ok((id, content, category, tier, importance, decay, recall, created, ns_val))
-    }).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-    let memories: Vec<Value> = rows.filter_map(|r| r.ok()).map(|(id, content, category, tier, importance, decay, recall, created, ns_val)| {
-        json!({
-            "id": id,
-            "content": content,
-            "category": category,
-            "tier": tier,
-            "importance": importance,
-            "decay_factor": (decay * 100.0).round() / 100.0,
-            "recall_count": recall,
-            "created_at": created,
-            "namespace": ns_val,
+    let rows = stmt
+        .query_map(param_refs.as_slice(), |r| {
+            let id: String = r.get(0)?;
+            let content: String = r.get(1)?;
+            let category: String = r.get(2)?;
+            let tier: String = r.get(3)?;
+            let importance: i32 = r.get::<_, i32>(4).unwrap_or(3);
+            let decay: f64 = r.get::<_, f64>(5).unwrap_or(1.0);
+            let recall: i32 = r.get::<_, i32>(6).unwrap_or(0);
+            let created: String = r.get::<_, String>(7).unwrap_or_default();
+            let ns_val: String = r.get::<_, String>(8).unwrap_or_default();
+            Ok((
+                id, content, category, tier, importance, decay, recall, created, ns_val,
+            ))
         })
-    }).collect();
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let memories: Vec<Value> = rows
+        .filter_map(|r| r.ok())
+        .map(
+            |(id, content, category, tier, importance, decay, recall, created, ns_val)| {
+                json!({
+                    "id": id,
+                    "content": content,
+                    "category": category,
+                    "tier": tier,
+                    "importance": importance,
+                    "decay_factor": (decay * 100.0).round() / 100.0,
+                    "recall_count": recall,
+                    "created_at": created,
+                    "namespace": ns_val,
+                })
+            },
+        )
+        .collect();
 
     Ok(Json(json!({"memories": memories, "total": memories.len()})))
 }
@@ -444,13 +516,16 @@ async fn api_get_memory(
     Extension(auth): Extension<AuthResult>,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, StatusCode> {
-    let conn = state.pool.get().map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+    let conn = state
+        .pool
+        .get()
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
     // P1-1 修复：先取该记忆所属 NS，做授权校验（防 IDOR 跨 NS 读取）
-    let mem_ns: String = conn.query_row(
-        "SELECT namespace FROM memories WHERE id = ?1",
-        [&id],
-        |r| r.get::<_, String>(0),
-    ).unwrap_or_default();
+    let mem_ns: String = conn
+        .query_row("SELECT namespace FROM memories WHERE id = ?1", [&id], |r| {
+            r.get::<_, String>(0)
+        })
+        .unwrap_or_default();
     if !mem_ns.is_empty() && !auth::check_ns_access(&auth, &mem_ns) {
         return Err(StatusCode::FORBIDDEN);
     }
@@ -495,29 +570,43 @@ async fn api_update_memory(
     Path(id): Path<String>,
     Json(body): Json<UpdateMemoryBody>,
 ) -> Result<Json<Value>, StatusCode> {
-    let conn = state.pool.get().map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+    let conn = state
+        .pool
+        .get()
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
     let mem_ns: String = conn
-        .query_row("SELECT namespace FROM memories WHERE id = ?1", [&id], |r| r.get(0))
+        .query_row("SELECT namespace FROM memories WHERE id = ?1", [&id], |r| {
+            r.get(0)
+        })
         .map_err(|_| StatusCode::NOT_FOUND)?;
     if !auth::check_ns_access(&auth, &mem_ns) {
         return Err(StatusCode::FORBIDDEN);
     }
 
     if let Some(ref content) = body.content {
-        conn.execute("UPDATE memories SET content = ?1 WHERE id = ?2", rusqlite::params![content, id])
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        conn.execute(
+            "UPDATE memories SET content = ?1 WHERE id = ?2",
+            rusqlite::params![content, id],
+        )
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     }
     if let Some(ref category) = body.category {
-        conn.execute("UPDATE memories SET category = ?1 WHERE id = ?2", rusqlite::params![category, id])
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        conn.execute(
+            "UPDATE memories SET category = ?1 WHERE id = ?2",
+            rusqlite::params![category, id],
+        )
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     }
     if let Some(ref tier) = body.tier {
         let allowed = ["hot", "warm", "cold"];
         if !allowed.contains(&tier.as_str()) {
             return Err(StatusCode::BAD_REQUEST);
         }
-        conn.execute("UPDATE memories SET tier = ?1 WHERE id = ?2", rusqlite::params![tier, id])
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        conn.execute(
+            "UPDATE memories SET tier = ?1 WHERE id = ?2",
+            rusqlite::params![tier, id],
+        )
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     }
     if let Some(importance) = body.importance {
         if !(1..=5).contains(&importance) {
@@ -550,9 +639,14 @@ async fn api_delete_memory(
         return Err(StatusCode::PRECONDITION_REQUIRED);
     }
 
-    let conn = state.pool.get().map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+    let conn = state
+        .pool
+        .get()
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
     let mem_ns: String = conn
-        .query_row("SELECT namespace FROM memories WHERE id = ?1", [&id], |r| r.get(0))
+        .query_row("SELECT namespace FROM memories WHERE id = ?1", [&id], |r| {
+            r.get(0)
+        })
         .map_err(|_| StatusCode::NOT_FOUND)?;
     if !auth::check_ns_access(&auth, &mem_ns) {
         return Err(StatusCode::FORBIDDEN);
@@ -577,7 +671,10 @@ async fn api_list_relations(
     State(state): State<Arc<WebApiState>>,
     Extension(auth): Extension<AuthResult>,
 ) -> Result<Json<Value>, StatusCode> {
-    let conn = state.pool.get().map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+    let conn = state
+        .pool
+        .get()
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
 
     // P1-1 修复：NS 过滤。admin/通配看全部；否则仅返回可访问 NS 的关系边
     let is_admin = auth.role == "admin" || auth.allowed_ns.iter().any(|n| n == "*");
@@ -592,7 +689,9 @@ async fn api_list_relations(
             vec![],
         )
     } else {
-        let placeholders: Vec<String> = (1..=auth.allowed_ns.len()).map(|i| format!("?{}", i)).collect();
+        let placeholders: Vec<String> = (1..=auth.allowed_ns.len())
+            .map(|i| format!("?{}", i))
+            .collect();
         (
             format!(
                 "SELECT id, source_id, target_id, relation_type, weight, created_at
@@ -603,20 +702,29 @@ async fn api_list_relations(
         )
     };
 
-    let mut stmt = conn.prepare(&sql).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let param_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p as &dyn rusqlite::types::ToSql).collect();
-    let relations: Vec<Value> = stmt.query_map(param_refs.as_slice(), |r| {
-        Ok(json!({
-            "id": r.get::<_, i64>(0)?,
-            "source_id": r.get::<_, String>(1)?,
-            "target_id": r.get::<_, String>(2)?,
-            "relation_type": r.get::<_, String>(3)?,
-            "weight": r.get::<_, f64>(4).unwrap_or(0.0),
-            "created_at": r.get::<_, String>(5).unwrap_or_default(),
-        }))
-    }).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-    .filter_map(|r| r.ok())
-    .collect();
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let param_refs: Vec<&dyn rusqlite::types::ToSql> = params
+        .iter()
+        .map(|p| p as &dyn rusqlite::types::ToSql)
+        .collect();
+    let relations: Vec<Value> = stmt
+        .query_map(param_refs.as_slice(), |r| {
+            Ok(json!({
+                "id": r.get::<_, i64>(0)?,
+                "source_id": r.get::<_, String>(1)?,
+                "target_id": r.get::<_, String>(2)?,
+                "relation_type": r.get::<_, String>(3)?,
+                "weight": r.get::<_, f64>(4).unwrap_or(0.0),
+                "created_at": r.get::<_, String>(5).unwrap_or_default(),
+            }))
+        })
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .filter_map(|r| r.ok())
+        .collect();
 
-    Ok(Json(json!({"relations": relations, "total": relations.len()})))
+    Ok(Json(
+        json!({"relations": relations, "total": relations.len()}),
+    ))
 }
