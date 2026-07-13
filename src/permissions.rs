@@ -65,6 +65,9 @@ pub const PERMISSION_MATRIX: &[Entry] = &[
     Entry { tool: "entity_add_mention", min_role: MinRole::Agent, ns_policy: NsPolicy::NamespaceArg, note: "实体提及" },
     Entry { tool: "entity_add_edge", min_role: MinRole::Agent, ns_policy: NsPolicy::NamespaceArg, note: "实体关系边" },
     Entry { tool: "entity_search", min_role: MinRole::Agent, ns_policy: NsPolicy::NamespaceArg, note: "实体搜索" },
+    Entry { tool: "memory_export", min_role: MinRole::Agent, ns_policy: NsPolicy::NamespaceArg, note: "导出本 ns 记忆/实体" },
+    Entry { tool: "memory_import", min_role: MinRole::Agent, ns_policy: NsPolicy::NamespaceArg, note: "导入到本 ns（幂等）" },
+    Entry { tool: "memory_migration_manifest", min_role: MinRole::Admin, ns_policy: NsPolicy::None, note: "迁移包校验和（admin）" },
 
     // ── Admin 专属管理操作 ──
     Entry { tool: "register_agent", min_role: MinRole::Admin, ns_policy: NsPolicy::NamespaceArg, note: "创建 Agent（admin）" },

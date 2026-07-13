@@ -281,6 +281,17 @@ pub fn tools_list() -> Vec<serde_json::Value> {
     tools.push(tool("memory_backup", "手动触发数据库备份（GFS 轮转）", serde_json::json!({})));
     tools.push(tool("memory_backup_list", "列出所有备份文件", serde_json::json!({})));
     tools.push(tool("memory_health", "完整健康检查报告", serde_json::json!({})));
+    // ── P2-4 导入导出与迁移 ──
+    tools.push(tool("memory_export", "导出某命名空间的记忆/实体为流式 JSONL（认证后；大库分块防 OOM）", serde_json::json!({
+        "namespace": {"type": "string", "description": "命名空间，默认 default"},
+        "include_vectors": {"type": "boolean", "description": "是否包含 embedding 向量（base64），默认 false"}
+    })));
+    tools.push(tool("memory_import", "从 memory_export 的 JSONL 导入记忆/实体到本命名空间（认证后；INSERT OR IGNORE 幂等，重复导入不翻倍）", serde_json::json!({
+        "namespace": {"type": "string", "description": "目标命名空间，默认 default"},
+        "jsonl": {"type": "string", "description": "memory_export 产出的 JSONL 文本"},
+        "on_conflict": {"type": "string", "description": "ignore（默认，跳过已存在）或 replace（覆盖）"}
+    })));
+    tools.push(tool("memory_migration_manifest", "生成跨机迁移包清单：DB + HNSW 的 sha256 校验和与全表行数（admin；与 GFS 备份格式统一）", serde_json::json!({})));
     tools.push(tool("memory_dedup_chain", "查询某条记忆的 superseded 链", serde_json::json!({
         "memory_id": {"type": "string", "description": "记忆 ID（必填）"}
     })));
@@ -640,6 +651,50 @@ fn dispatch(
                 "namespace": ns,
                 "quotas": quotas,
             })).unwrap_or_default()
+        },
+        "memory_export" => {
+            // P2-4：导出本 ns 记忆/实体为流式 JSONL（权限矩阵已按 NamespaceArg 校验 ns 归属）
+            let include_vectors = args.get("include_vectors").and_then(|v| v.as_bool()).unwrap_or(false);
+            match memoria_core::tools::imp_exp::export_ns(&state.pool, ns, include_vectors) {
+                Ok(jsonl) => serde_json::to_string(&serde_json::json!({
+                    "status": "ok",
+                    "namespace": ns,
+                    "bytes": jsonl.len(),
+                    "export": jsonl,
+                })).unwrap_or_default(),
+                Err(e) => format!(r#"{{"status":"error","message":"{}"}}"#, e),
+            }
+        },
+        "memory_import" => {
+            // P2-4：从 JSONL 导入到本 ns（INSERT OR IGNORE 幂等；内部校验每行 ns 一致）
+            let jsonl = args.get("jsonl").and_then(|v| v.as_str()).unwrap_or("");
+            let on_conflict = match args.get("on_conflict").and_then(|v| v.as_str()).unwrap_or("ignore") {
+                "replace" => memoria_core::tools::imp_exp::OnConflict::Replace,
+                _ => memoria_core::tools::imp_exp::OnConflict::Ignore,
+            };
+            if jsonl.is_empty() {
+                return r#"{"status":"error","message":"jsonl 必填"}"#.to_string();
+            }
+            match memoria_core::tools::imp_exp::import_ns(&state.pool, ns, jsonl, on_conflict) {
+                Ok(report) => serde_json::to_string(&serde_json::json!({
+                    "status": "ok",
+                    "namespace": ns,
+                    "inserted": report.inserted,
+                    "ignored": report.ignored,
+                    "errors": report.errors,
+                })).unwrap_or_default(),
+                Err(e) => format!(r#"{{"status":"error","message":"{}"}}"#, e),
+            }
+        },
+        "memory_migration_manifest" => {
+            // P2-4：迁移包清单（admin 专属，暴露全库行数 + DB/HNSW 校验和）
+            if _auth.role != "admin" {
+                return r#"{"status":"error","message":"admin required"}"#.to_string();
+            }
+            match memoria_core::tools::imp_exp::build_migration_manifest(&state.pool, &state.db_path, &state.vec_index_path) {
+                Ok(manifest) => serde_json::to_string(&serde_json::json!({"status":"ok","manifest":manifest})).unwrap_or_default(),
+                Err(e) => format!(r#"{{"status":"error","message":"{}"}}"#, e),
+            }
         },
         "register_agent" => {
             let new_id = args.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");

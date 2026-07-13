@@ -1460,6 +1460,7 @@ name = "memoria-core"
 version = "0.2.0"
 dependencies = [
  "axum",
+ "base64 0.22.1",
  "chrono",
  "console-subscriber",
  "getrandom 0.2.17",
