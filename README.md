@@ -114,7 +114,7 @@ docker compose up -d --build
 | `MEMORIA_DB_PATH` | `data/memoria.db` | Main database path |
 | `MEMORIA_PORT` | `9003` | Server port |
 | `MEMORIA_HOST` | `127.0.0.1` | Bind address (loopback by default) |
-| `MEMORIA_ADMIN_KEY` | Auto-generated | Admin token (set explicitly in prod) |
+| `MEMORIA_ADMIN_KEY` | (required) | Admin token; refuse to start if unset/empty |
 | `MEMORIA_AUTH_DB_PATH` | `<data>/audit.db` | Audit database path |
 | `MEMORIA_BACKUP_DIR` | `data/backups` | GFS backup directory |
 | `MEMORIA_BACKUP_INTERVAL_HOURS` | `24` | Backup interval |

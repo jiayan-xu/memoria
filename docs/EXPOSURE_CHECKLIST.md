@@ -32,9 +32,7 @@
 
 ## 4. 密钥与凭据
 
-- `MEMORIA_ADMIN_KEY`：**必须显式设置并持久化**（写入 `.env`，`.env` 入 `.gitignore`，**绝不提交仓库**）。
-- 未设置时 memoria 会**自动生成** admin key，仅写入本地受控文件 `<db 父目录>/admin_key.secret`（Unix 权限 `0600`），**启动日志不回显任何 key 片段**，且提示"仅显示一次"。
-- 自动生成的 key 在重启后丢失（除非已显式设 `MEMORIA_ADMIN_KEY`）——生产环境务必显式设置。
+- `MEMORIA_ADMIN_KEY`：**必须显式设置且非空**（写入 `.env`，`.env` 入 `.gitignore`，**绝不提交仓库**）。未设置或为空时进程**拒绝启动**（不再使用可预测的 timestamp 自动 key）。
 - 轮换 admin key 后，需同步更新依赖它的服务（agent-core `MEMORIA_ADMIN_KEY`、PFAiX、dashboard）配置。
 
 ## 5. 端口速查（本机栈）

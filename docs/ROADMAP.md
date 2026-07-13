@@ -37,6 +37,7 @@
 - **时序真值走"轻量 as_of"**：valid_from/valid_to 列 + 时点查询，不维护整图时间版本。
 - **巩固在 agent-core 侧**：Memoria 只提供哑 SQL 工具，LLM 提炼在 Python 侧，避免内置 Agent 主循环。
 - **安全默认 loopback**：`MEMORIA_HOST` 默认 `127.0.0.1`；docker-compose 仅 `127.0.0.1:9003` 暴露。
+- **强制 admin key**：未设或空的 `MEMORIA_ADMIN_KEY` 拒绝启动（禁止可预测自动 key）。
 
 ## 测试覆盖
 - `cargo test` 全绿（截至 2026-07-13：单元 + 集成测试覆盖核心 / 配额 / 实体图谱 / 导入导出 / Dashboard API）。

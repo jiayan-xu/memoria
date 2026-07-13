@@ -113,7 +113,7 @@ docker compose up -d --build
 | `MEMORIA_DB_PATH` | `data/memoria.db` | 主数据库路径 |
 | `MEMORIA_PORT` | `9003` | 服务端口 |
 | `MEMORIA_HOST` | `127.0.0.1` | 绑定地址（默认回环） |
-| `MEMORIA_ADMIN_KEY` | 自动生成 | 管理员令牌（生产环境务必显式设置） |
+| `MEMORIA_ADMIN_KEY` | （必填） | 管理员令牌；未设或为空则拒绝启动 |
 | `MEMORIA_AUTH_DB_PATH` | `<data>/audit.db` | 审计数据库路径 |
 | `MEMORIA_BACKUP_DIR` | `data/backups` | GFS 备份目录 |
 | `MEMORIA_BACKUP_INTERVAL_HOURS` | `24` | 备份间隔（小时） |

@@ -4,7 +4,7 @@
 //!   MEMORIA_DB_PATH  (default: data/memoria.db)
 //!   MEMORIA_PORT     (default: 9003)
 //!   MEMORIA_HOST     (default: 127.0.0.1)
-//!   MEMORIA_ADMIN_KEY (default: auto-generated)
+//!   MEMORIA_ADMIN_KEY (required — refuse to start if unset/empty)
 //!   MEMORIA_BACKUP_DIR (default: data/backups)
 //!   MEMORIA_BACKUP_INTERVAL_HOURS (default: 24)
 
@@ -100,12 +100,15 @@ fn main() {
     let port: u16 = std::env::var("MEMORIA_PORT")
         .ok().and_then(|s| s.parse().ok()).unwrap_or(9003);
     let host = std::env::var("MEMORIA_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
-    let (admin_key, admin_key_auto) = match std::env::var("MEMORIA_ADMIN_KEY") {
-        Ok(k) => (k, false),
-        Err(_) => {
-            let ts = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
-            (format!("mem-admin-{:x}", ts.as_nanos()), true)
+    // P1（审查 2026-07-13）：禁止可预测的 timestamp 自动 key；未设置则拒绝启动。
+    let admin_key = match std::env::var("MEMORIA_ADMIN_KEY") {
+        Ok(k) if !k.trim().is_empty() => k,
+        _ => {
+            eprintln!(
+                "[Memoria] FATAL: MEMORIA_ADMIN_KEY is required and must be non-empty.\n\
+                 [Memoria] Set it in the environment or .env (see .env.example). Refusing to start."
+            );
+            std::process::exit(1);
         }
     };
 
@@ -116,18 +119,6 @@ fn main() {
     // P0-2 修复：显式暴露到 0.0.0.0 / :: 时告警（远程须走反代 + TLS + auth）
     if is_exposed_bind(&host) {
         eprintln!("[Memoria][WARN] Binding to {} — service is exposed to the network. Use a reverse proxy + TLS + auth for remote access.", host);
-    }
-    // P0-2 修复：自动生成的 key 不再回显任何片段，写入本地受控文件（仅本次启动可查）
-    if admin_key_auto {
-        match write_auto_admin_key(&db_path, &admin_key) {
-            Ok(p) => {
-                eprintln!("[Memoria] Admin key auto-generated and written to: {}", p.display());
-                eprintln!("[Memoria] Shown only once — store it securely. Set MEMORIA_ADMIN_KEY to persist across restarts.");
-            }
-            Err(e) => {
-                eprintln!("[Memoria][WARN] Admin key auto-generated but failed to write key file ({}); it will NOT be recoverable after restart.", e);
-            }
-        }
     }
 
     let pool = storage::create_pool(&db_path, 16).expect("pool");
