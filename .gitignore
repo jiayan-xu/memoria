@@ -18,6 +18,13 @@ data/
 # Auto-generated admin key (P0-2: never commit)
 admin_key.secret
 
+# Local secrets (P0: never commit real .env)
+.env
+*.env.local
+*.env.*.local
+# but keep the documented example
+!.env.example
+
 # Single-writer lock file (P0-4)
 *.pid
 

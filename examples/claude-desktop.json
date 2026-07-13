@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "memoria": {
+      "url": "http://127.0.0.1:9003/mcp",
+      "transport": "http",
+      "headers": {
+        "X-Agent-Id": "claude-desktop",
+        "X-Agent-Key": "<AGENT_KEY>"
+      }
+    }
+  }
+}

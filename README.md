@@ -70,18 +70,42 @@ Agent (Claude Desktop / Jan / OpenClaw / ...)
 | P50 search latency | 182ms | 99ms | **1.8x** |
 | Zero-result rate | 32.2% | 0% | **—** |
 
+> *Measured on x86_64 Linux, Rust release build, 2026-07. The Python column is the
+> pre-Rust baseline for relative comparison only.*
+
+## Testing & CI
+
+- `cargo test` passes on all platforms (ubuntu / windows / macos) via GitHub Actions (`.github/workflows/ci.yml`).
+- As of 2026-07-13: **41 integration + unit tests** covering core search, quota (P2-2), entity graph (P2-3), and import/export (P2-4).
+
 ## Quick Start
 
 ### Build & Run
 
 ```bash
-git clone https://github.com/memoria-ai/memoria.git
+git clone https://github.com/jiayan-xu/memoria.git
 cd memoria
 cargo build --release
 ./target/release/memoria-server
 ```
 
-Server starts at `http://0.0.0.0:9003`. Web dashboard at `http://0.0.0.0:9003/app`.
+服务默认仅监听本机回环 `http://127.0.0.1:9003`（安全默认）。
+Web 仪表盘：`http://127.0.0.1:9003/app`。
+如需暴露到局域网，设置 `MEMORIA_HOST=0.0.0.0`（自担风险）。
+
+### Docker (loopback)
+
+```bash
+cp .env.example .env          # 编辑填入 MEMORIA_ADMIN_KEY
+docker compose up -d --build
+```
+
+仅本机 `127.0.0.1:9003` 可访问，不暴露到网络。详见 `docker-compose.yml` 与 `docs/ROADMAP.md`。
+
+### Config & Examples
+
+- 所有环境变量见 [`.env.example`](.env.example)（占位符，无真实密钥）。
+- MCP 客户端配置样例见 [`examples/`](examples/)：`claude-desktop.json` / `cursor.json` / `python-minimal-client.py`。
 
 ### Environment Variables
 
@@ -89,9 +113,21 @@ Server starts at `http://0.0.0.0:9003`. Web dashboard at `http://0.0.0.0:9003/ap
 |----------|---------|-------------|
 | `MEMORIA_DB_PATH` | `data/memoria.db` | Main database path |
 | `MEMORIA_PORT` | `9003` | Server port |
-| `MEMORIA_HOST` | `0.0.0.0` | Bind address |
-| `MEMORIA_ADMIN_KEY` | Auto-generated | Admin token |
+| `MEMORIA_HOST` | `127.0.0.1` | Bind address (loopback by default) |
+| `MEMORIA_ADMIN_KEY` | Auto-generated | Admin token (set explicitly in prod) |
 | `MEMORIA_AUTH_DB_PATH` | `<data>/audit.db` | Audit database path |
+| `MEMORIA_BACKUP_DIR` | `data/backups` | GFS backup directory |
+| `MEMORIA_BACKUP_INTERVAL_HOURS` | `24` | Backup interval |
+| `MEMORIA_WORKER_THREADS` | `4` | Async worker threads |
+| `MEMORIA_MAX_BLOCKING_THREADS` | `512` | Max blocking threads |
+| `MEMORIA_NEAR_DUP_ENABLED` | `true` | Near-duplicate dedup (P1-3) |
+| `MEMORIA_NEAR_DUP_THRESHOLD` | `0.92` | Dedup cosine threshold |
+| `MEMORIA_QUOTA_WRITES_PER_DAY` | `1000` | Write quota per ns/day (P2-2) |
+| `MEMORIA_QUOTA_SEARCHES_PER_MIN` | `120` | Search quota per ns/min (P2-2) |
+| `MEMORIA_QUOTA_BACKUPS_PER_HOUR` | `10` | Backup quota per ns/hour (P2-2) |
+| `MEMORIA_DREAM_COOLDOWN_DEFAULT` | `300` | Dream cooldown seconds (P1-4) |
+| `MEMORIA_DREAM_COOLDOWN_DECAY` | `60` | Decay-phase cooldown seconds |
+| `AGENT_CORE_LOG` / `RUST_LOG` | `info` | Log level (P2-1 tracing) |
 
 ### MCP Client Configuration
 
@@ -116,11 +152,27 @@ Add Memoria to any MCP-compatible client:
 | `memory_search_v2` | 5-signal RRF fusion search |
 | `memory_remember` | Store memory (SHA-256 dedup) |
 | `memory_observe` | Store low-priority observation |
-| `register_agent` | Register agent identity (admin key) |
-| `agent_list` | List registered agents |
-| `agent_revoke` | Revoke agent token |
-| `audit_query` | Query audit logs |
-| `db_stats` | Database statistics |
+| `memory_user_prefs` | Query user preference block |
+| `memory_recent_decisions` | Recent decision records |
+| `memory_export` | Streamed JSONL export of a namespace (P2-4) |
+| `memory_import` | Idempotent import into a namespace (P2-4) |
+| `memory_migration_manifest` | Cross-machine migration checksum manifest (admin, P2-4) |
+| `memory_quota_status` | Current quota usage & limits (P2-2) |
+| `memory_backup` / `memory_backup_list` | GFS backup trigger / list |
+| `memory_health` | Full health check report |
+| `memory_decay` | Run decay loop |
+| `memory_graph` | Build memory relation graph |
+| `memory_dedup_chain` | Query superseded chain of a memory |
+| `memory_merge` | Merge two near-duplicate memories (admin) |
+| `memory_fetch_unconsolidated` | Fetch raw observations for nightly consolidation |
+| `dream_state_get` / `dream_state_update` | Consolidation cursor state (P1-4) |
+| `entity_upsert` / `entity_add_mention` / `entity_add_edge` | Entity graph write (P2-3) |
+| `entity_search` | Entity search (incl. mention context, P2-3) |
+| `register_agent` / `agent_list` / `agent_revoke` | Agent registry (admin key) |
+| `register_user` / `login_user` | Local account login |
+| `import_install_memories` | Migrate a namespace (admin) |
+| `get_allowed_ns` | Return caller's authorized namespaces |
+| `audit_query` / `db_stats` | Audit log query / DB stats |
 | `a2a_send` / `a2a_recv` | A2A messaging |
 | `skill_market_*` | Skill marketplace (5 tools) |
 

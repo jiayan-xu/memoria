@@ -69,18 +69,41 @@ Agent (Claude Desktop / Jan / OpenClaw / ...)
 | P50 搜索延迟 | 182ms | 99ms | **1.8 倍** |
 | 零结果率 | 32.2% | 0% | **清零** |
 
+> *测量环境：x86_64 Linux，Rust release 构建，2026-07。Python 列仅为迁移前的基线对照。*
+
+## 测试与 CI
+
+- `cargo test` 在 GitHub Actions 三平台（ubuntu / windows / macos）全绿（`.github/workflows/ci.yml`）。
+- 截至 2026-07-13：**41 个集成 + 单元测试**，覆盖核心搜索、配额（P2-2）、实体图谱（P2-3）、导入导出（P2-4）。
+
 ## 快速开始
 
 ### 编译与运行
 
 ```bash
-git clone https://github.com/memoria-ai/memoria.git
+git clone https://github.com/jiayan-xu/memoria.git
 cd memoria
 cargo build --release
 ./target/release/memoria-server
 ```
 
-服务启动在 `http://0.0.0.0:9003`，Web 仪表盘在 `http://0.0.0.0:9003/app`。
+服务默认仅监听本机回环 `http://127.0.0.1:9003`（安全默认）。
+Web 仪表盘：`http://127.0.0.1:9003/app`。
+如需暴露到局域网，设置 `MEMORIA_HOST=0.0.0.0`（自担风险）。
+
+### Docker（回环部署）
+
+```bash
+cp .env.example .env          # 编辑填入 MEMORIA_ADMIN_KEY
+docker compose up -d --build
+```
+
+仅本机 `127.0.0.1:9003` 可访问，不暴露到网络。详见 `docker-compose.yml` 与 `docs/ROADMAP.md`。
+
+### 配置与示例
+
+- 所有环境变量见 [`.env.example`](.env.example)（占位符，无真实密钥）。
+- MCP 客户端配置样例见 [`examples/`](examples/)：`claude-desktop.json` / `cursor.json` / `python-minimal-client.py`。
 
 ### 环境变量
 
@@ -88,9 +111,21 @@ cargo build --release
 |------|--------|------|
 | `MEMORIA_DB_PATH` | `data/memoria.db` | 主数据库路径 |
 | `MEMORIA_PORT` | `9003` | 服务端口 |
-| `MEMORIA_HOST` | `0.0.0.0` | 绑定地址 |
-| `MEMORIA_ADMIN_KEY` | 自动生成 | 管理员令牌 |
+| `MEMORIA_HOST` | `127.0.0.1` | 绑定地址（默认回环） |
+| `MEMORIA_ADMIN_KEY` | 自动生成 | 管理员令牌（生产环境务必显式设置） |
 | `MEMORIA_AUTH_DB_PATH` | `<data>/audit.db` | 审计数据库路径 |
+| `MEMORIA_BACKUP_DIR` | `data/backups` | GFS 备份目录 |
+| `MEMORIA_BACKUP_INTERVAL_HOURS` | `24` | 备份间隔（小时） |
+| `MEMORIA_WORKER_THREADS` | `4` | 异步工作线程数 |
+| `MEMORIA_MAX_BLOCKING_THREADS` | `512` | 最大阻塞线程数 |
+| `MEMORIA_NEAR_DUP_ENABLED` | `true` | 近义去重（P1-3） |
+| `MEMORIA_NEAR_DUP_THRESHOLD` | `0.92` | 去重余弦阈值 |
+| `MEMORIA_QUOTA_WRITES_PER_DAY` | `1000` | 每命名空间每日写入限额（P2-2） |
+| `MEMORIA_QUOTA_SEARCHES_PER_MIN` | `120` | 每命名空间每分钟搜索限额（P2-2） |
+| `MEMORIA_QUOTA_BACKUPS_PER_HOUR` | `10` | 每命名空间每小时备份限额（P2-2） |
+| `MEMORIA_DREAM_COOLDOWN_DEFAULT` | `300` | Dream 巩固冷却秒数（P1-4） |
+| `MEMORIA_DREAM_COOLDOWN_DECAY` | `60` | decay 阶段冷却秒数 |
+| `AGENT_CORE_LOG` / `RUST_LOG` | `info` | 日志级别（P2-1 tracing） |
 
 ### MCP 客户端配置
 
@@ -115,11 +150,27 @@ cargo build --release
 | `memory_search_v2` | 5 信号 RRF 融合搜索 |
 | `memory_remember` | 存储记忆（SHA-256 去重） |
 | `memory_observe` | 存储低优先级观察 |
-| `register_agent` | 注册 Agent 身份（需管理员密钥） |
-| `agent_list` | 列出已注册 Agent |
-| `agent_revoke` | 吊销 Agent 令牌 |
-| `audit_query` | 查询审计日志 |
-| `db_stats` | 数据库统计 |
+| `memory_user_prefs` | 查询用户偏好块 |
+| `memory_recent_decisions` | 最近决策记录 |
+| `memory_export` | 流式导出某命名空间数据（P2-4） |
+| `memory_import` | 幂等导入数据到命名空间（P2-4） |
+| `memory_migration_manifest` | 跨机迁移包校验和清单（admin，P2-4） |
+| `memory_quota_status` | 当前配额用量与上限（P2-2） |
+| `memory_backup` / `memory_backup_list` | GFS 备份触发 / 列出 |
+| `memory_health` | 完整健康检查报告 |
+| `memory_decay` | 运行衰减循环 |
+| `memory_graph` | 构建记忆关系图 |
+| `memory_dedup_chain` | 查询某条记忆的 superseded 链 |
+| `memory_merge` | 合并两条近义记忆（admin） |
+| `memory_fetch_unconsolidated` | 拉取未巩固原料供夜间巩固 |
+| `dream_state_get` / `dream_state_update` | 巩固游标状态（P1-4） |
+| `entity_upsert` / `entity_add_mention` / `entity_add_edge` | 实体图谱写入（P2-3） |
+| `entity_search` | 实体搜索（含 mention 上下文，P2-3） |
+| `register_agent` / `agent_list` / `agent_revoke` | Agent 注册（需管理员密钥） |
+| `register_user` / `login_user` | 本地账号登录 |
+| `import_install_memories` | 迁移命名空间（admin） |
+| `get_allowed_ns` | 返回调用者授权的命名空间列表 |
+| `audit_query` / `db_stats` | 审计日志查询 / 数据库统计 |
 | `a2a_send` / `a2a_recv` | A2A 消息收发 |
 | `skill_market_*` | 技能市场（5 个工具） |
 
