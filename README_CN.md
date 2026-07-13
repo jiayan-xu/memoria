@@ -84,6 +84,7 @@ Agent (Claude Desktop / Jan / OpenClaw / ...)
 git clone https://github.com/jiayan-xu/memoria.git
 cd memoria
 cargo build --release
+# 默认不含 PyO3（P2-7）。Python 扩展：cargo build --release --features python（见 docs/PYO3.md）
 ./target/release/memoria-server
 ```
 

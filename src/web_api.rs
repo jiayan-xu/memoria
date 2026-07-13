@@ -7,7 +7,7 @@ use axum::{
     http::StatusCode,
     middleware::{self, Next},
     response::Response,
-    routing::{get},
+    routing::get,
     Json, Router,
 };
 use serde::Deserialize;
@@ -57,7 +57,10 @@ pub fn build_web_api_routes(state: Arc<WebApiState>) -> Router {
         .route("/graph", get(api_graph))
         .route("/decay_timeline", get(api_decay_timeline))
         .route("/api/memories", get(api_list_memories))
-        .route("/api/memories/{id}", get(api_get_memory))
+        .route(
+            "/api/memories/{id}",
+            get(api_get_memory).put(api_update_memory).delete(api_delete_memory),
+        )
         .route("/api/relations", get(api_list_relations))
         .layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
         .with_state(state)
@@ -475,6 +478,98 @@ async fn api_get_memory(
         Ok(memory) => Ok(Json(memory)),
         Err(_) => Err(StatusCode::NOT_FOUND),
     }
+}
+
+// ── PUT /api/memories/:id ──
+#[derive(Deserialize)]
+pub struct UpdateMemoryBody {
+    content: Option<String>,
+    category: Option<String>,
+    tier: Option<String>,
+    importance: Option<i32>,
+}
+
+async fn api_update_memory(
+    State(state): State<Arc<WebApiState>>,
+    Extension(auth): Extension<AuthResult>,
+    Path(id): Path<String>,
+    Json(body): Json<UpdateMemoryBody>,
+) -> Result<Json<Value>, StatusCode> {
+    let conn = state.pool.get().map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+    let mem_ns: String = conn
+        .query_row("SELECT namespace FROM memories WHERE id = ?1", [&id], |r| r.get(0))
+        .map_err(|_| StatusCode::NOT_FOUND)?;
+    if !auth::check_ns_access(&auth, &mem_ns) {
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    if let Some(ref content) = body.content {
+        conn.execute("UPDATE memories SET content = ?1 WHERE id = ?2", rusqlite::params![content, id])
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    }
+    if let Some(ref category) = body.category {
+        conn.execute("UPDATE memories SET category = ?1 WHERE id = ?2", rusqlite::params![category, id])
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    }
+    if let Some(ref tier) = body.tier {
+        let allowed = ["hot", "warm", "cold"];
+        if !allowed.contains(&tier.as_str()) {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+        conn.execute("UPDATE memories SET tier = ?1 WHERE id = ?2", rusqlite::params![tier, id])
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    }
+    if let Some(importance) = body.importance {
+        if !(1..=5).contains(&importance) {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+        conn.execute(
+            "UPDATE memories SET importance = ?1 WHERE id = ?2",
+            rusqlite::params![importance, id],
+        )
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    }
+
+    Ok(Json(json!({"status": "ok", "id": id})))
+}
+
+/// P2-5：删除须带二次确认头，防止仪表盘误触 / CSRF 风格单请求删除。
+/// 客户端须发送：`X-Confirm: delete-memory`
+async fn api_delete_memory(
+    State(state): State<Arc<WebApiState>>,
+    Extension(auth): Extension<AuthResult>,
+    Path(id): Path<String>,
+    request: Request,
+) -> Result<Json<Value>, StatusCode> {
+    let confirm = request
+        .headers()
+        .get("X-Confirm")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if confirm != "delete-memory" {
+        return Err(StatusCode::PRECONDITION_REQUIRED);
+    }
+
+    let conn = state.pool.get().map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+    let mem_ns: String = conn
+        .query_row("SELECT namespace FROM memories WHERE id = ?1", [&id], |r| r.get(0))
+        .map_err(|_| StatusCode::NOT_FOUND)?;
+    if !auth::check_ns_access(&auth, &mem_ns) {
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    let n = conn
+        .execute("DELETE FROM memories WHERE id = ?1", [&id])
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    if n == 0 {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    let _ = conn.execute(
+        "DELETE FROM memory_relations WHERE source_id = ?1 OR target_id = ?1",
+        [&id],
+    );
+
+    Ok(Json(json!({"status": "deleted", "id": id})))
 }
 
 // ── /api/relations ──

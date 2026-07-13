@@ -199,9 +199,14 @@ main { max-width: 1100px; margin: 0 auto; padding: 24px; }
 
 <header>
   <div class="logo">🧠 Memoria <span>记忆中心</span></div>
-  <div style="display:flex;align-items:center;gap:16px;">
-    <a href="intro.html" style="color:var(--accent2);text-decoration:none;font-size:0.82rem;padding:4px 10px;border:1px solid var(--border);border-radius:6px;transition:all .2s" onmouseover="this.style.borderColor='var(--accent)'" onmouseout="this.style.borderColor='var(--border)'">📋 项目介绍</a>
-    <a href="flow.html" style="color:var(--accent2);text-decoration:none;font-size:0.82rem;padding:4px 10px;border:1px solid var(--border);border-radius:6px;transition:all .2s" onmouseover="this.style.borderColor='var(--accent)'" onmouseout="this.style.borderColor='var(--border)'">🔀 架构流程</a>
+  <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;justify-content:flex-end">
+    <div class="auth-bar" title="凭证仅存本机 localStorage，请求走 X-Agent-Id / X-Agent-Key">
+      <input type="text" id="authAgentId" placeholder="Agent Id" style="width:100px;padding:4px 8px;border-radius:6px;border:1px solid var(--border);background:var(--surface2);color:var(--text);font-family:inherit;font-size:0.75rem">
+      <input type="password" id="authAgentKey" placeholder="Agent Key" style="width:120px;padding:4px 8px;border-radius:6px;border:1px solid var(--border);background:var(--surface2);color:var(--text);font-family:inherit;font-size:0.75rem">
+      <input type="text" id="authNamespace" placeholder="namespace" style="width:90px;padding:4px 8px;border-radius:6px;border:1px solid var(--border);background:var(--surface2);color:var(--text);font-family:inherit;font-size:0.75rem" value="default">
+      <button type="button" onclick="saveAuth()" style="padding:4px 10px;border-radius:6px;border:1px solid var(--accent);background:var(--accent);color:#fff;font-family:inherit;font-size:0.75rem;cursor:pointer;font-weight:600">保存凭证</button>
+    </div>
+    <a href="intro.html" style="color:var(--accent2);text-decoration:none;font-size:0.82rem;padding:4px 10px;border:1px solid var(--border);border-radius:6px">📋 介绍</a>
     <div class="stats-bar" id="statBar">
       <span>🔥 <b id="statHot">-</b></span>
       <span>🌡️ <b id="statWarm">-</b></span>
@@ -263,42 +268,26 @@ main { max-width: 1100px; margin: 0 auto; padding: 24px; }
   <!-- Settings Tab -->
   <div class="tab" id="tab-settings">
     <div class="setting-card">
-      <h3>💾 数据备份</h3>
-      <p style="font-size:0.85rem;color:var(--text2);margin-bottom:12px">导出全部数据为 zip 文件，可拷到其他机器恢复</p>
-      <button class="btn-save" onclick="exportData()" style="background:var(--accent);color:#fff;font-family:inherit;padding:10px 22px;border:none;border-radius:8px;cursor:pointer;font-weight:600">📥 导出备份 (ZIP)</button>
+      <h3>🔐 访问凭证（必填）</h3>
+      <p style="font-size:0.85rem;color:var(--text2);margin-bottom:12px">所有 API / MCP 调用需鉴权。凭证仅存浏览器 localStorage，不上传第三方。</p>
+      <p style="font-size:0.8rem;color:var(--text2)">当前命名空间：<b id="settingsNsLabel">default</b> · 顶栏可修改并点「保存凭证」</p>
     </div>
     <div class="setting-card">
-      <h3>📥 数据恢复</h3>
-      <p style="font-size:0.85rem;color:var(--text2);margin-bottom:12px">从备份 zip 恢复。会先备份当前数据为 .bak</p>
-      <input type="file" id="restoreFile" accept=".zip" style="display:block;margin-bottom:10px;color:var(--text)">
-      <button class="btn-ghost" onclick="importData()" style="background:var(--surface);color:var(--text);border:1px solid var(--border) !important;font-family:inherit;padding:10px 22px;border-radius:8px;cursor:pointer;font-weight:600">📤 恢复数据</button>
+      <h3>💾 导出命名空间（JSONL）</h3>
+      <p style="font-size:0.85rem;color:var(--text2);margin-bottom:12px">经 MCP <code>memory_export</code>，需二次确认。大库可能较慢。</p>
+      <button class="btn-save" onclick="exportData()" style="background:var(--accent);color:#fff;font-family:inherit;padding:10px 22px;border:none;border-radius:8px;cursor:pointer;font-weight:600">📥 导出当前 NS</button>
     </div>
     <div class="setting-card">
-      <h3>⚙️ 参数配置</h3>
-      <div class="setting-row">
-        <label>衰减半衰期 (天)</label>
-        <input type="number" id="cfgHalfLife" value="14" min="1" max="365">
-      </div>
-      <div class="setting-row">
-        <label>冷记忆阈值</label>
-        <input type="number" id="cfgColdThreshold" value="0.1" min="0" max="1" step="0.01">
-      </div>
-      <div class="setting-row">
-        <label>清理阈值</label>
-        <input type="number" id="cfgCleanupThreshold" value="0.05" min="0" max="1" step="0.01">
-      </div>
-      <div class="setting-row">
-        <label>梦境间隔 (小时)</label>
-        <input type="number" id="cfgDreamInterval" value="6" min="1" max="48">
-      </div>
-      <button class="btn-save" onclick="saveConfig()" style="background:var(--accent);color:#fff;font-family:inherit;padding:8px 18px;border:none;border-radius:8px;cursor:pointer;font-weight:600;margin-top:8px">保存配置</button>
+      <h3>📥 导入命名空间（危险）</h3>
+      <p style="font-size:0.85rem;color:var(--text2);margin-bottom:12px">粘贴 <code>memory_export</code> 产出的 JSONL。会写入当前 NS（INSERT OR IGNORE）。须输入 CONFIRM。</p>
+      <textarea id="importJsonl" placeholder="粘贴 JSONL…" style="width:100%;min-height:120px;padding:10px;border-radius:8px;border:1px solid var(--border);background:var(--surface2);color:var(--text);font-family:inherit;font-size:0.8rem;margin-bottom:10px"></textarea>
+      <button class="btn-danger" onclick="importData()" style="background:var(--danger);color:#fff;font-family:inherit;padding:10px 22px;border:none;border-radius:8px;cursor:pointer;font-weight:600">📤 确认导入</button>
     </div>
     <div class="setting-card">
-      <h3>🧹 维护操作</h3>
+      <h3>🧹 维护（经 MCP，只读/衰减）</h3>
       <div style="display:flex;gap:8px;flex-wrap:wrap">
-        <button class="btn-ghost" onclick="triggerDream()" style="background:var(--surface);color:var(--text);border:1px solid var(--border);font-family:inherit;padding:8px 16px;border-radius:8px;cursor:pointer">触发梦境</button>
         <button class="btn-ghost" onclick="triggerDecay()" style="background:var(--surface);color:var(--text);border:1px solid var(--border);font-family:inherit;padding:8px 16px;border-radius:8px;cursor:pointer">运行衰减</button>
-        <button class="btn-ghost" onclick="triggerBridgeSync()" style="background:var(--surface);color:var(--text);border:1px solid var(--border);font-family:inherit;padding:8px 16px;border-radius:8px;cursor:pointer">桥接同步</button>
+        <button class="btn-ghost" onclick="triggerBackup()" style="background:var(--surface);color:var(--text);border:1px solid var(--border);font-family:inherit;padding:8px 16px;border-radius:8px;cursor:pointer">触发备份（admin）</button>
       </div>
     </div>
   </div>
@@ -312,389 +301,7 @@ main { max-width: 1100px; margin: 0 auto; padding: 24px; }
 <!-- Toast -->
 <div id="toastContainer"></div>
 
-<script>
-// ─── API ────────────────────────────────────────
-const _rawEndpoints = ['/stats', '/graph', '/decay_timeline', '/bridge/sync', '/bridge/status'];
-const API = '';
+<script src="dashboard.js"></script>
 
-async function api(path, opts = {}) {
-  const prefix = _rawEndpoints.some(p => path.startsWith(p)) ? '' : '/api';
-  const res = await fetch(prefix + path, {
-    headers: { 'Content-Type': 'application/json', ...opts.headers },
-    ...opts
-  });
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({ detail: res.statusText }));
-    throw new Error(err.detail || res.statusText);
-  }
-  const ct = res.headers.get('content-type') || '';
-  if (ct.includes('application/zip') || opts.raw) return res;
-  return res.json();
-}
-
-// ─── Navigation ─────────────────────────────────
-document.querySelectorAll('nav button').forEach(btn => {
-  btn.addEventListener('click', () => {
-    document.querySelectorAll('nav button').forEach(b => b.classList.remove('active'));
-    document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
-    btn.classList.add('active');
-    document.getElementById('tab-' + btn.dataset.tab).classList.add('active');
-    if (btn.dataset.tab === 'graph') loadGraph();
-    if (btn.dataset.tab === 'settings') loadConfig();
-    if (btn.dataset.tab === 'browse') loadMemories();
-  });
-});
-
-// ─── Stats ──────────────────────────────────────
-async function loadStats() {
-  try {
-    const s = await api('/stats');
-    document.getElementById('statHot').textContent = s.memories.hot;
-    document.getElementById('statWarm').textContent = s.memories.warm;
-    document.getElementById('statCold').textContent = s.memories.cold;
-    document.getElementById('statTotal').textContent = s.memories.hot + s.memories.warm + s.memories.cold;
-  } catch(e) {}
-}
-
-// ─── Search ─────────────────────────────────────
-async function search() {
-  const q = document.getElementById('searchInput').value.trim();
-  if (!q) return;
-  const container = document.getElementById('searchResults');
-  container.innerHTML = '<div class="empty"><div class="icon">🔎</div>搜索中...</div>';
-  try {
-    // Try direct FTS+ChromaDB via stats-like approach
-    // Use MCP memory_search by posting to /mcp
-    const body = {
-      jsonrpc: '2.0', id: 1, method: 'tools/call',
-      params: { name: 'memory_search', arguments: { query: q, max_results: 10, search_type: 'hybrid' } }
-    };
-    const res = await fetch('/mcp', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body)
-    });
-    const data = await res.json();
-    const text = data.result?.content?.[0]?.text;
-    if (!text) { container.innerHTML = '<div class="empty"><div class="icon">📭</div>无结果</div>'; return; }
-    const parsed = JSON.parse(text);
-    if (!parsed.results?.length) {
-      container.innerHTML = '<div class="empty"><div class="icon">📭</div>未找到相关记忆</div>';
-      return;
-    }
-    renderMemoryCards(container, parsed.results);
-  } catch(e) {
-    container.innerHTML = `<div class="empty"><div class="icon">⚠️</div>${e.message}</div>`;
-  }
-}
-
-// ─── Browse ─────────────────────────────────────
-let currentPage = 1;
-async function loadMemories(page = 1) {
-  currentPage = page;
-  const tier = document.getElementById('filterTier').value;
-  const category = document.getElementById('filterCategory').value;
-  const search = document.getElementById('filterSearch').value.trim();
-  const params = new URLSearchParams({ page, limit: 30 });
-  if (tier) params.set('tier', tier);
-  if (category) params.set('category', category);
-  if (search) params.set('search', search);
-
-  const container = document.getElementById('browseResults');
-  container.innerHTML = '<div class="empty"><div class="icon">📂</div>加载中...</div>';
-
-  try {
-    const data = await api(`/memories?${params}`);
-    container.innerHTML = '';
-    if (!data.memories.length) {
-      container.innerHTML = '<div class="empty"><div class="icon">📭</div>暂无记忆</div>';
-      return;
-    }
-    data.memories.forEach(m => container.appendChild(createMemoryCard(m, true)));
-
-    // Pagination
-    const totalPages = Math.ceil(data.total / data.limit);
-    const pg = document.getElementById('pagination');
-    pg.innerHTML = '';
-    if (totalPages > 1) {
-      for (let i = 1; i <= totalPages; i++) {
-        const btn = document.createElement('button');
-        btn.textContent = i;
-        if (i === page) btn.classList.add('active');
-        btn.onclick = () => loadMemories(i);
-        pg.appendChild(btn);
-      }
-    }
-  } catch(e) {
-    container.innerHTML = `<div class="empty"><div class="icon">⚠️</div>${e.message}</div>`;
-  }
-}
-
-// ─── Memory Card ────────────────────────────────
-function createMemoryCard(m, showActions = false) {
-  const card = document.createElement('div');
-  card.className = 'memory-card';
-  card.onclick = () => openDetail(m.id || m.id);
-
-  const tier = m.tier || 'warm';
-  const tierLabel = {hot:'🔥 HOT', warm:'🌡️ WARM', cold:'❄️ COLD'}[tier] || tier;
-  const category = m.category || 'fact';
-  const imp = m.importance || 3;
-  const decay = m.decay_factor != null ? (m.decay_factor * 100).toFixed(0) + '%' : '100%';
-
-  // For search results, use type-specific fields
-  let content = m.content || '';
-  let source = m.source || '';
-  if (m.type === 'decision') content = `${m.topic}: ${m.decision}`;
-  if (m.type === 'message') source = `💬 ${m.session_date || ''}`;
-
-  card.innerHTML = `
-    <div class="meta">
-      <span class="badge badge-${tier}">${tierLabel}</span>
-      <span class="badge badge-importance">⭐${imp}</span>
-      <span style="color:var(--text2)">📉 ${decay}</span>
-      <span style="color:var(--text2);margin-left:auto">${source}</span>
-      <span style="color:var(--text2)">${category}</span>
-    </div>
-    <div class="content-preview">${escHtml(content)}</div>
-  `;
-  return card;
-}
-
-function renderMemoryCards(container, items) {
-  container.innerHTML = '';
-  items.forEach(m => container.appendChild(createMemoryCard(m)));
-}
-
-// ─── Detail Modal ───────────────────────────────
-async function openDetail(id) {
-  if (!id) return;
-  const overlay = document.getElementById('modalOverlay');
-  const content = document.getElementById('modalContent');
-  content.innerHTML = '<p style="color:var(--text2)">加载中...</p>';
-  overlay.classList.add('show');
-
-  try {
-    const m = await api(`/memories/${id}`);
-    content.innerHTML = `
-      <button class="close-btn" onclick="closeModal()" style="position:static;float:right;background:none;border:none;color:var(--text2);font-size:1.3rem;cursor:pointer">✕</button>
-      <h3>${escHtml(m.content?.substring(0, 60) || '记忆详情')}...</h3>
-      <div class="field">
-        <label>全文</label>
-        <textarea id="editContent">${escHtml(m.content || '')}</textarea>
-      </div>
-      <div class="field" style="display:flex;gap:8px">
-        <div style="flex:1">
-          <label>分类</label>
-          <select id="editCategory">
-            <option value="decision" ${m.category==='decision'?'selected':''}>决策</option>
-            <option value="preference" ${m.category==='preference'?'selected':''}>偏好</option>
-            <option value="constraint" ${m.category==='constraint'?'selected':''}>约束</option>
-            <option value="lesson" ${m.category==='lesson'?'selected':''}>教训</option>
-            <option value="fact" ${m.category==='fact'?'selected':''}>事实</option>
-            <option value="conversation" ${m.category==='conversation'?'selected':''}>对话</option>
-          </select>
-        </div>
-        <div style="flex:1">
-          <label>层级</label>
-          <select id="editTier">
-            <option value="hot" ${m.tier==='hot'?'selected':''}>🔥 Hot</option>
-            <option value="warm" ${m.tier==='warm'?'selected':''}>🌡️ Warm</option>
-            <option value="cold" ${m.tier==='cold'?'selected':''}>❄️ Cold</option>
-          </select>
-        </div>
-        <div style="flex:1">
-          <label>重要性</label>
-          <select id="editImportance">
-            ${[1,2,3,4,5].map(i => `<option value="${i}" ${m.importance===i?'selected':''}>⭐${i}</option>`).join('')}
-          </select>
-        </div>
-      </div>
-      <div class="field">
-        <label>ID: ${id}</label>
-        <span style="font-size:0.75rem;color:var(--text2)">来源: ${m.source || '-'} | 创建: ${m.created_at || '-'} | 召回: ${m.recall_count || 0}次 | 衰减: ${((m.decay_factor||1)*100).toFixed(0)}%</span>
-      </div>
-      <div class="actions">
-        <button class="btn-danger" onclick="deleteMemory('${id}')">删除</button>
-        <button class="btn-ghost" onclick="closeModal()">取消</button>
-        <button class="btn-save" onclick="saveMemory('${id}')">保存</button>
-      </div>
-    `;
-  } catch(e) {
-    content.innerHTML = `<p style="color:var(--danger)">错误: ${e.message}</p>`;
-  }
-}
-
-function closeModal() {
-  document.getElementById('modalOverlay').classList.remove('show');
-}
-
-async function saveMemory(id) {
-  try {
-    await api(`/memories/${id}`, {
-      method: 'PUT',
-      body: JSON.stringify({
-        content: document.getElementById('editContent').value,
-        category: document.getElementById('editCategory').value,
-        tier: document.getElementById('editTier').value,
-        importance: parseInt(document.getElementById('editImportance').value),
-      })
-    });
-    closeModal();
-    showToast('已保存', 'success');
-    loadStats();
-    if (document.getElementById('tab-browse').classList.contains('active')) loadMemories(currentPage);
-  } catch(e) { showToast(e.message, 'error'); }
-}
-
-async function deleteMemory(id) {
-  if (!confirm('确定删除这条记忆？')) return;
-  try {
-    await api(`/memories/${id}`, { method: 'DELETE' });
-    closeModal();
-    showToast('已删除', 'success');
-    loadStats();
-    if (document.getElementById('tab-browse').classList.contains('active')) loadMemories(currentPage);
-  } catch(e) { showToast(e.message, 'error'); }
-}
-
-// ─── Graph ──────────────────────────────────────
-let graphNetwork = null;
-async function loadGraph() {
-  try {
-    const data = await api('/graph');
-    const nodes = (data.nodes || []).map(n => ({
-      id: n.id,
-      label: (n.label || n.content || '').substring(0, 30),
-      title: `<b>${n.category||'?'}</b><br>${(n.content||'').substring(0,200)}`,
-      color: {
-        background: n.tier==='hot'?'#ff6b6b':n.tier==='cold'?'#6c8ebf':'#ffd93d',
-        border: '#1a1a23',
-      },
-      size: 10 + (n.importance || 3) * 4,
-      font: { size: 12, color: '#e4e4f0' },
-      borderWidth: 2,
-    }));
-    const edges = (data.edges || []).map(e => ({
-      from: e.source || e.from,
-      to: e.target || e.to,
-      color: { opacity: Math.min(1, (e.weight || 0.3) * 2) },
-      width: Math.max(0.5, (e.weight || 0.3) * 3),
-    }));
-
-    const container = document.getElementById('graph-container');
-    if (graphNetwork) graphNetwork.destroy();
-    graphNetwork = new vis.Network(container, { nodes: new vis.DataSet(nodes), edges: new vis.DataSet(edges) }, {
-      physics: { solver: 'forceAtlas2Based', forceAtlas2Based: { gravitationalConstant: -30, centralGravity: 0.005 } },
-      interaction: { hover: true, tooltipDelay: 200 },
-      nodes: { shape: 'dot' },
-    });
-    graphNetwork.on('click', function(params) {
-      if (params.nodes.length) openDetail(params.nodes[0]);
-    });
-  } catch(e) {
-    document.getElementById('graph-container').innerHTML = `<div class="empty"><div class="icon">⚠️</div>${e.message}</div>`;
-  }
-}
-
-// ─── Settings ───────────────────────────────────
-async function loadConfig() {
-  try {
-    const cfg = await api('/config');
-    document.getElementById('cfgHalfLife').value = cfg.decay_half_life_days || 14;
-    document.getElementById('cfgColdThreshold').value = cfg.decay_cold_threshold || 0.1;
-    document.getElementById('cfgCleanupThreshold').value = cfg.decay_cleanup_threshold || 0.05;
-    document.getElementById('cfgDreamInterval').value = cfg.dream_interval_hours || 6;
-  } catch(e) {}
-}
-
-async function saveConfig() {
-  try {
-    await api('/config', {
-      method: 'PUT',
-      body: JSON.stringify({
-        decay_half_life_days: document.getElementById('cfgHalfLife').value,
-        decay_cold_threshold: document.getElementById('cfgColdThreshold').value,
-        decay_cleanup_threshold: document.getElementById('cfgCleanupThreshold').value,
-        dream_interval_hours: document.getElementById('cfgDreamInterval').value,
-      })
-    });
-    showToast('配置已保存', 'success');
-  } catch(e) { showToast(e.message, 'error'); }
-}
-
-async function exportData() {
-  try {
-    const res = await api('/export', { raw: true });
-    const blob = await res.blob();
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `memoria_backup_${new Date().toISOString().slice(0,10)}.zip`;
-    a.click();
-    URL.revokeObjectURL(url);
-    showToast('备份下载中', 'success');
-  } catch(e) { showToast(e.message, 'error'); }
-}
-
-async function importData() {
-  const file = document.getElementById('restoreFile').files[0];
-  if (!file) { showToast('请先选择备份文件', 'error'); return; }
-  if (!confirm('恢复将覆盖当前数据（会自动备份为 .bak）。确定？')) return;
-  try {
-    await api('/import', {
-      method: 'POST',
-      body: file,
-      headers: { 'Content-Type': 'application/zip' },
-    });
-    showToast('恢复成功，刷新页面生效', 'success');
-    loadStats();
-  } catch(e) { showToast(e.message, 'error'); }
-}
-
-async function triggerDream() {
-  try {
-    const res = await fetch('/dream', { method: 'POST' });
-    const data = await res.json();
-    showToast('梦境周期完成', 'success');
-  } catch(e) { showToast(e.message, 'error'); }
-}
-
-async function triggerDecay() {
-  try {
-    // Use MCP
-    const body = { jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'memory_decay', arguments: { action: 'run' } } };
-    await fetch('/mcp', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
-    showToast('衰减已完成', 'success');
-  } catch(e) { showToast(e.message, 'error'); }
-}
-
-async function triggerBridgeSync() {
-  try {
-    await api('/bridge/sync', { method: 'POST' });
-    showToast('桥接同步完成', 'success');
-  } catch(e) { showToast(e.message, 'error'); }
-}
-
-// ─── Toast ──────────────────────────────────────
-function showToast(msg, type = 'success') {
-  const t = document.createElement('div');
-  t.className = `toast toast-${type}`;
-  t.textContent = msg;
-  document.getElementById('toastContainer').appendChild(t);
-  setTimeout(() => t.remove(), 3000);
-}
-
-// ─── Helpers ────────────────────────────────────
-function escHtml(s) {
-  if (!s) return '';
-  const d = document.createElement('div');
-  d.textContent = s;
-  return d.innerHTML;
-}
-
-// ─── Init ───────────────────────────────────────
-loadStats();
-</script>
 </body>
 </html>
