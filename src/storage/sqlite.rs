@@ -86,7 +86,6 @@ pub fn init_core_tables(pool: &SqlitePool) -> Result<(), String> {
             valid_from TEXT DEFAULT (datetime('now')),
             valid_to TEXT
         );
-        CREATE INDEX IF NOT EXISTS idx_mem_valid ON memories(namespace, valid_from);
 
         -- Memories FTS5 (virtual table)
         CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
