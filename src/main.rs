@@ -7,6 +7,8 @@
 //!   MEMORIA_ADMIN_KEY (required — refuse to start if unset/empty)
 //!   MEMORIA_BACKUP_DIR (default: data/backups)
 //!   MEMORIA_BACKUP_INTERVAL_HOURS (default: 24)
+//!   MEMORIA_EMBEDDING_URL (default: http://127.0.0.1:8777/embed — local embed_server.py;
+//!                         set to empty ("") to disable HNSW semantic search)
 
 mod mcp_server;
 mod permissions;
@@ -225,6 +227,11 @@ fn main() {
         admin_key,
         bridge_url: std::env::var("MEMORIA_BRIDGE_URL")
             .unwrap_or_else(|_| "http://127.0.0.1:9000/mcp".to_string()),
+        // P3-0: 查询时嵌入服务地址。空 = 禁用语义搜索（仅 FTS5+temporal+importance+category）。
+        // 默认启用本地嵌入服务（embed_server.py @ 127.0.0.1:8777），让 HNSW 语义检索开箱即用；
+        // 显式设为空字符串可关闭（语义信号优雅降级为跳过）。
+        embedding_url: std::env::var("MEMORIA_EMBEDDING_URL")
+            .unwrap_or_else(|_| "http://127.0.0.1:8777/embed".to_string()),
         http_client: reqwest::Client::new(),
         db_path: db_path.clone(),
         backup_dir: backup_dir.clone(),

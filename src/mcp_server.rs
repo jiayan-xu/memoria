@@ -35,10 +35,46 @@ pub struct AppState {
     pub query_cache: Arc<memoria_core::vector::QueryCache>,
     pub admin_key: String,
     pub bridge_url: String,
+    /// P3-0: 查询时嵌入服务地址。空 = 禁用 HNSW 语义信号（仅 FTS5+temporal+importance+category）。
+    /// 非空（如 http://127.0.0.1:8777/embed）= 启用，memory_search 会先把 query 向量注入 QueryCache。
+    pub embedding_url: String,
     pub http_client: reqwest::Client,
     pub db_path: String,
     pub backup_dir: String,
     pub vec_index_path: String,
+}
+
+/// P3-0: 查询时生成 query embedding —— 修复「HNSW 语义搜索从未生效」的根因。
+///
+/// 独立 MCP 服务（memoria-server）在查询时调用本地嵌入服务（默认 127.0.0.1:8777/embed）
+/// 将 query 文本转为向量，写入 QueryCache 后 `semantic_search` 即可参与融合排序。
+///
+/// 任何错误（未配置 / 服务不可用 / 超时 / 解析失败）均返回 `None` —— 优雅降级，
+/// 不影响既有 FTS5 + temporal + importance + category 信号。绝不抛错、绝不阻塞主链路。
+async fn embed_query(client: &reqwest::Client, url: &str, query: &str) -> Option<Vec<f32>> {
+    let body = serde_json::json!({ "texts": [query] });
+    let resp = client
+        .post(url)
+        .timeout(std::time::Duration::from_secs(5))
+        .json(&body)
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let v: serde_json::Value = resp.json().await.ok()?;
+    let arr = v.get("embeddings")?.as_array()?;
+    let first = arr.first()?.as_array()?;
+    let vec: Vec<f32> = first
+        .iter()
+        .filter_map(|x| x.as_f64().map(|f| f as f32))
+        .collect();
+    if vec.is_empty() {
+        None
+    } else {
+        Some(vec)
+    }
 }
 
 /// 构建 axum Router
@@ -604,6 +640,35 @@ async fn handle_tool_call(
             allowed,
         );
         return rpc_ok_text(id, &text);
+    }
+
+    // P3-0: 查询时注入 query embedding（在 async 上下文，早于 spawn_blocking）。
+    // 这是评测报告「HNSW 未生效」的根因修复点：原 MCP 路径从不生成 query 向量，
+    // 导致 semantic_search 的 QueryCache 恒为空、HNSW 那 1174 个向量永不参与融合排序。
+    // 此处异步调本地嵌入服务拿到向量写入共享 QueryCache，dispatch 内的 hybrid_search
+    // 即可让语义信号真正参与 RRF 融合。未配置 MEMORIA_EMBEDDING_URL 或服务不可用 → 静默降级。
+    if (tool == "memory_search" || tool == "memory_search_v2") && !state.embedding_url.is_empty() {
+        if let Some(q) = safe_args.get("query").and_then(|v| v.as_str()) {
+            if !q.is_empty() {
+                if let Some(qvec) = embed_query(&state.http_client, &state.embedding_url, q).await {
+                    state.query_cache.put(q, qvec);
+                }
+            }
+        }
+    }
+
+    // P3-0 写入侧嵌入（与查询侧对称）：memory_remember 时把 content 向量注入共享 QueryCache，
+    // 使 remember_with_dedup 能正常落表 + 入 HNSW。这是「写入侧从不嵌入、HNSW 恒空」根因的
+    // 另一半修复——benchmark / 独立 HTTP 部署只传 content，从不预缓存向量，导致记忆写入后
+    // 索引里永远没有它的向量。此处异步调本地嵌入服务补齐，未配置/不可用则静默降级。
+    if tool == "memory_remember" && !state.embedding_url.is_empty() {
+        if let Some(c) = safe_args.get("content").and_then(|v| v.as_str()) {
+            if !c.is_empty() {
+                if let Some(cvec) = embed_query(&state.http_client, &state.embedding_url, c).await {
+                    state.query_cache.put(c, cvec);
+                }
+            }
+        }
     }
 
     // P0 修复：dispatch 内含同步重计算（FTS5 / HNSW 语义检索等）+ audit_log 同步写，
@@ -2152,11 +2217,59 @@ mod tests {
             query_cache: Arc::new(memoria_core::vector::QueryCache::new()),
             admin_key: "test-admin-key".to_string(),
             bridge_url: "http://127.0.0.1:9000/mcp".to_string(),
+            embedding_url: String::new(),
             http_client: reqwest::Client::new(),
             db_path: ":memory:".to_string(),
             backup_dir: ".".to_string(),
             vec_index_path: ":memory:".to_string(),
         })
+    }
+
+    // ── P3-0: embed_query 解析 + 优雅降级验证 ──
+    #[tokio::test]
+    async fn test_embed_query_parses_mock_response() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let url = format!("http://{}", addr);
+        let h = std::thread::spawn(move || {
+            for stream in listener.incoming().take(1) {
+                let mut s = stream.unwrap();
+                let mut buf = [0u8; 4096];
+                let _ = s.read(&mut buf).unwrap(); // 读掉请求
+                let body = r#"{"embeddings":[[0.1,0.2,0.3]],"dim":3,"model":"x"}"#;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = s.write_all(resp.as_bytes());
+            }
+        });
+        let client = reqwest::Client::new();
+        let v = super::embed_query(&client, &url, "hello").await;
+        h.join().unwrap();
+        assert_eq!(v, Some(vec![0.1f32, 0.2, 0.3]), "应解析出 embeddings[0]");
+    }
+
+    #[tokio::test]
+    async fn test_embed_query_handles_500_gracefully() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let url = format!("http://{}", addr);
+        let h = std::thread::spawn(move || {
+            for stream in listener.incoming().take(1) {
+                let mut s = stream.unwrap();
+                let _ = s.read(&mut [0u8; 4096]).unwrap();
+                let resp = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                let _ = s.write_all(resp.as_bytes());
+            }
+        });
+        let client = reqwest::Client::new();
+        let v = super::embed_query(&client, &url, "hello").await;
+        h.join().unwrap();
+        assert_eq!(v, None, "500 应优雅降级为 None，而非报错");
     }
 
     #[test]

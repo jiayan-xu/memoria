@@ -92,6 +92,21 @@ pub fn remember_with_dedup(
     // Use content_hash as memory ID for dedup
     let mem_id = content_hash.clone();
 
+    // P3-0 写入侧嵌入（关键修复）：在「精确重复检查」之前先取候选向量，供两个分支复用。
+    // 来源优先级：
+    //   1. query_cache 中由 MCP handler 刚刚注入的 content 向量（memory_remember 时异步调
+    //      本地嵌入服务生成，见 mcp_server.rs 的 embed_query 注入）；
+    //   2. memory_vectors 持久表中已存的该记忆向量（重启/重跑后兜底）。
+    // 若两者皆无 → None（优雅降级，记忆仍照常写入，仅无语义向量）。
+    // 根因：原设计假定「调用方在调 memory_remember 前通过 cache_query_vector 预缓存向量」，
+    // 但独立 HTTP 部署 + benchmark 写入路径从不调用，导致向量永不落表、HNSW 恒空、
+    // 语义检索永远不参与融合。此处补齐写入侧嵌入，让索引随写入自然增长。
+    let candidate_vector: Option<Vec<f32>> = if let (Some(qc), Some(_h)) = (query_cache, hnsw) {
+        qc.get(content).or_else(|| crate::vector::persist::get_stored_vector(pool, &mem_id))
+    } else {
+        None
+    };
+
     // Check if already exists (exact duplicate)
     let existing: Result<String, _> = conn.query_row(
         "SELECT id FROM memories WHERE id = ?",
@@ -117,6 +132,21 @@ pub fn remember_with_dedup(
                 rusqlite::params![tags_safe, mem_id],
             );
         }
+        // P3-0 写入侧嵌入（精确重复分支）：精确重复的记忆若尚未落向量，补一次。
+        // benchmark 重跑 / 跨会话重复写入等场景下，记忆早已存在但无向量，
+        // 此处分支负责把它补进 memory_vectors + HNSW，使语义检索可命中。
+        if near_dup_enabled() {
+            if let (Some(hnsw_idx), Some(qv)) = (hnsw, &candidate_vector) {
+                if crate::vector::persist::get_stored_vector(pool, &mem_id).is_none() {
+                    let _ = crate::vector::persist::put_stored_vector(pool, &mem_id, namespace, qv);
+                    let _ = hnsw_idx.add(&[VectorEntry {
+                        id: mem_id.clone(),
+                        vector: qv.clone(),
+                    }]);
+                }
+            }
+        }
+
         return Ok(RememberResult {
             id: mem_id,
             action: "updated_exact".to_string(),
@@ -158,13 +188,11 @@ pub fn remember_with_dedup(
     let mut similarities = Vec::new();
 
     if near_dup_enabled() {
-        if let (Some(hnsw_idx), Some(qc)) = (hnsw, query_cache) {
-            // 向量来源：query_cache 优先；其次 memory_vectors 持久表（重启后仍可用，
-            // 解决了 QueryCache 进程内、重启后近义去重弱化的问题）。
-            // Python / 调用方在调 memory_remember 前通过 cache_query_vector 提供新内容向量。
-            let query_vector: Option<Vec<f32>> = qc
-                .get(content)
-                .or_else(|| crate::vector::persist::get_stored_vector(pool, &mem_id));
+        if let (Some(hnsw_idx), Some(_qc)) = (hnsw, query_cache) {
+            // P3-0：向量来源统一走 candidate_vector（query_cache 优先 → memory_vectors 兜底），
+            // 即 MCP handler 在 memory_remember 时异步注入的 content 向量（见 mcp_server.rs）。
+            // 不再依赖「调用方预缓存」这一从未在 HTTP 部署中触发的隐式契约。
+            let query_vector: Option<Vec<f32>> = candidate_vector.clone();
 
             if let Some(qv) = query_vector {
                 let threshold = near_dup_threshold();

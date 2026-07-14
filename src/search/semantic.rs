@@ -57,12 +57,42 @@ pub fn semantic_search(
     };
 
     let mut out = Vec::with_capacity(allowed.len());
+    if allowed.is_empty() {
+        return Ok(out);
+    }
+
+    // P3-0 修复：语义结果此前 content 恒为空（只带 memory_id），
+    // 经 rrf_merge 首次插入即锁定空正文，导致「仅被语义命中」的记忆在 fusion 后丢失正文，
+    // benchmark 拼上下文时得不到内容、答案必错。此处按 allowed id 批量回取 content 补齐。
+    let mut contents: HashMap<String, String> = HashMap::new();
+    if let Some(p) = pool {
+        let ids: Vec<&String> = allowed.iter().collect();
+        let placeholders = vec!["?"; ids.len()].join(",");
+        let sql = format!(
+            "SELECT id, content FROM memories WHERE id IN ({})",
+            placeholders
+        );
+        if let Ok(conn) = p.get() {
+            if let Ok(mut stmt) = conn.prepare(&sql) {
+                if let Ok(rows) = stmt.query_map(
+                    rusqlite::params_from_iter(ids.iter().map(|s| *s)),
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                ) {
+                    for r in rows.flatten() {
+                        contents.insert(r.0, r.1);
+                    }
+                }
+            }
+        }
+    }
+
     for (memory_id, distance) in results {
         let score = 1.0 - distance; // Convert cosine distance to similarity
         if score > 0.0 && allowed.contains(&memory_id) {
+            let content = contents.get(&memory_id).cloned().unwrap_or_default();
             out.push(SignalResult {
                 memory_id,
-                content: String::new(),
+                content,
                 score: score as f64,
                 source: "hnsw_semantic".to_string(),
             });
