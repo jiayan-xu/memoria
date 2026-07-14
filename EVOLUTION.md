@@ -340,4 +340,21 @@ memoria-server (:9003)  — Rust 独立二进制
 
 ---
 
+## 2026-07-14 — `/health` 暴露 embed + 本地嵌入通道可观测
+
+### 背景
+HNSW 语义检索依赖本机 `embed_server.py`（默认 `:8777`），但公开 `/health` 不反映嵌入是否在线，托盘与 agent-core 无法区分「Memoria 起了但语义降级」。
+
+### 变更
+- **`health.rs`**：`check_embedding_endpoint`（软检查）；`run_health_check` 纳入 embedding
+- **公开 `/health`**：返回 `embed.{configured,status,message,duration_ms}`；嵌入不可达时顶层 `status=degraded`
+- **`/health/full` / `memory_health`**：同步带 embed 摘要
+- **同批**：本地嵌入服务 + 写入侧向量（既有提交）；A2A 信封存 `content` JSON
+
+### 验证
+- Embed 在线：`GET /health` → `embed.status=pass`（model/dim 可见）
+- Embed 停：`degraded` + 明确 message；硬检查仍通过，服务可起
+
+---
+
 *Memoria — Not bound to any software. Serving only you.*

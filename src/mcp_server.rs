@@ -87,8 +87,21 @@ pub fn build_app(state: Arc<AppState>) -> Router {
 }
 
 /// 健康检查（简化版，向后兼容）
-async fn health_check() -> Json<serde_json::Value> {
-    Json(serde_json::json!({"status":"ok","service":"memoria","version":"0.2.0"}))
+async fn health_check(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    // 公开探针：含嵌入通道摘要（无密钥），供托盘 / PFAiX / agent-core 判断语义是否在线。
+    let emb = memoria_core::health::check_embedding_endpoint(&state.embedding_url);
+    let semantic_ok = emb.status == "pass";
+    Json(serde_json::json!({
+        "status": if semantic_ok { "ok" } else { "degraded" },
+        "service": "memoria",
+        "version": env!("CARGO_PKG_VERSION"),
+        "embed": {
+            "configured": !state.embedding_url.trim().is_empty(),
+            "status": emb.status,
+            "message": emb.message,
+            "duration_ms": emb.duration_ms,
+        },
+    }))
 }
 
 /// 健康检查（完整版 — P0: 启动自检）
@@ -121,6 +134,7 @@ async fn health_check_full(
         return Err(StatusCode::FORBIDDEN);
     }
     let st = state.clone();
+    let emb_url = state.embedding_url.clone();
     let report = tokio::task::spawn_blocking(move || {
         memoria_core::health::run_health_check(
             &st.pool,
@@ -128,6 +142,7 @@ async fn health_check_full(
             &st.hnsw,
             &st.db_path,
             &st.hnsw_status,
+            &emb_url,
         )
     })
     .await
@@ -139,10 +154,22 @@ async fn health_check_full(
         version: env!("CARGO_PKG_VERSION").to_string(),
     });
     let overall = report.overall.clone();
+    let embed_check = report
+        .soft_checks
+        .iter()
+        .find(|c| c.name == "embedding")
+        .map(|c| {
+            serde_json::json!({
+                "status": c.status,
+                "message": c.message,
+                "duration_ms": c.duration_ms,
+            })
+        });
     Ok(Json(serde_json::json!({
         "status": overall,
         "service": "memoria",
-        "version": "0.2.0",
+        "version": env!("CARGO_PKG_VERSION"),
+        "embed": embed_check,
         "report": report,
     })))
 }
@@ -1810,8 +1837,13 @@ fn dispatch(
                 &state.hnsw,
                 &state.db_path,
                 &state.hnsw_status,
+                &state.embedding_url,
             );
-            serde_json::to_string(&serde_json::json!({"status":"ok","report":report}))
+            serde_json::to_string(&serde_json::json!({
+                "status":"ok",
+                "embed": report.soft_checks.iter().find(|c| c.name == "embedding"),
+                "report": report
+            }))
                 .unwrap_or_default()
         }
         "memory_dedup_chain" => {

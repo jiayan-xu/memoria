@@ -35,13 +35,14 @@ const EXPECTED_SCHEMA_VERSION: u32 = 2;
 /// 最小磁盘空间 (500MB)
 const MIN_DISK_SPACE_MB: u64 = 500;
 
-/// 执行完整健康检查
+/// 执行完整健康检查。`embedding_url` 为空表示未配置语义后端（软警告，不致 fail）。
 pub fn run_health_check(
     pool: &SqlitePool,
     auth_pool: &SqlitePool,
     hnsw: &HnswIndex,
     db_path: &str,
     hnsw_status: &str,
+    embedding_url: &str,
 ) -> HealthReport {
     let timestamp = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
     let version = env!("CARGO_PKG_VERSION").to_string();
@@ -87,6 +88,9 @@ pub fn run_health_check(
     // 10. 连接池状态
     soft_checks.push(check_pool_stats(pool));
 
+    // 11. 本地嵌入服务（语义检索通道）
+    soft_checks.push(check_embedding_endpoint(embedding_url));
+
     // 判定总体状态
     let hard_fail = hard_checks.iter().any(|c| c.status == "fail");
     let soft_fail = soft_checks.iter().any(|c| c.status == "fail");
@@ -107,6 +111,132 @@ pub fn run_health_check(
         timestamp,
         version,
     }
+}
+
+/// 探测嵌入服务：未配置 → warn；配置了但不可达 → fail（软）；可达 → pass。
+/// 仅返回摘要，不含密钥。`url` 形如 `http://127.0.0.1:8777/embed`。
+pub fn check_embedding_endpoint(url: &str) -> CheckResult {
+    let start = std::time::Instant::now();
+    let url = url.trim();
+    if url.is_empty() {
+        return CheckResult {
+            name: "embedding".to_string(),
+            status: "warn".to_string(),
+            message: "MEMORIA_EMBEDDING_URL 未配置，语义检索降级为 FTS/时间信号".to_string(),
+            duration_ms: start.elapsed().as_millis() as u64,
+        };
+    }
+    // 将 .../embed 规范为 .../health
+    let health_url = if url.ends_with("/embed") {
+        format!("{}health", &url[..url.len() - 5])
+    } else if url.ends_with('/') {
+        format!("{}health", url)
+    } else {
+        format!("{}/health", url)
+    };
+    match http_get_json_summary(&health_url, 2000) {
+        Ok((code, body_snip)) if (200..300).contains(&code) => {
+            let dim = extract_json_number(&body_snip, "dim");
+            let model = extract_json_string(&body_snip, "model").unwrap_or_else(|| "?".into());
+            CheckResult {
+                name: "embedding".to_string(),
+                status: "pass".to_string(),
+                message: format!(
+                    "ok http={} model={} dim={}",
+                    code,
+                    model,
+                    dim.map(|d| d.to_string()).unwrap_or_else(|| "?".into())
+                ),
+                duration_ms: start.elapsed().as_millis() as u64,
+            }
+        }
+        Ok((code, _)) => CheckResult {
+            name: "embedding".to_string(),
+            status: "fail".to_string(),
+            message: format!("嵌入 /health 返回 HTTP {}", code),
+            duration_ms: start.elapsed().as_millis() as u64,
+        },
+        Err(e) => CheckResult {
+            name: "embedding".to_string(),
+            status: "fail".to_string(),
+            message: format!("嵌入服务不可达: {}（语义检索已降级）", e),
+            duration_ms: start.elapsed().as_millis() as u64,
+        },
+    }
+}
+
+/// 轻量 HTTP GET（不引入 blocking reqwest），供同步健康检查使用。
+fn http_get_json_summary(url: &str, timeout_ms: u64) -> Result<(u16, String), String> {
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+    use std::time::Duration;
+
+    let url = url
+        .strip_prefix("http://")
+        .ok_or_else(|| "仅支持 http:// 嵌入地址".to_string())?;
+    let (host_port, path) = match url.find('/') {
+        Some(i) => (&url[..i], &url[i..]),
+        None => (url, "/"),
+    };
+    let (host, port) = match host_port.rsplit_once(':') {
+        Some((h, p)) => (h, p.parse::<u16>().map_err(|_| "端口无效".to_string())?),
+        None => (host_port, 80u16),
+    };
+    let mut stream = TcpStream::connect((host, port)).map_err(|e| e.to_string())?;
+    stream
+        .set_read_timeout(Some(Duration::from_millis(timeout_ms)))
+        .ok();
+    stream
+        .set_write_timeout(Some(Duration::from_millis(timeout_ms)))
+        .ok();
+    let req = format!(
+        "GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+        path, host_port
+    );
+    stream.write_all(req.as_bytes()).map_err(|e| e.to_string())?;
+    let mut buf = Vec::new();
+    stream.read_to_end(&mut buf).map_err(|e| e.to_string())?;
+    let text = String::from_utf8_lossy(&buf);
+    let status_line = text.lines().next().unwrap_or("");
+    let code = status_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse::<u16>().ok())
+        .unwrap_or(0);
+    let body = text
+        .split("\r\n\r\n")
+        .nth(1)
+        .or_else(|| text.split("\n\n").nth(1))
+        .unwrap_or("")
+        .chars()
+        .take(400)
+        .collect::<String>();
+    Ok((code, body))
+}
+
+fn extract_json_string(body: &str, key: &str) -> Option<String> {
+    let pat = format!("\"{}\"", key);
+    let i = body.find(&pat)?;
+    let rest = &body[i + pat.len()..];
+    let rest = rest.trim_start_matches(|c: char| c == ':' || c.is_whitespace());
+    if !rest.starts_with('"') {
+        return None;
+    }
+    let rest = &rest[1..];
+    let end = rest.find('"')?;
+    Some(rest[..end].to_string())
+}
+
+fn extract_json_number(body: &str, key: &str) -> Option<i64> {
+    let pat = format!("\"{}\"", key);
+    let i = body.find(&pat)?;
+    let rest = &body[i + pat.len()..];
+    let rest = rest.trim_start_matches(|c: char| c == ':' || c.is_whitespace());
+    let num: String = rest
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    num.parse().ok()
 }
 
 // ── 硬失败检查 ──

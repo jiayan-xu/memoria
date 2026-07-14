@@ -199,7 +199,9 @@ fn main() {
 
     // ── P0: 启动健康检查 ──
     println!("[Memoria] Running startup health check...");
-    let report = health::run_health_check(&pool, &auth_pool, &hnsw, &db_path, hnsw_status);
+    let emb_url = std::env::var("MEMORIA_EMBEDDING_URL").unwrap_or_default();
+    let report =
+        health::run_health_check(&pool, &auth_pool, &hnsw, &db_path, hnsw_status, &emb_url);
     match report.overall.as_str() {
         "pass" => println!("[Memoria] Health check: PASS (all checks OK)"),
         "degraded" => {
