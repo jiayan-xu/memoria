@@ -252,6 +252,12 @@ pub fn enrich_ledger(
         .cloned()
         .unwrap_or_default();
 
+      let text_signals = crate::search::text_signals::extract_text_signals(
+        &f.content,
+        tags_json,
+        Some(occurred.as_str()),
+      );
+
       json!({
         "index": i + 1,
         "memory_id": f.memory_id,
@@ -263,6 +269,7 @@ pub fn enrich_ledger(
         "mentioned": valid_from,
         "source_ref": format!("{}:{}", namespace, f.memory_id),
         "entities": entities,
+        "text_signals": text_signals,
         "is_latest": true,
       })
     })

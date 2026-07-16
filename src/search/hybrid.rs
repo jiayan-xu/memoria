@@ -142,6 +142,8 @@ pub fn hybrid_search(
     // Phase B / M1.3：轻量共现启发式 rerank（O5：无 cross-encoder）
     // 在 take 前对候选池加成重排，再截断到 max_results。
     search::cooccur::rerank_by_cooccurrence(pool, namespace, query, &mut unique);
+    // P2 / M2.1：text_signals 数字/日期重叠加成（可 MEMORIA_TEXT_SIGNALS_RERANK=0 关闭）
+    search::text_signals::rerank_by_text_signals(query, &mut unique);
 
     let unique: Vec<FusedResult> = unique.into_iter().take(max_results as usize).collect();
 

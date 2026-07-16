@@ -1,4 +1,5 @@
 pub mod cooccur;
+pub mod text_signals;
 pub mod hybrid;
 pub mod importance;
 pub mod keyword;
