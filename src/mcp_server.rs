@@ -265,7 +265,8 @@ pub fn tools_list() -> Vec<serde_json::Value> {
                 "max_results": {"type": "number", "description": "最大返回结果数", "default": 5},
                 "tags": {"type": "string", "description": "标签过滤，JSON 数组字符串"},
                 "as_of": {"type": "string", "description": "P1-5 时序真值：仅返回该 ISO-8601 时刻有效的记忆；不传则默认返回「当前真值」（superseded_by IS NULL 且未失效）"},
-                "include_superseded": {"type": "boolean", "description": "P0: 是否包含已被取代的历史记忆（默认 false，仅看当前真值）"}
+                "include_superseded": {"type": "boolean", "description": "P0: 是否包含已被取代的历史记忆（默认 false，仅看当前真值）"},
+                "enrich_ledger": {"type": "boolean", "description": "O6：可选账本富化，默认 false；ledger 主路径在 memory_context"}
             }),
         ),
         tool(
@@ -276,10 +277,10 @@ pub fn tools_list() -> Vec<serde_json::Value> {
                 "category": {"type": "string", "description": "类别，默认 fact"},
                 "importance": {"type": "number", "description": "重要度 1-5，默认 3"},
                 "source": {"type": "string", "description": "来源，默认 mcp"},
-                "tags": {"type": "string", "description": "标签 JSON 数组字符串"},
+                "tags": {"type": "string", "description": "标签 JSON 数组字符串（事件日：occurred:YYYY-MM-DD，O3）"},
                 "valid_from": {"type": "string", "description": "P1-5 时序真值：记忆生效起点 ISO-8601（默认插入时刻）"},
                 "valid_to": {"type": "string", "description": "P1-5 时序真值：记忆失效点 ISO-8601（默认 NULL，长期有效）"},
-                "event_time": {"type": "string", "description": "P0+ 吸收 HMS：事件「发生」时刻 ISO-8601；与 valid_from（断言时刻）区分，用于新旧状态区分 / 相对日期落地"},
+                "event_time": {"type": "string", "description": "DEPRECATED(O2)：勿写列；若传入则映射为 tags occurred:YYYY-MM-DD，不再 UPDATE event_time"},
                 "supersedes_id": {"type": "string", "description": "P0-4: 显式取代的目标记忆 id（须同 ns 且为当前 tip）；失败返回 404/403/409"},
                 "relation": {"type": "string", "description": "记忆边类型：updates|extends|derives（默认 updates）"}
             }),
@@ -292,10 +293,10 @@ pub fn tools_list() -> Vec<serde_json::Value> {
                 "category": {"type": "string", "description": "类别，默认 fact"},
                 "importance": {"type": "number", "description": "重要度 1-5，默认 3"},
                 "source": {"type": "string", "description": "来源，默认 mcp"},
-                "tags": {"type": "string", "description": "标签 JSON 数组字符串"},
+                "tags": {"type": "string", "description": "标签 JSON 数组字符串（事件日用 occurred:YYYY-MM-DD，O3）"},
                 "valid_from": {"type": "string", "description": "P1-5 时序真值：记忆生效起点 ISO-8601"},
                 "valid_to": {"type": "string", "description": "P1-5 时序真值：记忆失效点 ISO-8601"},
-                "event_time": {"type": "string", "description": "P0+ 吸收 HMS：事件「发生」时刻 ISO-8601；与 valid_from 区分"},
+                "event_time": {"type": "string", "description": "DEPRECATED(O2)：映射为 occurred: tag，不写列"},
                 "supersedes_id": {"type": "string", "description": "P0-4: 显式取代的目标记忆 id"},
                 "relation": {"type": "string", "description": "记忆边类型：updates|extends|derives（默认 updates）"}
             }),
@@ -331,7 +332,8 @@ pub fn tools_list() -> Vec<serde_json::Value> {
                 "max_results": {"type": "number", "description": "最大返回结果数，默认 5"},
                 "tags": {"type": "string", "description": "标签过滤，JSON 数组字符串"},
                 "as_of": {"type": "string", "description": "P1-5 时序真值：仅返回该 ISO-8601 时刻有效的记忆；不传则默认返回当前真值"},
-                "include_superseded": {"type": "boolean", "description": "P0: 是否包含已被取代的历史记忆（默认 false）"}
+                "include_superseded": {"type": "boolean", "description": "P0: 是否包含已被取代的历史记忆（默认 false）"},
+                "enrich_ledger": {"type": "boolean", "description": "O6：可选账本富化，默认 false"}
             }),
         ),
         tool(
@@ -941,32 +943,50 @@ fn dispatch(
                 fused
             };
 
-            // P0+ 吸收 HMS：富化为类型化证据账本（type/occurred/mentioned/source_ref/entities）
-            let ledger = tools::ledger::enrich_ledger(&state.pool, ns, &filtered);
-            let is_latest = as_of.is_none();
-            let results: Vec<serde_json::Value> = ledger
-                .into_iter()
-                .take(max_results as usize)
-                .map(|mut row| {
-                    if let Some(obj) = row.as_object_mut() {
-                        // 向后兼容：保留 content(截断) / rrf_score / source 旧字段
-                        let text = obj
-                            .get("content")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .to_string();
-                        obj.insert("content".to_string(), serde_json::json!(truncate(&text, 2000)));
-                        obj.insert("is_latest".to_string(), serde_json::json!(is_latest));
-                    }
-                    row
-                })
-                .collect();
-            // P0+ 吸收 HMS：Self-Evolution 护栏（答案时刻确定性控制，零 LLM 调用）
-            let guardrails = match query {
-                q if !q.is_empty() => tools::self_evolution::guardrails(q),
-                _ => Vec::new(),
+            // O6：默认不 enrich ledger；仅 enrich_ledger=true 时可选富化
+            let want_ledger = args
+                .get("enrich_ledger")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let results: Vec<serde_json::Value> = if want_ledger {
+                tools::ledger::enrich_ledger(&state.pool, ns, &filtered)
+                    .into_iter()
+                    .take(max_results as usize)
+                    .map(|mut row| {
+                        if let Some(obj) = row.as_object_mut() {
+                            let text = obj
+                                .get("content")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            obj.insert(
+                                "content".to_string(),
+                                serde_json::json!(truncate(&text, 2000)),
+                            );
+                        }
+                        row
+                    })
+                    .collect()
+            } else {
+                filtered
+                    .iter()
+                    .take(max_results as usize)
+                    .map(|r| {
+                        serde_json::json!({
+                            "memory_id": r.memory_id,
+                            "content": truncate(&r.content, 2000),
+                            "rrf_score": r.rrf_score,
+                            "source": r.source,
+                        })
+                    })
+                    .collect()
             };
-            serde_json::to_string(&serde_json::json!({"status":"ok","total_results":filtered.len(),"results":results,"guardrails":guardrails})).unwrap_or_default()
+            serde_json::to_string(&serde_json::json!({
+                "status": "ok",
+                "total_results": filtered.len(),
+                "results": results,
+            }))
+            .unwrap_or_default()
         }
         "memory_remember" | "memory" => {
             // P2-2 配额：写入限流（admin 豁免）
@@ -981,10 +1001,9 @@ fn dispatch(
             let imp = args.get("importance").and_then(|v| v.as_i64()).unwrap_or(3);
             let src = args.get("source").and_then(|v| v.as_str()).unwrap_or("mcp");
             // tags: 支持 JSON 数组 ["a","b"] 或 JSON 字符串 "[\"a\",\"b\"]"
-            let tags = if let Some(arr) = args.get("tags").and_then(|v| v.as_array()) {
+            let mut tags = if let Some(arr) = args.get("tags").and_then(|v| v.as_array()) {
                 serde_json::to_string(arr).unwrap_or_else(|_| "[]".to_string())
             } else if let Some(s) = args.get("tags").and_then(|v| v.as_str()) {
-                // 已经是 JSON 字符串，确保格式正确
                 if s.is_empty() || s == "[]" {
                     "[]".to_string()
                 } else {
@@ -996,8 +1015,17 @@ fn dispatch(
             // P1-5: 可选时序真值区间
             let valid_from = args.get("valid_from").and_then(|v| v.as_str());
             let valid_to = args.get("valid_to").and_then(|v| v.as_str());
-            // P0+ 吸收 HMS: 可选「事件发生」时刻（与 valid_from 断言时刻区分）
-            let event_time = args.get("event_time").and_then(|v| v.as_str());
+            // O2/O3：event_time 参数 deprecate → 映射为 occurred:YYYY-MM-DD tag，不写列
+            if let Some(et) = args.get("event_time").and_then(|v| v.as_str()) {
+                if !et.is_empty() {
+                    eprintln!(
+                        "[Memoria] WARN: event_time param deprecated (O2); mapping to occurred: tag"
+                    );
+                    if let Some(otag) = tools::ledger::occurred_tag_from_iso(et) {
+                        tags = tools::ledger::merge_occurred_tag(&tags, &otag);
+                    }
+                }
+            }
             // P0-4: 显式取代目标（取代指定旧记忆，带 404/403/409 失败模式）
             let supersedes_id = args.get("supersedes_id").and_then(|v| v.as_str());
             let relation = args.get("relation").and_then(|v| v.as_str());
@@ -1018,10 +1046,6 @@ fn dispatch(
                 relation,
             ) {
                 Ok(result) => {
-                    // P0+ 吸收 HMS: 事件发生时点（与 valid_from 断言时刻区分），作为 remember 后的独立 UPDATE
-                    if let Some(et) = event_time {
-                        let _ = tools::remember::set_event_time(&state.pool, &result.id, et);
-                    }
                     if result.action == "superseded_near_dup" && !result.superseded_ids.is_empty() {
                         let pairs: Vec<String> = result
                             .superseded_ids

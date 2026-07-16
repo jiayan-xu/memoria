@@ -1,9 +1,7 @@
-//! Self-Evolution 护栏 — 吸收 HMS 的四条确定性控制规则（Phase A / P0+）。
+//! Self-Evolution 护栏 — HMS 四条确定性控制规则（纯函数，供单测复用）。
 //!
-//! HMS 在答案时刻按关键词触发启发式控制（非 ML），覆盖长程记忆推理的典型失败模式：
-//! 去重计数 / 相对日期落地 / 金额差值校准 / 当前态vs历史态仲裁。
-//! 这里作为 recall 侧 prompt 护栏注记返回，零 LLM 调用、纯规则。
-//! 对应 HMS `organizer._controls`。
+//! **O4**：生产注入在 **agent-core** `search_memory`→knowledge 路径；
+//! Memoria MCP **不必**强塞 `guardrails` 字段，本模块不当作 O4 完成依据。
 
 /// 中英文关键词 → 控制规则注记。
 /// 返回命中的规则文本列表（可能为空）。

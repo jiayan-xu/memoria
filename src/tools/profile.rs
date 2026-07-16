@@ -199,18 +199,13 @@ pub fn memory_context(
                 as_of, // 透传 as_of；None → is_latest_now
                 false, // include_superseded=false
             ) {
-                // P0+ 吸收 HMS：富化为类型化证据账本（type/occurred/mentioned/source_ref/entities）
+                // O6：仅 memory_context 组装 ledger；O1 entities=[]；O3 occurred 自 tags
                 recall = crate::tools::ledger::enrich_ledger(pool, namespace, &fused);
             }
         }
     }
 
-    // P0+ 吸收 HMS：Self-Evolution 护栏（答案时刻确定性控制，零 LLM 调用）
-    let guardrails = match query {
-        Some(q) if !q.is_empty() => crate::tools::self_evolution::guardrails(q),
-        _ => Vec::new(),
-    };
-
+    // O4：Self-Evolution 在 agent-core；此处不再强塞 guardrails
     let prompt_block = render_prompt_block(&profile, &recall);
 
     Ok(json!({
@@ -218,7 +213,7 @@ pub fn memory_context(
         "namespace": namespace,
         "profile": profile,
         "recall": recall,
-        "guardrails": guardrails,
+        "ledger": recall,
         "prompt_block": prompt_block,
     }))
 }

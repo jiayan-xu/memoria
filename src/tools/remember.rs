@@ -167,20 +167,23 @@ pub fn remember(
     Ok(result.id)
 }
 
-/// P0+ 吸收 HMS: 写入「事件发生」时刻（与 valid_from 断言时刻区分）。
-/// 作为 remember 后的独立 UPDATE，避免改动 remember_with_dedup 签名而牵连大量调用方。
-/// event_time 缺省留 NULL（召回时以 valid_from 兜底为 occurred）。
+/// **Deprecated (O2)**：不再作为 P0 写入主路径。保留函数以免外部调用方编译断裂；
+/// 调用方应改用 tags `occurred:YYYY-MM-DD`。本函数仍写旧列（只读兼容遗留数据），
+/// 但 MCP `memory_remember` 已不再调用。
 pub fn set_event_time(
     pool: &SqlitePool,
     memory_id: &str,
     event_time: &str,
 ) -> Result<(), String> {
+    eprintln!(
+        "[Memoria] WARN: set_event_time deprecated (O2); prefer tags occurred:YYYY-MM-DD (id={})",
+        memory_id
+    );
     let conn = pool.get().map_err(|e| format!("pool: {}", e))?;
-    conn.execute(
+    let _ = conn.execute(
         "UPDATE memories SET event_time = ? WHERE id = ?",
         rusqlite::params![event_time, memory_id],
-    )
-    .map_err(|e| format!("set event_time: {}", e))?;
+    );
     Ok(())
 }
 
