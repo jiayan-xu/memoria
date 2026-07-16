@@ -144,7 +144,10 @@ pub fn init_core_tables(pool: &SqlitePool) -> Result<(), String> {
             namespace TEXT NOT NULL DEFAULT 'default',
             source_id TEXT NOT NULL,
             target_id TEXT NOT NULL,
-            relation_type TEXT NOT NULL CHECK(relation_type IN ('same_entity','chronological','semantic_related')),
+            relation_type TEXT NOT NULL CHECK(relation_type IN (
+                'same_entity','chronological','semantic_related',
+                'updates','extends','derives'
+            )),
             weight REAL DEFAULT 0.5,
             evidence TEXT,
             created_at TEXT DEFAULT (datetime('now')),
@@ -340,6 +343,57 @@ pub fn migrate_dream_state_ns(pool: &SqlitePool) -> Result<(), String> {
             "[Memoria] Migration: rebuilt dream_state with (phase, namespace) composite PK (preserved old rows)"
         );
     }
+    Ok(())
+}
+
+/// P0/P1：扩展 `memory_relations.relation_type` CHECK，加入 `updates|extends|derives`。
+/// SQLite 无法 ALTER CHECK，需重建表；幂等：新 CHECK 已含 updates 则跳过。
+pub fn migrate_memory_relation_types(pool: &SqlitePool) -> Result<(), String> {
+    let conn = pool.get().map_err(|e| format!("pool get: {}", e))?;
+    let sql: String = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='memory_relations'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or_default();
+    if sql.is_empty() {
+        return Ok(());
+    }
+    if sql.contains("'updates'") {
+        return Ok(());
+    }
+    conn.execute_batch(
+        "ALTER TABLE memory_relations RENAME TO _memory_relations_old;
+         CREATE TABLE memory_relations (
+             id INTEGER PRIMARY KEY AUTOINCREMENT,
+             namespace TEXT NOT NULL DEFAULT 'default',
+             source_id TEXT NOT NULL,
+             target_id TEXT NOT NULL,
+             relation_type TEXT NOT NULL CHECK(relation_type IN (
+                 'same_entity','chronological','semantic_related',
+                 'updates','extends','derives'
+             )),
+             weight REAL DEFAULT 0.5,
+             evidence TEXT,
+             created_at TEXT DEFAULT (datetime('now')),
+             valid_from TEXT DEFAULT (datetime('now')),
+             valid_to TEXT
+         );
+         INSERT INTO memory_relations(
+             id, namespace, source_id, target_id, relation_type, weight, evidence,
+             created_at, valid_from, valid_to
+         )
+         SELECT id, namespace, source_id, target_id, relation_type, weight, evidence,
+                created_at, valid_from, valid_to
+         FROM _memory_relations_old;
+         DROP TABLE _memory_relations_old;
+         CREATE INDEX IF NOT EXISTS idx_rel_source ON memory_relations(source_id);
+         CREATE INDEX IF NOT EXISTS idx_rel_target ON memory_relations(target_id);
+         CREATE INDEX IF NOT EXISTS idx_rel_namespace ON memory_relations(namespace);",
+    )
+    .map_err(|e| format!("migrate memory_relations types: {}", e))?;
+    println!("[Memoria] Migration: memory_relations CHECK extended with updates|extends|derives");
     Ok(())
 }
 

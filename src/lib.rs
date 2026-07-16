@@ -37,6 +37,7 @@ impl MemoriaEngine {
         storage::migrate_user_prefs_namespace(&pool)?;
         storage::migrate_dream_state_ns(&pool)?;
         storage::migrate_temporal(&pool)?;
+        storage::migrate_memory_relation_types(&pool)?;
         // P2-2：配额计数表随引擎自洽（与 main.rs 一致，避免 lib/MemoriaEngine 路径缺表）
         quota::init_quota_table(&pool)?;
 
@@ -75,6 +76,7 @@ impl MemoriaEngine {
         _intent: &str,
         namespace: &str,
         _tier: &str,
+        include_superseded: bool,
     ) -> Result<String, String> {
         let results = search::hybrid::hybrid_search(
             &self.pool,
@@ -84,6 +86,7 @@ impl MemoriaEngine {
             Some(&self.hnsw),
             Some(&self.query_cache),
             None,
+            include_superseded,
         )?;
         let items: Vec<serde_json::Value> = results
             .iter()
@@ -213,6 +216,7 @@ mod python {
                 .map(|e| PyEngine { inner: e })
                 .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))
         }
+        #[pyo3(signature = (query, max_results=5, intent="", namespace="default", tier="", include_superseded=false))]
         fn hybrid_search(
             &self,
             query: &str,
@@ -220,9 +224,10 @@ mod python {
             intent: &str,
             namespace: &str,
             tier: &str,
+            include_superseded: bool,
         ) -> PyResult<String> {
             self.inner
-                .hybrid_search(query, max_results, intent, namespace, tier)
+                .hybrid_search(query, max_results, intent, namespace, tier, include_superseded)
                 .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))
         }
         fn db_stats(&self) -> PyResult<String> {

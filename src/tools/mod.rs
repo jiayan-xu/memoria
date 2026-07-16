@@ -5,4 +5,5 @@ pub mod graph;
 pub mod imp_exp;
 pub mod observe;
 pub mod prefs;
+pub mod profile;
 pub mod remember;

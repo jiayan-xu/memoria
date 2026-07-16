@@ -264,7 +264,8 @@ pub fn tools_list() -> Vec<serde_json::Value> {
                 "query": {"type": "string", "description": "搜索关键词（必填）"},
                 "max_results": {"type": "number", "description": "最大返回结果数", "default": 5},
                 "tags": {"type": "string", "description": "标签过滤，JSON 数组字符串"},
-                "as_of": {"type": "string", "description": "P1-5 时序真值：仅返回该 ISO-8601 时刻有效的记忆；不传则默认 now，自动过滤已失效"}
+                "as_of": {"type": "string", "description": "P1-5 时序真值：仅返回该 ISO-8601 时刻有效的记忆；不传则默认返回「当前真值」（superseded_by IS NULL 且未失效）"},
+                "include_superseded": {"type": "boolean", "description": "P0: 是否包含已被取代的历史记忆（默认 false，仅看当前真值）"}
             }),
         ),
         tool(
@@ -277,7 +278,58 @@ pub fn tools_list() -> Vec<serde_json::Value> {
                 "source": {"type": "string", "description": "来源，默认 mcp"},
                 "tags": {"type": "string", "description": "标签 JSON 数组字符串"},
                 "valid_from": {"type": "string", "description": "P1-5 时序真值：记忆生效起点 ISO-8601（默认插入时刻）"},
-                "valid_to": {"type": "string", "description": "P1-5 时序真值：记忆失效点 ISO-8601（默认 NULL，长期有效）"}
+                "valid_to": {"type": "string", "description": "P1-5 时序真值：记忆失效点 ISO-8601（默认 NULL，长期有效）"},
+                "supersedes_id": {"type": "string", "description": "P0-4: 显式取代的目标记忆 id（须同 ns 且为当前 tip）；失败返回 404/403/409"},
+                "relation": {"type": "string", "description": "记忆边类型：updates|extends|derives（默认 updates）"}
+            }),
+        ),
+        tool(
+            "memory",
+            "写入记忆（memory_remember 薄别名）：支持 supersedes_id / relation / valid_*",
+            serde_json::json!({
+                "content": {"type": "string", "description": "记忆内容（必填）"},
+                "category": {"type": "string", "description": "类别，默认 fact"},
+                "importance": {"type": "number", "description": "重要度 1-5，默认 3"},
+                "source": {"type": "string", "description": "来源，默认 mcp"},
+                "tags": {"type": "string", "description": "标签 JSON 数组字符串"},
+                "valid_from": {"type": "string", "description": "P1-5 时序真值：记忆生效起点 ISO-8601"},
+                "valid_to": {"type": "string", "description": "P1-5 时序真值：记忆失效点 ISO-8601"},
+                "supersedes_id": {"type": "string", "description": "P0-4: 显式取代的目标记忆 id"},
+                "relation": {"type": "string", "description": "记忆边类型：updates|extends|derives（默认 updates）"}
+            }),
+        ),
+        tool(
+            "memory_profile",
+            "会话开场注入：返回 ns 的静态偏好(static)+近期动态(dynamic)合成视图，计入 profile 配额",
+            serde_json::json!({
+                "namespace": {"type": "string", "description": "命名空间，默认 default"},
+                "static_limit": {"type": "number", "description": "static 条数上限，默认 12"},
+                "dynamic_limit": {"type": "number", "description": "dynamic 条数上限，默认 15"},
+                "as_of": {"type": "string", "description": "可选 ISO-8601：按该时刻 valid_* 过滤（默认 now + tip）"}
+            }),
+        ),
+        tool(
+            "memory_context",
+            "会话开场注入：memory_profile + 可选 query 追加 top-k recall，产出 prompt_block",
+            serde_json::json!({
+                "namespace": {"type": "string", "description": "命名空间，默认 default"},
+                "query": {"type": "string", "description": "可选：本轮用户首句，用于追加 recall"},
+                "recall_k": {"type": "number", "description": "recall 条数，默认 3"},
+                "include_profile": {"type": "boolean", "description": "是否包含 profile，默认 true"},
+                "static_limit": {"type": "number", "description": "static 条数上限，默认 12"},
+                "dynamic_limit": {"type": "number", "description": "dynamic 条数上限，默认 15"},
+                "as_of": {"type": "string", "description": "可选 ISO-8601：透传到 profile 过滤"}
+            }),
+        ),
+        tool(
+            "memory_recall",
+            "回忆检索（别名 memory_search_v2）：默认 isLatest，走 search 配额",
+            serde_json::json!({
+                "query": {"type": "string", "description": "搜索关键词（必填）"},
+                "max_results": {"type": "number", "description": "最大返回结果数，默认 5"},
+                "tags": {"type": "string", "description": "标签过滤，JSON 数组字符串"},
+                "as_of": {"type": "string", "description": "P1-5 时序真值：仅返回该 ISO-8601 时刻有效的记忆；不传则默认返回当前真值"},
+                "include_superseded": {"type": "boolean", "description": "P0: 是否包含已被取代的历史记忆（默认 false）"}
             }),
         ),
         tool(
@@ -511,6 +563,13 @@ pub fn tools_list() -> Vec<serde_json::Value> {
             "admin_key": {"type": "string", "description": "Admin Key"}
         }),
     ));
+    tools.push(tool(
+        "memory_maintenance_normalize",
+        "Q1 维护：归一 valid_from/valid_to 时间格式（补 T）+ 清洗 1970 哨兵为空。⚠️ 破坏性，调用前必须先 memory_backup（需 Admin key）",
+        serde_json::json!({
+            "admin_key": {"type": "string", "description": "Admin Key"}
+        }),
+    ));
     // ── 暗知识层 A1：夜间巩固哑工具（认知在 agent-core，此处只做纯 SQL）──
     tools.push(tool("memory_fetch_unconsolidated", "取本命名空间中 created_at > since 的未巩固观察记录（供 agent-core 夜间巩固提炼；纯读取）", serde_json::json!({
         "namespace": {"type": "string", "description": "命名空间，默认 default"},
@@ -688,7 +747,7 @@ async fn handle_tool_call(
     // 使 remember_with_dedup 能正常落表 + 入 HNSW。这是「写入侧从不嵌入、HNSW 恒空」根因的
     // 另一半修复——benchmark / 独立 HTTP 部署只传 content，从不预缓存向量，导致记忆写入后
     // 索引里永远没有它的向量。此处异步调本地嵌入服务补齐，未配置/不可用则静默降级。
-    if tool == "memory_remember" && !state.embedding_url.is_empty() {
+    if (tool == "memory_remember" || tool == "memory") && !state.embedding_url.is_empty() {
         if let Some(c) = safe_args.get("content").and_then(|v| v.as_str()) {
             if !c.is_empty() {
                 if let Some(cvec) = embed_query(&state.http_client, &state.embedding_url, c).await {
@@ -819,7 +878,7 @@ fn dispatch(
         .unwrap_or("default");
 
     match tool {
-        "memory_search" | "memory_search_v2" => {
+        "memory_search" | "memory_search_v2" | "memory_recall" => {
             // P2-2 配额：搜索 QPS（admin 豁免）
             if let Some(err) = quota_gate(state, ns, memoria_core::quota::KIND_SEARCH, &_auth.role)
             {
@@ -846,14 +905,14 @@ fn dispatch(
                 }
             });
 
-            // P1-1: 统一检索入口（与评测 harness 同一路径），替代内联 5 信号构建。
-            // 生产路径传入 hnsw/query_cache（运行时语义通道可用）；CI 评测无 embedding 后端时传 None。
-            // P1-5: as_of 时序真值（默认 now → 自动过滤已失效记忆）。
-            let now_str = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S").to_string();
-            let as_of: Option<&str> = args
-                .get("as_of")
-                .and_then(|v| v.as_str())
-                .or(Some(&now_str));
+            // P0-2 (§14.1 Q2): 默认不传 as_of → hybrid 走 is_latest_now（superseded_by IS NULL + 当前有效），
+            // 即默认检索只见「当前真值」；显式 as_of → visible_as_of（仅 valid_*，含后来被取代的历史真值）。
+            // include_superseded 默认 false（可由 MCP 参数开启以查看历史）。
+            let as_of: Option<&str> = args.get("as_of").and_then(|v| v.as_str());
+            let include_superseded = args
+                .get("include_superseded")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
             let fused = search::hybrid::hybrid_search(
                 &state.pool,
                 query,
@@ -862,6 +921,7 @@ fn dispatch(
                 Some(&state.hnsw),
                 Some(&state.query_cache),
                 as_of,
+                include_superseded,
             )
             .unwrap_or_default();
 
@@ -884,7 +944,7 @@ fn dispatch(
             }).collect();
             serde_json::to_string(&serde_json::json!({"status":"ok","total_results":filtered.len(),"results":results})).unwrap_or_default()
         }
-        "memory_remember" => {
+        "memory_remember" | "memory" => {
             // P2-2 配额：写入限流（admin 豁免）
             if let Some(err) = quota_gate(state, ns, memoria_core::quota::KIND_WRITE, &_auth.role) {
                 return err;
@@ -912,6 +972,9 @@ fn dispatch(
             // P1-5: 可选时序真值区间
             let valid_from = args.get("valid_from").and_then(|v| v.as_str());
             let valid_to = args.get("valid_to").and_then(|v| v.as_str());
+            // P0-4: 显式取代目标（取代指定旧记忆，带 404/403/409 失败模式）
+            let supersedes_id = args.get("supersedes_id").and_then(|v| v.as_str());
+            let relation = args.get("relation").and_then(|v| v.as_str());
             // P0: 带近义重复检测的 remember
             match tools::remember::remember_with_dedup(
                 &state.pool,
@@ -925,6 +988,8 @@ fn dispatch(
                 Some(&state.query_cache),
                 valid_from,
                 valid_to,
+                supersedes_id,
+                relation,
             ) {
                 Ok(result) => {
                     if result.action == "superseded_near_dup" && !result.superseded_ids.is_empty() {
@@ -953,6 +1018,82 @@ fn dispatch(
                         )
                     }
                 }
+                Err(e) => {
+                    // P0-4：把 remember_with_dedup 返回的 "404:/403:/409:" 前缀映射为结构化错误码；
+                    // 其余（db 写入失败等内部错误）归为 400。
+                    let (code, msg) = match e.split_once(':') {
+                        Some((prefix, rest)) => match prefix.trim().parse::<u16>() {
+                            Ok(c @ (404 | 403 | 409)) => (c, rest.trim().to_string()),
+                            _ => (400u16, e.clone()),
+                        },
+                        None => (400u16, e.clone()),
+                    };
+                    format!(r#"{{"status":"error","code":{},"message":"{}"}}"#, code, msg)
+                }
+            }
+        }
+        "memory_profile" => {
+            // P0-3：profile_bucket 配额（每 ns ≤10/分钟，admin 豁免，见 §14.1 Q3）
+            if let Some(err) = quota_gate(state, ns, memoria_core::quota::KIND_PROFILE, &_auth.role)
+            {
+                return err;
+            }
+            let static_limit = args
+                .get("static_limit")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(12) as usize;
+            let dynamic_limit = args
+                .get("dynamic_limit")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(15) as usize;
+            let as_of = args.get("as_of").and_then(|v| v.as_str());
+            match tools::profile::memory_profile(
+                &state.pool,
+                ns,
+                static_limit,
+                dynamic_limit,
+                as_of,
+            ) {
+                Ok(v) => serde_json::to_string(&v)
+                    .unwrap_or_else(|_| "{\"status\":\"error\",\"message\":\"serialize\"}".to_string()),
+                Err(e) => format!(r#"{{"status":"error","message":"{}"}}"#, e),
+            }
+        }
+        "memory_context" => {
+            // P0-3：profile_bucket 配额（同上）
+            if let Some(err) = quota_gate(state, ns, memoria_core::quota::KIND_PROFILE, &_auth.role)
+            {
+                return err;
+            }
+            let query = args.get("query").and_then(|v| v.as_str());
+            let recall_k = args.get("recall_k").and_then(|v| v.as_u64()).unwrap_or(3) as u32;
+            let include_profile = args
+                .get("include_profile")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
+            let static_limit = args
+                .get("static_limit")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(12) as usize;
+            let dynamic_limit = args
+                .get("dynamic_limit")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(15) as usize;
+            let as_of = args.get("as_of").and_then(|v| v.as_str());
+            match tools::profile::memory_context(
+                &state.pool,
+                Some(&state.hnsw),
+                Some(&state.query_cache),
+                ns,
+                query,
+                recall_k,
+                include_profile,
+                static_limit,
+                dynamic_limit,
+                as_of,
+            ) {
+                Ok(v) => serde_json::to_string(&v)
+                    .unwrap_or_else(|_| "{\"status\":\"error\",\"message\":\"serialize\"}".to_string()),
                 Err(e) => format!(r#"{{"status":"error","message":"{}"}}"#, e),
             }
         }
@@ -974,11 +1115,12 @@ fn dispatch(
             }
         }
         "memory_quota_status" => {
-            // P2-2：返回本 ns 当前配额用量与上限（写入=日、搜索=分钟、备份=小时）
-            use memoria_core::quota::{KIND_BACKUP, KIND_SEARCH, KIND_WRITE};
-            let kinds: [(&str, &str, &str); 3] = [
+            // P2-2：返回本 ns 当前配额用量与上限（写入=日、搜索/profile=分钟、备份=小时）
+            use memoria_core::quota::{KIND_BACKUP, KIND_PROFILE, KIND_SEARCH, KIND_WRITE};
+            let kinds: [(&str, &str, &str); 4] = [
                 ("write", KIND_WRITE, "MEMORIA_QUOTA_WRITES_PER_DAY"),
                 ("search", KIND_SEARCH, "MEMORIA_QUOTA_SEARCHES_PER_MIN"),
+                ("profile", KIND_PROFILE, "MEMORIA_QUOTA_PROFILES_PER_MIN"),
                 ("backup", KIND_BACKUP, "MEMORIA_QUOTA_BACKUPS_PER_HOUR"),
             ];
             let mut quotas = serde_json::Map::new();
@@ -1892,6 +2034,22 @@ fn dispatch(
                 Err(e) => format!(r#"{{"status":"error","message":"{}"}}"#, e),
             }
         }
+        "memory_maintenance_normalize" => {
+            // Q1（§14.1 Q1）：admin 专属，破坏性操作，调用方须先 memory_backup。
+            let admin_key_val = args.get("admin_key").and_then(|v| v.as_str()).unwrap_or("");
+            if !crate::permissions::require_admin(&_auth, admin_key_val, &state.admin_key) {
+                return r#"{"status":"error","message":"admin required"}"#.to_string();
+            }
+            match tools::imp_exp::normalize_valid_to(&state.pool) {
+                Ok(rep) => serde_json::to_string(&serde_json::json!({
+                    "status": "normalized",
+                    "updated": rep.updated,
+                    "samples": rep.samples,
+                }))
+                .unwrap_or_else(|_| "{\"status\":\"error\",\"message\":\"serialize\"}".to_string()),
+                Err(e) => format!(r#"{{"status":"error","message":"{}"}}"#, e),
+            }
+        }
         // ── 暗知识层 A1：夜间巩固哑工具（ns 门控已在 handle_tool_call 完成）──
         "memory_fetch_unconsolidated" => {
             let since = args
@@ -2235,9 +2393,21 @@ mod tests {
     use super::*;
 
     fn build_test_state() -> Arc<AppState> {
-        let pool = memoria_core::storage::create_pool(":memory:", 4).expect("pool");
+        // 每个测试用独立的共享内存库名，避免 :memory: 进程级共享导致的配额/数据串扰
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let db_path = format!(
+            "file:memoria_mcp_{}_{}?mode=memory&cache=shared",
+            std::process::id(),
+            seq
+        );
+        let pool = memoria_core::storage::create_pool(&db_path, 4).expect("pool");
         memoria_core::storage::init_schema(&pool).expect("schema");
         memoria_core::storage::init_core_tables(&pool).expect("core");
+        memoria_core::storage::migrate_superseded_by(&pool).expect("migrate superseded_by");
+        memoria_core::storage::migrate_temporal(&pool).expect("migrate temporal");
+        memoria_core::storage::migrate_memory_relation_types(&pool).expect("migrate relation types");
+        memoria_core::quota::init_quota_table(&pool).expect("quota table");
         let auth_pool = memoria_core::storage::create_pool(":memory:", 4).expect("auth pool");
         memoria_core::storage::init_schema(&auth_pool).expect("auth schema");
         memoria_core::auth::init_auth_tables(&auth_pool).expect("auth tables");
@@ -2328,5 +2498,74 @@ mod tests {
             let res = health_check_full(axum::extract::State(state), headers).await;
             assert!(res.is_ok(), "valid admin key must allow /health/full");
         });
+    }
+
+    // ── P0-3：profile_bucket 配额（每 ns ≤10/分钟，admin 豁免，见 §14.1 Q3）──
+    #[test]
+    fn test_profile_bucket_limits_agent_then_exempts_admin() {
+        let state = build_test_state();
+        memoria_core::quota::init_quota_table(&state.pool).expect("quota table");
+        let agent_auth = memoria_core::auth::AuthResult {
+            agent_id: "agent/x".to_string(),
+            allowed_ns: vec!["agent/x".to_string()],
+            role: "read_write".to_string(),
+        };
+        let ns = serde_json::json!({ "namespace": "agent/x" });
+
+        // 前 10 次 agent 调用放行，第 11 次被 profile_bucket 限流
+        let mut allowed = 0;
+        let mut denied = 0;
+        for _ in 0..11 {
+            let args = ns.as_object().unwrap().clone();
+            let text = dispatch(&state, "memory_profile", &args, &agent_auth);
+            if text.contains(r#""status":"ok""#) {
+                allowed += 1;
+            } else if text.contains("quota_exceeded") {
+                denied += 1;
+            } else {
+                panic!("unexpected profile response: {}", text);
+            }
+        }
+        assert_eq!(allowed, 10, "agent 前 10 次 profile 应放行");
+        assert_eq!(denied, 1, "第 11 次 profile 应被 profile_bucket 限流");
+
+        // admin 角色豁免：再调 5 次均放行
+        let admin_auth = memoria_core::auth::AuthResult {
+            agent_id: "admin".to_string(),
+            allowed_ns: vec!["*".to_string()],
+            role: "admin".to_string(),
+        };
+        for _ in 0..5 {
+            let args = ns.as_object().unwrap().clone();
+            let text = dispatch(&state, "memory_profile", &args, &admin_auth);
+            assert!(
+                text.contains(r#""status":"ok""#),
+                "admin 应豁免 profile_bucket，但得到: {}",
+                text
+            );
+        }
+    }
+
+    #[test]
+    fn test_memory_context_returns_prompt_block() {
+        let state = build_test_state();
+        let auth = memoria_core::auth::AuthResult {
+            agent_id: "agent/x".to_string(),
+            allowed_ns: vec!["agent/x".to_string()],
+            role: "read_write".to_string(),
+        };
+        let args = serde_json::json!({
+            "namespace": "agent/x",
+            "query": "测试回忆",
+            "include_profile": true
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        let text = dispatch(&state, "memory_context", &args, &auth);
+        let v: serde_json::Value = serde_json::from_str(&text).expect("valid json");
+        assert_eq!(v["status"], "ok", "memory_context response: {}", text);
+        assert!(v["prompt_block"].is_string(), "memory_context 应产出 prompt_block");
+        assert!(v["profile"].is_object(), "memory_context 应含 profile 块");
     }
 }

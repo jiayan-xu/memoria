@@ -103,7 +103,7 @@ fn memory_eval() {
 
         let start = Instant::now();
         // 与生产同一路径；CI 无 embedding 后端，hnsw/query_cache 传 None
-        let results = hybrid_search(&pool, q, ns, k, None, None, None).unwrap_or_default();
+        let results = hybrid_search(&pool, q, ns, k, None, None, None, false).unwrap_or_default();
         latencies.push(start.elapsed().as_secs_f64() * 1000.0);
 
         let result_ids: Vec<&str> = results.iter().map(|r| r.memory_id.as_str()).collect();

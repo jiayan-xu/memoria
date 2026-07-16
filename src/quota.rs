@@ -23,6 +23,8 @@ use rusqlite::params;
 pub const KIND_WRITE: &str = "write";
 pub const KIND_SEARCH: &str = "search";
 pub const KIND_BACKUP: &str = "backup";
+/// P0-3：Profile / Context 合成视图配额（每 ns ≤10 次/分钟，admin 豁免，见 §14.1 Q3）。
+pub const KIND_PROFILE: &str = "profile";
 
 /// 配额超限错误（含提示客户端退避的秒数）
 #[derive(Debug, PartialEq, Eq)]
@@ -53,6 +55,7 @@ pub fn quota_window(kind: &str) -> String {
     match kind {
         KIND_WRITE => now.format("%Y-%m-%d").to_string(),
         KIND_SEARCH => now.format("%Y-%m-%dT%H:%M").to_string(),
+        KIND_PROFILE => now.format("%Y-%m-%dT%H:%M").to_string(),
         KIND_BACKUP => now.format("%Y-%m-%dT%H").to_string(),
         _ => now.format("%Y-%m-%d").to_string(),
     }
@@ -63,6 +66,7 @@ pub fn quota_limit(kind: &str) -> u64 {
     let (env_key, default) = match kind {
         KIND_WRITE => ("MEMORIA_QUOTA_WRITES_PER_DAY", 10_000u64),
         KIND_SEARCH => ("MEMORIA_QUOTA_SEARCHES_PER_MIN", 600u64),
+        KIND_PROFILE => ("MEMORIA_QUOTA_PROFILES_PER_MIN", 10u64),
         KIND_BACKUP => ("MEMORIA_QUOTA_BACKUPS_PER_HOUR", 12u64),
         _ => return u64::MAX,
     };
@@ -82,7 +86,7 @@ pub fn retry_after_sec(kind: &str) -> u64 {
                 now.hour() as u64 * 3600 + now.minute() as u64 * 60 + now.second() as u64;
             (24 * 3600 - sec_of_day) % (24 * 3600)
         }
-        KIND_SEARCH => {
+        KIND_SEARCH | KIND_PROFILE => {
             // 距下一分钟边界
             (60 - now.second() as u64) % 60
         }

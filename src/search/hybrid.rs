@@ -8,8 +8,11 @@ use crate::vector::{HnswIndex, QueryCache};
 
 /// 执行 5 信号融合搜索，返回 RRF 排序结果
 ///
-/// `as_of`: P1-5 轻量时序真值。传 `Some("2026-01-02T00:00:00")` 仅返回该时刻「有效」的记忆
-/// （valid_from <= as_of 且 (valid_to IS NULL 或 valid_to >= as_of)）。`None` 不过滤（默认 now）。
+/// `as_of`: P1-5 轻量时序真值。
+/// - `Some("2026-01-02T00:00:00")` → `visible_as_of`：仅返回该时刻「有效」的记忆
+///   （valid_from <= as_of 且 (valid_to IS NULL 或 valid_to >= as_of)），不查 superseded_by（时序真值优先）。
+/// - `None`（默认）→ `is_latest_now`：superseded_by IS NULL 且当前(now)有效（§14.1 Q2）。
+/// `include_superseded=true` 跳过整段 isLatest/visible_as_of 过滤（含时序），返回全部行。
 pub fn hybrid_search(
     pool: &SqlitePool,
     query: &str,
@@ -18,6 +21,7 @@ pub fn hybrid_search(
     hnsw: Option<&HnswIndex>,
     query_cache: Option<&QueryCache>,
     as_of: Option<&str>,
+    include_superseded: bool,
 ) -> Result<Vec<FusedResult>, String> {
     let fts_limit = max_results * 3;
     let mut signals: Vec<Vec<SignalResult>> = Vec::new();
@@ -90,35 +94,47 @@ pub fn hybrid_search(
         .filter(|r| seen.insert(r.memory_id.clone()))
         .collect();
 
-    // P1-5: as_of 时序真值过滤（默认 now，不过滤）。
-    // 一次性取候选记忆的有效区间，剔除 as_of 时刻无效的行。
-    if let Some(as_of) = as_of {
-        if !unique.is_empty() {
-            if let Ok(conn) = pool.get() {
-                let ids: Vec<String> = unique.iter().map(|r| r.memory_id.clone()).collect();
-                let ph = vec!["?"; ids.len()].join(",");
-                let sql = format!(
-                    "SELECT id, valid_from, valid_to FROM memories WHERE id IN ({})",
-                    ph
-                );
-                if let Ok(mut stmt) = conn.prepare(&sql) {
-                    let valid: std::collections::HashMap<String, (Option<String>, Option<String>)> =
-                        stmt.query_map(rusqlite::params_from_iter(ids.iter()), |row| {
-                            Ok((
-                                row.get::<_, String>(0)?,
-                                (
-                                    row.get::<_, Option<String>>(1)?,
-                                    row.get::<_, Option<String>>(2)?,
-                                ),
-                            ))
-                        })
-                        .map(|rows| rows.flatten().collect())
-                        .unwrap_or_default();
-                    unique.retain(|r| match valid.get(&r.memory_id) {
-                        Some((vf, vt)) => valid_at(vf.as_deref(), vt.as_deref(), as_of),
-                        None => false,
-                    });
-                }
+    // P0 + P1-5: isLatest / visible_as_of 过滤（§14.1 Q2）。
+    // 统一在 dedup 后、take 前执行；graph_expand 邻居因已并入 unique 一并覆盖。
+    // 规则：
+    //  - include_superseded=true → 不过滤（返回全部，含历史被取代行）
+    //  - as_of=Some(T)          → 仅 visible_as_of（valid_* 有效），不查 superseded_by（时序真值优先）
+    //  - as_of=None（默认 tip） → is_latest_now：superseded_by IS NULL 且当前(now)有效
+    if !include_superseded && !unique.is_empty() {
+        if let Ok(conn) = pool.get() {
+            let ids: Vec<String> = unique.iter().map(|r| r.memory_id.clone()).collect();
+            let ph = vec!["?"; ids.len()].join(",");
+            let sql = format!(
+                "SELECT id, superseded_by, valid_from, valid_to FROM memories WHERE id IN ({})",
+                ph
+            );
+            if let Ok(mut stmt) = conn.prepare(&sql) {
+                let info: std::collections::HashMap<
+                    String,
+                    (Option<String>, Option<String>, Option<String>),
+                > = stmt
+                    .query_map(rusqlite::params_from_iter(ids.iter()), |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            (
+                                row.get::<_, Option<String>>(1)?,
+                                row.get::<_, Option<String>>(2)?,
+                                row.get::<_, Option<String>>(3)?,
+                            ),
+                        ))
+                    })
+                    .map(|rows| rows.flatten().collect())
+                    .unwrap_or_default();
+                let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S").to_string();
+                unique.retain(|r| match info.get(&r.memory_id) {
+                    Some((sup, vf, vt)) => match as_of {
+                        Some(t) => valid_at(vf.as_deref(), vt.as_deref(), t), // visible_as_of
+                        None => {
+                            sup.is_none() && valid_at(vf.as_deref(), vt.as_deref(), now.as_str())
+                        } // is_latest_now
+                    },
+                    None => false,
+                });
             }
         }
     }

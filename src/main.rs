@@ -135,6 +135,8 @@ fn main() {
     storage::migrate_dream_state_ns(&pool).expect("migration: dream_state namespace");
     // P1-5: 三表补充 valid_from/valid_to 列（轻量时序真值 / as_of 查询）
     storage::migrate_temporal(&pool).expect("migration: temporal columns");
+    // P0/P1: memory_relations CHECK 扩展 updates|extends|derives
+    storage::migrate_memory_relation_types(&pool).expect("migration: relation types");
     // P2-2: 配额计数表（滥用防护，按 ns 限额）
     memoria_core::quota::init_quota_table(&pool).expect("init quota table");
 

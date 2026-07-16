@@ -56,6 +56,8 @@ fn near_dup_survives_restart() {
         Some(&engine1.query_cache),
         None,
         None,
+        None,
+        None,
     )
     .expect("remember A");
     let id_a = r1.id.clone();
@@ -87,6 +89,8 @@ fn near_dup_survives_restart() {
         "[]",
         Some(&engine2.hnsw),
         Some(&engine2.query_cache),
+        None,
+        None,
         None,
         None,
     )
@@ -132,6 +136,8 @@ fn near_dup_below_threshold_not_merged() {
         Some(&engine.query_cache),
         None,
         None,
+        None,
+        None,
     )
     .expect("remember A");
 
@@ -148,6 +154,8 @@ fn near_dup_below_threshold_not_merged() {
         "[]",
         Some(&engine.hnsw),
         Some(&engine.query_cache),
+        None,
+        None,
         None,
         None,
     )
@@ -186,6 +194,8 @@ fn near_dup_respects_namespace() {
         Some(&engine.query_cache),
         None,
         None,
+        None,
+        None,
     )
     .expect("remember A");
 
@@ -201,6 +211,8 @@ fn near_dup_respects_namespace() {
         "[]",
         Some(&engine.hnsw),
         Some(&engine.query_cache),
+        None,
+        None,
         None,
         None,
     )

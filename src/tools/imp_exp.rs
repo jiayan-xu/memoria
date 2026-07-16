@@ -69,6 +69,7 @@ const TABLES: &[TableSpec] = &[
             "tags",
             "valid_from",
             "valid_to",
+            "superseded_by",
         ],
         ns_col: "namespace",
         blob_col: None,
@@ -370,6 +371,90 @@ pub fn import_ns(
     }
 
     tx.commit().map_err(|e| format!("commit: {}", e))?;
+    Ok(report)
+}
+
+/// Q1（§14.1 Q1）归一结果报告
+#[derive(Debug, Default)]
+pub struct NormalizeReport {
+    /// 被更新的行数（含置 NULL 与补 T 两类）
+    pub updated: u64,
+    /// 样本（最多 20 条，便于审计溯源）
+    pub samples: Vec<String>,
+}
+
+/// P0 / Q1（§14.1 Q1）：脏值清洗 + ISO 格式归一。
+///
+/// 作用对象：`memories` / `memory_relations` / `entity_edges` 的 `valid_from` / `valid_to`。
+/// 规则：
+/// - 哨兵：`<= '1970-01-02'`（含 `1970-01-01...` 的各种写法，及 `1970-01-02T00:00:00`）→ 置 NULL；
+/// - 归一：`YYYY-MM-DD HH:MM:SS`（空格分隔）一律补 `T` 为 `YYYY-MM-DDTHH:MM:SS`，
+///   使字典序即时间序，与 `valid_at` 比较一致，修复 R2 全空/漏滤。
+///
+/// ⚠️ **破坏性操作**：调用方**必须先 `memory_backup`**（见设计 §14.1 Q1）。
+pub fn normalize_valid_to(pool: &SqlitePool) -> Result<NormalizeReport, String> {
+    let conn = pool.get().map_err(|e| format!("pool: {}", e))?;
+    // 哨兵阈值：<= 此字面量视为「无效时间」哨兵（含 1970-01-01 全系）
+    let sentinel = "1970-01-02";
+    let targets: &[(&str, &str, &str)] = &[
+        ("memories", "valid_from", "id"),
+        ("memories", "valid_to", "id"),
+        ("memory_relations", "valid_from", "id"),
+        ("memory_relations", "valid_to", "id"),
+        ("entity_edges", "valid_from", "id"),
+        ("entity_edges", "valid_to", "id"),
+    ];
+    let mut report = NormalizeReport::default();
+
+    for (table, col, id_col) in targets {
+        // 仅选出需处理（哨兵或空格格式）的非空行
+        let select = format!(
+            "SELECT {id}, {col} FROM {tbl} \
+             WHERE {col} IS NOT NULL \
+               AND ({col} <= ?1 OR {col} LIKE '1970-01-01%' \
+                    OR {col} LIKE '1970-01-02T%' OR {col} LIKE '% %')",
+            id = id_col,
+            col = col,
+            tbl = table
+        );
+        let rows: Vec<(String, String)> = conn
+            .prepare(&select)
+            .and_then(|mut stmt| {
+                stmt.query_map(rusqlite::params![sentinel], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                })
+                .map(|it| it.flatten().collect())
+            })
+            .map_err(|e| format!("select {} {}: {}", table, col, e))?;
+
+        for (rid, raw) in rows {
+            let val = raw.trim();
+            let is_sentinel = val <= sentinel
+                || val.starts_with("1970-01-01")
+                || val.starts_with("1970-01-02T00:00:00");
+            if is_sentinel {
+                let upd = format!("UPDATE {} SET {} = NULL WHERE {} = ?", table, col, id_col);
+                conn.execute(&upd, params![rid])
+                    .map_err(|e| format!("null {} {}: {}", table, col, e))?;
+                report.updated += 1;
+                if report.samples.len() < 20 {
+                    report.samples.push(format!("{}:{}:{}->NULL", table, col, rid));
+                }
+            } else if val.contains(' ') {
+                // 空格格式 → 补 T
+                let normalized = val.replace(' ', "T");
+                let upd = format!("UPDATE {} SET {} = ? WHERE {} = ?", table, col, id_col);
+                conn.execute(&upd, params![normalized, rid])
+                    .map_err(|e| format!("norm {} {}: {}", table, col, e))?;
+                report.updated += 1;
+                if report.samples.len() < 20 {
+                    report
+                        .samples
+                        .push(format!("{}:{}:{}->{}", table, col, rid, normalized));
+                }
+            }
+        }
+    }
     Ok(report)
 }
 

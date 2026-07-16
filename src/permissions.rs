@@ -68,6 +68,30 @@ pub const PERMISSION_MATRIX: &[Entry] = &[
         note: "写入记忆",
     },
     Entry {
+        tool: "memory",
+        min_role: MinRole::Agent,
+        ns_policy: NsPolicy::NamespaceArg,
+        note: "memory_remember 薄别名",
+    },
+    Entry {
+        tool: "memory_profile",
+        min_role: MinRole::Agent,
+        ns_policy: NsPolicy::NamespaceArg,
+        note: "会话开场静态/动态合成视图（P0-3）",
+    },
+    Entry {
+        tool: "memory_context",
+        min_role: MinRole::Agent,
+        ns_policy: NsPolicy::NamespaceArg,
+        note: "profile + recall 合成 prompt_block（P0-3）",
+    },
+    Entry {
+        tool: "memory_recall",
+        min_role: MinRole::Agent,
+        ns_policy: NsPolicy::NamespaceArg,
+        note: "回忆检索别名（走 search 配额）",
+    },
+    Entry {
         tool: "memory_observe",
         min_role: MinRole::Agent,
         ns_policy: NsPolicy::NamespaceArg,
@@ -217,6 +241,12 @@ pub const PERMISSION_MATRIX: &[Entry] = &[
         min_role: MinRole::Admin,
         ns_policy: NsPolicy::None,
         note: "合并记忆（admin）",
+    },
+    Entry {
+        tool: "memory_maintenance_normalize",
+        min_role: MinRole::Admin,
+        ns_policy: NsPolicy::None,
+        note: "Q1 归一时间格式/清洗哨兵（admin，须先备份）",
     },
     // ── 无命名空间的身份/自省工具 ──
     Entry {
