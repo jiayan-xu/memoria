@@ -1,3 +1,4 @@
+pub mod cooccur;
 pub mod hybrid;
 pub mod importance;
 pub mod keyword;

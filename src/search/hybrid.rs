@@ -139,6 +139,10 @@ pub fn hybrid_search(
         }
     }
 
+    // Phase B / M1.3：轻量共现启发式 rerank（O5：无 cross-encoder）
+    // 在 take 前对候选池加成重排，再截断到 max_results。
+    search::cooccur::rerank_by_cooccurrence(pool, namespace, query, &mut unique);
+
     let unique: Vec<FusedResult> = unique.into_iter().take(max_results as usize).collect();
 
     Ok(unique)

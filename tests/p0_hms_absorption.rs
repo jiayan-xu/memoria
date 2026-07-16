@@ -1,5 +1,5 @@
 //! Phase A / O1–O6 验收
-//!   O1: entities 硬 []
+//!   O1: P0 无 mention 时 entities=[]（P1 JOIN 见 p1_hms_phase_b）
 //!   O2/O3: occurred 自 tags `occurred:YYYY-MM-DD`；不以 event_time 写入为主路径
 //!   O6: ledger 仅 memory_context；search_v2 默认不 enrich
 //!   Self-Evolution 纯函数可测；O4 完成依据在 agent-core
@@ -63,7 +63,8 @@ fn occurred_from_tags_distinct_from_mentioned() {
 }
 
 #[test]
-fn entities_always_empty_array() {
+fn entities_empty_without_mentions() {
+    // Phase A 语义保留：无 entity_mentions 时 entities=[]；有 mention 的 JOIN 见 Phase B 测试
     let (engine, ns) = fresh_engine("ent");
     let _ = remember_with_dedup(
         &engine.pool,
