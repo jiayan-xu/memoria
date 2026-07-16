@@ -2,7 +2,8 @@
 //!   P2.1a: ledger 行含 text_signals（numbers/dates/update_markers）
 //!   P2.1b: occurred tag 并入 dates 信号（O3，不写 event_time 列）
 //!   P2.1c: hybrid 检索数字/日期 query 与正文重叠加成（O5，无 cross-encoder）
-//!   P2.2 未做: retain 时 LLM 抽取、agent-core 护栏消费、写入 tags 持久化
+//!   P2.2 未做: retain 时 LLM 抽取、写入 tags 持久化
+//!   P2.2a 已做: 相对中文日期读时解析（上周三/昨天 → YYYY-MM-DD）
 //!
 //! 运行：`cargo test --test p2_hms_text_signals`
 
@@ -113,6 +114,43 @@ fn search_boosts_on_numeric_query_overlap() {
     top.source.contains("text_signals") || top.rrf_score > 0.0,
     "source={}",
     top.source
+  );
+}
+
+#[test]
+fn relative_date_in_ledger_signals() {
+  let (engine, ns) = fresh_engine("reldate");
+  let _ = remember_with_dedup(
+    &engine.pool,
+    "上周三巡检发现异常，昨天已修复",
+    "fact",
+    3,
+    "test",
+    &ns,
+    "[]",
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+  )
+  .expect("remember");
+
+  let ctx: Value =
+    memory_context(&engine.pool, None, None, &ns, Some("上周三 异常"), 5, true, 8, 8, None)
+      .expect("context");
+  let row = &ctx["recall"].as_array().expect("recall")[0];
+  let dates = row["text_signals"]["dates"].as_array().expect("dates");
+  assert!(
+    dates.len() >= 2,
+    "P2.2a: 相对日期应解析为绝对日 dates={:?}",
+    dates
+  );
+  assert!(
+    dates.iter().any(|d| d.as_str().map(|s| s.len() == 10).unwrap_or(false)),
+    "dates={:?}",
+    dates
   );
 }
 

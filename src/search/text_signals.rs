@@ -5,6 +5,7 @@
 //! - hybrid 检索后小幅加成重排（与 cooccur 同级，保守幅度）
 
 use crate::search::rrf::FusedResult;
+use chrono::{Datelike, Duration, NaiveDate, Weekday};
 use serde_json::{json, Value};
 
 const MAX_NUMBERS: usize = 8;
@@ -57,6 +58,12 @@ pub fn extract_text_signals(content: &str, tags_json: &str, occurred_date: Optio
     }
   }
 
+  // P2.2：相对中文日期读时解析（锚点 UTC 今天；不写 event_time / 不落库）
+  let anchor = chrono::Utc::now().date_naive();
+  for d in resolve_relative_dates(content, anchor) {
+    push_unique(&mut dates, &d);
+  }
+
   // tags 中的 supersede / pattern 提示更新语义
   let tags_lower = tags_json.to_ascii_lowercase();
   if tags_lower.contains("supersed") || tags_lower.contains("\"pattern\"") {
@@ -80,7 +87,11 @@ pub fn rerank_by_text_signals(query: &str, results: &mut Vec<FusedResult>) {
     return;
   }
   let q_nums = extract_numbers(query);
-  let q_dates = extract_dates(query);
+  let mut q_dates = extract_dates(query);
+  let anchor = chrono::Utc::now().date_naive();
+  for d in resolve_relative_dates(query, anchor) {
+    push_unique(&mut q_dates, &d);
+  }
   if q_nums.is_empty() && q_dates.is_empty() {
     return;
   }
@@ -231,6 +242,117 @@ fn truncate(v: &mut Vec<String>, max: usize) {
   v.truncate(max);
 }
 
+/// P2.2：相对中文日期 → `YYYY-MM-DD`（读时、锚点由调用方传入，默认 UTC 今天）。
+pub fn resolve_relative_dates(content: &str, anchor: NaiveDate) -> Vec<String> {
+  let mut out = Vec::new();
+
+  if content.contains("今天")
+    || content.contains("今日")
+    || content.contains("当日")
+    || content.contains("当天")
+  {
+    push_unique(&mut out, &fmt_date(anchor));
+  }
+  if content.contains("昨天") || content.contains("昨日") {
+    push_unique(&mut out, &fmt_date(anchor - Duration::days(1)));
+  }
+  if content.contains("明天") || content.contains("明日") {
+    push_unique(&mut out, &fmt_date(anchor + Duration::days(1)));
+  }
+  if content.contains("前天") {
+    push_unique(&mut out, &fmt_date(anchor - Duration::days(2)));
+  }
+  if content.contains("后天") {
+    push_unique(&mut out, &fmt_date(anchor + Duration::days(2)));
+  }
+
+  if content.contains("上周") {
+    push_unique(&mut out, &fmt_date(start_of_week(anchor) - Duration::days(7)));
+  }
+  if content.contains("本周") || content.contains("这周") {
+    push_unique(&mut out, &fmt_date(start_of_week(anchor)));
+  }
+
+  resolve_weekday_phrases(content, anchor, &mut out);
+
+  if content.contains("上月") || content.contains("上个月") {
+    push_unique(&mut out, &fmt_date(first_of_month(prev_month(anchor))));
+  }
+  if content.contains("本月") || content.contains("这个月") {
+    push_unique(&mut out, &fmt_date(first_of_month(anchor)));
+  }
+  if content.contains("下月") || content.contains("下个月") {
+    push_unique(&mut out, &fmt_date(first_of_month(next_month(anchor))));
+  }
+  if content.contains("今年") {
+    push_unique(
+      &mut out,
+      &fmt_date(NaiveDate::from_ymd_opt(anchor.year(), 1, 1).unwrap_or(anchor)),
+    );
+  }
+  if content.contains("去年") {
+    push_unique(
+      &mut out,
+      &fmt_date(NaiveDate::from_ymd_opt(anchor.year() - 1, 1, 1).unwrap_or(anchor)),
+    );
+  }
+
+  out
+}
+
+fn fmt_date(d: NaiveDate) -> String {
+  d.format("%Y-%m-%d").to_string()
+}
+
+fn start_of_week(d: NaiveDate) -> NaiveDate {
+  d - Duration::days(d.weekday().num_days_from_monday() as i64)
+}
+
+fn first_of_month(d: NaiveDate) -> NaiveDate {
+  NaiveDate::from_ymd_opt(d.year(), d.month(), 1).unwrap_or(d)
+}
+
+fn prev_month(d: NaiveDate) -> NaiveDate {
+  if d.month() == 1 {
+    NaiveDate::from_ymd_opt(d.year() - 1, 12, 1).unwrap_or(d)
+  } else {
+    NaiveDate::from_ymd_opt(d.year(), d.month() - 1, 1).unwrap_or(d)
+  }
+}
+
+fn next_month(d: NaiveDate) -> NaiveDate {
+  if d.month() == 12 {
+    NaiveDate::from_ymd_opt(d.year() + 1, 1, 1).unwrap_or(d)
+  } else {
+    NaiveDate::from_ymd_opt(d.year(), d.month() + 1, 1).unwrap_or(d)
+  }
+}
+
+fn resolve_weekday_phrases(content: &str, anchor: NaiveDate, out: &mut Vec<String>) {
+  static PAIRS: &[(&str, Weekday)] = &[
+    ("一", Weekday::Mon),
+    ("二", Weekday::Tue),
+    ("三", Weekday::Wed),
+    ("四", Weekday::Thu),
+    ("五", Weekday::Fri),
+    ("六", Weekday::Sat),
+    ("日", Weekday::Sun),
+  ];
+  for (ch, wd) in PAIRS {
+    if content.contains(&format!("上周{}", ch)) {
+      push_unique(out, &fmt_date(weekday_in_week(anchor, *wd, -1)));
+    }
+    if content.contains(&format!("本周{}", ch)) || content.contains(&format!("这周{}", ch)) {
+      push_unique(out, &fmt_date(weekday_in_week(anchor, *wd, 0)));
+    }
+  }
+}
+
+fn weekday_in_week(anchor: NaiveDate, target: Weekday, week_offset: i64) -> NaiveDate {
+  let monday = start_of_week(anchor) + Duration::days(week_offset * 7);
+  monday + Duration::days(target.num_days_from_monday() as i64)
+}
+
 #[cfg(test)]
 mod unit_tests {
   use super::*;
@@ -252,6 +374,25 @@ mod unit_tests {
     let sig = extract_text_signals("无 inline 日期", r#"["occurred:2025-03-15"]"#, Some("2025-03-15"));
     let dates = sig["dates"].as_array().unwrap();
     assert!(dates.iter().any(|d| d.as_str() == Some("2025-03-15")));
+  }
+
+  #[test]
+  fn relative_dates_resolved() {
+    let anchor = NaiveDate::from_ymd_opt(2026, 7, 16).unwrap(); // 周四
+    let sig = extract_text_signals("上周三开会，昨天登记 120 吨", "[]", None);
+    let dates = sig["dates"].as_array().unwrap();
+    assert!(
+      dates.iter().any(|d| d.as_str() == Some("2026-07-09")),
+      "上周三={:?}",
+      dates
+    );
+    assert!(
+      dates.iter().any(|d| d.as_str() == Some("2026-07-15")),
+      "昨天={:?}",
+      dates
+    );
+    let direct = resolve_relative_dates("本周五交付", anchor);
+    assert!(direct.iter().any(|d| d == "2026-07-18"));
   }
 
   #[test]
