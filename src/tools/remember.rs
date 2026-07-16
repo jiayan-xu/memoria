@@ -167,6 +167,23 @@ pub fn remember(
     Ok(result.id)
 }
 
+/// P0+ 吸收 HMS: 写入「事件发生」时刻（与 valid_from 断言时刻区分）。
+/// 作为 remember 后的独立 UPDATE，避免改动 remember_with_dedup 签名而牵连大量调用方。
+/// event_time 缺省留 NULL（召回时以 valid_from 兜底为 occurred）。
+pub fn set_event_time(
+    pool: &SqlitePool,
+    memory_id: &str,
+    event_time: &str,
+) -> Result<(), String> {
+    let conn = pool.get().map_err(|e| format!("pool: {}", e))?;
+    conn.execute(
+        "UPDATE memories SET event_time = ? WHERE id = ?",
+        rusqlite::params![event_time, memory_id],
+    )
+    .map_err(|e| format!("set event_time: {}", e))?;
+    Ok(())
+}
+
 /// 带近义重复检测的 remember
 ///
 /// `supersedes_id`：显式取代目标；与 INSERT 同事务，失败 ROLLBACK。

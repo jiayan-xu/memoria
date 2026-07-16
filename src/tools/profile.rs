@@ -199,18 +199,17 @@ pub fn memory_context(
                 as_of, // 透传 as_of；None → is_latest_now
                 false, // include_superseded=false
             ) {
-                for f in fused {
-                    recall.push(json!({
-                        "memory_id": f.memory_id,
-                        "content": f.content,
-                        "rrf_score": f.rrf_score,
-                        "source": f.source,
-                        "is_latest": as_of.is_none(),
-                    }));
-                }
+                // P0+ 吸收 HMS：富化为类型化证据账本（type/occurred/mentioned/source_ref/entities）
+                recall = crate::tools::ledger::enrich_ledger(pool, namespace, &fused);
             }
         }
     }
+
+    // P0+ 吸收 HMS：Self-Evolution 护栏（答案时刻确定性控制，零 LLM 调用）
+    let guardrails = match query {
+        Some(q) if !q.is_empty() => crate::tools::self_evolution::guardrails(q),
+        _ => Vec::new(),
+    };
 
     let prompt_block = render_prompt_block(&profile, &recall);
 
@@ -219,6 +218,7 @@ pub fn memory_context(
         "namespace": namespace,
         "profile": profile,
         "recall": recall,
+        "guardrails": guardrails,
         "prompt_block": prompt_block,
     }))
 }

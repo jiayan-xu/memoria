@@ -129,6 +129,8 @@ fn main() {
 
     // P0: 迁移 — 添加 superseded_by 列
     storage::migrate_superseded_by(&pool).expect("migration: superseded_by");
+    // P0+ 吸收 HMS: 添加 event_time 列（事件发生时点，与 valid_from 区分）
+    storage::migrate_event_time(&pool).expect("migration: event_time");
     // P0: 迁移 — user_prefs 增加 namespace 列（跨租户隔离，B3 修复）
     storage::migrate_user_prefs_namespace(&pool).expect("migration: user_prefs namespace");
     // 暗知识层 A1: dream_state 升级为 (phase, namespace) 复合 PK + cursor_ts 幂等游标

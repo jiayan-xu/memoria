@@ -279,6 +279,7 @@ pub fn tools_list() -> Vec<serde_json::Value> {
                 "tags": {"type": "string", "description": "标签 JSON 数组字符串"},
                 "valid_from": {"type": "string", "description": "P1-5 时序真值：记忆生效起点 ISO-8601（默认插入时刻）"},
                 "valid_to": {"type": "string", "description": "P1-5 时序真值：记忆失效点 ISO-8601（默认 NULL，长期有效）"},
+                "event_time": {"type": "string", "description": "P0+ 吸收 HMS：事件「发生」时刻 ISO-8601；与 valid_from（断言时刻）区分，用于新旧状态区分 / 相对日期落地"},
                 "supersedes_id": {"type": "string", "description": "P0-4: 显式取代的目标记忆 id（须同 ns 且为当前 tip）；失败返回 404/403/409"},
                 "relation": {"type": "string", "description": "记忆边类型：updates|extends|derives（默认 updates）"}
             }),
@@ -294,6 +295,7 @@ pub fn tools_list() -> Vec<serde_json::Value> {
                 "tags": {"type": "string", "description": "标签 JSON 数组字符串"},
                 "valid_from": {"type": "string", "description": "P1-5 时序真值：记忆生效起点 ISO-8601"},
                 "valid_to": {"type": "string", "description": "P1-5 时序真值：记忆失效点 ISO-8601"},
+                "event_time": {"type": "string", "description": "P0+ 吸收 HMS：事件「发生」时刻 ISO-8601；与 valid_from 区分"},
                 "supersedes_id": {"type": "string", "description": "P0-4: 显式取代的目标记忆 id"},
                 "relation": {"type": "string", "description": "记忆边类型：updates|extends|derives（默认 updates）"}
             }),
@@ -939,10 +941,32 @@ fn dispatch(
                 fused
             };
 
-            let results: Vec<serde_json::Value> = filtered.iter().take(max_results as usize).map(|r| {
-                serde_json::json!({"memory_id": r.memory_id, "content": truncate(&r.content, 2000), "rrf_score": r.rrf_score, "source": r.source})
-            }).collect();
-            serde_json::to_string(&serde_json::json!({"status":"ok","total_results":filtered.len(),"results":results})).unwrap_or_default()
+            // P0+ 吸收 HMS：富化为类型化证据账本（type/occurred/mentioned/source_ref/entities）
+            let ledger = tools::ledger::enrich_ledger(&state.pool, ns, &filtered);
+            let is_latest = as_of.is_none();
+            let results: Vec<serde_json::Value> = ledger
+                .into_iter()
+                .take(max_results as usize)
+                .map(|mut row| {
+                    if let Some(obj) = row.as_object_mut() {
+                        // 向后兼容：保留 content(截断) / rrf_score / source 旧字段
+                        let text = obj
+                            .get("content")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        obj.insert("content".to_string(), serde_json::json!(truncate(&text, 2000)));
+                        obj.insert("is_latest".to_string(), serde_json::json!(is_latest));
+                    }
+                    row
+                })
+                .collect();
+            // P0+ 吸收 HMS：Self-Evolution 护栏（答案时刻确定性控制，零 LLM 调用）
+            let guardrails = match query {
+                q if !q.is_empty() => tools::self_evolution::guardrails(q),
+                _ => Vec::new(),
+            };
+            serde_json::to_string(&serde_json::json!({"status":"ok","total_results":filtered.len(),"results":results,"guardrails":guardrails})).unwrap_or_default()
         }
         "memory_remember" | "memory" => {
             // P2-2 配额：写入限流（admin 豁免）
@@ -972,11 +996,13 @@ fn dispatch(
             // P1-5: 可选时序真值区间
             let valid_from = args.get("valid_from").and_then(|v| v.as_str());
             let valid_to = args.get("valid_to").and_then(|v| v.as_str());
+            // P0+ 吸收 HMS: 可选「事件发生」时刻（与 valid_from 断言时刻区分）
+            let event_time = args.get("event_time").and_then(|v| v.as_str());
             // P0-4: 显式取代目标（取代指定旧记忆，带 404/403/409 失败模式）
             let supersedes_id = args.get("supersedes_id").and_then(|v| v.as_str());
             let relation = args.get("relation").and_then(|v| v.as_str());
             // P0: 带近义重复检测的 remember
-            match tools::remember::remember_with_dedup(
+            let body = match tools::remember::remember_with_dedup(
                 &state.pool,
                 content,
                 cat,
@@ -992,6 +1018,10 @@ fn dispatch(
                 relation,
             ) {
                 Ok(result) => {
+                    // P0+ 吸收 HMS: 事件发生时点（与 valid_from 断言时刻区分），作为 remember 后的独立 UPDATE
+                    if let Some(et) = event_time {
+                        let _ = tools::remember::set_event_time(&state.pool, &result.id, et);
+                    }
                     if result.action == "superseded_near_dup" && !result.superseded_ids.is_empty() {
                         let pairs: Vec<String> = result
                             .superseded_ids
@@ -1030,7 +1060,8 @@ fn dispatch(
                     };
                     format!(r#"{{"status":"error","code":{},"message":"{}"}}"#, code, msg)
                 }
-            }
+            };
+            body
         }
         "memory_profile" => {
             // P0-3：profile_bucket 配额（每 ns ≤10/分钟，admin 豁免，见 §14.1 Q3）
@@ -2405,6 +2436,7 @@ mod tests {
         memoria_core::storage::init_schema(&pool).expect("schema");
         memoria_core::storage::init_core_tables(&pool).expect("core");
         memoria_core::storage::migrate_superseded_by(&pool).expect("migrate superseded_by");
+        memoria_core::storage::migrate_event_time(&pool).expect("migrate event_time");
         memoria_core::storage::migrate_temporal(&pool).expect("migrate temporal");
         memoria_core::storage::migrate_memory_relation_types(&pool).expect("migrate relation types");
         memoria_core::quota::init_quota_table(&pool).expect("quota table");

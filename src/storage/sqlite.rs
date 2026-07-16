@@ -286,6 +286,29 @@ pub fn migrate_superseded_by(pool: &SqlitePool) -> Result<(), String> {
     Ok(())
 }
 
+/// P0+ 吸收 HMS：为 `memories` 增加 `event_time` 列（事件「发生」时刻），
+/// 与 `valid_from`（记忆「被断言/认知」时刻）区分，支撑新旧状态区分 / 相对日期落地。
+/// 幂等：列已存在则跳过。event_time 缺省 NULL（召回时以 valid_from 兜底为 occurred）。
+pub fn migrate_event_time(pool: &SqlitePool) -> Result<(), String> {
+    let conn = pool.get().map_err(|e| format!("pool get: {}", e))?;
+
+    let has_column: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('memories') WHERE name = 'event_time'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+
+    if has_column == 0 {
+        conn.execute_batch("ALTER TABLE memories ADD COLUMN event_time TEXT;")
+            .map_err(|e| format!("add event_time: {}", e))?;
+        println!("[Memoria] Migration: added event_time column to memories");
+    }
+
+    Ok(())
+}
+
 /// P0 迁移：为 `user_prefs` 增加 `namespace` 列（跨租户隔离，B3 修复）。
 /// 幂等：列已存在则跳过。
 pub fn migrate_user_prefs_namespace(pool: &SqlitePool) -> Result<(), String> {

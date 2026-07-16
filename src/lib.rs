@@ -34,6 +34,7 @@ impl MemoriaEngine {
         // 迁移必须随引擎自洽（之前仅在 main.rs 调用，导致 lib/MemoriaEngine 路径下
         // superseded_by 等列缺失，近义去重静默失效）。统一在此收口，避免入口分叉。
         storage::migrate_superseded_by(&pool)?;
+        storage::migrate_event_time(&pool)?;
         storage::migrate_user_prefs_namespace(&pool)?;
         storage::migrate_dream_state_ns(&pool)?;
         storage::migrate_temporal(&pool)?;
