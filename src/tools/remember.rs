@@ -228,6 +228,13 @@ pub fn remember_with_dedup(
     } else {
         tags.to_string()
     };
+    // P2.2c：写入前把确定性 text_signals 落到 tags（O2：occurred 仍走 tags，不写 event_time 列）
+    let occurred_for_signals = crate::tools::ledger::parse_occurred_tag(&tags_safe);
+    let tags_safe = crate::search::text_signals::merge_signal_tags(
+        &tags_safe,
+        content,
+        occurred_for_signals.as_deref(),
+    );
 
     // Check if already exists (exact duplicate)
     let existing: Result<String, _> = conn.query_row(

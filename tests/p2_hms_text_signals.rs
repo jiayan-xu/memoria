@@ -2,8 +2,8 @@
 //!   P2.1a: ledger 行含 text_signals（numbers/dates/update_markers）
 //!   P2.1b: occurred tag 并入 dates 信号（O3，不写 event_time 列）
 //!   P2.1c: hybrid 检索数字/日期 query 与正文重叠加成（O5，无 cross-encoder）
-//!   P2.2 未做: retain 时 LLM 抽取、写入 tags 持久化
-//!   P2.2a 已做: 相对中文日期读时解析（上周三/昨天 → YYYY-MM-DD）
+//!   P2.2c 已做: tags 持久化 signal:*（remember 写入 + ledger 读时合并）
+//!   P2.2d 已做: agent-core consolidate LLM 抽取 signal tags
 //!
 //! 运行：`cargo test --test p2_hms_text_signals`
 
@@ -184,5 +184,53 @@ fn text_signals_rerank_env_off() {
   assert!(
     fused.iter().all(|r| !r.source.contains("text_signals")),
     "关闭 rerank 时不应出现 text_signals 通道标记"
+  );
+}
+
+#[test]
+fn signal_tags_persisted_on_remember() {
+  let (engine, ns) = fresh_engine("sigtags");
+  let result = remember_with_dedup(
+    &engine.pool,
+    "2026-07-12 登记 120 吨，改为应急模式",
+    "fact",
+    3,
+    "test",
+    &ns,
+    r#"["occurred:2026-07-12"]"#,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+  )
+  .expect("remember");
+
+  let conn = engine.pool.get().expect("conn");
+  let tags: String = conn
+    .query_row(
+      "SELECT tags FROM memories WHERE id = ?",
+      rusqlite::params![result.id],
+      |r| r.get(0),
+    )
+    .expect("tags row");
+  assert!(
+    tags.contains("signal:num:120"),
+    "P2.2c: tags 应含 signal:num:120, got {tags}"
+  );
+  assert!(tags.contains("signal:date:2026-07-12"));
+  assert!(tags.contains("signal:update:改为"));
+  assert!(tags.contains("occurred:2026-07-12"));
+
+  let ctx: Value =
+    memory_context(&engine.pool, None, None, &ns, Some("120 吨"), 5, true, 8, 8, None)
+      .expect("context");
+  let row = &ctx["recall"].as_array().expect("recall")[0];
+  let nums = row["text_signals"]["numbers"].as_array().expect("numbers");
+  assert!(
+    nums.iter().any(|n| n.as_str() == Some("120")),
+    "ledger 应从 tags 读回 numbers={:?}",
+    nums
   );
 }

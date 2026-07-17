@@ -3,6 +3,7 @@
 //! 从记忆正文确定性提取 numeric / date / update 信号，供：
 //! - `memory_context` ledger 显式化（O6）
 //! - hybrid 检索后小幅加成重排（与 cooccur 同级，保守幅度）
+//! - P2.2c：`signal:*` tags 持久化（写入 remember；读时合并回 text_signals）
 
 use crate::search::rrf::FusedResult;
 use chrono::{Datelike, Duration, NaiveDate, Weekday};
@@ -15,6 +16,11 @@ const MAX_UPDATE_MARKERS: usize = 4;
 const NUMBER_HIT_BOOST: f64 = 0.010;
 const DATE_HIT_BOOST: f64 = 0.015;
 const MAX_TOTAL_BOOST: f64 = 0.05;
+
+/// P2.2c：tags 持久化前缀（对齐 O3 `occurred:` 风格）。
+pub const SIGNAL_NUM_PREFIX: &str = "signal:num:";
+pub const SIGNAL_DATE_PREFIX: &str = "signal:date:";
+pub const SIGNAL_UPDATE_PREFIX: &str = "signal:update:";
 
 static UPDATE_MARKERS: &[&str] = &[
   "更新",
@@ -46,7 +52,83 @@ pub fn text_signals_rerank_enabled() -> bool {
   }
 }
 
-/// 从正文 + tags + 已解析 occurred 抽取轻量 text_signals（不落库、不写列）。
+/// P2.2c：`MEMORIA_TEXT_SIGNALS_PERSIST=0/false/off` 关闭写入 tags 持久化（读时仍解析已有 tag）。
+pub fn text_signals_persist_enabled() -> bool {
+  match std::env::var("MEMORIA_TEXT_SIGNALS_PERSIST") {
+    Ok(v) => {
+      let t = v.trim().to_ascii_lowercase();
+      !(t == "0" || t == "false" || t == "off" || t == "no")
+    }
+    Err(_) => true,
+  }
+}
+
+/// 从 tags JSON 解析已持久化的 `signal:*` 信号。
+pub fn parse_persisted_signal_tags(tags_json: &str) -> (Vec<String>, Vec<String>, Vec<String>) {
+  let tags: Vec<String> = serde_json::from_str(tags_json).unwrap_or_default();
+  let mut numbers = Vec::new();
+  let mut dates = Vec::new();
+  let mut update_markers = Vec::new();
+  for t in tags {
+    let s = t.trim();
+    if let Some(v) = s.strip_prefix(SIGNAL_NUM_PREFIX) {
+      push_unique(&mut numbers, v);
+    } else if let Some(v) = s.strip_prefix(SIGNAL_DATE_PREFIX) {
+      push_unique(&mut dates, v);
+    } else if let Some(v) = s.strip_prefix(SIGNAL_UPDATE_PREFIX) {
+      push_unique(&mut update_markers, v);
+    }
+  }
+  (numbers, dates, update_markers)
+}
+
+/// 把 text_signals JSON 转为 `signal:*` tags（上限与读时抽取一致）。
+pub fn signal_tags_from_value(signals: &Value) -> Vec<String> {
+  let mut out = Vec::new();
+  if let Some(nums) = signals["numbers"].as_array() {
+    for n in nums.iter().take(MAX_NUMBERS) {
+      if let Some(s) = n.as_str() {
+        out.push(format!("{SIGNAL_NUM_PREFIX}{s}"));
+      }
+    }
+  }
+  if let Some(dates) = signals["dates"].as_array() {
+    for d in dates.iter().take(MAX_DATES) {
+      if let Some(s) = d.as_str() {
+        out.push(format!("{SIGNAL_DATE_PREFIX}{s}"));
+      }
+    }
+  }
+  if let Some(markers) = signals["update_markers"].as_array() {
+    for m in markers.iter().take(MAX_UPDATE_MARKERS) {
+      if let Some(s) = m.as_str() {
+        out.push(format!("{SIGNAL_UPDATE_PREFIX}{s}"));
+      }
+    }
+  }
+  out
+}
+
+/// P2.2c：合并 `signal:*` tags（同前缀替换；保留 occurred / 业务 tag）。
+pub fn merge_signal_tags(tags_json: &str, content: &str, occurred_date: Option<&str>) -> String {
+  if !text_signals_persist_enabled() {
+    return tags_json.to_string();
+  }
+  let signals = extract_text_signals(content, "[]", occurred_date);
+  let signal_tags = signal_tags_from_value(&signals);
+  let mut tags: Vec<String> = serde_json::from_str(tags_json).unwrap_or_default();
+  tags.retain(|t| {
+    let s = t.trim();
+    !s.starts_with(SIGNAL_NUM_PREFIX)
+      && !s.starts_with(SIGNAL_DATE_PREFIX)
+      && !s.starts_with(SIGNAL_UPDATE_PREFIX)
+  });
+  tags.extend(signal_tags);
+  serde_json::to_string(&tags).unwrap_or_else(|_| "[]".to_string())
+}
+
+/// 从正文 + tags + 已解析 occurred 抽取轻量 text_signals。
+/// P2.2c：已持久化的 `signal:*` tags 合并进结果（便于检索/回归）。
 pub fn extract_text_signals(content: &str, tags_json: &str, occurred_date: Option<&str>) -> Value {
   let mut numbers = extract_numbers(content);
   let mut dates = extract_dates(content);
@@ -62,6 +144,18 @@ pub fn extract_text_signals(content: &str, tags_json: &str, occurred_date: Optio
   let anchor = chrono::Utc::now().date_naive();
   for d in resolve_relative_dates(content, anchor) {
     push_unique(&mut dates, &d);
+  }
+
+  // P2.2c：读时合并 tags 中已持久化的 signal:*
+  let (p_nums, p_dates, p_updates) = parse_persisted_signal_tags(tags_json);
+  for n in p_nums {
+    push_unique(&mut numbers, &n);
+  }
+  for d in p_dates {
+    push_unique(&mut dates, &d);
+  }
+  for m in p_updates {
+    push_unique(&mut update_markers, &m);
   }
 
   // tags 中的 supersede / pattern 提示更新语义
@@ -393,6 +487,31 @@ mod unit_tests {
     );
     let direct = resolve_relative_dates("本周五交付", anchor);
     assert!(direct.iter().any(|d| d == "2026-07-18"));
+  }
+
+  #[test]
+  fn signal_tags_persist_and_read_back() {
+    let merged = merge_signal_tags("[]", "2026-07-01 进厂 120 吨，改为应急", None);
+    let tags: Vec<String> = serde_json::from_str(&merged).unwrap();
+    assert!(tags.iter().any(|t| t == "signal:num:120"));
+    assert!(tags.iter().any(|t| t == "signal:date:2026-07-01"));
+    assert!(tags.iter().any(|t| t == "signal:update:改为"));
+
+    let sig = extract_text_signals("正文无数字", &merged, None);
+    let nums = sig["numbers"].as_array().unwrap();
+    assert!(nums.iter().any(|n| n.as_str() == Some("120")));
+  }
+
+  #[test]
+  fn merge_signal_tags_preserves_occurred() {
+    let merged = merge_signal_tags(
+      r#"["fact","occurred:2026-07-10"]"#,
+      "库存 88 件",
+      Some("2026-07-10"),
+    );
+    let tags: Vec<String> = serde_json::from_str(&merged).unwrap();
+    assert!(tags.iter().any(|t| t == "occurred:2026-07-10"));
+    assert!(tags.iter().any(|t| t == "signal:num:88"));
   }
 
   #[test]
