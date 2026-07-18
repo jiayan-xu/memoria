@@ -6,8 +6,331 @@
 //! HNSW 向量索引文件同步复制。
 
 use crate::storage::SqlitePool;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+/// Phase A (OpenClaw 吸收): `backup create/verify/restore` 的归档清单 schema 版本。
+/// 与 OpenClaw 的 `schemaVersion:1` 对齐 —— verify 只接受同版本，拒绝未知清单。
+const BACKUP_MANIFEST_SCHEMA_VERSION: u32 = 1;
+
+/// 归档清单中的单条数据库条目。
+#[derive(Debug, Serialize, Deserialize)]
+struct BackupEntry {
+    /// 归档内相对文件名（必须在 path_allowlist 内，防路径穿越）
+    name: String,
+    /// 内容 sha256（16 进制），verify 时逐字节校验
+    sha256: String,
+    /// "main" = 主记忆库；"audit" = 鉴权/审计库
+    role: String,
+}
+
+/// `backup create` 写出的清单，夹在归档目录根。
+#[derive(Debug, Serialize, Deserialize)]
+struct BackupManifest {
+    schema_version: u32,
+    created_at: String,
+    entries: Vec<BackupEntry>,
+    /// 允许出现的文件名白名单；verify 时任何条目名不在其中即判失败
+    path_allowlist: Vec<String>,
+}
+
+/// 计算文件 sha256（分块读取，避免大库一次性载入内存）。
+fn sha256_file(path: &str) -> Result<String, String> {
+    let mut f =
+        std::fs::File::open(path).map_err(|e| format!("open {}: {}", path, e))?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        let n = f.read(&mut buf).map_err(|e| format!("read {}: {}", path, e))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// 对源库做事务一致性热备（VACUUM INTO），复用 `perform_backup` 的范式。
+fn vacuum_into(src: &str, dst: &str) -> Result<(), String> {
+    let conn = rusqlite::Connection::open(src)
+        .map_err(|e| format!("open source {}: {}", src, e))?;
+    let sql = format!("VACUUM INTO '{}'", escape_sql_path(dst));
+    conn.execute_batch(&sql)
+        .map_err(|e| format!("VACUUM INTO {}: {}", dst, e))?;
+    Ok(())
+}
+
+/// `memoria-server backup create` —— 对主库（及可选审计库）做 VACUUM INTO 快照，
+/// 写出 `manifest.json`（schemaVersion + 每条目 sha256 + path_allowlist）。
+/// 拒绝覆盖已存在的归档目录（防误写）。
+pub fn backup_create_cli(main_db: &str, auth_db: &str, backup_dir: &str) -> Result<(), String> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|e| e.to_string())?;
+    let ts = chrono::DateTime::from_timestamp(now.as_secs() as i64, 0)
+        .ok_or("invalid timestamp")?
+        .format("%Y%m%d_%H%M%S")
+        .to_string();
+
+    let archive_dir = Path::new(backup_dir).join("cli").join(&ts);
+    if archive_dir.exists() {
+        return Err(format!(
+            "refusing to overwrite existing archive: {}",
+            archive_dir.display()
+        ));
+    }
+    std::fs::create_dir_all(&archive_dir).map_err(|e| format!("mkdir archive: {}", e))?;
+
+    let mut entries: Vec<BackupEntry> = Vec::new();
+    let mut allowlist: Vec<String> = Vec::new();
+
+    if !Path::new(main_db).exists() {
+        return Err(format!("main db not found: {}", main_db));
+    }
+    let main_dst = archive_dir.join("memoria.db");
+    vacuum_into(main_db, &main_dst.to_string_lossy())?;
+    let main_hash = sha256_file(&main_dst.to_string_lossy())?;
+    entries.push(BackupEntry {
+        name: "memoria.db".to_string(),
+        sha256: main_hash,
+        role: "main".to_string(),
+    });
+    allowlist.push("memoria.db".to_string());
+
+    if Path::new(auth_db).exists() {
+        let audit_dst = archive_dir.join("audit.db");
+        vacuum_into(auth_db, &audit_dst.to_string_lossy())?;
+        let audit_hash = sha256_file(&audit_dst.to_string_lossy())?;
+        entries.push(BackupEntry {
+            name: "audit.db".to_string(),
+            sha256: audit_hash,
+            role: "audit".to_string(),
+        });
+        allowlist.push("audit.db".to_string());
+    }
+
+    let manifest = BackupManifest {
+        schema_version: BACKUP_MANIFEST_SCHEMA_VERSION,
+        created_at: ts,
+        entries,
+        path_allowlist: allowlist,
+    };
+    let manifest_path = archive_dir.join("manifest.json");
+    let json = serde_json::to_string_pretty(&manifest).map_err(|e| format!("manifest ser: {}", e))?;
+    std::fs::write(&manifest_path, json).map_err(|e| format!("write manifest: {}", e))?;
+
+    println!("[Memoria][backup] created archive: {}", archive_dir.display());
+    println!("[Memoria][backup] entries: {}", manifest.entries.len());
+    for e in &manifest.entries {
+        println!(
+            "[Memoria][backup]   {}  role={}  sha256={}..",
+            e.name,
+            e.role,
+            &e.sha256[..16.min(e.sha256.len())]
+        );
+    }
+    println!("[Memoria][backup] NOTE: HNSW vector index is rebuildable from memory_vectors; not archived separately.");
+    Ok(())
+}
+
+/// `memoria-server backup verify <archive_dir>` —— 校验 manifest 合法、条目名在白名单、
+/// 文件存在、sha256 匹配、且 PRAGMA integrity_check 通过。不提取、不还原。
+pub fn backup_verify_cli(archive_dir: &str) -> Result<(), String> {
+    let dir = Path::new(archive_dir);
+    let manifest_path = dir.join("manifest.json");
+    if !manifest_path.exists() {
+        return Err(format!("manifest not found in archive: {}", archive_dir));
+    }
+    let raw =
+        std::fs::read_to_string(&manifest_path).map_err(|e| format!("read manifest: {}", e))?;
+    let manifest: BackupManifest =
+        serde_json::from_str(&raw).map_err(|e| format!("parse manifest: {}", e))?;
+    if manifest.schema_version != BACKUP_MANIFEST_SCHEMA_VERSION {
+        return Err(format!(
+            "unsupported manifest schema_version: {} (expected {})",
+            manifest.schema_version, BACKUP_MANIFEST_SCHEMA_VERSION
+        ));
+    }
+
+    let mut all_ok = true;
+    for entry in &manifest.entries {
+        if !manifest.path_allowlist.contains(&entry.name) {
+            eprintln!(
+                "[Memoria][backup][verify] FAIL: entry '{}' not in path_allowlist",
+                entry.name
+            );
+            all_ok = false;
+            continue;
+        }
+        let fp = dir.join(&entry.name);
+        if !fp.exists() {
+            eprintln!(
+                "[Memoria][backup][verify] FAIL: entry file missing: {}",
+                entry.name
+            );
+            all_ok = false;
+            continue;
+        }
+        let hash = match sha256_file(&fp.to_string_lossy()) {
+            Ok(h) => h,
+            Err(e) => {
+                eprintln!("[Memoria][backup][verify] FAIL: {}", e);
+                all_ok = false;
+                continue;
+            }
+        };
+        if hash != entry.sha256 {
+            eprintln!(
+                "[Memoria][backup][verify] FAIL: sha256 mismatch for {}",
+                entry.name
+            );
+            all_ok = false;
+            continue;
+        }
+        if !check_integrity(&fp.to_string_lossy()) {
+            eprintln!(
+                "[Memoria][backup][verify] FAIL: integrity_check failed for {}",
+                entry.name
+            );
+            all_ok = false;
+            continue;
+        }
+        println!(
+            "[Memoria][backup][verify] OK: {} (role={})",
+            entry.name, entry.role
+        );
+    }
+
+    if all_ok {
+        println!("[Memoria][backup][verify] ALL ENTRIES VERIFIED");
+        Ok(())
+    } else {
+        Err("one or more entries failed verification".to_string())
+    }
+}
+
+/// `memoria-server backup restore <archive_dir> <target_main_db> [target_audit_db]` ——
+/// **仅允许恢复到全新（fresh）目标库**，防止覆盖线上运行库（OpenClaw 缺失、我们自研的补强点）。
+/// 若目标已存在则拒绝，并给出操作步骤。恢复前仍走 `restore_from_backup` 的 integrity_check + 原子替换。
+pub fn backup_restore_cli(
+    archive_dir: &str,
+    target_main: &str,
+    target_audit_opt: Option<&str>,
+) -> Result<(), String> {
+    let dir = Path::new(archive_dir);
+    let manifest_path = dir.join("manifest.json");
+    if !manifest_path.exists() {
+        return Err(format!("manifest not found in archive: {}", archive_dir));
+    }
+    let raw =
+        std::fs::read_to_string(&manifest_path).map_err(|e| format!("read manifest: {}", e))?;
+    let manifest: BackupManifest =
+        serde_json::from_str(&raw).map_err(|e| format!("parse manifest: {}", e))?;
+    if manifest.schema_version != BACKUP_MANIFEST_SCHEMA_VERSION {
+        return Err(format!(
+            "unsupported manifest schema_version: {} (expected {})",
+            manifest.schema_version, BACKUP_MANIFEST_SCHEMA_VERSION
+        ));
+    }
+
+    // fresh-target 守卫：目标主库必须不存在，避免覆盖线上运行库
+    if Path::new(target_main).exists() {
+        return Err(format!(
+            "refusing to restore over existing target '{}' (fresh-target-only policy).\n\
+             [Memoria] Stop the service, move the live db aside, then restore into a fresh path\n\
+             [Memoria] (e.g. '{}'.restored) and swap manually after verification.",
+            target_main, target_main
+        ));
+    }
+    let target_main_parent = Path::new(target_main)
+        .parent()
+        .ok_or("invalid target_main path")?;
+    std::fs::create_dir_all(target_main_parent).map_err(|e| format!("mkdir target parent: {}", e))?;
+
+    for entry in &manifest.entries {
+        let src = dir.join(&entry.name);
+        if !src.exists() {
+            return Err(format!("archive entry missing: {}", entry.name));
+        }
+        let dst = match entry.role.as_str() {
+            "main" => target_main.to_string(),
+            "audit" => match target_audit_opt {
+                Some(t) => t.to_string(),
+                None => target_main_parent
+                    .join("audit.db")
+                    .to_string_lossy()
+                    .to_string(),
+            },
+            _ => continue,
+        };
+        if Path::new(&dst).exists() {
+            return Err(format!(
+                "refusing to restore over existing target '{}' (fresh-target-only)",
+                dst
+            ));
+        }
+        let dst_parent = Path::new(&dst)
+            .parent()
+            .ok_or("invalid audit target path")?;
+        std::fs::create_dir_all(dst_parent).map_err(|e| format!("mkdir audit target parent: {}", e))?;
+        restore_from_backup(&src.to_string_lossy(), &dst)?;
+        println!("[Memoria][backup][restore] restored {} -> {}", entry.name, dst);
+    }
+    println!("[Memoria][backup][restore] DONE. With the service stopped, swap the restored file into place, then start.");
+    Ok(())
+}
+
+/// CLI 顶层分发：`memoria-server backup <create|verify|restore> [args]`。
+/// 由 `main.rs` 在获取单写者锁之前调用，避免与运行实例双写。
+pub fn run_backup_cli(args: &[String]) -> Result<(), String> {
+    if args.is_empty() {
+        return Err(
+            "usage: memoria-server backup <create|verify|restore> [args]\n\
+              create\n\
+              verify <archive_dir>\n\
+              restore <archive_dir> <target_main_db> [target_audit_db]"
+                .to_string(),
+        );
+    }
+    let db_path =
+        std::env::var("MEMORIA_DB_PATH").unwrap_or_else(|_| "data/memoria.db".to_string());
+    let auth_db_path = std::env::var("MEMORIA_AUTH_DB_PATH").unwrap_or_else(|_| {
+        let p = std::path::Path::new(&db_path);
+        p.parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .join("audit.db")
+            .to_string_lossy()
+            .to_string()
+    });
+    let backup_dir = std::env::var("MEMORIA_BACKUP_DIR").unwrap_or_else(|_| {
+        let p = std::path::Path::new(&db_path);
+        p.parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .join("backups")
+            .to_string_lossy()
+            .to_string()
+    });
+    match args[0].as_str() {
+        "create" => backup_create_cli(&db_path, &auth_db_path, &backup_dir),
+        "verify" => {
+            let d = args.get(1).ok_or("verify requires <archive_dir>")?;
+            backup_verify_cli(d)
+        }
+        "restore" => {
+            let d = args.get(1).ok_or("restore requires <archive_dir>")?;
+            let t = args.get(2).ok_or("restore requires <target_main_db>")?;
+            let ta = args.get(3).map(|s| s.as_str());
+            backup_restore_cli(d, t, ta)
+        }
+        other => Err(format!(
+            "unknown backup subcommand: {} (expected create|verify|restore)",
+            other
+        )),
+    }
+}
 
 /// GFS 轮转配置
 const DAILY_RETENTION: usize = 7;

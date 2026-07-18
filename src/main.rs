@@ -65,6 +65,20 @@ fn build_runtime() -> tokio::runtime::Runtime {
 fn main() {
     // 联调：tracing 底板（与 agent-core 对齐：AGENT_CORE_LOG > RUST_LOG > 默认 info）
     init_tracing();
+
+    // Phase A (OpenClaw 吸收): `memoria-server backup <create|verify|restore>` 子命令。
+    // 必须在获取单写者锁之前分发，避免与运行实例双写同一数据库。
+    let cli_args: Vec<String> = std::env::args().collect();
+    if cli_args.len() >= 2 && cli_args[1] == "backup" {
+        match backup::run_backup_cli(&cli_args[2..]) {
+            Ok(()) => std::process::exit(0),
+            Err(e) => {
+                eprintln!("[Memoria][backup] ERROR: {}", e);
+                std::process::exit(1);
+            }
+        }
+    }
+
     let runtime = build_runtime();
     // P0-4 单写者守卫：启动早期加锁，防止两个 memoria-server 实例并发写同一数据库（双写损坏）。
     let db_path_for_lock =
