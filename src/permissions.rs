@@ -287,12 +287,6 @@ pub const PERMISSION_MATRIX: &[Entry] = &[
         note: "Bridge 转发",
     },
     Entry {
-        tool: "panel_discuss",
-        min_role: MinRole::Agent,
-        ns_policy: NsPolicy::None,
-        note: "Bridge 转发",
-    },
-    Entry {
         tool: "reasonix_dispatch",
         min_role: MinRole::Agent,
         ns_policy: NsPolicy::None,

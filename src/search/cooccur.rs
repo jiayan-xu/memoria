@@ -157,7 +157,7 @@ mod unit_tests {
 
   #[test]
   fn empty_results_noop() {
-    let mut v = Vec::new();
+    let mut v: Vec<String> = Vec::new();
     // pool 不可用时也不应 panic —— 用假路径会拿不到 pool；这里只测空输入
     assert!(v.is_empty());
     let _ = &mut v;

@@ -20,7 +20,6 @@ use memoria_core::tools;
 const BRIDGE_TOOLS: &[&str] = &[
     "cross_agent_query",
     "system_status",
-    "panel_discuss",
     "reasonix_dispatch",
     "continue_task",
     "auto_route",
@@ -435,12 +434,11 @@ pub fn tools_list() -> Vec<serde_json::Value> {
             }),
         ),
     ];
-    // Bridge 转发工具
+    // Bridge 转发工具（圆桌 panel_discuss 已 native 进 agent-core，不再经 bridge）
     for name in BRIDGE_TOOLS {
         let desc = match *name {
             "cross_agent_query" => "向另一个Agent提问",
             "system_status" => "检查各Agent连接状态",
-            "panel_discuss" => "多Agent圆桌讨论",
             "reasonix_dispatch" => "派发编码任务给Reasonix",
             "continue_task" => "继续一个等待输入的任务",
             "auto_route" => "动态路由查询到最佳Agent",
