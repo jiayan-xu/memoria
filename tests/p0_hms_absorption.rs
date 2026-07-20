@@ -38,7 +38,11 @@ fn occurred_from_tags_distinct_from_mentioned() {
         None,
         None,
         None,
-    )
+    
+        None,
+        None,
+        None,
+        None)
     .expect("remember");
 
     let ctx: Value =
@@ -80,7 +84,11 @@ fn entities_empty_without_mentions() {
         None,
         None,
         None,
-    )
+    
+        None,
+        None,
+        None,
+        None)
     .expect("remember");
     let fused = memoria_core::search::hybrid::hybrid_search(
         &engine.pool,
@@ -119,7 +127,11 @@ fn occurred_falls_back_to_valid_from_without_tag() {
         None,
         None,
         None,
-    )
+    
+        None,
+        None,
+        None,
+        None)
     .expect("remember");
 
     let ctx: Value = memory_context(
@@ -184,7 +196,11 @@ fn prompt_block_compatible() {
         None,
         None,
         None,
-    )
+    
+        None,
+        None,
+        None,
+        None)
     .expect("remember");
     let ctx: Value = memory_context(
         &engine.pool,

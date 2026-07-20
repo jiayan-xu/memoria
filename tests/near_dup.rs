@@ -58,7 +58,11 @@ fn near_dup_survives_restart() {
         None,
         None,
         None,
-    )
+    
+        None,
+        None,
+        None,
+        None)
     .expect("remember A");
     let id_a = r1.id.clone();
     // 确认向量已落持久表（重启可用）
@@ -93,7 +97,11 @@ fn near_dup_survives_restart() {
         None,
         None,
         None,
-    )
+    
+        None,
+        None,
+        None,
+        None)
     .expect("remember B");
 
     // 验收：B 应被标记为 A 的近义 supersede（superseded_by 记在旧记忆 A 上：A.superseded_by = B）
@@ -138,7 +146,11 @@ fn near_dup_below_threshold_not_merged() {
         None,
         None,
         None,
-    )
+    
+        None,
+        None,
+        None,
+        None)
     .expect("remember A");
 
     // B 与 A 余弦 0.5（远低于 0.92 默认阈值）→ 不应合并
@@ -158,7 +170,11 @@ fn near_dup_below_threshold_not_merged() {
         None,
         None,
         None,
-    )
+    
+        None,
+        None,
+        None,
+        None)
     .expect("remember B");
 
     assert_eq!(r2.action, "created", "低于阈值的近义不应合并");
@@ -196,7 +212,11 @@ fn near_dup_respects_namespace() {
         None,
         None,
         None,
-    )
+    
+        None,
+        None,
+        None,
+        None)
     .expect("remember A");
 
     // ns2 写入 B，向量与 A 完全相同（余弦 1.0），但不同 ns → 不应被 A supersede
@@ -215,7 +235,11 @@ fn near_dup_respects_namespace() {
         None,
         None,
         None,
-    )
+    
+        None,
+        None,
+        None,
+        None)
     .expect("remember B");
 
     assert_eq!(

@@ -38,7 +38,11 @@ fn ledger_includes_text_signals() {
     None,
     None,
     None,
-  )
+  
+        None,
+        None,
+        None,
+        None)
   .expect("remember");
 
   let ctx: Value =
@@ -85,7 +89,11 @@ fn search_boosts_on_numeric_query_overlap() {
     None,
     None,
     None,
-  )
+  
+        None,
+        None,
+        None,
+        None)
   .expect("a");
   let _b = remember_with_dedup(
     &engine.pool,
@@ -101,7 +109,11 @@ fn search_boosts_on_numeric_query_overlap() {
     None,
     None,
     None,
-  )
+  
+        None,
+        None,
+        None,
+        None)
   .expect("b");
   let mid_a = a.id.clone();
 
@@ -134,7 +146,11 @@ fn relative_date_in_ledger_signals() {
     None,
     None,
     None,
-  )
+  
+        None,
+        None,
+        None,
+        None)
   .expect("remember");
 
   let ctx: Value =
@@ -171,7 +187,11 @@ fn text_signals_rerank_env_off() {
     None,
     None,
     None,
-  )
+  
+        None,
+        None,
+        None,
+        None)
   .expect("mem");
 
   unsafe {
@@ -204,7 +224,11 @@ fn signal_tags_persisted_on_remember() {
     None,
     None,
     None,
-  )
+  
+        None,
+        None,
+        None,
+        None)
   .expect("remember");
 
   let conn = engine.pool.get().expect("conn");

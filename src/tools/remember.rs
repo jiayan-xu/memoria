@@ -40,13 +40,28 @@ pub struct RememberResult {
     pub similarities: Vec<f32>,
 }
 
-/// §9.1：supersede 时计算旧行 valid_to（stamp_to）。
-/// - 旧 valid_to 已过期（< now）→ 保留，不回拨
-/// - 否则 → stamp 为 now（截断未来 TTL 或关闭开放区间）
-pub fn compute_stamp_to(old_valid_to: Option<&str>, now: &str) -> String {
+/// §9.1（PR3 双时态补洞）：supersede 时计算旧行 valid_to（stamp_to）。
+///
+/// 统一更新路径：旧 tip 的失效点 = 新事实的生效起点（new_valid_from，即 DESIGN Profile
+/// 「旧 valid_to = 新 valid_from」），而非墙钟 `now` —— 否则 `as_of=now` 仍会命中已被
+/// 取代的旧事实（端点闭合导致旧 tip 在 `now` 时刻仍“有效”）。
+/// 边界规则：
+/// - 提供 new_valid_from（非空）→ 以它为候选边界；
+/// - 旧 valid_to 已存在且早于候选边界（旧事实本就更早结束）→ 保留旧值，不回拨/不扩展；
+/// - 否则 → stamp 为候选边界（new_valid_from 或 `now` 兜底）。
+/// 语义：旧事实在「新事实开始生效」那一刻停止为真，且绝不把旧事实有效期拉长或回拨。
+pub fn compute_stamp_to_boundary(
+    old_valid_to: Option<&str>,
+    now: &str,
+    new_valid_from: Option<&str>,
+) -> String {
+    let boundary = match new_valid_from {
+        Some(b) if !b.is_empty() => b,
+        _ => now,
+    };
     match old_valid_to {
-        Some(vt) if !vt.is_empty() && vt < now => vt.to_string(),
-        _ => now.to_string(),
+        Some(ovt) if !ovt.is_empty() && ovt < boundary => ovt.to_string(),
+        _ => boundary.to_string(),
     }
 }
 
@@ -105,6 +120,7 @@ fn validate_supersede_target(
 }
 
 /// 事务内 stamp 旧 tip：superseded_by + tier=cold + §9.1 valid_to，并写记忆边。
+/// `new_valid_from`：新事实的生效起点；旧 tip 的 valid_to 据此边界关闭（PR3 双时态补洞）。
 fn apply_supersede_in_tx(
     conn: &Connection,
     new_id: &str,
@@ -113,6 +129,7 @@ fn apply_supersede_in_tx(
     now: &str,
     relation_type: &str,
     evidence: &str,
+    new_valid_from: Option<&str>,
 ) -> Result<(), String> {
     let old_vt: Option<String> = conn
         .query_row(
@@ -121,7 +138,7 @@ fn apply_supersede_in_tx(
             |r| r.get(0),
         )
         .unwrap_or(None);
-    let stamp_to = compute_stamp_to(old_vt.as_deref(), now);
+    let stamp_to = compute_stamp_to_boundary(old_vt.as_deref(), now, new_valid_from);
     conn.execute(
         "UPDATE memories SET superseded_by = ?, tier = 'cold', valid_to = ? WHERE id = ?",
         rusqlite::params![new_id, stamp_to, target_id],
@@ -278,6 +295,7 @@ pub fn remember_with_dedup(
                 &now,
                 relation_type,
                 "explicit_supersede_exact",
+                valid_from,
             )?;
             tx.commit().map_err(|e| format!("commit: {}", e))?;
 
@@ -407,7 +425,8 @@ pub fn remember_with_dedup(
                                             |r| r.get(0),
                                         )
                                         .unwrap_or(None);
-                                    let stamp_to = compute_stamp_to(old_vt.as_deref(), &now);
+                                    let stamp_to =
+                                        compute_stamp_to_boundary(old_vt.as_deref(), &now, Some(valid_from_val));
                                     tx.execute(
                                         "UPDATE memories SET superseded_by = ?, tier = 'cold', valid_to = ?
                                          WHERE id = ?",
@@ -446,6 +465,7 @@ pub fn remember_with_dedup(
             &now,
             relation_type,
             "explicit_supersede",
+            Some(valid_from_val),
         )?;
         superseded_ids.push(target_id.to_string());
         explicit_superseded = true;
@@ -527,7 +547,15 @@ pub fn merge_memories(pool: &SqlitePool, keep_id: &str, merge_id: &str) -> Resul
             |r| r.get(0),
         )
         .unwrap_or(None);
-    let stamp_to = compute_stamp_to(old_vt.as_deref(), &now);
+    // 保留事实（keep_id）的生效起点作为被合并事实的失效边界：合并即「旧事实在 keep 生效时失效」。
+    let keep_vf: Option<String> = tx
+        .query_row(
+            "SELECT valid_from FROM memories WHERE id = ?",
+            rusqlite::params![keep_id],
+            |r| r.get(0),
+        )
+        .unwrap_or(None);
+    let stamp_to = compute_stamp_to_boundary(old_vt.as_deref(), &now, keep_vf.as_deref());
 
     tx.execute(
         "UPDATE memories SET superseded_by = ?, tier = 'cold', valid_to = ? WHERE id = ?",

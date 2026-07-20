@@ -44,7 +44,11 @@ fn explicit_supersede_stamps_valid_to_and_hides_by_default() {
         None,
         None,
         None,
-    )
+    
+        None,
+        None,
+        None,
+        None)
     .expect("remember A");
     let a_id = a.id.clone();
 
@@ -63,7 +67,11 @@ fn explicit_supersede_stamps_valid_to_and_hides_by_default() {
         None,
         Some(&a_id),
         None,
-    )
+    
+        None,
+        None,
+        None,
+        None)
     .expect("remember B superseding A");
     assert_eq!(b.action, "superseded_explicit", "应标记 superseded_explicit");
 
@@ -121,7 +129,11 @@ fn supersedes_id_404_when_target_missing() {
         None,
         Some("deadbeefdeadbeef"),
         None,
-    );
+    
+        None,
+        None,
+        None,
+        None);
     assert!(r.is_err(), "目标不存在应返回 Err");
     assert!(
         r.unwrap_err().contains("404"),
@@ -150,7 +162,11 @@ fn supersedes_id_403_cross_namespace() {
         None,
         None,
         None,
-    )
+    
+        None,
+        None,
+        None,
+        None)
     .expect("remember A in other ns");
 
     let ns_self = "agent/self";
@@ -168,7 +184,11 @@ fn supersedes_id_403_cross_namespace() {
         None,
         Some(&a.id),
         None,
-    );
+    
+        None,
+        None,
+        None,
+        None);
     assert!(r.is_err(), "跨 ns 取代应返回 Err");
     assert!(
         r.unwrap_err().contains("403"),
@@ -198,7 +218,11 @@ fn supersedes_id_409_when_target_not_tip() {
         None,
         None,
         None,
-    )
+    
+        None,
+        None,
+        None,
+        None)
     .expect("remember A");
     // B 取代 A → A 不再是 tip
     let _b = remember_with_dedup(
@@ -215,7 +239,11 @@ fn supersedes_id_409_when_target_not_tip() {
         None,
         Some(&a.id),
         None,
-    )
+    
+        None,
+        None,
+        None,
+        None)
     .expect("remember B superseding A");
 
     // 再尝试用 C 取代已非 tip 的 A → 409
@@ -233,7 +261,11 @@ fn supersedes_id_409_when_target_not_tip() {
         None,
         Some(&a.id),
         None,
-    );
+    
+        None,
+        None,
+        None,
+        None);
     assert!(r.is_err(), "取代非 tip 应返回 Err");
     assert!(
         r.unwrap_err().contains("409"),
@@ -264,7 +296,11 @@ fn supersedes_id_409_self_reference() {
         None,
         Some(&self_id),
         None,
-    );
+    
+        None,
+        None,
+        None,
+        None);
     assert!(r.is_err(), "自指取代应返回 Err");
     assert!(
         r.unwrap_err().contains("409"),
@@ -294,7 +330,11 @@ fn stamp_preserves_expired_valid_to() {
         Some("2020-06-01T00:00:00"), // 已过期
         None,
         None,
-    )
+    
+        None,
+        None,
+        None,
+        None)
     .expect("A");
 
     let b = remember_with_dedup(
@@ -311,7 +351,11 @@ fn stamp_preserves_expired_valid_to() {
         None,
         Some(&a.id),
         None,
-    )
+    
+        None,
+        None,
+        None,
+        None)
     .expect("B");
     assert_eq!(b.action, "superseded_explicit");
 
@@ -352,7 +396,11 @@ fn supersede_404_does_not_leave_dirty_tip() {
         None,
         Some("deadbeefdeadbeef"),
         None,
-    );
+    
+        None,
+        None,
+        None,
+        None);
     assert!(r.is_err());
     assert!(r.unwrap_err().contains("404"));
     let conn = engine.pool.get().unwrap();
@@ -387,7 +435,11 @@ fn explicit_supersede_writes_updates_edge() {
         None,
         None,
         None,
-    )
+    
+        None,
+        None,
+        None,
+        None)
     .expect("A");
     let b = remember_with_dedup(
         &engine.pool,
@@ -403,7 +455,11 @@ fn explicit_supersede_writes_updates_edge() {
         None,
         Some(&a.id),
         Some("updates"),
-    )
+    
+        None,
+        None,
+        None,
+        None)
     .expect("B");
     let conn = engine.pool.get().unwrap();
     let rt: String = conn
@@ -438,7 +494,11 @@ fn exact_duplicate_still_applies_supersedes_id() {
         None,
         None,
         None,
-    )
+    
+        None,
+        None,
+        None,
+        None)
     .expect("first");
     let old = remember_with_dedup(
         &engine.pool,
@@ -454,7 +514,11 @@ fn exact_duplicate_still_applies_supersedes_id() {
         None,
         None,
         None,
-    )
+    
+        None,
+        None,
+        None,
+        None)
     .expect("old");
     let r = remember_with_dedup(
         &engine.pool,
@@ -470,7 +534,11 @@ fn exact_duplicate_still_applies_supersedes_id() {
         None,
         Some(&old.id),
         None,
-    )
+    
+        None,
+        None,
+        None,
+        None)
     .expect("exact+supersede");
     assert_eq!(r.action, "superseded_explicit");
     assert_eq!(r.id, first.id);

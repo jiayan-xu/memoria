@@ -68,7 +68,11 @@ fn ledger_entities_empty_without_mentions() {
     None,
     None,
     None,
-  )
+  
+        None,
+        None,
+        None,
+        None)
   .expect("remember");
 
   let ctx: Value =
@@ -96,7 +100,11 @@ fn ledger_entities_join_when_mentions_exist() {
     None,
     None,
     None,
-  )
+  
+        None,
+        None,
+        None,
+        None)
   .expect("remember");
   let mid = mem.id.clone();
 
@@ -154,7 +162,11 @@ fn cooccur_rerank_boosts_query_entity_hit() {
     None,
     None,
     None,
-  )
+  
+        None,
+        None,
+        None,
+        None)
   .expect("a");
   let _b = remember_with_dedup(
     &engine.pool,
@@ -170,7 +182,11 @@ fn cooccur_rerank_boosts_query_entity_hit() {
     None,
     None,
     None,
-  )
+  
+        None,
+        None,
+        None,
+        None)
   .expect("b");
   let mid_a = a.id.clone();
 
@@ -189,7 +205,11 @@ fn cooccur_rerank_boosts_query_entity_hit() {
     None,
     None,
     None,
-  )
+  
+        None,
+        None,
+        None,
+        None)
   .expect("c");
   seed_entity_mention(
     &engine,
@@ -230,7 +250,11 @@ fn pattern_conflict_uses_supersede_not_delete() {
     None,
     None,
     None,
-  )
+  
+        None,
+        None,
+        None,
+        None)
   .expect("old");
   let old_id = old.id.clone();
 
@@ -248,7 +272,11 @@ fn pattern_conflict_uses_supersede_not_delete() {
     None,
     Some(old_id.as_str()),
     None,
-  )
+  
+        None,
+        None,
+        None,
+        None)
   .expect("new");
   assert_eq!(new.action, "superseded_explicit");
 
@@ -295,7 +323,11 @@ fn enrich_ledger_join_matches_context() {
     None,
     None,
     None,
-  )
+  
+        None,
+        None,
+        None,
+        None)
   .expect("remember");
   seed_entity_mention(
     &engine,

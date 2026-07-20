@@ -34,7 +34,11 @@ fn profile_returns_static_and_dynamic_excluding_insight() {
         None,
         None,
         None,
-    )
+    
+        None,
+        None,
+        None,
+        None)
     .expect("pref");
 
     // dynamic 源：decision
@@ -52,7 +56,11 @@ fn profile_returns_static_and_dynamic_excluding_insight() {
         None,
         None,
         None,
-    )
+    
+        None,
+        None,
+        None,
+        None)
     .expect("decision");
 
     // insight 不应进入 dynamic
@@ -70,7 +78,11 @@ fn profile_returns_static_and_dynamic_excluding_insight() {
         None,
         None,
         None,
-    )
+    
+        None,
+        None,
+        None,
+        None)
     .expect("insight");
 
     let v: Value = memory_profile(&engine.pool, ns, 12, 15, None).expect("profile");
