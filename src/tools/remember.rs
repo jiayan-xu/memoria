@@ -163,6 +163,10 @@ pub fn remember(
         valid_to,
         None,
         None,
+        None,
+        None,
+        None,
+        None,
     )?;
     Ok(result.id)
 }
@@ -205,6 +209,10 @@ pub fn remember_with_dedup(
     valid_to: Option<&str>,
     supersedes_id: Option<&str>,
     relation: Option<&str>,
+    actor: Option<&str>,
+    memory_type: Option<&str>,
+    parent_id: Option<&str>,
+    raw_ref: Option<&str>,
 ) -> Result<RememberResult, String> {
     let relation_type = normalize_memory_relation(relation)?;
     let mut conn = pool.get().map_err(|e| format!("pool: {}", e))?;
@@ -339,8 +347,9 @@ pub fn remember_with_dedup(
 
     tx.execute(
         "INSERT INTO memories (id, namespace, source, content, category, confidence,
-         recall_count, created_at, tier, importance, decay_factor, tags, valid_from, valid_to)
-         VALUES (?, ?, ?, ?, ?, 0.8, 0, ?, 'hot', ?, 1.0, ?, ?, ?)",
+         recall_count, created_at, tier, importance, decay_factor, tags, valid_from, valid_to,
+         actor, memory_type, parent_id, raw_ref)
+         VALUES (?, ?, ?, ?, ?, 0.8, 0, ?, 'hot', ?, 1.0, ?, ?, ?, ?, ?, ?, ?)",
         rusqlite::params![
             mem_id,
             namespace,
@@ -351,7 +360,11 @@ pub fn remember_with_dedup(
             importance,
             tags_safe,
             valid_from_val,
-            valid_to_val
+            valid_to_val,
+            actor,
+            memory_type,
+            parent_id,
+            raw_ref
         ],
     )
     .map_err(|e| format!("insert: {}", e))?;

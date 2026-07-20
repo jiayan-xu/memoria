@@ -22,6 +22,14 @@ pub struct Memory {
     pub importance: i64,
     pub decay_factor: f64,
     pub superseded_by: Option<String>,
+    /// PR1（Phase B 前置）：写入前门提取压缩元数据（agent-core 主，Memoria 薄存储）。
+    /// actor=事实作者/来源主体；memory_type=declarative/procedural/...；
+    /// parent_id=原子事实挂回的原始记忆；raw_ref=原文旁路存储引用。
+    /// 旧行 NULL 视为 agent_inferred / declarative（检索/画像读取时兜底）。
+    pub actor: Option<String>,
+    pub memory_type: Option<String>,
+    pub parent_id: Option<String>,
+    pub raw_ref: Option<String>,
 }
 
 /// A conversation message (matches `messages` table).

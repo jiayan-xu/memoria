@@ -459,3 +459,30 @@ pub fn migrate_temporal(pool: &SqlitePool) -> Result<(), String> {
     .map_err(|e| format!("temporal index: {}", e))?;
     Ok(())
 }
+
+/// PR1（Phase B 前置）：为 `memories` 增加提取压缩元数据列
+/// `actor` / `memory_type` / `parent_id` / `raw_ref`（均为可空 TEXT）。
+/// 这些列由 agent-core 的写入前门提取（Phase B）填充；Memoria 仅哑存储，
+/// 不在 remember_with_dedup 内调 LLM（遵守 H1/H2）。旧行 NULL 视为
+/// agent_inferred / declarative，读取时兜底。幂等：列已存在则跳过。
+pub fn migrate_extract_fields(pool: &SqlitePool) -> Result<(), String> {
+    let conn = pool.get().map_err(|e| format!("pool get: {}", e))?;
+    for col in ["actor", "memory_type", "parent_id", "raw_ref"] {
+        let has: i64 = conn
+            .query_row(
+                &format!(
+                    "SELECT COUNT(*) FROM pragma_table_info('memories') WHERE name = '{}'",
+                    col
+                ),
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        if has == 0 {
+            conn.execute_batch(&format!("ALTER TABLE memories ADD COLUMN {} TEXT;", col))
+                .map_err(|e| format!("add memories.{}: {}", col, e))?;
+            println!("[Memoria] Migration: added memories.{} column", col);
+        }
+    }
+    Ok(())
+}

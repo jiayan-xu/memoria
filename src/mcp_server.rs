@@ -281,7 +281,11 @@ pub fn tools_list() -> Vec<serde_json::Value> {
                 "valid_to": {"type": "string", "description": "P1-5 时序真值：记忆失效点 ISO-8601（默认 NULL，长期有效）"},
                 "event_time": {"type": "string", "description": "DEPRECATED(O2)：勿写列；若传入则映射为 tags occurred:YYYY-MM-DD，不再 UPDATE event_time"},
                 "supersedes_id": {"type": "string", "description": "P0-4: 显式取代的目标记忆 id（须同 ns 且为当前 tip）；失败返回 404/403/409"},
-                "relation": {"type": "string", "description": "记忆边类型：updates|extends|derives（默认 updates）"}
+                "relation": {"type": "string", "description": "记忆边类型：updates|extends|derives（默认 updates）"},
+                "actor": {"type": "string", "description": "PR1(Phase B 前置)：事实作者/来源主体；NULL 视为 agent_inferred"},
+                "memory_type": {"type": "string", "description": "PR1：记忆类型 declarative/procedural/episodic/...；NULL 视为 declarative"},
+                "parent_id": {"type": "string", "description": "PR1：原子事实挂回的原始记忆 id（1 raw→N 原子事实时用）"},
+                "raw_ref": {"type": "string", "description": "PR1：原文旁路存储引用（避免整段 raw 入库）"}
             }),
         ),
         tool(
@@ -297,7 +301,11 @@ pub fn tools_list() -> Vec<serde_json::Value> {
                 "valid_to": {"type": "string", "description": "P1-5 时序真值：记忆失效点 ISO-8601"},
                 "event_time": {"type": "string", "description": "DEPRECATED(O2)：映射为 occurred: tag，不写列"},
                 "supersedes_id": {"type": "string", "description": "P0-4: 显式取代的目标记忆 id"},
-                "relation": {"type": "string", "description": "记忆边类型：updates|extends|derives（默认 updates）"}
+                "relation": {"type": "string", "description": "记忆边类型：updates|extends|derives（默认 updates）"},
+                "actor": {"type": "string", "description": "PR1(Phase B 前置)：事实作者/来源主体；NULL 视为 agent_inferred"},
+                "memory_type": {"type": "string", "description": "PR1：记忆类型 declarative/procedural/episodic/...；NULL 视为 declarative"},
+                "parent_id": {"type": "string", "description": "PR1：原子事实挂回的原始记忆 id（1 raw→N 原子事实时用）"},
+                "raw_ref": {"type": "string", "description": "PR1：原文旁路存储引用（避免整段 raw 入库）"}
             }),
         ),
         tool(
@@ -1027,6 +1035,11 @@ fn dispatch(
             // P0-4: 显式取代目标（取代指定旧记忆，带 404/403/409 失败模式）
             let supersedes_id = args.get("supersedes_id").and_then(|v| v.as_str());
             let relation = args.get("relation").and_then(|v| v.as_str());
+            // PR1（Phase B 前置）：提取压缩元数据（由 agent-core 写入前门填充；Memoria 哑存储，不调 LLM）
+            let actor = args.get("actor").and_then(|v| v.as_str());
+            let memory_type = args.get("memory_type").and_then(|v| v.as_str());
+            let parent_id = args.get("parent_id").and_then(|v| v.as_str());
+            let raw_ref = args.get("raw_ref").and_then(|v| v.as_str());
             // P0: 带近义重复检测的 remember
             let body = match tools::remember::remember_with_dedup(
                 &state.pool,
@@ -1042,6 +1055,10 @@ fn dispatch(
                 valid_to,
                 supersedes_id,
                 relation,
+                actor,
+                memory_type,
+                parent_id,
+                raw_ref,
             ) {
                 Ok(result) => {
                     if result.action == "superseded_near_dup" && !result.superseded_ids.is_empty() {
@@ -2460,6 +2477,7 @@ mod tests {
         memoria_core::storage::migrate_superseded_by(&pool).expect("migrate superseded_by");
         memoria_core::storage::migrate_event_time(&pool).expect("migrate event_time");
         memoria_core::storage::migrate_temporal(&pool).expect("migrate temporal");
+        memoria_core::storage::migrate_extract_fields(&pool).expect("migrate extract fields");
         memoria_core::storage::migrate_memory_relation_types(&pool).expect("migrate relation types");
         memoria_core::quota::init_quota_table(&pool).expect("quota table");
         let auth_pool = memoria_core::storage::create_pool(":memory:", 4).expect("auth pool");

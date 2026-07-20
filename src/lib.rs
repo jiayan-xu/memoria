@@ -38,6 +38,7 @@ impl MemoriaEngine {
         storage::migrate_user_prefs_namespace(&pool)?;
         storage::migrate_dream_state_ns(&pool)?;
         storage::migrate_temporal(&pool)?;
+        storage::migrate_extract_fields(&pool)?;
         storage::migrate_memory_relation_types(&pool)?;
         // P2-2：配额计数表随引擎自洽（与 main.rs 一致，避免 lib/MemoriaEngine 路径缺表）
         quota::init_quota_table(&pool)?;
