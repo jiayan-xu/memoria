@@ -139,6 +139,33 @@ pub fn hybrid_search(
         }
     }
 
+    // PR4（Phase A 演化）：演化脏标记（evolved_at IS NULL = 待演化）+ 可选降权。
+    // 独立于 isLatest/as_of 过滤，对全部候选（含 include_superseded）标注，供 recall 降权/标注。
+    if !unique.is_empty() {
+        if let Ok(conn) = pool.get() {
+            let ids: Vec<String> = unique.iter().map(|r| r.memory_id.clone()).collect();
+            let ph = vec!["?"; ids.len()].join(",");
+            let sql = format!("SELECT id, evolved_at FROM memories WHERE id IN ({})", ph);
+            if let Ok(mut stmt) = conn.prepare(&sql) {
+                let evo: std::collections::HashMap<String, Option<String>> = stmt
+                    .query_map(rusqlite::params_from_iter(ids.iter()), |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+                    })
+                    .map(|rows| rows.flatten().collect())
+                    .unwrap_or_default();
+                let downweight = pending_downweight();
+                for r in unique.iter_mut() {
+                    let ev = evo.get(&r.memory_id).cloned().flatten();
+                    r.evolved_at = ev.clone();
+                    r.pending_evolution = ev.is_none();
+                    if r.pending_evolution && downweight < 1.0 {
+                        r.rrf_score *= downweight;
+                    }
+                }
+            }
+        }
+    }
+
     // Phase B / M1.3：轻量共现启发式 rerank（O5：无 cross-encoder）
     // 在 take 前对候选池加成重排，再截断到 max_results。
     search::cooccur::rerank_by_cooccurrence(pool, namespace, query, &mut unique);
@@ -163,4 +190,14 @@ fn valid_at(valid_from: Option<&str>, valid_to: Option<&str>, as_of: &str) -> bo
         Some(v) => v >= as_of,
     };
     from_ok && to_ok
+}
+
+/// PR4（Phase A 演化）：待演化 tip 的召回降权系数。
+/// 默认 1.0 = 仅标注不降权（避免大量新鲜写入被无谓压低，保护 recall 质量）；
+/// 可由 `MEMORIA_PENDING_DOWNWEIGHT` 配置（如 0.85）。脏标记 `pending_evolution` 始终标注。
+fn pending_downweight() -> f64 {
+    match std::env::var("MEMORIA_PENDING_DOWNWEIGHT") {
+        Ok(v) => v.trim().parse::<f64>().unwrap_or(1.0).clamp(0.0, 1.0),
+        Err(_) => 1.0,
+    }
 }

@@ -523,6 +523,8 @@ mod unit_tests {
         rrf_score: 0.5,
         source: "keyword".into(),
         signal_scores: vec![],
+        evolved_at: None,
+        pending_evolution: false,
       },
       FusedResult {
         memory_id: "b".into(),
@@ -530,6 +532,8 @@ mod unit_tests {
         rrf_score: 0.51,
         source: "keyword".into(),
         signal_scores: vec![],
+        evolved_at: None,
+        pending_evolution: false,
       },
     ];
     rerank_by_text_signals("120 吨", &mut results);

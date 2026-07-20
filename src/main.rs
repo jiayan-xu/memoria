@@ -153,6 +153,7 @@ fn main() {
     storage::migrate_temporal(&pool).expect("migration: temporal columns");
     // PR1（Phase B 前置）：memories 增加 actor/memory_type/parent_id/raw_ref 提取元数据列
     storage::migrate_extract_fields(&pool).expect("migration: extract fields");
+    storage::migrate_evolution(&pool).expect("migration: evolution");
     // P0/P1: memory_relations CHECK 扩展 updates|extends|derives
     storage::migrate_memory_relation_types(&pool).expect("migration: relation types");
     // P2-2: 配额计数表（滥用防护，按 ns 限额）

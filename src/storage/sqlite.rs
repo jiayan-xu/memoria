@@ -486,3 +486,48 @@ pub fn migrate_extract_fields(pool: &SqlitePool) -> Result<(), String> {
     }
     Ok(())
 }
+
+/// PR4（Phase A 演化）：为 `memories` 增加演化写回元数据列
+/// `evolved_context` / `evolved_at` / `link_count`（可空），并建 `evolution_log` 表。
+/// 演化认知在 agent-core 的 Dream/consolidate（批处理），Memoria 仅哑存储（守 H1/H2）。
+/// 回滚依据 `evolution_log.old_value` 恢复旧值，不依赖 DROP 列（H5：可逆）。幂等。
+pub fn migrate_evolution(pool: &SqlitePool) -> Result<(), String> {
+    let conn = pool.get().map_err(|e| format!("pool get: {}", e))?;
+    // 新增 3 列（evolved_at NULL = 待演化/脏标记；link_count 默认 NULL）
+    for (col, ctype) in [
+        ("evolved_context", "TEXT"),
+        ("evolved_at", "TEXT"),
+        ("link_count", "INTEGER"),
+    ] {
+        let has: i64 = conn
+            .query_row(
+                &format!(
+                    "SELECT COUNT(*) FROM pragma_table_info('memories') WHERE name = '{}'",
+                    col
+                ),
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        if has == 0 {
+            conn.execute_batch(&format!("ALTER TABLE memories ADD COLUMN {} {};", col, ctype))
+                .map_err(|e| format!("add memories.{}: {}", col, e))?;
+            println!("[Memoria] Migration: added memories.{} column", col);
+        }
+    }
+    // evolution_log：演化变更审计，old_value 可回滚
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS evolution_log (
+            id TEXT PRIMARY KEY,
+            new_id TEXT,
+            target_id TEXT NOT NULL,
+            change_type TEXT,
+            old_value TEXT,
+            new_value TEXT,
+            model TEXT,
+            created_at TEXT DEFAULT (datetime('now'))
+        )",
+    )
+    .map_err(|e| format!("create evolution_log: {}", e))?;
+    Ok(())
+}

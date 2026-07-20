@@ -37,6 +37,10 @@ pub struct FusedResult {
     pub rrf_score: f64,
     pub source: String,
     pub signal_scores: Vec<(String, f64)>,
+    /// PR4（Phase A 演化）：最近演化时间戳；None=待演化/脏标记。
+    pub evolved_at: Option<String>,
+    /// PR4：该 tip 是否尚未演化（evolved_at IS NULL）。recall 可据此降权/标注。
+    pub pending_evolution: bool,
 }
 
 /// Merge multiple ranked signal lists using RRF.
@@ -69,15 +73,17 @@ pub fn rrf_merge(signals: &[Vec<SignalResult>], weights: &[f64], k: f64) -> Vec<
 
     let mut fused: Vec<FusedResult> = score_map
         .into_iter()
-        .map(
-            |(memory_id, (rrf_score, content, source, signal_scores))| FusedResult {
-                memory_id,
-                content,
-                rrf_score,
-                source,
-                signal_scores,
-            },
-        )
+            .map(
+                |(memory_id, (rrf_score, content, source, signal_scores))| FusedResult {
+                    memory_id,
+                    content,
+                    rrf_score,
+                    source,
+                    signal_scores,
+                    evolved_at: None,
+                    pending_evolution: false,
+                },
+            )
         .collect();
 
     fused.sort_by(|a, b| {
@@ -154,6 +160,8 @@ pub fn graph_expand(
                             rrf_score: result.rrf_score * 0.5 * weight,
                             source: format!("graph_expand_{}", _rel_type),
                             signal_scores: vec![],
+                            evolved_at: None,
+                            pending_evolution: false,
                         });
                     }
                 }

@@ -30,6 +30,12 @@ pub struct Memory {
     pub memory_type: Option<String>,
     pub parent_id: Option<String>,
     pub raw_ref: Option<String>,
+    /// PR4（Phase A 演化）：演化写回元数据（agent-core 的 Dream/consolidate 批处理填充；Memoria 哑存储）。
+    /// evolved_context=演化合成的上下文/摘要；evolved_at=最近演化时间戳（NULL=待演化/脏标记）；
+    /// link_count=演化后关联边数。旧行 NULL 视为「待演化」，recall 可降权/标注。
+    pub evolved_context: Option<String>,
+    pub evolved_at: Option<String>,
+    pub link_count: Option<i64>,
 }
 
 /// A conversation message (matches `messages` table).

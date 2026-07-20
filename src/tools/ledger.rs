@@ -271,6 +271,8 @@ pub fn enrich_ledger(
         "entities": entities,
         "text_signals": text_signals,
         "is_latest": true,
+        "evolved_at": f.evolved_at,
+        "pending_evolution": f.pending_evolution,
       })
     })
     .collect()

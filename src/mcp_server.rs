@@ -573,6 +573,27 @@ pub fn tools_list() -> Vec<serde_json::Value> {
             "admin_key": {"type": "string", "description": "Admin Key"}
         }),
     ));
+    // ── PR4（Phase A 演化）：演化写回 + 回滚（认知在 agent-core Dream/consolidate，此处哑存储）──
+    tools.push(tool(
+        "memory_evolve",
+        "（PR4）对一条记忆施加演化：写入 evolved_context/evolved_at/link_count，并记 evolution_log（old_value 可回滚）。由 agent-core 夜间 consolidate 批处理调用，亦可手动。",
+        serde_json::json!({
+            "target_id": {"type": "string", "description": "被演化的记忆 id（必填）"},
+            "namespace": {"type": "string", "description": "记忆所属命名空间（默认 default）"},
+            "evolved_context": {"type": "string", "description": "演化合成的上下文/摘要（必填）"},
+            "link_count": {"type": "number", "description": "演化后关联边数；省略则按 memory_relations 自动统计"},
+            "model": {"type": "string", "description": "演化所用模型标识（记入 evolution_log）"},
+            "change_type": {"type": "string", "description": "变更类型，如 context_update/links_update"}
+        }),
+    ));
+    tools.push(tool(
+        "evolution_rollback",
+        "（PR4）按 evolution_log.id 回滚某次演化，恢复 old_value（evolved_context/link_count）。敏感操作，需 Admin key。",
+        serde_json::json!({
+            "log_id": {"type": "string", "description": "evolution_log 行 id（必填）"},
+            "admin_key": {"type": "string", "description": "Admin Key"}
+        }),
+    ));
     tools.push(tool(
         "memory_maintenance_normalize",
         "Q1 维护：归一 valid_from/valid_to 时间格式（补 T）+ 清洗 1970 哨兵为空。⚠️ 破坏性，调用前必须先 memory_backup（需 Admin key）",
@@ -983,6 +1004,8 @@ fn dispatch(
                             "content": truncate(&r.content, 2000),
                             "rrf_score": r.rrf_score,
                             "source": r.source,
+                            "evolved_at": r.evolved_at,
+                            "pending_evolution": r.pending_evolution,
                         })
                     })
                     .collect()
@@ -2104,6 +2127,56 @@ fn dispatch(
                 Err(e) => format!(r#"{{"status":"error","message":"{}"}}"#, e),
             }
         }
+        "memory_evolve" => {
+            // 演化写回：ns 门控（与写入同权），不强制 admin（agent-core consolidate 用 dashboard badge 调）
+            let target_id = args.get("target_id").and_then(|v| v.as_str()).unwrap_or("");
+            let ev_ns = args
+                .get("namespace")
+                .and_then(|v| v.as_str())
+                .unwrap_or(ns);
+            let evolved_context = args
+                .get("evolved_context")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if target_id.is_empty() || evolved_context.is_empty() {
+                return r#"{"status":"error","message":"missing target_id or evolved_context"}"#.to_string();
+            }
+            let link_count = args.get("link_count").and_then(|v| v.as_i64());
+            let model = args.get("model").and_then(|v| v.as_str()).unwrap_or("");
+            let change_type = args
+                .get("change_type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("context_update");
+            if !auth::check_ns_access(&_auth, ev_ns) {
+                return r#"{"status":"error","message":"ns access denied"}"#.to_string();
+            }
+            match tools::evolve::evolve_memory(
+                &state.pool,
+                target_id,
+                ev_ns,
+                evolved_context,
+                link_count,
+                model,
+                change_type,
+            ) {
+                Ok(v) => serde_json::to_string(&v).unwrap_or_else(|_| r#"{"status":"evolved"}"#.to_string()),
+                Err(e) => format!(r#"{{"status":"error","message":"{}"}}"#, e),
+            }
+        }
+        "evolution_rollback" => {
+            let admin_key_val = args.get("admin_key").and_then(|v| v.as_str()).unwrap_or("");
+            if !crate::permissions::require_admin(&_auth, admin_key_val, &state.admin_key) {
+                return r#"{"status":"error","message":"admin required"}"#.to_string();
+            }
+            let log_id = args.get("log_id").and_then(|v| v.as_str()).unwrap_or("");
+            if log_id.is_empty() {
+                return r#"{"status":"error","message":"missing log_id"}"#.to_string();
+            }
+            match tools::evolve::evolution_rollback(&state.pool, log_id) {
+                Ok(v) => serde_json::to_string(&v).unwrap_or_else(|_| r#"{"status":"rolled_back"}"#.to_string()),
+                Err(e) => format!(r#"{{"status":"error","message":"{}"}}"#, e),
+            }
+        }
         "memory_maintenance_normalize" => {
             // Q1（§14.1 Q1）：admin 专属，破坏性操作，调用方须先 memory_backup。
             let admin_key_val = args.get("admin_key").and_then(|v| v.as_str()).unwrap_or("");
@@ -2478,6 +2551,7 @@ mod tests {
         memoria_core::storage::migrate_event_time(&pool).expect("migrate event_time");
         memoria_core::storage::migrate_temporal(&pool).expect("migrate temporal");
         memoria_core::storage::migrate_extract_fields(&pool).expect("migrate extract fields");
+        memoria_core::storage::migrate_evolution(&pool).expect("migrate evolution");
         memoria_core::storage::migrate_memory_relation_types(&pool).expect("migrate relation types");
         memoria_core::quota::init_quota_table(&pool).expect("quota table");
         let auth_pool = memoria_core::storage::create_pool(":memory:", 4).expect("auth pool");
