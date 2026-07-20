@@ -143,3 +143,57 @@ pub fn evolution_rollback(pool: &SqlitePool, log_id: &str) -> Result<Value, Stri
         "restored_link_count": old_links,
     }))
 }
+
+/// PR5（P-A 元进化）：查询 `evolution_log` 负样本（rolled_back / corrected 等），
+/// 供 agent-core 元进化闭环采样。纯只读，不调 LLM、不写库。
+///
+/// - `change_types`：按变更类型过滤（如 `["rolled_back","corrected"]`），空=不过滤。
+/// - `since`：`created_at` 下界（ISO8601 `YYYY-MM-DDTHH:MM:SS`，与 evolve.rs `now_iso` 同格式，便于字典序比较）。
+/// - `limit`：最多返回条数（默认 500）。
+pub fn evolution_log_query(
+    pool: &SqlitePool,
+    change_types: &[String],
+    since: &str,
+    limit: i64,
+) -> Result<Value, String> {
+    let conn = pool.get().map_err(|e| format!("pool: {}", e))?;
+    let limit = if limit <= 0 { 500 } else { limit.min(5000) };
+    let mut sql = String::from(
+        "SELECT id, new_id, target_id, change_type, old_value, new_value, model, created_at \
+         FROM evolution_log WHERE created_at >= ?",
+    );
+    let mut params_vec: Vec<String> = vec![since.to_string()];
+    if !change_types.is_empty() {
+        let placeholders = change_types
+            .iter()
+            .map(|_| "?")
+            .collect::<Vec<_>>()
+            .join(",");
+        sql.push_str(&format!(" AND change_type IN ({})", placeholders));
+        for ct in change_types {
+            params_vec.push(ct.clone());
+        }
+    }
+    sql.push_str(&format!(" ORDER BY created_at DESC LIMIT {}", limit));
+
+    let rows: Vec<Value> = conn
+        .prepare(&sql)
+        .map_err(|e| format!("prepare: {}", e))?
+        .query_map(rusqlite::params_from_iter(params_vec.iter()), |row| {
+            Ok(json!({
+                "id": row.get::<_, String>(0).unwrap_or_default(),
+                "new_id": row.get::<_, String>(1).unwrap_or_default(),
+                "target_id": row.get::<_, String>(2).unwrap_or_default(),
+                "change_type": row.get::<_, String>(3).unwrap_or_default(),
+                "old_value": row.get::<_, String>(4).unwrap_or_default(),
+                "new_value": row.get::<_, String>(5).unwrap_or_default(),
+                "model": row.get::<_, String>(6).unwrap_or_default(),
+                "created_at": row.get::<_, String>(7).unwrap_or_default(),
+            }))
+        })
+        .map_err(|e| format!("query: {}", e))?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    Ok(json!({ "status": "ok", "count": rows.len(), "items": rows }))
+}

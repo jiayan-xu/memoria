@@ -595,6 +595,15 @@ pub fn tools_list() -> Vec<serde_json::Value> {
         }),
     ));
     tools.push(tool(
+        "evolution_log_query",
+        "（PR5）只读查询 evolution_log 负样本（rolled_back/corrected 等），供 agent-core 元进化闭环采样。纯读取，不写库、不调 LLM。",
+        serde_json::json!({
+            "change_types": {"type": "array", "description": "按变更类型过滤，如 [\"rolled_back\",\"corrected\"]；空数组=不过滤"},
+            "since": {"type": "string", "description": "created_at 下界 ISO8601（YYYY-MM-DDTHH:MM:SS），默认 1970-01-01"},
+            "limit": {"type": "number", "description": "最多返回条数，默认 500，上限 5000"}
+        }),
+    ));
+    tools.push(tool(
         "memory_maintenance_normalize",
         "Q1 维护：归一 valid_from/valid_to 时间格式（补 T）+ 清洗 1970 哨兵为空。⚠️ 破坏性，调用前必须先 memory_backup（需 Admin key）",
         serde_json::json!({
@@ -2174,6 +2183,24 @@ fn dispatch(
             }
             match tools::evolve::evolution_rollback(&state.pool, log_id) {
                 Ok(v) => serde_json::to_string(&v).unwrap_or_else(|_| r#"{"status":"rolled_back"}"#.to_string()),
+                Err(e) => format!(r#"{{"status":"error","message":"{}"}}"#, e),
+            }
+        }
+        "evolution_log_query" => {
+            // PR5（P-A 元进化）：只读采样 evolution_log 负样本，供 agent-core 元进化闭环使用。
+            let change_types: Vec<String> = args
+                .get("change_types")
+                .and_then(|v| v.as_array())
+                .map(|a| a.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect())
+                .unwrap_or_default();
+            let since = args
+                .get("since")
+                .and_then(|v| v.as_str())
+                .unwrap_or("1970-01-01T00:00:00");
+            let limit = args.get("limit").and_then(|v| v.as_i64()).unwrap_or(500);
+            match tools::evolve::evolution_log_query(&state.pool, &change_types, since, limit) {
+                Ok(v) => serde_json::to_string(&v)
+                    .unwrap_or_else(|_| r#"{"status":"ok","count":0,"items":[]}"#.to_string()),
                 Err(e) => format!(r#"{{"status":"error","message":"{}"}}"#, e),
             }
         }

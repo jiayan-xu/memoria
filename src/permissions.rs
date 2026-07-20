@@ -145,6 +145,26 @@ pub const PERMISSION_MATRIX: &[Entry] = &[
         ns_policy: NsPolicy::NamespaceArg,
         note: "巩固进度推进",
     },
+    // ── PR4 演化（哑存储，认知在 agent-core）──
+    Entry {
+        tool: "memory_evolve",
+        min_role: MinRole::Agent,
+        ns_policy: NsPolicy::NamespaceArg,
+        note: "（PR4）演化写回，记 evolution_log",
+    },
+    Entry {
+        tool: "evolution_rollback",
+        min_role: MinRole::Admin,
+        ns_policy: NsPolicy::NamespaceArg,
+        note: "（PR4）按 log 回滚演化，敏感需 Admin",
+    },
+    // ── PR5 元进化（只读采样 evolution_log 负样本）──
+    Entry {
+        tool: "evolution_log_query",
+        min_role: MinRole::Agent,
+        ns_policy: NsPolicy::NamespaceArg,
+        note: "（PR5）只读查询 evolution_log 负样本，供元进化采样",
+    },
     Entry {
         tool: "entity_upsert",
         min_role: MinRole::Agent,
