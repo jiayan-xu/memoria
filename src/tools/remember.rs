@@ -232,7 +232,7 @@ pub fn remember_with_dedup(
     raw_ref: Option<&str>,
 ) -> Result<RememberResult, String> {
     let relation_type = normalize_memory_relation(relation)?;
-    let mut conn = pool.get().map_err(|e| format!("pool: {}", e))?;
+    let conn = pool.get().map_err(|e| format!("pool: {}", e))?;
 
     // SHA-256 hash matching Python's hashlib.sha256(content.encode()).hexdigest()[:16]
     let mut hasher = Sha256::new();
@@ -533,7 +533,7 @@ pub fn get_supersession_chain(
 
 /// 手动合并两条近义记忆（管理员操作）
 pub fn merge_memories(pool: &SqlitePool, keep_id: &str, merge_id: &str) -> Result<(), String> {
-    let mut conn = pool.get().map_err(|e| format!("pool: {}", e))?;
+    let conn = pool.get().map_err(|e| format!("pool: {}", e))?;
     let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S").to_string();
 
     let tx = conn

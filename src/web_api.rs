@@ -320,18 +320,10 @@ async fn api_graph(
 }
 
 // ── /decay_timeline ──
-#[derive(Deserialize)]
-pub struct DecayQuery {
-    days: Option<i64>,
-    namespace: Option<String>,
-}
-
 async fn api_decay_timeline(
     State(state): State<Arc<WebApiState>>,
     Extension(auth): Extension<AuthResult>,
-    Query(q): Query<DecayQuery>,
 ) -> Result<Json<Vec<Value>>, StatusCode> {
-    let _ns = q.namespace.as_deref().unwrap_or("default");
     let conn = state
         .pool
         .get()
