@@ -1,5 +1,10 @@
 [
   {
+    "date": "2026-07-21",
+    "title": "Rust 重写 v0.3.0 发布",
+    "body": "彻底重写为 Rust（crate memoria-core + bin memoria-server），启动即用、schema 自举（首次启动自动建表，无需手动迁移）\n命名空间多租户隔离修复：所有记忆/关系/审计按 namespace 隔离，agent 仅见授权命名空间\n可选语义检索：新增 embed_server.py（本地 sentence_transformers，离线 CPU，:8777/embed）；配置 MEMORIA_EMBEDDING_URL 后启用 HNSW 向量语义信号，未配置则退化为 FTS5 + temporal + importance + category 融合（默认关闭，克隆即可跑）\nagent-core（jarvis）admin 接线：以 X-Agent-Id: jarvis + X-Agent-Key 访问 memoria 全量命名空间\nWeb 面板：图谱依赖本地化（vis-network 不再依赖 CDN），页脚版本号更正为 v0.3.0\n去掉 ChromaDB 外部依赖，纯 SQLite + FTS5 + 可选 HNSW\n注意：仓库默认数据为空，自演化（梦境消化 / 实体图谱）由 agent-core 驱动，克隆即得干净实例"
+  },
+  {
     "date": "2026-06-23",
     "title": "代码整洁度优化 + 审查修复收官",
     "body": "P0-3: tools/list schema 提取为模块级常量 _TOOLS_SCHEMA（14个工具，~170行JSON移出handler）\nP1-7: reembed_endpoint 移除硬编码业务路径（常熟浦发2/工程部/固废监管）\n修复: _safe_print() 函数体被regex误替换的递归调用bug\n修复: tools/list 引用未定义常量导致 NameError\n统计: 三轮审查累计修复28+项，memoria 当前 707 hot + 5483 warm 记忆，23838 关系边"
