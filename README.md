@@ -47,6 +47,17 @@ Agent (Claude Desktop / Jan / OpenClaw / ...)
 - **Category** — Intent classification filter
 - **RRF Fusion** — Reciprocal Rank Fusion across all 5 signals
 
+### 🧠 Semantic Search (optional)
+- The **Semantic** signal (HNSW vector search) is **off by default**. When `MEMORIA_EMBEDDING_URL` is empty, Memoria silently degrades to keyword-only fusion (FTS5 + temporal + importance + category) — see runtime `/health` (`embed` → `warn: 语义检索降级为 FTS/时间信号`).
+- **Capability gap:** with embeddings off you lose semantic / paraphrase recall — queries that don't share keywords with stored memories may return nothing. With embeddings on, Memoria gains true semantic recall across rephrasings and synonyms. (For a concrete example, try querying a stored memory with different wording before vs after enabling embeddings.)
+- **Wiring:** start the bundled embed server and point Memoria at it:
+  ```bash
+  python embed_server.py                       # listens 127.0.0.1:8777/embed
+  # then set in .env:
+  MEMORIA_EMBEDDING_URL=http://127.0.0.1:8777/embed
+  ```
+  The embed server (sentence_transformers, offline CPU, model `shibing624/text2vec-base-chinese`) is documented in `embed_server.py`. It is loopback-only and optional; Memoria runs fully without it.
+
 ### 🔐 Identity & Audit
 - **Namespace isolation** — Multi-tenant data separation
 - **Badge token auth** — SHA-256 token-based authentication
@@ -128,6 +139,7 @@ docker compose up -d --build
 | `MEMORIA_DREAM_COOLDOWN_DEFAULT` | `300` | Dream cooldown seconds (P1-4) |
 | `MEMORIA_DREAM_COOLDOWN_DECAY` | `60` | Decay-phase cooldown seconds |
 | `AGENT_CORE_LOG` / `RUST_LOG` | `info` | Log level (P2-1 tracing) |
+| `MEMORIA_EMBEDDING_URL` | (empty) | Embed server URL; if empty, semantic search degrades to FTS-only (optional). See "Semantic Search" above. |
 
 ### MCP Client Configuration
 

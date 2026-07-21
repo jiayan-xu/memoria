@@ -46,6 +46,17 @@ Agent (Claude Desktop / Jan / OpenClaw / ...)
 - **分类** — 意图分类过滤
 - **RRF 融合** — 倒数排名融合，综合 5 个信号
 
+### 🧠 语义检索（可选）
+- **语义**信号（HNSW 向量搜索）默认**关闭**。当 `MEMORIA_EMBEDDING_URL` 为空时，Memoria 自动退化为仅关键词融合（FTS5 + 时间 + 重要性 + 分类）——运行时 `/health` 会显示 `embed` → `warn: 语义检索降级为 FTS/时间信号`。
+- **能力差距**：关嵌入会丢失语义/近义召回——与已存记忆不共享关键词的查询可能查不到；开嵌入后获得真正的语义召回（跨改写、同义）。可用「换种说法查询同一段记忆」在开/关前后直观对比。
+- **接线方法**：启动自带的嵌入服务并指向它：
+  ```bash
+  python embed_server.py                       # 监听 127.0.0.1:8777/embed
+  # 在 .env 中设置：
+  MEMORIA_EMBEDDING_URL=http://127.0.0.1:8777/embed
+  ```
+  嵌入服务（sentence_transformers，离线 CPU，模型 `shibing624/text2vec-base-chinese`）说明见 `embed_server.py`。仅监听回环、完全可选；不接也能完整运行。
+
 ### 🔐 身份认证与审计
 - **命名空间隔离** — 多租户数据分离
 - **名牌令牌认证** — SHA-256 令牌认证
@@ -127,6 +138,7 @@ docker compose up -d --build
 | `MEMORIA_DREAM_COOLDOWN_DEFAULT` | `300` | Dream 巩固冷却秒数（P1-4） |
 | `MEMORIA_DREAM_COOLDOWN_DECAY` | `60` | decay 阶段冷却秒数 |
 | `AGENT_CORE_LOG` / `RUST_LOG` | `info` | 日志级别（P2-1 tracing） |
+| `MEMORIA_EMBEDDING_URL` | （空） | 嵌入服务地址；留空则语义检索退化为仅 FTS（可选）。见上文「语义检索（可选）」。 |
 
 ### MCP 客户端配置
 
