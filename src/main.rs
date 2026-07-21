@@ -183,9 +183,16 @@ fn main() {
             let token = &badge.badge_token;
             if !token.is_empty() {
                 use std::io::Write;
-                let end = 16.min(token.len());
-                // P2-3 修复：默认 agent token 前缀改 stderr（避免被 stdout 日志捕获泄露）
-                let _ = writeln!(std::io::stderr(), "[Memoria] Default agent token: {}...", &token[..end]);
+                // P1-⑤ 修复：release 构建不回显任何 token 片段，仅在 debug 构建打印前缀供本地排错
+                #[cfg(debug_assertions)]
+                {
+                    let end = 16.min(token.len());
+                    let _ = writeln!(std::io::stderr(), "[Memoria] Default agent token: {}...", &token[..end]);
+                }
+                #[cfg(not(debug_assertions))]
+                {
+                    let _ = writeln!(std::io::stderr(), "[Memoria] Default agent 'default' registered (token omitted in release build)");
+                }
             }
         }
         Err(e) => {

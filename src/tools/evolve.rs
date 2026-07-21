@@ -89,9 +89,9 @@ pub fn evolve_memory(
     let new_value = json!({ "evolved_context": evolved_context, "link_count": links }).to_string();
     let log_id = gen_id("ev");
     conn.execute(
-        "INSERT INTO evolution_log (id, new_id, target_id, change_type, old_value, new_value, model, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        params![log_id, target_id, target_id, change_type, old_value, new_value, model, now],
+        "INSERT INTO evolution_log (id, new_id, target_id, change_type, old_value, new_value, model, created_at, namespace)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        params![log_id, target_id, target_id, change_type, old_value, new_value, model, now, namespace],
     )
     .map_err(|e| format!("evolution_log insert: {}", e))?;
 
@@ -155,14 +155,15 @@ pub fn evolution_log_query(
     change_types: &[String],
     since: &str,
     limit: i64,
+    namespace: &str,
 ) -> Result<Value, String> {
     let conn = pool.get().map_err(|e| format!("pool: {}", e))?;
     let limit = if limit <= 0 { 500 } else { limit.min(5000) };
     let mut sql = String::from(
         "SELECT id, new_id, target_id, change_type, old_value, new_value, model, created_at \
-         FROM evolution_log WHERE created_at >= ?",
+         FROM evolution_log WHERE namespace = ? AND created_at >= ?",
     );
-    let mut params_vec: Vec<String> = vec![since.to_string()];
+    let mut params_vec: Vec<String> = vec![namespace.to_string(), since.to_string()];
     if !change_types.is_empty() {
         let placeholders = change_types
             .iter()

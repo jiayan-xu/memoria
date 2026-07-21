@@ -247,6 +247,15 @@ pub fn init_core_tables(pool: &SqlitePool) -> Result<(), String> {
         END;
     ").map_err(|e| format!("create tables: {}", e))?;
 
+    // 折叠增量迁移，确保任何调用方（含集成测试）拿到完整 schema（P0-2 根治：
+    // 此前仅 main.rs 显式调迁移，测试 bootstrap 缺 actor 等列导致 eval 测试 panic）。
+    // 所有迁移均幂等（列/表存在则跳过），与 main.rs 显式调用重复调用安全。
+    migrate_dream_state_ns(pool)?;
+    migrate_temporal(pool)?;
+    migrate_extract_fields(pool)?;
+    migrate_evolution(pool)?;
+    migrate_memory_relation_types(pool)?;
+
     Ok(())
 }
 
@@ -525,9 +534,24 @@ pub fn migrate_evolution(pool: &SqlitePool) -> Result<(), String> {
             old_value TEXT,
             new_value TEXT,
             model TEXT,
-            created_at TEXT DEFAULT (datetime('now'))
+            created_at TEXT DEFAULT (datetime('now')),
+            namespace TEXT NOT NULL DEFAULT 'default'
         )",
     )
     .map_err(|e| format!("create evolution_log: {}", e))?;
+    // 存量 evolution_log 表补 namespace 列（幂等，防 P1-③ 跨租户泄露）
+    let has_ns: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('evolution_log') WHERE name = 'namespace'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    if has_ns == 0 {
+        conn.execute_batch(
+            "ALTER TABLE evolution_log ADD COLUMN namespace TEXT NOT NULL DEFAULT 'default';",
+        )
+        .map_err(|e| format!("add evolution_log.namespace: {}", e))?;
+    }
     Ok(())
 }

@@ -48,3 +48,15 @@
 - 本地编辑从 canonical 副本（`memoria-open`）发起；另一工作副本 `memoria` 标记 `.NO_PUSH`，含内部审查文档，**勿推送**。
 - 提交流程：先在 `memoria-open` 改 → 跑回归 → `git push origin main`；pre-push hook 校验 canonical 远端。
 - 任何提交**不得含密钥或本机用户路径**。
+
+## 9. 安全加固记录（2026-07-21，canonical 提交）
+
+| 项 | 主题 | 落点 |
+|----|------|------|
+| P0-2 | 集成测试（`tests/eval.rs`）缺 `actor` 等列 panic；根因＝测试 bootstrap 仅调 `init_schema`+`init_core_tables` 漏跑增量迁移。已将 `migrate_*` 序列折叠进 `init_core_tables`，所有调用方拿到完整 schema。`cargo test --test eval` 转绿。 | `storage/sqlite.rs` |
+| P1-③ | `evolution_log_query` 跨租户泄露：表无 `namespace` 列、查询无过滤、handler 不传 ns。已加 `namespace` 列（CREATE+幂等 ALTER）、INSERT 写 `namespace`、`evolution_log_query` 增 `namespace` 参数并按 `namespace = ?` 过滤、handler 透传校验后的 `ns`。 | `storage/sqlite.rs` / `tools/evolve.rs` / `mcp_server.rs` |
+| P1-④ | ns 门控 `unwrap_or("default")` 静默落到默认命名空间。改为查 `PERMISSION_MATRIX` 的 `NsPolicy`：`None` 用调用者主 ns 并跳过校验；`NamespaceArg` 等要求显式 `namespace` 参数，缺失即拒；未登记工具维持历史行为。 | `mcp_server.rs` |
+| P1-⑤ | release 构建仍向 stderr 回显默认 agent token 前缀。改为仅在 `debug_assertions` 下打印前缀，release 仅打 `agent_id`。 | `main.rs` |
+| P1-⑦ | `/health` 回显具体 embedding 模型名/维度（信息暴露面）。改为仅回显可达性与 HTTP 状态。 | `health.rs` |
+
+> 验收：`cargo test --test eval` 绿；`cargo build --release` 通过；`evolution_log_query` 仅返回调用者自身 `namespace` 行；`NamespaceArg` 类工具缺失 `namespace` 参数被拒。

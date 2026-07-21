@@ -739,11 +739,39 @@ async fn handle_tool_call(
         return rpc_ok_text(id, &text);
     }
 
-    let ns = safe_args
-        .get("namespace")
-        .and_then(|v| v.as_str())
-        .unwrap_or("default");
-    if !auth::check_ns_access(&auth, ns) {
+    // P1-④ ns 门控：依据 NsPolicy 矩阵决定 namespace 来源与是否校验（去 unwrap_or("default")）
+    let ns_policy = crate::permissions::matrix_lookup(tool).map(|e| e.ns_policy.clone());
+    let ns: &str = match ns_policy {
+        // 无命名空间概念的工具：用调用者主命名空间占位，跳过校验
+        Some(crate::permissions::NsPolicy::None) => {
+            auth.allowed_ns.first().map(|s| s.as_str()).unwrap_or("default")
+        }
+        // NamespaceArg 及其它需按 namespace 门控的变体：要求调用方显式传 namespace，缺失即拒绝
+        // （防静默落到 "default" 造成跨租户访问）
+        Some(_) => match safe_args.get("namespace").and_then(|v| v.as_str()) {
+            Some(n) => n,
+            None => {
+                spawn_audit(
+                    state,
+                    agent_id,
+                    tool,
+                    &serde_json::to_string(&args).unwrap_or_else(|_| format!("{:?}", args)),
+                    false,
+                );
+                return rpc_error(id, -32002, "Namespace argument required for this tool.");
+            }
+        },
+        // 未在矩阵登记的工具：维持历史行为（默认 default + 校验），避免误伤
+        None => safe_args
+            .get("namespace")
+            .and_then(|v| v.as_str())
+            .unwrap_or("default"),
+    };
+    let ns_authorized = match ns_policy {
+        Some(crate::permissions::NsPolicy::None) => true, // 无 ns 概念，跳过校验
+        _ => auth::check_ns_access(&auth, ns),
+    };
+    if !ns_authorized {
         spawn_audit(
             state,
             agent_id,
@@ -2198,7 +2226,7 @@ fn dispatch(
                 .and_then(|v| v.as_str())
                 .unwrap_or("1970-01-01T00:00:00");
             let limit = args.get("limit").and_then(|v| v.as_i64()).unwrap_or(500);
-            match tools::evolve::evolution_log_query(&state.pool, &change_types, since, limit) {
+            match tools::evolve::evolution_log_query(&state.pool, &change_types, since, limit, ns) {
                 Ok(v) => serde_json::to_string(&v)
                     .unwrap_or_else(|_| r#"{"status":"ok","count":0,"items":[]}"#.to_string()),
                 Err(e) => format!(r#"{{"status":"error","message":"{}"}}"#, e),

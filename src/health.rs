@@ -135,18 +135,12 @@ pub fn check_embedding_endpoint(url: &str) -> CheckResult {
         format!("{}/health", url)
     };
     match http_get_json_summary(&health_url, 2000) {
-        Ok((code, body_snip)) if (200..300).contains(&code) => {
-            let dim = extract_json_number(&body_snip, "dim");
-            let model = extract_json_string(&body_snip, "model").unwrap_or_else(|| "?".into());
+        Ok((code, _body_snip)) if (200..300).contains(&code) => {
+            // P1-⑦：不回显具体 embedding 模型名/维度，缩小 /health 信息暴露面
             CheckResult {
                 name: "embedding".to_string(),
                 status: "pass".to_string(),
-                message: format!(
-                    "ok http={} model={} dim={}",
-                    code,
-                    model,
-                    dim.map(|d| d.to_string()).unwrap_or_else(|| "?".into())
-                ),
+                message: format!("ok http={}", code),
                 duration_ms: start.elapsed().as_millis() as u64,
             }
         }
@@ -212,31 +206,6 @@ fn http_get_json_summary(url: &str, timeout_ms: u64) -> Result<(u16, String), St
         .take(400)
         .collect::<String>();
     Ok((code, body))
-}
-
-fn extract_json_string(body: &str, key: &str) -> Option<String> {
-    let pat = format!("\"{}\"", key);
-    let i = body.find(&pat)?;
-    let rest = &body[i + pat.len()..];
-    let rest = rest.trim_start_matches(|c: char| c == ':' || c.is_whitespace());
-    if !rest.starts_with('"') {
-        return None;
-    }
-    let rest = &rest[1..];
-    let end = rest.find('"')?;
-    Some(rest[..end].to_string())
-}
-
-fn extract_json_number(body: &str, key: &str) -> Option<i64> {
-    let pat = format!("\"{}\"", key);
-    let i = body.find(&pat)?;
-    let rest = &body[i + pat.len()..];
-    let rest = rest.trim_start_matches(|c: char| c == ':' || c.is_whitespace());
-    let num: String = rest
-        .chars()
-        .take_while(|c| c.is_ascii_digit())
-        .collect();
-    num.parse().ok()
 }
 
 // ── 硬失败检查 ──
