@@ -301,6 +301,7 @@ pub fn tools_list() -> Vec<serde_json::Value> {
             "记录一条记忆",
             serde_json::json!({
                 "content": {"type": "string", "description": "记忆内容（必填）"},
+                "namespace": {"type": "string", "description": "命名空间（NamespaceArg 必填）：写入目标命名空间；不传将被拒绝（Namespace argument required）"},
                 "category": {"type": "string", "description": "类别，默认 fact"},
                 "importance": {"type": "number", "description": "重要度 1-5，默认 3"},
                 "source": {"type": "string", "description": "来源，默认 mcp"},
@@ -321,6 +322,7 @@ pub fn tools_list() -> Vec<serde_json::Value> {
             "写入记忆（memory_remember 薄别名）：支持 supersedes_id / relation / valid_*",
             serde_json::json!({
                 "content": {"type": "string", "description": "记忆内容（必填）"},
+                "namespace": {"type": "string", "description": "命名空间（NamespaceArg 必填）：写入目标命名空间；不传将被拒绝（Namespace argument required）"},
                 "category": {"type": "string", "description": "类别，默认 fact"},
                 "importance": {"type": "number", "description": "重要度 1-5，默认 3"},
                 "source": {"type": "string", "description": "来源，默认 mcp"},
