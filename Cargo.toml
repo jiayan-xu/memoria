@@ -1,6 +1,6 @@
 [package]
 name = "memoria-core"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 description = "Independent memory center for AI agents — MCP protocol, Rust-native"
 license = "MIT"

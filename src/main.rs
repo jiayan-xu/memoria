@@ -128,7 +128,7 @@ fn main() {
         }
     };
 
-    println!("[Memoria] v0.2.0 — standalone MCP server");
+    println!("[Memoria] v0.3.0 — standalone MCP server");
     println!("[Memoria] DB: {}", db_path);
     println!("[Memoria] Backup dir: {}", backup_dir);
     println!("[Memoria] Listen: {}:{}", host, port);

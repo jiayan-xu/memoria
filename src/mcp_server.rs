@@ -242,7 +242,7 @@ async fn handle_mcp(
                 &id,
                 serde_json::json!({
                     "protocolVersion": requested,
-                    "serverInfo": {"name": "memoria", "version": "0.2.0"},
+                    "serverInfo": {"name": "memoria", "version": "0.3.0"},
                     "capabilities": {"tools": {}},
                 }),
             )
