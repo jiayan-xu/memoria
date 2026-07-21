@@ -49,7 +49,7 @@
 
 - [ ] **P0-1** 运维 Memoria 二进制与 `memoria-open` 目标 commit 对齐；确认 `CARGO_TARGET_DIR` 不写到沙箱导致「以为编了、托盘仍旧包」
 - [ ] **P0-2** 验证 P3-0 语义/HNSW 通道：新写入记忆有向量或明确降级日志；embed `:8777`（或现网 embed）健康进 `/health`
-- [ ] **P0-3** admin / `MEMORIA_DASHBOARD_BADGE` 与 K1+K3 文档一致；托盘与 `.env` 同源
+- [ ] **P0-3** admin / `MEMORIA_JARVIS_BADGE` 与 K1+K3 文档一致；托盘与 `.env` 同源
 - [ ] **P0-4** 清理 `agent_registry` 测试残留（≥20 行量级，以现网为准）
 - [ ] **P0-5**（可选同迭代）密钥轮换若审计仍要求——单独清单，勿与功能 PR 混推
 
