@@ -472,21 +472,22 @@ mod unit_tests {
 
   #[test]
   fn relative_dates_resolved() {
+    // 固定锚点，避免 extract_text_signals 内部 Utc::now() 导致日期漂移挂 CI
     let anchor = NaiveDate::from_ymd_opt(2026, 7, 16).unwrap(); // 周四
-    let sig = extract_text_signals("上周三开会，昨天登记 120 吨", "[]", None);
-    let dates = sig["dates"].as_array().unwrap();
+    let dates = resolve_relative_dates("上周三开会，昨天登记 120 吨", anchor);
+    // 上周三 = 上周一(07-06) + 2 → 2026-07-08；昨天 = 2026-07-15
     assert!(
-      dates.iter().any(|d| d.as_str() == Some("2026-07-09")),
+      dates.iter().any(|d| d == "2026-07-08"),
       "上周三={:?}",
       dates
     );
     assert!(
-      dates.iter().any(|d| d.as_str() == Some("2026-07-15")),
+      dates.iter().any(|d| d == "2026-07-15"),
       "昨天={:?}",
       dates
     );
     let direct = resolve_relative_dates("本周五交付", anchor);
-    assert!(direct.iter().any(|d| d == "2026-07-18"));
+    assert!(direct.iter().any(|d| d == "2026-07-17"));
   }
 
   #[test]

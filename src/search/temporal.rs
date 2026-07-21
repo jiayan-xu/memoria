@@ -60,9 +60,17 @@ pub fn temporal_search(
 
 fn days_ago(date_str: &Option<String>) -> Option<f64> {
     let s = date_str.as_ref()?;
-    let days = chrono::Utc::now()
-        .date_naive()
-        .signed_duration_since(chrono::NaiveDate::parse_from_str(&s[..10], "%Y-%m-%d").ok()?)
-        .num_days();
+    // P2-8 修复：防御性切片。`created_at`/`last_recalled` 应为 ISO 日期（≥10 字符），
+    // 但脏数据可能更短，`&s[..10]` 会 panic。长度不足时按 30 天兜底，避免切片越界崩溃。
+    let days = if s.len() >= 10 {
+        chrono::Utc::now()
+            .date_naive()
+            .signed_duration_since(
+                chrono::NaiveDate::parse_from_str(&s[..10], "%Y-%m-%d").ok()?,
+            )
+            .num_days()
+    } else {
+        30
+    };
     Some(days.max(0) as f64)
 }

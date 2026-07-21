@@ -33,6 +33,11 @@ pub struct HnswIndex {
     vectors: RwLock<Vec<VectorEntry>>,
 }
 
+// SAFETY (P2-9): `HnswIndex` 的所有字段都包裹在 `RwLock` 内
+// （inner: RwLock<Hnsw>, id_map, id_to_seq, ef_search, vectors），
+// 对内部的访问一律经由 `RwLock` 的独占/共享锁进行，不存在跨线程数据竞争。
+// 被包裹的 `Hnsw<'static, f32, DistCosine>` 本身不要求 `Send`/`Sync`，
+// 但本类型的并发安全性完全由上述 `RwLock` 保证，因此可安全显式实现 `Send` + `Sync`。
 unsafe impl Send for HnswIndex {}
 unsafe impl Sync for HnswIndex {}
 

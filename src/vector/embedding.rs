@@ -18,6 +18,9 @@ pub struct QueryCache {
     cache: Mutex<LruCache<String, Vec<f32>>>,
 }
 
+// SAFETY (P2-10): `QueryCache` 内部唯一字段 `cache: Mutex<LruCache<...>>`
+// 经 `std::sync::Mutex` 提供互斥访问，跨线程读写均经锁保护，不存在数据竞争。
+// 因此可为 `QueryCache` 安全实现 `Send` + `Sync`。
 unsafe impl Send for QueryCache {}
 unsafe impl Sync for QueryCache {}
 

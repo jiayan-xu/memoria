@@ -248,6 +248,14 @@ fn main() {
         _ => {}
     }
 
+    // P2-12：审计有界通道 + 异步落库 worker（背压，满则丢弃单条）
+    let audit_capacity: usize = std::env::var("MEMORIA_AUDIT_CHANNEL_CAPACITY")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1024);
+    let (audit_tx, audit_rx) = tokio::sync::mpsc::channel(audit_capacity);
+    mcp_server::spawn_audit_worker(auth_pool.clone(), audit_rx);
+
     let state = Arc::new(AppState {
         pool,
         auth_pool,
@@ -266,6 +274,7 @@ fn main() {
         db_path: db_path.clone(),
         backup_dir: backup_dir.clone(),
         vec_index_path: vec_path.to_string_lossy().to_string(),
+        audit_tx,
     });
     let mut app = mcp_server::build_app(state.clone());
 

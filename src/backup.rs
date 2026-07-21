@@ -488,7 +488,8 @@ fn check_disk_space(path: &Path) -> Result<(), String> {
         use std::ffi::CString;
         let path_cstr =
             CString::new(path.to_string_lossy().as_bytes()).map_err(|e| format!("cstr: {}", e))?;
-        extern "C" {
+        // Rust 2024: extern blocks must be unsafe
+        unsafe extern "C" {
             fn statvfs(path: *const i8, buf: *mut Statvfs) -> i32;
         }
         #[repr(C)]

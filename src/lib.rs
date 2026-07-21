@@ -28,7 +28,13 @@ pub struct MemoriaEngine {
 
 impl MemoriaEngine {
     pub fn new(db_path: &str) -> Result<Self, String> {
-        let pool = storage::create_pool(db_path, 4)?;
+        // P2-11：SQLite 连接池大小可经 MEMORIA_DB_POOL_SIZE 覆盖（默认 4，范围 1..=64）。
+        let pool_size: u32 = std::env::var("MEMORIA_DB_POOL_SIZE")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .filter(|&n| (1..=64).contains(&n))
+            .unwrap_or(4);
+        let pool = storage::create_pool(db_path, pool_size)?;
         storage::init_schema(&pool)?;
         storage::init_core_tables(&pool)?;
         // 迁移必须随引擎自洽（之前仅在 main.rs 调用，导致 lib/MemoriaEngine 路径下

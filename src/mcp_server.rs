@@ -41,6 +41,34 @@ pub struct AppState {
     pub db_path: String,
     pub backup_dir: String,
     pub vec_index_path: String,
+    /// P2-12：审计事件有界通道（背压）。落库 worker 在 main.rs 启动。
+    pub audit_tx: tokio::sync::mpsc::Sender<AuditEvent>,
+}
+
+/// 审计事件（经有界通道异步落库，提供背压）
+pub struct AuditEvent {
+    pub agent_id: String,
+    pub tool: String,
+    pub params: String,
+    pub allowed: bool,
+}
+
+/// 审计写入 worker：从有界通道取事件，隔离到阻塞线程池写 auth_pool。
+/// 通道满（默认 1024）时 `spawn_audit` 的 `try_send` 丢弃该条审计（fire-and-forget，
+/// 不阻塞业务响应），从而防止审计洪峰下无限 `spawn_blocking` 拖垮服务（P2-12 背压）。
+pub fn spawn_audit_worker(
+    pool: storage::SqlitePool,
+    mut rx: tokio::sync::mpsc::Receiver<AuditEvent>,
+) {
+    tokio::spawn(async move {
+        while let Some(ev) = rx.recv().await {
+            let p = pool.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                auth::audit_log(&p, &ev.agent_id, &ev.tool, &ev.params, ev.allowed);
+            })
+            .await;
+        }
+    });
 }
 
 /// P3-0: 查询时生成 query embedding —— 修复「HNSW 语义搜索从未生效」的根因。
@@ -875,15 +903,18 @@ async fn authenticate_async(
         .unwrap_or(None)
 }
 
-/// 审计日志写入（同步 SQLite 写隔离到阻塞线程池，fire-and-forget 不阻塞调用方）
+/// 审计日志写入（P2-12 背压）：经有界通道发送给 worker，fire-and-forget 不阻塞调用方。
+/// 通道满（默认 1024）时丢弃该条审计（审计为尽力而为，不阻塞业务响应）。
 fn spawn_audit(state: &Arc<AppState>, agent_id: &str, tool: &str, params: &str, allowed: bool) {
-    let st = state.clone();
-    let aid = agent_id.to_string();
-    let t = tool.to_string();
-    let p = params.to_string();
-    tokio::task::spawn_blocking(move || {
-        auth::audit_log(&st.auth_pool, &aid, &t, &p, allowed);
-    });
+    let ev = AuditEvent {
+        agent_id: agent_id.to_string(),
+        tool: tool.to_string(),
+        params: params.to_string(),
+        allowed,
+    };
+    if let Err(e) = state.audit_tx.try_send(ev) {
+        eprintln!("[Memoria][audit] dropped (channel full): {}", e);
+    }
 }
 
 /// P1-4：Dream 阶段 ns 限流（per-(phase, namespace) cooldown，秒）。
@@ -2612,6 +2643,10 @@ mod tests {
         let auth_pool = memoria_core::storage::create_pool(":memory:", 4).expect("auth pool");
         memoria_core::storage::init_schema(&auth_pool).expect("auth schema");
         memoria_core::auth::init_auth_tables(&auth_pool).expect("auth tables");
+
+        // P2-12：测试夹具也需要审计通道；丢弃 receiver（测试不校验审计落库）
+        let (audit_tx, _audit_rx) = tokio::sync::mpsc::channel(1024);
+
         Arc::new(AppState {
             pool,
             auth_pool,
@@ -2625,6 +2660,7 @@ mod tests {
             db_path: ":memory:".to_string(),
             backup_dir: ".".to_string(),
             vec_index_path: ":memory:".to_string(),
+            audit_tx,
         })
     }
 
