@@ -506,9 +506,25 @@ fn read_pid(lock_path: &std::path::Path) -> Option<u32> {
         .ok()
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn is_process_alive(pid: u32) -> bool {
     std::path::Path::new(&format!("/proc/{}", pid)).exists()
+}
+
+/// macOS / BSD 无 /proc；用 `kill -0` 探测（EPERM 也算存活）。
+#[cfg(all(unix, not(target_os = "linux")))]
+fn is_process_alive(pid: u32) -> bool {
+    use std::process::{Command, Stdio};
+    match Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+    {
+        Ok(s) => s.success(),
+        // 无法判定时保守认为存活（拒绝接管）
+        Err(_) => true,
+    }
 }
 
 #[cfg(windows)]
