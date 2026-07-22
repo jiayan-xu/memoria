@@ -25,8 +25,11 @@ fn git(args: &[&str]) -> Option<String> {
 }
 
 fn main() {
-    // 不声明 rerun-if-changed：每次构建都重跑本脚本，保证 MEMORIA_BUILD_VERSION
-    // 始终反映最新 git HEAD（溯源时效优先于增量构建缓存）。
+    // 声明 git 引用为重建触发条件：commit / 分支切换时 cargo 会重跑本脚本，
+    // 使 MEMORIA_BUILD_VERSION 始终反映最新 HEAD（不声明则 cargo 仅在本文件变更时重跑）。
+    println!("cargo:rerun-if-changed=.git/HEAD");
+    println!("cargo:rerun-if-changed=.git/refs");
+    println!("cargo:rerun-if-changed=.git/packed-refs");
     let pkg = env!("CARGO_PKG_VERSION");
     let commit = git(&["rev-parse", "--short", "HEAD"]);
     let dirty = git(&["status", "--porcelain"])
