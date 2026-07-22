@@ -45,7 +45,7 @@ pub fn run_health_check(
     embedding_url: &str,
 ) -> HealthReport {
     let timestamp = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
-    let version = env!("CARGO_PKG_VERSION").to_string();
+    let version = env!("MEMORIA_BUILD_VERSION").to_string();
 
     let mut hard_checks = Vec::new();
     let mut soft_checks = Vec::new();

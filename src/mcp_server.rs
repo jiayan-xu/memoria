@@ -121,7 +121,7 @@ async fn health_check(State(state): State<Arc<AppState>>) -> Json<serde_json::Va
     Json(serde_json::json!({
         "status": if semantic_ok { "ok" } else { "degraded" },
         "service": "memoria",
-        "version": env!("CARGO_PKG_VERSION"),
+        "version": env!("MEMORIA_BUILD_VERSION"),
         "embed": {
             "configured": !state.embedding_url.trim().is_empty(),
             "status": emb.status,
@@ -178,7 +178,7 @@ async fn health_check_full(
         hard_checks: vec![],
         soft_checks: vec![],
         timestamp: chrono::Utc::now().to_rfc3339(),
-        version: env!("CARGO_PKG_VERSION").to_string(),
+        version: env!("MEMORIA_BUILD_VERSION").to_string(),
     });
     let overall = report.overall.clone();
     let embed_check = report
@@ -195,7 +195,7 @@ async fn health_check_full(
     Ok(Json(serde_json::json!({
         "status": overall,
         "service": "memoria",
-        "version": env!("CARGO_PKG_VERSION"),
+        "version": env!("MEMORIA_BUILD_VERSION"),
         "embed": embed_check,
         "report": report,
     })))

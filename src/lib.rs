@@ -275,7 +275,7 @@ mod python {
     #[pymodule]
     fn memoria_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_class::<PyEngine>()?;
-        m.add("__version__", env!("CARGO_PKG_VERSION"))?;
+        m.add("__version__", env!("MEMORIA_BUILD_VERSION"))?;
         Ok(())
     }
 }
