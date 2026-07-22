@@ -12,6 +12,7 @@ use axum::{
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use crate::auth::{self, AuthResult};
@@ -159,7 +160,13 @@ async fn api_graph(
     Extension(auth): Extension<AuthResult>,
     Query(q): Query<GraphQuery>,
 ) -> Result<Json<Value>, StatusCode> {
-    let ns = q.namespace.as_deref().unwrap_or("default");
+    // 主数据 ns；旧前端 default 几乎无边，统一映射到 agent/xujiayan
+    let ns_raw = q.namespace.as_deref().unwrap_or("agent/xujiayan");
+    let ns = if ns_raw.is_empty() || ns_raw == "default" {
+        "agent/xujiayan"
+    } else {
+        ns_raw
+    };
     if !auth::check_ns_access(&auth, ns) {
         return Err(StatusCode::FORBIDDEN);
     }
@@ -168,119 +175,220 @@ async fn api_graph(
         .get()
         .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
 
-    // 读取 memories
-    let mut stmt = conn.prepare(
-        "SELECT id, content, category, tier, confidence, recall_count, importance, decay_factor, created_at
-         FROM memories WHERE tier != 'forgotten' AND namespace = ?1
-         ORDER BY CASE tier WHEN 'hot' THEN 0 WHEN 'warm' THEN 1 ELSE 2 END, decay_factor DESC
-         LIMIT 200"
-    ).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-    let mut nodes = Vec::new();
-    let mut node_data = Vec::new();
-
-    let rows = stmt
-        .query_map([ns], |r| {
-            let id: String = r.get(0)?;
-            let content: String = r.get(1)?;
-            let category: String = r.get(2)?;
-            let tier: String = r.get(3)?;
-            let decay: f64 = r.get::<_, f64>(7).unwrap_or(1.0);
-            let importance: i32 = r.get::<_, i32>(8).unwrap_or(3);
-            Ok((id, content, category, tier, decay, importance))
-        })
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-    for row in rows {
-        if let Ok((id, content, category, tier, decay, importance)) = row {
-            let cat_color = match category.as_str() {
-                "candidate" => "#94a3b8",
-                "decision" => "#3b82f6",
-                "preference" => "#f59e0b",
-                "constraint" => "#ef4444",
-                "lesson" => "#8b5cf6",
-                "fact" => "#10b981",
-                "correction" => "#ec4899",
-                _ => "#6b7280",
-            };
-            let tier_size = match tier.as_str() {
-                "hot" => 24,
-                "warm" => 16,
-                "cold" => 10,
-                _ => 8,
-            };
-            let label = if content.chars().count() > 60 {
-                let truncated: String = content.chars().take(60).collect();
-                format!("{}...", truncated)
-            } else {
-                content.clone()
-            };
-            let opacity = 0.3 + (decay as f32) * 0.7;
-
-            nodes.push(json!({
-                "id": id,
-                "label": label,
-                "title": content.chars().take(200).collect::<String>(),
-                "group": tier,
-                "category": category,
-                "color": cat_color,
-                "size": tier_size,
-                "opacity": opacity,
-                "decay": (decay * 100.0).round() / 100.0,
-                "importance": importance,
-            }));
-            node_data.push((id, content));
+    // ── 关系优先构图：先从 memory_relations 收节点，再画真边（避免「高连接度点互不相连」）──
+    let mut pending_edges: Vec<(String, String, String, f64)> = Vec::new();
+    let mut id_order: Vec<String> = Vec::new();
+    let mut id_set: HashSet<String> = HashSet::new();
+    if let Ok(mut estmt) = conn.prepare(
+        // 注意：存量数据 valid_to 常为 '1970-01-01T00:00:00Z' 哨兵（表示未关闭），
+        // 不可用「IS NULL OR ''」过滤，否则会把全部真边滤光。
+        "SELECT source_id, target_id, relation_type, COALESCE(weight, 0.5)
+         FROM memory_relations
+         WHERE namespace = ?1
+           AND (
+             valid_to IS NULL
+             OR valid_to = ''
+             OR valid_to < '1971-01-01'
+             OR valid_to > datetime('now')
+           )
+         ORDER BY weight DESC, id DESC
+         LIMIT 12000",
+    ) {
+        if let Ok(erows) = estmt.query_map([ns], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, f64>(3).unwrap_or(0.5),
+            ))
+        }) {
+            for row in erows.flatten() {
+                let (src, tgt, rtype, weight) = row;
+                if src == tgt {
+                    continue;
+                }
+                for id in [&src, &tgt] {
+                    if id_set.insert((*id).clone()) {
+                        id_order.push((*id).clone());
+                    }
+                }
+                pending_edges.push((src, tgt, rtype, weight));
+                // 收满约 220 个候选 id 后继续扫一会儿边，使子图更密
+                if id_order.len() >= 220 && pending_edges.len() >= 2500 {
+                    break;
+                }
+            }
         }
     }
 
-    // Jaccard 边计算（简化版：关键词提取器使用常用分词）
-    fn extract_keywords(text: &str) -> Vec<String> {
-        let mut words = Vec::new();
-        let chars: Vec<char> = text.chars().collect();
-        // 2-4字中文词组
-        for i in 0..chars.len().saturating_sub(1) {
-            if chars[i] >= '\u{4e00}' && chars[i] <= '\u{9fff}' {
-                for len in 2..=4.min(chars.len() - i) {
-                    let w: String = chars[i..i + len].iter().collect();
-                    if w.chars().all(|c| c >= '\u{4e00}' && c <= '\u{9fff}') {
-                        words.push(w);
+    // 截到 200 个节点 id
+    if id_order.len() > 200 {
+        let keep: HashSet<String> = id_order.iter().take(200).cloned().collect();
+        id_set = keep;
+        id_order.truncate(200);
+    }
+
+    // 若几乎无关系，回退到按 tier 取记忆（再靠 Jaccard 补边）
+    if id_order.is_empty() {
+        if let Ok(mut stmt) = conn.prepare(
+            "SELECT id FROM memories
+             WHERE tier != 'forgotten' AND namespace = ?1
+             ORDER BY CASE tier WHEN 'hot' THEN 0 WHEN 'warm' THEN 1 ELSE 2 END, decay_factor DESC
+             LIMIT 200",
+        ) {
+            if let Ok(rows) = stmt.query_map([ns], |r| r.get::<_, String>(0)) {
+                for id in rows.flatten() {
+                    if id_set.insert(id.clone()) {
+                        id_order.push(id);
                     }
                 }
             }
         }
-        words.sort();
-        words.dedup();
-        words
     }
 
-    let kw_map: Vec<(String, Vec<String>)> = node_data
-        .iter()
-        .map(|(id, content)| (id.clone(), extract_keywords(content)))
-        .collect();
+    let mut nodes = Vec::new();
+    let mut node_data = Vec::new();
+    let node_ids = id_set;
+    for id in &id_order {
+        let row = conn.query_row(
+            "SELECT content, category, tier, decay_factor, importance
+             FROM memories WHERE id = ?1 AND namespace = ?2 AND tier != 'forgotten'",
+            rusqlite::params![id, ns],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, f64>(3).unwrap_or(1.0),
+                    r.get::<_, i32>(4).unwrap_or(3),
+                ))
+            },
+        );
+        let Ok((content, category, tier, decay, importance)) = row else {
+            continue;
+        };
+        let cat_color = match category.as_str() {
+            "candidate" => "#94a3b8",
+            "decision" => "#3b82f6",
+            "preference" => "#f59e0b",
+            "constraint" => "#ef4444",
+            "lesson" => "#8b5cf6",
+            "fact" => "#10b981",
+            "correction" => "#ec4899",
+            _ => "#6b7280",
+        };
+        let tier_size = match tier.as_str() {
+            "hot" => 24,
+            "warm" => 16,
+            "cold" => 10,
+            _ => 8,
+        };
+        let label = if content.chars().count() > 60 {
+            let truncated: String = content.chars().take(60).collect();
+            format!("{}...", truncated)
+        } else {
+            content.clone()
+        };
+        let opacity = 0.3 + (decay as f32) * 0.7;
+        nodes.push(json!({
+            "id": id,
+            "label": label,
+            "title": content.chars().take(200).collect::<String>(),
+            "group": tier,
+            "tier": tier,
+            "category": category,
+            "color": cat_color,
+            "size": tier_size,
+            "opacity": opacity,
+            "decay": (decay * 100.0).round() / 100.0,
+            "importance": importance,
+        }));
+        node_data.push((id.clone(), content));
+    }
 
+    // 真边：两端都在节点集内
     let mut edges = Vec::new();
-    for i in 0..kw_map.len() {
-        for j in (i + 1)..kw_map.len() {
-            let kwi = &kw_map[i].1;
-            let kwj = &kw_map[j].1;
-            if kwi.is_empty() || kwj.is_empty() {
-                continue;
-            }
+    let mut edge_seen: HashSet<(String, String, String)> = HashSet::new();
+    for (src, tgt, rtype, weight) in pending_edges {
+        if !node_ids.contains(&src) || !node_ids.contains(&tgt) {
+            continue;
+        }
+        let (a, b) = if src <= tgt {
+            (src.clone(), tgt.clone())
+        } else {
+            (tgt.clone(), src.clone())
+        };
+        if !edge_seen.insert((a, b, rtype.clone())) {
+            continue;
+        }
+        let w = weight.clamp(0.05, 1.0);
+        edges.push(json!({
+            "from": src,
+            "to": tgt,
+            "source": src,
+            "target": tgt,
+            "value": (w * 100.0).round() / 100.0,
+            "weight": (w * 100.0).round() / 100.0,
+            "relation_type": rtype,
+            "title": format!("{} · {:.0}%", rtype, w * 100.0),
+        }));
+        if edges.len() >= 500 {
+            break;
+        }
+    }
 
-            let intersection: usize = kwi.iter().filter(|w| kwj.contains(w)).count();
-            let union: usize = kwi.len() + kwj.len() - intersection;
-            if union == 0 {
-                continue;
+    // 真边过少时用 Jaccard 相似度补边（标注为相似度，避免图谱完全散点）
+    if edges.len() < 20 {
+        fn extract_keywords(text: &str) -> Vec<String> {
+            let mut words = Vec::new();
+            let chars: Vec<char> = text.chars().collect();
+            for i in 0..chars.len().saturating_sub(1) {
+                if chars[i] >= '\u{4e00}' && chars[i] <= '\u{9fff}' {
+                    for len in 2..=4.min(chars.len() - i) {
+                        let w: String = chars[i..i + len].iter().collect();
+                        if w.chars().all(|c| c >= '\u{4e00}' && c <= '\u{9fff}') {
+                            words.push(w);
+                        }
+                    }
+                }
             }
-
-            let jaccard = intersection as f64 / union as f64;
-            if jaccard >= 0.25 {
-                edges.push(json!({
-                    "from": kw_map[i].0,
-                    "to": kw_map[j].0,
-                    "value": (jaccard * 100.0).round() / 100.0,
-                    "title": format!("相似度: {}%", (jaccard * 100.0).round() as i32),
-                }));
+            words.sort();
+            words.dedup();
+            words
+        }
+        let kw_map: Vec<(String, Vec<String>)> = node_data
+            .iter()
+            .map(|(id, content)| (id.clone(), extract_keywords(content)))
+            .collect();
+        for i in 0..kw_map.len() {
+            for j in (i + 1)..kw_map.len() {
+                let kwi = &kw_map[i].1;
+                let kwj = &kw_map[j].1;
+                if kwi.is_empty() || kwj.is_empty() {
+                    continue;
+                }
+                let intersection: usize = kwi.iter().filter(|w| kwj.contains(w)).count();
+                let union: usize = kwi.len() + kwj.len() - intersection;
+                if union == 0 {
+                    continue;
+                }
+                let jaccard = intersection as f64 / union as f64;
+                if jaccard >= 0.2 {
+                    let src = &kw_map[i].0;
+                    let tgt = &kw_map[j].0;
+                    if edge_seen.insert((src.clone(), tgt.clone(), "similarity".into())) {
+                        edges.push(json!({
+                            "from": src,
+                            "to": tgt,
+                            "source": src,
+                            "target": tgt,
+                            "value": (jaccard * 100.0).round() / 100.0,
+                            "weight": (jaccard * 100.0).round() / 100.0,
+                            "relation_type": "similarity",
+                            "title": format!("相似度: {}%", (jaccard * 100.0).round() as i32),
+                        }));
+                    }
+                }
             }
         }
     }
@@ -291,7 +399,7 @@ async fn api_graph(
             .partial_cmp(&a.get("value").and_then(|v| v.as_f64()).unwrap_or(0.0))
             .unwrap_or(std::cmp::Ordering::Equal)
     });
-    edges.truncate(300);
+    edges.truncate(500);
 
     let hot_count = nodes
         .iter()

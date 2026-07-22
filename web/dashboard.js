@@ -1,13 +1,26 @@
 // Memoria Dashboard client (P2-5) — authz headers + danger confirm
 const AUTH_KEYS = { id: 'memoria_agent_id', key: 'memoria_agent_key', ns: 'memoria_namespace' };
+// 主数据命名空间（~98% 记忆在此）；旧默认 default 几乎无业务边
+const DEFAULT_NS = 'agent/xujiayan';
 const _rawEndpoints = ['/stats', '/graph', '/decay_timeline'];
+
+function resolveNs(raw) {
+  const v = (raw || '').trim();
+  if (!v || v === 'default') return DEFAULT_NS;
+  return v;
+}
 
 function loadAuthIntoForm() {
   const idEl = document.getElementById('authAgentId');
   if (!idEl) return;
   idEl.value = localStorage.getItem(AUTH_KEYS.id) || '';
   document.getElementById('authAgentKey').value = localStorage.getItem(AUTH_KEYS.key) || '';
-  document.getElementById('authNamespace').value = localStorage.getItem(AUTH_KEYS.ns) || 'default';
+  const ns = resolveNs(localStorage.getItem(AUTH_KEYS.ns));
+  document.getElementById('authNamespace').value = ns;
+  // 迁移：localStorage 仍是 default/空时写回主 ns，避免每次刷新又落回旧默认
+  if (resolveNs(localStorage.getItem(AUTH_KEYS.ns)) === DEFAULT_NS) {
+    localStorage.setItem(AUTH_KEYS.ns, DEFAULT_NS);
+  }
   const lab = document.getElementById('settingsNsLabel');
   if (lab) lab.textContent = currentNs();
 }
@@ -15,7 +28,8 @@ function loadAuthIntoForm() {
 function saveAuth() {
   localStorage.setItem(AUTH_KEYS.id, document.getElementById('authAgentId').value.trim());
   localStorage.setItem(AUTH_KEYS.key, document.getElementById('authAgentKey').value.trim());
-  localStorage.setItem(AUTH_KEYS.ns, document.getElementById('authNamespace').value.trim() || 'default');
+  localStorage.setItem(AUTH_KEYS.ns, resolveNs(document.getElementById('authNamespace').value));
+  document.getElementById('authNamespace').value = currentNs();
   const lab = document.getElementById('settingsNsLabel');
   if (lab) lab.textContent = currentNs();
   showToast('凭证已保存到本机', 'success');
@@ -23,7 +37,9 @@ function saveAuth() {
 }
 
 function currentNs() {
-  return (document.getElementById('authNamespace')?.value || localStorage.getItem(AUTH_KEYS.ns) || 'default').trim() || 'default';
+  return resolveNs(
+    document.getElementById('authNamespace')?.value || localStorage.getItem(AUTH_KEYS.ns) || DEFAULT_NS
+  );
 }
 
 function authHeaders(extra) {
@@ -253,37 +269,54 @@ async function loadGraph() {
   try {
     const data = await api('/graph?namespace=' + encodeURIComponent(currentNs()));
     const nodes = (data.nodes || []).map(function (n) {
+      const tier = n.tier || n.group || 'warm';
       return {
         id: n.id,
         label: (n.label || n.content || '').substring(0, 30),
-        title: '<b>' + (n.category || '?') + '</b><br>' + (n.content || '').substring(0, 200),
+        title: '<b>' + (n.category || '?') + '</b> · ' + tier + '<br>' + (n.title || n.content || '').substring(0, 200),
         color: {
-          background: n.tier === 'hot' ? '#ff6b6b' : n.tier === 'cold' ? '#6c8ebf' : '#ffd93d',
+          background: n.color || (tier === 'hot' ? '#ff6b6b' : tier === 'cold' ? '#6c8ebf' : '#ffd93d'),
           border: '#1a1a23'
         },
-        size: 10 + (n.importance || 3) * 4,
+        size: n.size || (10 + (n.importance || 3) * 4),
         font: { size: 12, color: '#e4e4f0' },
         borderWidth: 2
       };
     });
     const edges = (data.edges || []).map(function (e) {
+      const w = Number(e.weight != null ? e.weight : (e.value != null ? e.value : 0.5));
+      const ww = isFinite(w) ? Math.max(0.05, Math.min(1, w)) : 0.5;
       return {
         from: e.source || e.from,
         to: e.target || e.to,
-        color: { opacity: Math.min(1, (e.weight || 0.3) * 2) },
-        width: Math.max(0.5, (e.weight || 0.3) * 3)
+        title: e.title || e.relation_type || '',
+        color: {
+          color: '#8b9cb3',
+          highlight: '#c5d0e0',
+          hover: '#a8b8cc',
+          opacity: 0.55 + ww * 0.45
+        },
+        width: Math.max(1.5, ww * 4),
+        smooth: { type: 'continuous', roundness: 0.2 }
       };
     });
     const container = document.getElementById('graph-container');
     if (graphNetwork) graphNetwork.destroy();
+    const summary = data.summary || {};
     graphNetwork = new vis.Network(container, { nodes: new vis.DataSet(nodes), edges: new vis.DataSet(edges) }, {
       physics: { solver: 'forceAtlas2Based', forceAtlas2Based: { gravitationalConstant: -30, centralGravity: 0.005 } },
       interaction: { hover: true, tooltipDelay: 200 },
-      nodes: { shape: 'dot' }
+      nodes: { shape: 'dot' },
+      edges: { selectionWidth: 3 }
     });
     graphNetwork.on('click', function (params) {
       if (params.nodes.length) openDetail(params.nodes[0]);
     });
+    const hint = document.getElementById('graph-hint');
+    if (hint) {
+      hint.textContent = 'NS ' + currentNs() + ' · 点 ' + (summary.total_nodes != null ? summary.total_nodes : nodes.length)
+        + ' · 边 ' + (summary.total_edges != null ? summary.total_edges : edges.length);
+    }
   } catch (e) {
     document.getElementById('graph-container').innerHTML = '<div class="empty"><div class="icon">⚠️</div>' + escHtml(e.message) + '</div>';
   }

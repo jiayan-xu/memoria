@@ -203,7 +203,7 @@ main { max-width: 1100px; margin: 0 auto; padding: 24px; }
     <div class="auth-bar" title="凭证仅存本机 localStorage，请求走 X-Agent-Id / X-Agent-Key">
       <input type="text" id="authAgentId" placeholder="Agent Id" style="width:100px;padding:4px 8px;border-radius:6px;border:1px solid var(--border);background:var(--surface2);color:var(--text);font-family:inherit;font-size:0.75rem">
       <input type="password" id="authAgentKey" placeholder="Agent Key" style="width:120px;padding:4px 8px;border-radius:6px;border:1px solid var(--border);background:var(--surface2);color:var(--text);font-family:inherit;font-size:0.75rem">
-      <input type="text" id="authNamespace" placeholder="namespace" style="width:90px;padding:4px 8px;border-radius:6px;border:1px solid var(--border);background:var(--surface2);color:var(--text);font-family:inherit;font-size:0.75rem" value="default">
+      <input type="text" id="authNamespace" placeholder="agent/xujiayan" style="width:140px;padding:4px 8px;border-radius:6px;border:1px solid var(--border);background:var(--surface2);color:var(--text);font-family:inherit;font-size:0.75rem" value="agent/xujiayan">
       <button type="button" onclick="saveAuth()" style="padding:4px 10px;border-radius:6px;border:1px solid var(--accent);background:var(--accent);color:#fff;font-family:inherit;font-size:0.75rem;cursor:pointer;font-weight:600">保存凭证</button>
     </div>
     <a href="intro.html" style="color:var(--accent2);text-decoration:none;font-size:0.82rem;padding:4px 10px;border:1px solid var(--border);border-radius:6px">📋 介绍</a>
@@ -262,6 +262,7 @@ main { max-width: 1100px; margin: 0 auto; padding: 24px; }
 
   <!-- Graph Tab -->
   <div class="tab" id="tab-graph">
+    <div id="graph-hint" style="font-size:0.8rem;color:var(--text2);margin-bottom:8px">加载中…</div>
     <div id="graph-container"></div>
   </div>
 
@@ -270,7 +271,7 @@ main { max-width: 1100px; margin: 0 auto; padding: 24px; }
     <div class="setting-card">
       <h3>🔐 访问凭证（必填）</h3>
       <p style="font-size:0.85rem;color:var(--text2);margin-bottom:12px">所有 API / MCP 调用需鉴权。凭证仅存浏览器 localStorage，不上传第三方。</p>
-      <p style="font-size:0.8rem;color:var(--text2)">当前命名空间：<b id="settingsNsLabel">default</b> · 顶栏可修改并点「保存凭证」</p>
+      <p style="font-size:0.8rem;color:var(--text2)">当前命名空间：<b id="settingsNsLabel">agent/xujiayan</b> · 顶栏可修改并点「保存凭证」</p>
     </div>
     <div class="setting-card">
       <h3>💾 导出命名空间（JSONL）</h3>
