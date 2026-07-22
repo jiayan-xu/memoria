@@ -136,9 +136,18 @@ pub fn evolution_rollback(pool: &SqlitePool, log_id: &str) -> Result<Value, Stri
         params![old_ctx, old_links, target_id],
     )
     .map_err(|e| format!("rollback update: {}", e))?;
+    // G3（HY3 硬门）：回滚同时把对应 evolution_log 行标记为 rolled_back，
+    // 使 PR5 的 evolution_log_query 能采到负样本，元进化闭环连通。
+    conn.execute(
+        "UPDATE evolution_log SET change_type = 'rolled_back' WHERE id = ?",
+        params![log_id],
+    )
+    .map_err(|e| format!("rollback log mark: {}", e))?;
     Ok(json!({
         "status": "rolled_back",
         "target_id": target_id,
+        "marked_evolution_log": log_id,
+        "marked_change_type": "rolled_back",
         "restored_evolved_context": old_ctx,
         "restored_link_count": old_links,
     }))
@@ -197,4 +206,80 @@ pub fn evolution_log_query(
         .collect();
 
     Ok(json!({ "status": "ok", "count": rows.len(), "items": rows }))
+}
+
+/// G2（HY3 硬门）：自包含自动演化触发。memoria 是哑存储（不调 LLM），
+/// 故内置「提升式」演化：对 `evolved_at IS NULL` 的记忆读取原文做确定性归一摘要，
+/// 写入 `evolved_context`（model=`memoria:builtin-auto`, change_type=`auto_promote`）。
+/// 仅处理 `evolved_at IS NULL` → 幂等，可周期/事件触发，不依赖 agent-core 上游。
+///
+/// 注：`evolve_memory` 已遵守 `MEMORIA_EVOLVE_WRITE` 开关；关闭时返回 skipped。
+/// 生产级 LLM 演化仍由 agent-core 的 consolidate 通过 `memory_evolve` 驱动（后续接入）。
+pub fn evolve_memory_auto(
+    pool: &SqlitePool,
+    namespace: &str,
+    limit: i64,
+) -> Result<Value, String> {
+    let limit = if limit <= 0 { 50 } else { limit.min(2000) };
+    let conn = pool.get().map_err(|e| format!("pool: {}", e))?;
+    let rows: Vec<(String, Option<String>)> = conn
+        .prepare(
+            "SELECT id, content FROM memories WHERE namespace = ? AND evolved_at IS NULL \
+             ORDER BY importance DESC, id LIMIT ?",
+        )
+        .map_err(|e| format!("prepare: {}", e))?
+        .query_map(rusqlite::params![namespace, limit], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+        })
+        .map_err(|e| format!("query: {}", e))?
+        .filter_map(|r| r.ok())
+        .collect();
+    let total = rows.len();
+    let mut evolved = 0i64;
+    for (id, content) in rows {
+        let ctx = synthesize_evolved_context(content.as_deref());
+        if evolve_memory(pool, &id, namespace, &ctx, None, "memoria:builtin-auto", "auto_promote")
+            .is_ok()
+        {
+            evolved += 1;
+        }
+    }
+    Ok(json!({
+        "status": "auto_evolved",
+        "namespace": namespace,
+        "scanned": total,
+        "evolved": evolved,
+        "model": "memoria:builtin-auto",
+        "change_type": "auto_promote",
+    }))
+}
+
+/// 返回 `evolved_at IS NULL` 记忆数最多的命名空间（供调度器 drain 用）。
+pub fn most_backlogged_namespace(pool: &SqlitePool) -> Option<String> {
+    let conn = pool.get().ok()?;
+    conn.query_row(
+        "SELECT namespace FROM memories WHERE evolved_at IS NULL \
+         GROUP BY namespace ORDER BY COUNT(*) DESC LIMIT 1",
+        [],
+        |row| row.get::<_, String>(0),
+    )
+    .ok()
+}
+
+/// 确定性内置摘要（不调 LLM）：原文截断归一 + 结构标记。
+fn synthesize_evolved_context(content: Option<&str>) -> String {
+    match content {
+        Some(c) if !c.trim().is_empty() => {
+            let trimmed = c.trim();
+            let head = if trimmed.chars().count() > 120 {
+                let mut s: String = trimmed.chars().take(120).collect();
+                s.push('…');
+                s
+            } else {
+                trimmed.to_string()
+            };
+            format!("[auto-promoted] {}", head)
+        }
+        _ => "[auto-promoted] (no content)".to_string(),
+    }
 }

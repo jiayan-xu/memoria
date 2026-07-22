@@ -356,6 +356,21 @@ fn main() {
         }
     });
 
+    // ── G2（HY3 硬门）：自动演化定时触发（每6小时 drain 最积压命名空间）──
+    let evolve_pool = state.pool.clone();
+    tokio::spawn(async move {
+        let interval = std::time::Duration::from_secs(6 * 3600);
+        loop {
+            tokio::time::sleep(interval).await;
+            if let Some(ns) = memoria_core::tools::evolve::most_backlogged_namespace(&evolve_pool) {
+                match memoria_core::tools::evolve::evolve_memory_auto(&evolve_pool, &ns, 500) {
+                    Ok(v) => println!("[Memoria] Auto-evolve({}): {}", ns, v),
+                    Err(e) => eprintln!("[Memoria] Auto-evolve FAILED: {}", e),
+                }
+            }
+        }
+    });
+
     // ── P1-1: 审计日志定时清理（每6小时）──
     let cleanup_auth_pool = state.auth_pool.clone();
     tokio::spawn(async move {

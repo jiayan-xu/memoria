@@ -634,6 +634,21 @@ pub fn tools_list() -> Vec<serde_json::Value> {
         }),
     ));
     tools.push(tool(
+        "memory_evolve_auto",
+        "（G2 自动演化）对命名空间内 evolved_at IS NULL 的记忆做内置提升式演化（memoria:builtin-auto，不调 LLM），写入 evolution_log 并标 evolved_at。幂等（只处理未演化），可周期/事件触发。",
+        serde_json::json!({
+            "namespace": {"type": "string", "description": "命名空间，默认 default"},
+            "limit": {"type": "number", "description": "本次最多处理条数，默认 50，上限 2000"}
+        }),
+    ));
+    tools.push(tool(
+        "agent_registry_cleanup",
+        "（G4 注册表清理）保守幂等移除 agent_registry 中死行（badge 为空 / test_ / demo_ 占位）。不删真实 agent。需 Admin key。",
+        serde_json::json!({
+            "admin_key": {"type": "string", "description": "Admin Key"}
+        }),
+    ));
+    tools.push(tool(
         "memory_maintenance_normalize",
         "Q1 维护：归一 valid_from/valid_to 时间格式（补 T）+ 清洗 1970 哨兵为空。⚠️ 破坏性，调用前必须先 memory_backup（需 Admin key）",
         serde_json::json!({
@@ -2262,6 +2277,33 @@ fn dispatch(
             match tools::evolve::evolution_log_query(&state.pool, &change_types, since, limit, ns) {
                 Ok(v) => serde_json::to_string(&v)
                     .unwrap_or_else(|_| r#"{"status":"ok","count":0,"items":[]}"#.to_string()),
+                Err(e) => format!(r#"{{"status":"error","message":"{}"}}"#, e),
+            }
+        }
+        "memory_evolve_auto" => {
+            // G2（HY3 硬门）：自包含自动演化触发。ns 门控（与写入同权）。
+            let auto_ns = args.get("namespace").and_then(|v| v.as_str()).unwrap_or(ns);
+            let auto_limit = args.get("limit").and_then(|v| v.as_i64()).unwrap_or(50);
+            if !auth::check_ns_access(&_auth, auto_ns) {
+                return r#"{"status":"error","message":"ns access denied"}"#.to_string();
+            }
+            match tools::evolve::evolve_memory_auto(&state.pool, auto_ns, auto_limit) {
+                Ok(v) => serde_json::to_string(&v)
+                    .unwrap_or_else(|_| r#"{"status":"auto_evolved"}"#.to_string()),
+                Err(e) => format!(r#"{{"status":"error","message":"{}"}}"#, e),
+            }
+        }
+        "agent_registry_cleanup" => {
+            // G4（HY3 硬门）：保守幂等清理 agent_registry 死行。需 Admin key。
+            let admin_key_val = args.get("admin_key").and_then(|v| v.as_str()).unwrap_or("");
+            if !crate::permissions::require_admin(&_auth, admin_key_val, &state.admin_key) {
+                return r#"{"status":"error","message":"admin required"}"#.to_string();
+            }
+            match auth::cleanup_agent_registry(&state.auth_pool) {
+                Ok((removed, ids)) => serde_json::to_string(&serde_json::json!({
+                    "status": "cleaned", "removed": removed, "removed_ids": ids
+                }))
+                .unwrap_or_else(|_| r#"{"status":"cleaned"}"#.to_string()),
                 Err(e) => format!(r#"{{"status":"error","message":"{}"}}"#, e),
             }
         }

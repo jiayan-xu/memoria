@@ -545,3 +545,29 @@ fn cleanup_stale_tables(conn: &rusqlite::Connection) {
         }
     }
 }
+
+/// G4（HY3 硬门）：保守、幂等的 agent_registry 清理。
+/// 仅移除明确为「死」的行：badge_token 为空，或 agent_id 命中已知测试/占位标记
+///（`test_` / `demo_`）。**不删除任何真实 agent**（即便命名空间大小写变体也保留）。
+/// 返回 (移除数, 被移除 agent_id 列表)；无死行时为 (0, [])，可安全重复运行。
+pub fn cleanup_agent_registry(pool: &SqlitePool) -> Result<(usize, Vec<String>), String> {
+    let conn = pool.get().map_err(|e| format!("pool: {}", e))?;
+    let dead_ids: Vec<String> = conn
+        .prepare(
+            "SELECT agent_id FROM agent_registry \
+             WHERE badge_token IS NULL OR badge_token = '' \
+                OR agent_id LIKE 'test_%' OR agent_id LIKE 'demo_%'",
+        )
+        .map_err(|e| format!("prepare: {}", e))?
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(|e| format!("query: {}", e))?
+        .filter_map(|r| r.ok())
+        .collect();
+    let mut removed = 0;
+    for id in &dead_ids {
+        conn.execute("DELETE FROM agent_registry WHERE agent_id = ?", [id])
+            .map_err(|e| format!("delete {}: {}", id, e))?;
+        removed += 1;
+    }
+    Ok((removed, dead_ids))
+}
