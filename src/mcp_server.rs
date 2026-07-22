@@ -621,7 +621,8 @@ pub fn tools_list() -> Vec<serde_json::Value> {
         "（PR4）按 evolution_log.id 回滚某次演化，恢复 old_value（evolved_context/link_count）。敏感操作，需 Admin key。",
         serde_json::json!({
             "log_id": {"type": "string", "description": "evolution_log 行 id（必填）"},
-            "admin_key": {"type": "string", "description": "Admin Key"}
+            "admin_key": {"type": "string", "description": "Admin Key"},
+            "namespace": {"type": "string", "description": "记忆所属命名空间（NamespaceArg 必填）；不传将被拒绝（Namespace argument required）"}
         }),
     ));
     tools.push(tool(
@@ -630,7 +631,8 @@ pub fn tools_list() -> Vec<serde_json::Value> {
         serde_json::json!({
             "change_types": {"type": "array", "description": "按变更类型过滤，如 [\"rolled_back\",\"corrected\"]；空数组=不过滤"},
             "since": {"type": "string", "description": "created_at 下界 ISO8601（YYYY-MM-DDTHH:MM:SS），默认 1970-01-01"},
-            "limit": {"type": "number", "description": "最多返回条数，默认 500，上限 5000"}
+            "limit": {"type": "number", "description": "最多返回条数，默认 500，上限 5000"},
+            "namespace": {"type": "string", "description": "命名空间（NamespaceArg 必填）；不传将被拒绝（Namespace argument required）"}
         }),
     ));
     tools.push(tool(
