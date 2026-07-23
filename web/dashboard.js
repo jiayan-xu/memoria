@@ -267,7 +267,7 @@ async function deleteMemory(id) {
 var graphNetwork = null;
 async function loadGraph() {
   try {
-    const data = await api('/graph?namespace=' + encodeURIComponent(currentNs()));
+    const data = await api('/graph?namespace=' + encodeURIComponent(currentNs()) + '&limit=1200');
     const nodes = (data.nodes || []).map(function (n) {
       const tier = n.tier || n.group || 'warm';
       return {
@@ -314,8 +314,9 @@ async function loadGraph() {
     });
     const hint = document.getElementById('graph-hint');
     if (hint) {
-      hint.textContent = 'NS ' + currentNs() + ' · 点 ' + (summary.total_nodes != null ? summary.total_nodes : nodes.length)
-        + ' · 边 ' + (summary.total_edges != null ? summary.total_edges : edges.length);
+      var tm = summary.total_memories != null ? (' / ' + summary.total_memories) : '';
+      var tr = summary.total_relations != null ? (' / ' + summary.total_relations) : '';
+      hint.textContent = 'NS ' + currentNs() + ' · 点 ' + nodes.length + tm + ' · 边 ' + edges.length + tr + ' (采样预览)';
     }
   } catch (e) {
     document.getElementById('graph-container').innerHTML = '<div class="empty"><div class="icon">⚠️</div>' + escHtml(e.message) + '</div>';

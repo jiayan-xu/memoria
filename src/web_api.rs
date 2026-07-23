@@ -153,6 +153,9 @@ async fn api_stats(
 #[derive(Deserialize)]
 pub struct GraphQuery {
     namespace: Option<String>,
+    /// 采样上限：?limit=N 控制返回节点数（边上限=节点上限×3）。默认 200，硬顶 5000，
+    /// 防止把全库十几万点一次性灌进 vis.Network 卡死浏览器。
+    limit: Option<i64>,
 }
 
 async fn api_graph(
@@ -170,6 +173,11 @@ async fn api_graph(
     if !auth::check_ns_access(&auth, ns) {
         return Err(StatusCode::FORBIDDEN);
     }
+    // 图谱采样上限：默认 200 节点，边上限 = 节点上限×3，均设硬顶防浏览器卡死。
+    let raw_limit = q.limit.unwrap_or(200).clamp(10, 5000);
+    let node_cap: usize = raw_limit as usize;
+    let edge_cap: usize = (raw_limit as usize * 3).clamp(10, 15000);
+
     let conn = state
         .pool
         .get()
@@ -213,19 +221,19 @@ async fn api_graph(
                     }
                 }
                 pending_edges.push((src, tgt, rtype, weight));
-                // 收满约 220 个候选 id 后继续扫一会儿边，使子图更密
-                if id_order.len() >= 220 && pending_edges.len() >= 2500 {
+                // 收满约 node_cap 个候选 id 后继续扫一会儿边，使子图更密
+                if id_order.len() >= node_cap && pending_edges.len() >= edge_cap {
                     break;
                 }
             }
         }
     }
 
-    // 截到 200 个节点 id
-    if id_order.len() > 200 {
-        let keep: HashSet<String> = id_order.iter().take(200).cloned().collect();
+    // 截到 node_cap 个节点 id
+    if id_order.len() > node_cap {
+        let keep: HashSet<String> = id_order.iter().take(node_cap).cloned().collect();
         id_set = keep;
-        id_order.truncate(200);
+        id_order.truncate(node_cap);
     }
 
     // 若几乎无关系，回退到按 tier 取记忆（再靠 Jaccard 补边）
@@ -234,9 +242,9 @@ async fn api_graph(
             "SELECT id FROM memories
              WHERE tier != 'forgotten' AND namespace = ?1
              ORDER BY CASE tier WHEN 'hot' THEN 0 WHEN 'warm' THEN 1 ELSE 2 END, decay_factor DESC
-             LIMIT 200",
+             LIMIT ?2",
         ) {
-            if let Ok(rows) = stmt.query_map([ns], |r| r.get::<_, String>(0)) {
+            if let Ok(rows) = stmt.query_map(rusqlite::params![ns, node_cap as i64], |r| r.get::<_, String>(0)) {
                 for id in rows.flatten() {
                     if id_set.insert(id.clone()) {
                         id_order.push(id);
@@ -332,7 +340,7 @@ async fn api_graph(
             "relation_type": rtype,
             "title": format!("{} · {:.0}%", rtype, w * 100.0),
         }));
-        if edges.len() >= 500 {
+        if edges.len() >= edge_cap {
             break;
         }
     }
@@ -399,7 +407,7 @@ async fn api_graph(
             .partial_cmp(&a.get("value").and_then(|v| v.as_f64()).unwrap_or(0.0))
             .unwrap_or(std::cmp::Ordering::Equal)
     });
-    edges.truncate(500);
+    edges.truncate(edge_cap);
 
     let hot_count = nodes
         .iter()
@@ -414,12 +422,30 @@ async fn api_graph(
         .filter(|n| n.get("group").and_then(|g| g.as_str()) == Some("cold"))
         .count();
 
+    // 真实总量（不受采样上限影响），用于界面区分"显示数 vs 全库数"
+    let total_mem: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM memories WHERE namespace = ?1 AND tier != 'forgotten'",
+            [ns],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    let total_rel: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM memory_relations WHERE namespace = ?1 AND (valid_to IS NULL OR valid_to = '' OR valid_to < '1971-01-01' OR valid_to > datetime('now'))",
+            [ns],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+
     Ok(Json(json!({
         "nodes": nodes,
         "edges": edges,
         "summary": {
             "total_nodes": nodes.len(),
             "total_edges": edges.len(),
+            "total_memories": total_mem,
+            "total_relations": total_rel,
             "hot": hot_count,
             "warm": warm_count,
             "cold": cold_count,

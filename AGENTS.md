@@ -63,3 +63,16 @@ which commit produced the running binary. No manual step required.
 On 2026-07-08 the repo was scrubbed: admin key rotated, agent API key rotated, hardcoded
 `C:/Users/user/...` paths removed, internal review docs & runtime logs removed from the public tree.
 Historical commits may still contain inert (revoked) secret strings — do not reintroduce live ones.
+
+## The `/graph` endpoint is a CAPPED SAMPLE (do not treat it as the full graph)
+`GET /graph?namespace=<ns>[&limit=N]` returns a **weight-biased subgraph preview**, NOT the whole
+memory graph. Defaults: `limit=200` nodes, edges = `limit×3` (hard caps: 5000 nodes / 15000 edges).
+This exists because the DB holds ~110k memories / ~54k relations — drawing all of them crashes the
+browser (`vis.Network`).
+- The JSON `summary.total_nodes` / `summary.total_edges` are the **displayed (capped)** counts.
+- The REAL totals are in `summary.total_memories` / `summary.total_relations` (a separate `COUNT(*)`).
+- If a user says "my graph only has 200 nodes / 500 edges", that is the cap, not the data size —
+  point them at `total_memories` / `total_relations`, or raise `?limit=`.
+- Editing graph caps lives in `src/web_api.rs` (`api_graph`): `node_cap` / `edge_cap`. After changing,
+  rebuild (see build provenance) and restart.
+
