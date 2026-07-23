@@ -264,6 +264,14 @@ async function deleteMemory(id) {
   } catch (e) { showToast(e.message, 'error'); }
 }
 
+// 图谱节点标签：取内容首行（避免原文里 'not found' 等短语霸屏）；空内容回退为「记忆<id前8位>」
+function cleanGraphLabel(n) {
+  var raw = (n.title || n.content || n.label || '').trim();
+  if (!raw) return '记忆 ' + String(n.id || '').slice(0, 8);
+  var firstLine = raw.split('\n')[0].split('\r')[0];
+  return firstLine.substring(0, 30);
+}
+
 var graphNetwork = null;
 async function loadGraph() {
   try {
@@ -272,7 +280,7 @@ async function loadGraph() {
       const tier = n.tier || n.group || 'warm';
       return {
         id: n.id,
-        label: (n.label || n.content || '').substring(0, 30),
+        label: cleanGraphLabel(n),
         title: '<b>' + (n.category || '?') + '</b> · ' + tier + '<br>' + (n.title || n.content || '').substring(0, 200),
         color: {
           background: n.color || (tier === 'hot' ? '#ff6b6b' : tier === 'cold' ? '#6c8ebf' : '#ffd93d'),
