@@ -374,7 +374,8 @@ function cleanGraphLabel(n) {
 var graphNetwork = null;
 async function loadGraph() {
   try {
-    const data = await api('/graph?namespace=' + encodeURIComponent(currentNs()) + '&limit=1200');
+    // 默认高价值视图（pattern/fact/decision…）；要看全量加 &include=all
+    const data = await api('/graph?namespace=' + encodeURIComponent(currentNs()) + '&limit=1200&include=value');
     const nodes = (data.nodes || []).map(function (n) {
       const tier = n.tier || n.group || 'warm';
       return {
@@ -421,9 +422,11 @@ async function loadGraph() {
     });
     const hint = document.getElementById('graph-hint');
     if (hint) {
+      var view = summary.view === 'all' ? '全量' : '高价值(pattern等)';
       var tm = summary.total_memories != null ? (' / ' + summary.total_memories) : '';
+      var tall = summary.total_memories_all != null ? (' · 全库 ' + summary.total_memories_all) : '';
       var tr = summary.total_relations != null ? (' / ' + summary.total_relations) : '';
-      hint.textContent = 'NS ' + currentNs() + ' · 点 ' + nodes.length + tm + ' · 边 ' + edges.length + tr + ' (采样预览)';
+      hint.textContent = 'NS ' + currentNs() + ' · ' + view + ' · 点 ' + nodes.length + tm + tall + ' · 边 ' + edges.length + tr + ' (采样预览)';
     }
   } catch (e) {
     document.getElementById('graph-container').innerHTML = '<div class="empty"><div class="icon">⚠️</div>' + escHtml(e.message) + '</div>';

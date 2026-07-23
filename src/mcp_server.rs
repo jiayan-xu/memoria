@@ -963,6 +963,8 @@ fn dream_cooldown(phase: &str) -> u64 {
     }
     match phase {
         "decay" => 60,
+        // consolidate 追平会连续多轮推进游标；300s 冷却会导致更新被静默拒绝、同批 observation 反复写 pattern
+        "consolidate" => 0,
         _ => 300,
     }
 }

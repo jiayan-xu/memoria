@@ -330,7 +330,28 @@ pub struct GraphQuery {
     /// 采样上限：?limit=N 控制返回节点数（边上限=节点上限×3）。默认 200，硬顶 5000，
     /// 防止把全库十几万点一次性灌进 vis.Network 卡死浏览器。
     limit: Option<i64>,
+    /// 视图：`value`（默认）= pattern/高价值类；`all` = 含 observation
+    include: Option<String>,
 }
+
+/// 图谱默认高价值类（排除海量 observation 噪声）
+fn graph_value_category(cat: &str) -> bool {
+    matches!(
+        cat,
+        "pattern"
+            | "fact"
+            | "decision"
+            | "preference"
+            | "constraint"
+            | "lesson"
+            | "correction"
+            | "infrastructure"
+            | "note"
+            | "report"
+    )
+}
+
+const GRAPH_VALUE_SQL: &str = "category IN ('pattern','fact','decision','preference','constraint','lesson','correction','infrastructure','note','report')";
 
 async fn api_graph(
     State(state): State<Arc<WebApiState>>,
@@ -347,6 +368,10 @@ async fn api_graph(
     if !auth::check_ns_access(&auth, ns) {
         return Err(StatusCode::FORBIDDEN);
     }
+    let value_only = !matches!(
+        q.include.as_deref().unwrap_or("value"),
+        "all" | "full" | "observation"
+    );
     // 图谱采样上限：默认 200 节点，边上限 = 节点上限×3，均设硬顶防浏览器卡死。
     let raw_limit = q.limit.unwrap_or(200).clamp(10, 5000);
     let node_cap: usize = raw_limit as usize;
@@ -357,13 +382,42 @@ async fn api_graph(
         .get()
         .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
 
-    // ── 关系优先构图：先从 memory_relations 收节点，再画真边（避免「高连接度点互不相连」）──
+    // ── 默认：先按高价值记忆种子节点，再挂真边（避免 observation 淹没图谱）──
     let mut pending_edges: Vec<(String, String, String, f64)> = Vec::new();
     let mut id_order: Vec<String> = Vec::new();
     let mut id_set: HashSet<String> = HashSet::new();
+
+    let seed_sql = if value_only {
+        format!(
+            "SELECT id FROM memories
+             WHERE tier != 'forgotten' AND namespace = ?1 AND {GRAPH_VALUE_SQL}
+             ORDER BY CASE category WHEN 'pattern' THEN 0 WHEN 'decision' THEN 1 WHEN 'constraint' THEN 2
+               WHEN 'preference' THEN 3 WHEN 'lesson' THEN 4 WHEN 'fact' THEN 5 ELSE 6 END,
+               CASE tier WHEN 'hot' THEN 0 WHEN 'warm' THEN 1 ELSE 2 END,
+               importance DESC, decay_factor DESC
+             LIMIT ?2"
+        )
+    } else {
+        "SELECT id FROM memories
+         WHERE tier != 'forgotten' AND namespace = ?1
+         ORDER BY CASE tier WHEN 'hot' THEN 0 WHEN 'warm' THEN 1 ELSE 2 END, decay_factor DESC
+         LIMIT ?2"
+            .to_string()
+    };
+    if let Ok(mut stmt) = conn.prepare(&seed_sql) {
+        if let Ok(rows) =
+            stmt.query_map(rusqlite::params![ns, node_cap as i64], |r| r.get::<_, String>(0))
+        {
+            for id in rows.flatten() {
+                if id_set.insert(id.clone()) {
+                    id_order.push(id);
+                }
+            }
+        }
+    }
+
+    // 关系边：两端都已在种子集，或（全量模式）可扩展进图
     if let Ok(mut estmt) = conn.prepare(
-        // 注意：存量数据 valid_to 常为 '1970-01-01T00:00:00Z' 哨兵（表示未关闭），
-        // 不可用「IS NULL OR ''」过滤，否则会把全部真边滤光。
         "SELECT source_id, target_id, relation_type, COALESCE(weight, 0.5)
          FROM memory_relations
          WHERE namespace = ?1
@@ -389,43 +443,34 @@ async fn api_graph(
                 if src == tgt {
                     continue;
                 }
-                for id in [&src, &tgt] {
-                    if id_set.insert((*id).clone()) {
-                        id_order.push((*id).clone());
+                if value_only {
+                    // 仅保留两端都在高价值种子集内的边
+                    if !id_set.contains(&src) || !id_set.contains(&tgt) {
+                        continue;
+                    }
+                } else {
+                    for id in [&src, &tgt] {
+                        if id_set.len() < node_cap && id_set.insert((*id).clone()) {
+                            id_order.push((*id).clone());
+                        }
+                    }
+                    if !id_set.contains(&src) || !id_set.contains(&tgt) {
+                        continue;
                     }
                 }
                 pending_edges.push((src, tgt, rtype, weight));
-                // 收满约 node_cap 个候选 id 后继续扫一会儿边，使子图更密
-                if id_order.len() >= node_cap && pending_edges.len() >= edge_cap {
+                if pending_edges.len() >= edge_cap {
                     break;
                 }
             }
         }
     }
 
-    // 截到 node_cap 个节点 id
+    // 截到 node_cap
     if id_order.len() > node_cap {
         let keep: HashSet<String> = id_order.iter().take(node_cap).cloned().collect();
         id_set = keep;
         id_order.truncate(node_cap);
-    }
-
-    // 若几乎无关系，回退到按 tier 取记忆（再靠 Jaccard 补边）
-    if id_order.is_empty() {
-        if let Ok(mut stmt) = conn.prepare(
-            "SELECT id FROM memories
-             WHERE tier != 'forgotten' AND namespace = ?1
-             ORDER BY CASE tier WHEN 'hot' THEN 0 WHEN 'warm' THEN 1 ELSE 2 END, decay_factor DESC
-             LIMIT ?2",
-        ) {
-            if let Ok(rows) = stmt.query_map(rusqlite::params![ns, node_cap as i64], |r| r.get::<_, String>(0)) {
-                for id in rows.flatten() {
-                    if id_set.insert(id.clone()) {
-                        id_order.push(id);
-                    }
-                }
-            }
-        }
     }
 
     let mut nodes = Vec::new();
@@ -449,6 +494,9 @@ async fn api_graph(
         let Ok((content, category, tier, decay, importance)) = row else {
             continue;
         };
+        if value_only && !graph_value_category(&category) {
+            continue;
+        }
         let cat_color = match category.as_str() {
             "candidate" => "#94a3b8",
             "decision" => "#3b82f6",
@@ -457,6 +505,7 @@ async fn api_graph(
             "lesson" => "#8b5cf6",
             "fact" => "#10b981",
             "correction" => "#ec4899",
+            "pattern" => "#06b6d4",
             _ => "#6b7280",
         };
         let tier_size = match tier.as_str() {
@@ -604,6 +653,15 @@ async fn api_graph(
             |r| r.get(0),
         )
         .unwrap_or(0);
+    let total_value: i64 = conn
+        .query_row(
+            &format!(
+                "SELECT COUNT(*) FROM memories WHERE namespace = ?1 AND tier != 'forgotten' AND {GRAPH_VALUE_SQL}"
+            ),
+            [ns],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
     let total_rel: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM memory_relations WHERE namespace = ?1 AND (valid_to IS NULL OR valid_to = '' OR valid_to < '1971-01-01' OR valid_to > datetime('now'))",
@@ -616,9 +674,12 @@ async fn api_graph(
         "nodes": nodes,
         "edges": edges,
         "summary": {
+            "view": if value_only { "value" } else { "all" },
             "total_nodes": nodes.len(),
             "total_edges": edges.len(),
-            "total_memories": total_mem,
+            "total_memories": if value_only { total_value } else { total_mem },
+            "total_memories_all": total_mem,
+            "total_value_memories": total_value,
             "total_relations": total_rel,
             "hot": hot_count,
             "warm": warm_count,
