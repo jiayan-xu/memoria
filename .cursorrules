@@ -1,0 +1,6 @@
+# Cursor Rules — jiayan-xu/memoria
+Read AGENTS.md (repo root) before any git or code action.
+- CANONICAL checkout (edit & push HERE): C:/Users/user/.qclaw/workspace/memoria-open (branch main).
+- C:/Users/user/.qclaw/workspace/memoria is a RUNTIME MIRROR (live DB/.env/web/launchers) — NEVER edit
+  code there; the running binary builds from memoria-open, so mirror edits won't take effect.
+- Push only to main on the canonical GitHub remote. No secrets or C:/Users/<name>/... paths in commits.

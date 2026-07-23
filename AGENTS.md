@@ -1,20 +1,45 @@
 # AGENTS.md — Operational Rules for AI Assistants (and humans)
 
 This repository is **publicly open-sourced on GitHub**. Read this file **before running any `git`
-command**. Violating these rules can leak private data or push to the wrong place — both have
-happened here before and are now structurally prevented.
+command or editing code**. Violating these rules can leak private data, push to the wrong place,
+or — most commonly — waste hours editing the wrong directory. All of these have happened before
+and are now structurally prevented.
+
+## Two local directories — know which is which (CRITICAL)
+There are TWO local checkouts of `jiayan-xu/memoria`. Confusing them is the #1 cause of wasted work.
+
+| Directory | Role | Edit code here? | Branch |
+|-----------|------|-----------------|--------|
+| `C:/Users/user/.qclaw/workspace/memoria-open` | **CANONICAL source of truth** (code + built binary) | ✅ YES — always | `main` (= `origin/main`) |
+| `C:/Users/user/.qclaw/workspace/memoria` | **Runtime mirror** — holds the live DB (`data/memoria.db`, ~110k memories), `web/`, `.env`, and launcher scripts | ❌ NEVER | local `master` (mirrors `origin/main`) |
+
+- The running `memoria-server.exe` is **always built from `memoria-open`**
+  (`memoria-open/target/release/memoria-server.exe`). The watchdog/launcher
+  (`memoria_stack_launcher.py`, `start_both_tray.ps1`) point the **binary** there; only the
+  DB / `web/` / `.env` paths point at `memoria\`.
+- **If you edit code in `memoria\`, your change will NOT reach the running binary** (it builds from
+  `memoria-open`). This produces the classic "my edit didn't take effect" confusion. **Always edit
+  `memoria-open`.**
 
 ## Canonical source of truth
-- **GitHub repo:** `jiayan-xu/memoria` (default branch: **`main`** — the ONLY branch)
+- **GitHub repo:** `jiayan-xu/memoria` (default + only publish branch: **`main`**).
 - **Canonical local checkout (edit & push from HERE):** `C:/Users/user/.qclaw/workspace/memoria-open`
 - **Remote `origin`:** `https://ghfast.top/https://github.com/jiayan-xu/memoria.git`
-  - The `ghfast.top/https://` prefix is a GitHub mirror proxy. Treat it as `github.com/jiayan-xu/memoria`.
+  (the `ghfast.top/https://` prefix is a GitHub mirror proxy; treat it as `github.com/jiayan-xu/memoria`).
 
-## DO NOT push from the other local copy
-There is a SECOND, stale local working copy at `C:/Users/user/.qclaw/workspace/memoria`.
-It is marked with a `.NO_PUSH` file and its `pre-push` hook blocks all pushes. Do not edit or push
-from there — it previously held internal-only files (runtime logs, review docs) that must stay out of
-the public repo. The public branch is `main` only; the old `master` branch was intentionally removed.
+## Keeping the runtime mirror in sync
+After you push changes to `memoria-open` (main), re-sync the runtime mirror so its checkout matches:
+```sh
+cd C:/Users/user/.qclaw/workspace/memoria
+git fetch origin
+git reset --hard origin/main      # data/, web/, .env are gitignored → safe; the DB is untouched
+```
+Do NOT `git pull` / `merge` there, and never commit in `memoria\` (a `pre-commit` hook blocks it).
+
+## DO NOT push / edit from the runtime mirror
+`memoria\` is guarded: it carries a `.NO_PUSH` marker and a `pre-push` hook that blocks pushes, plus a
+`pre-commit` hook that blocks commits. If you (or another tool) somehow try, it is refused with a
+message pointing you to `memoria-open`.
 
 ## Hard rules (P0)
 1. **Before ANY `git push`:** confirm (a) `git remote -v` shows the canonical GitHub URL, and
@@ -27,6 +52,12 @@ the public repo. The public branch is `main` only; the old `master` branch was i
 5. A safety `pre-push` hook ships in `.githooks/pre-push`. After cloning, run
    `git config core.hooksPath .githooks` to activate it. It blocks wrong-branch, wrong-remote,
    branch-deletion, and `.NO_PUSH` checkouts.
+
+## Build provenance (version carries git SHA)
+`build.rs` injects `MEMORIA_BUILD_VERSION = "<pkg>-g<short-sha>[-dirty]"` at compile time
+(e.g. `0.3.0-gdc43632`). It auto-refreshes on every commit (declared `rerun-if-changed` on the git
+refs). The running `/health` endpoint and MCP `initialize` report this version, so you can always tell
+which commit produced the running binary. No manual step required.
 
 ## Privacy history
 On 2026-07-08 the repo was scrubbed: admin key rotated, agent API key rotated, hardcoded
