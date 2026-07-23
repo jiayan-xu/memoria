@@ -219,6 +219,7 @@ main { max-width: 1280px; margin: 0 auto; padding: 24px; }
 <nav>
   <button class="active" data-tab="search">🔍 搜索</button>
   <button data-tab="browse">🗂️ 浏览</button>
+  <button data-tab="docs">📄 文档</button>
   <button data-tab="graph">📊 图谱</button>
   <button data-tab="settings">⚙️ 设置</button>
   <a href="timeline.html" style="background:none;border:none;color:var(--text2);padding:8px 18px;border-radius:8px;cursor:pointer;font-size:0.9rem;font-family:inherit;text-decoration:none;transition:all 0.15s;display:inline-flex;align-items:center;gap:4px" onmouseover="this.style.background='var(--surface2)';this.style.color='var(--text)'" onmouseout="this.style.background='none';this.style.color='var(--text2)'">⏱ 时间线</a>
@@ -246,6 +247,7 @@ main { max-width: 1280px; margin: 0 auto; padding: 24px; }
       </select>
       <select id="filterCategory" onchange="loadMemories()">
         <option value="">全部分类</option>
+        <option value="document">文档</option>
         <option value="decision">决策</option>
         <option value="preference">偏好</option>
         <option value="constraint">约束</option>
@@ -258,6 +260,29 @@ main { max-width: 1280px; margin: 0 auto; padding: 24px; }
     </div>
     <div id="browseResults"></div>
     <div class="pagination" id="pagination"></div>
+  </div>
+
+  <!-- Documents Tab：部门共享 PDF/DOCX -->
+  <div class="tab" id="tab-docs">
+    <div class="setting-card">
+      <h3>📄 部门共享文档入库</h3>
+      <p style="font-size:0.85rem;color:var(--text2);margin-bottom:12px">
+        上传 PDF / Word(.docx) / Excel(.xlsx/.xls) → 抽文本 → 写入目标命名空间（默认固废部门）。
+        二进制旁路存盘，记忆 <code>memory_type=document</code>。扫描件 PDF 暂不支持 OCR。
+      </p>
+      <div class="setting-row" style="margin-bottom:12px">
+        <label>目标 NS</label>
+        <input type="text" id="docNamespace" value="org/cs-pufa-2nd-thermal/dept/gufei" style="max-width:420px;flex:1">
+      </div>
+      <div class="setting-row" style="margin-bottom:12px">
+        <label>文件</label>
+        <input type="file" id="docFile" accept=".pdf,.docx,.xlsx,.xls,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-excel" style="max-width:420px;flex:1;color:var(--text)">
+      </div>
+      <button type="button" class="btn-save" onclick="uploadDocument()" style="background:var(--accent);color:#fff;font-family:inherit;padding:10px 22px;border:none;border-radius:8px;cursor:pointer;font-weight:600">⬆️ 上传并入库</button>
+      <button type="button" class="btn-ghost" onclick="loadDocuments()" style="margin-left:8px;background:var(--surface);color:var(--text);border:1px solid var(--border);font-family:inherit;padding:10px 16px;border-radius:8px;cursor:pointer">刷新列表</button>
+      <p id="docUploadStatus" style="font-size:0.8rem;color:var(--text2);margin-top:10px"></p>
+    </div>
+    <div id="docsList"></div>
   </div>
 
   <!-- Graph Tab -->

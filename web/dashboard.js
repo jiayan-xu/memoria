@@ -98,8 +98,80 @@ document.querySelectorAll('nav button').forEach(function (btn) {
       if (lab) lab.textContent = currentNs();
     }
     if (btn.dataset.tab === 'browse') loadMemories();
+    if (btn.dataset.tab === 'docs') loadDocuments();
   });
 });
+
+async function uploadDocument() {
+  const status = document.getElementById('docUploadStatus');
+  const fileEl = document.getElementById('docFile');
+  const nsEl = document.getElementById('docNamespace');
+  const file = fileEl && fileEl.files && fileEl.files[0];
+  if (!file) {
+    showToast('请先选择 PDF / DOCX / Excel', 'error');
+    return;
+  }
+  const ns = (nsEl && nsEl.value.trim()) || 'org/cs-pufa-2nd-thermal/dept/gufei';
+  const id = (document.getElementById('authAgentId')?.value || localStorage.getItem(AUTH_KEYS.id) || '').trim();
+  const key = (document.getElementById('authAgentKey')?.value || localStorage.getItem(AUTH_KEYS.key) || '').trim();
+  if (!id || !key) {
+    showToast('请先在顶栏保存 Agent Id / Key', 'error');
+    return;
+  }
+  if (status) status.textContent = '上传解析中…';
+  const fd = new FormData();
+  fd.append('file', file);
+  fd.append('namespace', ns);
+  try {
+    const res = await fetch('/api/documents', {
+      method: 'POST',
+      headers: { 'X-Agent-Id': id, 'X-Agent-Key': key },
+      body: fd
+    });
+    const data = await res.json().catch(function () { return {}; });
+    if (!res.ok) {
+      throw new Error(data.detail || data.message || res.statusText);
+    }
+    if (status) {
+      status.textContent = '已入库：' + (data.filename || file.name) +
+        ' · ns=' + (data.namespace || ns) +
+        ' · 分块=' + (data.chunk_count || 0) +
+        ' · manifest=' + (data.manifest_id || '');
+    }
+    showToast('文档已写入部门记忆', 'success');
+    loadDocuments();
+    loadStats();
+  } catch (e) {
+    if (status) status.textContent = '失败：' + e.message;
+    showToast(e.message, 'error');
+  }
+}
+
+async function loadDocuments() {
+  const box = document.getElementById('docsList');
+  if (!box) return;
+  const ns = (document.getElementById('docNamespace')?.value || '').trim() ||
+    'org/cs-pufa-2nd-thermal/dept/gufei';
+  box.innerHTML = '<div class="empty">加载中…</div>';
+  try {
+    const data = await api('/documents?namespace=' + encodeURIComponent(ns) + '&limit=50');
+    const docs = data.documents || [];
+    if (!docs.length) {
+      box.innerHTML = '<div class="empty"><div class="icon">📄</div>该 NS 暂无文档清单</div>';
+      return;
+    }
+    box.innerHTML = docs.map(function (d) {
+      const preview = (d.content || '').slice(0, 220);
+      return '<div class="memory-card" onclick="openDetail(\'' + escHtml(d.id) + '\')">' +
+        '<div class="meta"><span class="badge badge-importance">document</span>' +
+        '<span>' + escHtml(d.created_at || '') + '</span>' +
+        '<span>' + escHtml(d.raw_ref || '') + '</span></div>' +
+        '<div class="content-preview">' + escHtml(preview) + '</div></div>';
+    }).join('');
+  } catch (e) {
+    box.innerHTML = '<div class="empty"><div class="icon">⚠️</div>' + escHtml(e.message) + '</div>';
+  }
+}
 
 async function loadStats() {
   try {
@@ -198,6 +270,30 @@ function renderMemoryCards(container, items) {
   items.forEach(function (m) { container.appendChild(createMemoryCard(m)); });
 }
 
+/** 详情：走 ?id=（/{id} 动态段在现网 handler 不执行，恒空 404） */
+async function fetchMemoryById(id) {
+  var enc = encodeURIComponent(id);
+  var ns = encodeURIComponent(currentNs());
+  var attempts = [
+    '/memories?id=' + enc,
+    '/memories?namespace=' + ns + '&q=' + enc + '&limit=50'
+  ];
+  var lastErr = null;
+  for (var i = 0; i < attempts.length; i++) {
+    try {
+      var data = await api(attempts[i]);
+      if (data && data.id) return data;
+      if (data && data.memories && data.memories.length) {
+        var hit = data.memories.find(function (m) { return m.id === id; });
+        if (hit) return hit;
+      }
+    } catch (e) {
+      lastErr = e;
+    }
+  }
+  throw lastErr || new Error('Not Found');
+}
+
 async function openDetail(id) {
   if (!id) return;
   const overlay = document.getElementById('modalOverlay');
@@ -205,7 +301,7 @@ async function openDetail(id) {
   content.innerHTML = '<p style="color:var(--text2)">加载中...</p>';
   overlay.classList.add('show');
   try {
-    const m = await api('/memories/' + id);
+    const m = await fetchMemoryById(id);
     var cats = ['decision', 'preference', 'constraint', 'lesson', 'fact', 'conversation'];
     content.innerHTML =
       '<button class="close-btn" onclick="closeModal()" style="position:static;float:right;background:none;border:none;color:var(--text2);font-size:1.3rem;cursor:pointer">✕</button>' +
@@ -237,7 +333,7 @@ function closeModal() {
 
 async function saveMemory(id) {
   try {
-    await api('/memories/' + id, {
+    await api('/memories?id=' + encodeURIComponent(id), {
       method: 'PUT',
       body: JSON.stringify({
         content: document.getElementById('editContent').value,
@@ -256,7 +352,10 @@ async function saveMemory(id) {
 async function deleteMemory(id) {
   if (!confirmDanger('删除记忆 ' + id)) return;
   try {
-    await api('/memories/' + id, { method: 'DELETE', headers: { 'X-Confirm': 'delete-memory' } });
+    await api('/memories?id=' + encodeURIComponent(id), {
+      method: 'DELETE',
+      headers: { 'X-Confirm': 'delete-memory' }
+    });
     closeModal();
     showToast('已删除', 'success');
     loadStats();

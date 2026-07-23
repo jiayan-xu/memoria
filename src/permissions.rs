@@ -68,6 +68,12 @@ pub const PERMISSION_MATRIX: &[Entry] = &[
         note: "写入记忆",
     },
     Entry {
+        tool: "ingest_document",
+        min_role: MinRole::Agent,
+        ns_policy: NsPolicy::NamespaceArg,
+        note: "部门共享：已抽文本的 PDF/DOCX 入库（二进制上传走 HTTP /api/documents）",
+    },
+    Entry {
         tool: "memory",
         min_role: MinRole::Agent,
         ns_policy: NsPolicy::NamespaceArg,

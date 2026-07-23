@@ -4,24 +4,32 @@
 
 use axum::{
     Json, Router,
-    extract::{Extension, Path, Query, Request, State},
+    extract::{Extension, Multipart, Query, Request, State},
     http::StatusCode,
     middleware::{self, Next},
-    response::Response,
+    response::{IntoResponse, Response},
     routing::get,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::HashSet;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::auth::{self, AuthResult};
+use crate::document::{self, DEFAULT_DEPT_NS};
 use crate::storage::SqlitePool;
 
 /// App state shared across web API handlers
 pub struct WebApiState {
     pub pool: SqlitePool,
     pub auth_pool: SqlitePool,
+    /// 文档二进制根目录（通常为 data/，其下 documents/…）
+    pub doc_dir: PathBuf,
+}
+
+fn json_err(status: StatusCode, detail: impl Into<String>) -> Response {
+    (status, Json(json!({ "detail": detail.into() }))).into_response()
 }
 
 /// Auth middleware: 校验 X-Agent-Id / X-Agent-Key
@@ -34,21 +42,23 @@ async fn auth_middleware(
         .headers()
         .get("X-Agent-Id")
         .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
+        .unwrap_or("")
+        .to_string();
     let badge_token = request
         .headers()
         .get("X-Agent-Key")
         .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
+        .unwrap_or("")
+        .to_string();
 
     if agent_id.is_empty() || badge_token.is_empty() {
         return Err(StatusCode::UNAUTHORIZED);
     }
 
-    let auth = auth::authenticate(&state.auth_pool, agent_id, badge_token)
+    let auth = auth::authenticate(&state.auth_pool, &agent_id, &badge_token)
         .map_err(|_| StatusCode::UNAUTHORIZED)?;
 
-    // P1-1 修复：把认证结果注入请求 extensions，供下游 handler 做 NS 授权校验
+    // P1-1：注入认证结果。注意：必须在 next.run 前插入；且勿在持有 headers 借用时插入。
     request.extensions_mut().insert(auth);
     Ok(next.run(request).await)
 }
@@ -59,19 +69,183 @@ pub fn build_web_api_routes(state: Arc<WebApiState>) -> Router {
         .route("/stats", get(api_stats))
         .route("/graph", get(api_graph))
         .route("/decay_timeline", get(api_decay_timeline))
-        .route("/api/memories", get(api_list_memories))
+        // 单条 CRUD 一律走 query ?id=（/{id} 动态段在本服务 merge+layer 下 handler 不执行，见证据）
         .route(
-            "/api/memories/{id}",
-            get(api_get_memory)
+            "/api/memories",
+            get(api_list_memories)
                 .put(api_update_memory)
                 .delete(api_delete_memory),
         )
         .route("/api/relations", get(api_list_relations))
+        .route(
+            "/api/documents",
+            get(api_list_documents).post(api_upload_document),
+        )
         .layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,
         ))
         .with_state(state)
+}
+
+// ── /api/documents ──
+
+#[derive(Deserialize)]
+pub struct DocumentsQuery {
+    namespace: Option<String>,
+    limit: Option<i64>,
+}
+
+/// 列出文档清单（memory_type=document 且 parent_id 为空）
+async fn api_list_documents(
+    State(state): State<Arc<WebApiState>>,
+    Extension(auth): Extension<AuthResult>,
+    Query(q): Query<DocumentsQuery>,
+) -> Result<Json<Value>, StatusCode> {
+    let ns = q
+        .namespace
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .unwrap_or(DEFAULT_DEPT_NS);
+    if !auth::check_ns_access(&auth, ns) {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    let limit = q.limit.unwrap_or(50).clamp(1, 200);
+    let conn = state
+        .pool
+        .get()
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, content, raw_ref, created_at, source, tags
+             FROM memories
+             WHERE namespace = ?1
+               AND memory_type = 'document'
+               AND (parent_id IS NULL OR parent_id = '')
+             ORDER BY created_at DESC
+             LIMIT ?2",
+        )
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let rows = stmt
+        .query_map(rusqlite::params![ns, limit], |r| {
+            Ok(json!({
+                "id": r.get::<_, String>(0)?,
+                "content": r.get::<_, String>(1)?,
+                "raw_ref": r.get::<_, Option<String>>(2)?,
+                "created_at": r.get::<_, Option<String>>(3)?,
+                "source": r.get::<_, Option<String>>(4)?,
+                "tags": r.get::<_, Option<String>>(5)?,
+            }))
+        })
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let mut docs = Vec::new();
+    for row in rows.flatten() {
+        docs.push(row);
+    }
+    Ok(Json(json!({
+        "namespace": ns,
+        "count": docs.len(),
+        "documents": docs,
+        "default_dept_ns": DEFAULT_DEPT_NS,
+    })))
+}
+
+/// multipart: file + namespace(可选，默认固废部门 ns)
+async fn api_upload_document(
+    State(state): State<Arc<WebApiState>>,
+    Extension(auth): Extension<AuthResult>,
+    mut multipart: Multipart,
+) -> Response {
+    let mut namespace = DEFAULT_DEPT_NS.to_string();
+    let mut filename = String::new();
+    let mut content_type: Option<String> = None;
+    let mut bytes: Option<Vec<u8>> = None;
+
+    loop {
+        let field = match multipart.next_field().await {
+            Ok(Some(f)) => f,
+            Ok(None) => break,
+            Err(e) => return json_err(StatusCode::BAD_REQUEST, format!("multipart: {e}")),
+        };
+        let name = field.name().unwrap_or("").to_string();
+        if name == "namespace" {
+            if let Ok(v) = field.text().await {
+                let t = v.trim().to_string();
+                if !t.is_empty() {
+                    namespace = t;
+                }
+            }
+            continue;
+        }
+        if name == "file" || name == "document" {
+            filename = field
+                .file_name()
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| "upload.bin".into());
+            content_type = field.content_type().map(|m| m.to_string());
+            match field.bytes().await {
+                Ok(b) => bytes = Some(b.to_vec()),
+                Err(e) => return json_err(StatusCode::BAD_REQUEST, format!("read file: {e}")),
+            }
+            continue;
+        }
+        // 忽略其它字段
+        let _ = field.bytes().await;
+    }
+
+    let Some(bytes) = bytes else {
+        return json_err(StatusCode::BAD_REQUEST, "缺少 file 字段（PDF/DOCX）");
+    };
+    if !auth::check_ns_access(&auth, &namespace) {
+        return json_err(
+            StatusCode::FORBIDDEN,
+            format!("无权限写入命名空间 {namespace}"),
+        );
+    }
+    let Some(kind) = document::detect_kind(&filename, content_type.as_deref()) else {
+        return json_err(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "仅支持 .pdf / .docx / .xlsx / .xls",
+        );
+    };
+
+    let pool = state.pool.clone();
+    let doc_dir = state.doc_dir.clone();
+    let actor = auth.agent_id.clone();
+    let ns = namespace.clone();
+    let fname = filename.clone();
+    let kind_owned = kind.to_string();
+
+    let result = tokio::task::spawn_blocking(move || {
+        document::ingest_bytes(
+            &pool,
+            &doc_dir,
+            &ns,
+            &fname,
+            &kind_owned,
+            &bytes,
+            &actor,
+        )
+    })
+    .await;
+
+    match result {
+        Ok(Ok(out)) => Json(json!({
+            "status": "ok",
+            "doc_id": out.doc_id,
+            "namespace": out.namespace,
+            "filename": out.filename,
+            "kind": out.kind,
+            "raw_ref": out.raw_ref,
+            "chars": out.chars,
+            "chunk_count": out.chunk_count,
+            "manifest_id": out.manifest_id,
+            "chunk_ids": out.chunk_ids,
+        }))
+        .into_response(),
+        Ok(Err(e)) => json_err(StatusCode::UNPROCESSABLE_ENTITY, e),
+        Err(e) => json_err(StatusCode::INTERNAL_SERVER_ERROR, format!("task: {e}")),
+    }
 }
 
 // ── /stats ──
@@ -544,6 +718,8 @@ pub struct MemoriesQuery {
     tier: Option<String>,
     category: Option<String>,
     q: Option<String>,
+    /// 精确按 id 取单条（规避部分部署上 `/api/memories/{id}` 路由未命中）
+    id: Option<String>,
 }
 
 async fn api_list_memories(
@@ -551,6 +727,16 @@ async fn api_list_memories(
     Extension(auth): Extension<AuthResult>,
     Query(q): Query<MemoriesQuery>,
 ) -> Result<Json<Value>, StatusCode> {
+    // 精确 id：走与详情相同的加载逻辑，供图谱/前端兜底
+    if let Some(ref id) = q.id {
+        let id = id.trim();
+        if !id.is_empty() {
+            return match load_memory_by_id(&state, &auth, id) {
+                Ok(v) => Ok(Json(v)),
+                Err(code) => Err(code),
+            };
+        }
+    }
     let ns = q.namespace.as_deref().unwrap_or("default");
     if !auth::check_ns_access(&auth, ns) {
         return Err(StatusCode::FORBIDDEN);
@@ -636,33 +822,39 @@ async fn api_list_memories(
     Ok(Json(json!({"memories": memories, "total": memories.len()})))
 }
 
-// ── /api/memories/:id ──
-async fn api_get_memory(
-    State(state): State<Arc<WebApiState>>,
-    Extension(auth): Extension<AuthResult>,
-    Path(id): Path<String>,
-) -> Result<Json<Value>, StatusCode> {
+fn load_memory_by_id(
+    state: &WebApiState,
+    auth: &AuthResult,
+    id: &str,
+) -> Result<Value, StatusCode> {
+    let id = id.trim();
+    if id.is_empty() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
     let conn = state
         .pool
         .get()
         .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
-    // P1-1 修复：先取该记忆所属 NS，做授权校验（防 IDOR 跨 NS 读取）
+    // P1-1：先取所属 NS 再授权（防 IDOR）
     let mem_ns: String = conn
-        .query_row("SELECT namespace FROM memories WHERE id = ?1", [&id], |r| {
+        .query_row("SELECT namespace FROM memories WHERE id = ?1", [id], |r| {
             r.get::<_, String>(0)
         })
-        .unwrap_or_default();
-    if !mem_ns.is_empty() && !auth::check_ns_access(&auth, &mem_ns) {
+        .map_err(|e| {
+            eprintln!("[api_get_memory] miss id={:?} len={} err={}", id, id.len(), e);
+            StatusCode::NOT_FOUND
+        })?;
+    if !auth::check_ns_access(auth, &mem_ns) {
         return Err(StatusCode::FORBIDDEN);
     }
-    let result = conn.query_row(
+    conn.query_row(
         "SELECT id, content, category, tier, importance, decay_factor, recall_count, created_at, namespace FROM memories WHERE id = ?1",
-        [&id],
+        [id],
         |r| {
             let id: String = r.get(0)?;
             let content: String = r.get(1)?;
-            let category: String = r.get(2)?;
-            let tier: String = r.get(3)?;
+            let category: String = r.get(2).unwrap_or_default();
+            let tier: String = r.get(3).unwrap_or_else(|_| "warm".to_string());
             let importance: i32 = r.get::<_, i32>(4).unwrap_or(3);
             let decay: f64 = r.get::<_, f64>(5).unwrap_or(1.0);
             let recall: i32 = r.get::<_, i32>(6).unwrap_or(0);
@@ -673,12 +865,12 @@ async fn api_get_memory(
                 "importance": importance, "decay_factor": decay, "recall_count": recall,
                 "created_at": created, "namespace": ns,
             }))
-        }
-    );
-    match result {
-        Ok(memory) => Ok(Json(memory)),
-        Err(_) => Err(StatusCode::NOT_FOUND),
-    }
+        },
+    )
+    .map_err(|e| {
+        eprintln!("[api_get_memory] row map fail id={:?} err={}", id, e);
+        StatusCode::NOT_FOUND
+    })
 }
 
 // ── PUT /api/memories/:id ──
@@ -690,18 +882,27 @@ pub struct UpdateMemoryBody {
     importance: Option<i32>,
 }
 
+#[derive(Deserialize)]
+pub struct MemoryIdQuery {
+    id: String,
+}
+
 async fn api_update_memory(
     State(state): State<Arc<WebApiState>>,
     Extension(auth): Extension<AuthResult>,
-    Path(id): Path<String>,
+    Query(q): Query<MemoryIdQuery>,
     Json(body): Json<UpdateMemoryBody>,
 ) -> Result<Json<Value>, StatusCode> {
+    let id = q.id.trim();
+    if id.is_empty() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
     let conn = state
         .pool
         .get()
         .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
     let mem_ns: String = conn
-        .query_row("SELECT namespace FROM memories WHERE id = ?1", [&id], |r| {
+        .query_row("SELECT namespace FROM memories WHERE id = ?1", [id], |r| {
             r.get(0)
         })
         .map_err(|_| StatusCode::NOT_FOUND)?;
@@ -749,13 +950,17 @@ async fn api_update_memory(
 }
 
 /// P2-5：删除须带二次确认头，防止仪表盘误触 / CSRF 风格单请求删除。
-/// 客户端须发送：`X-Confirm: delete-memory`
+/// 客户端须发送：`X-Confirm: delete-memory`；id 走 query：`DELETE /api/memories?id=`
 async fn api_delete_memory(
     State(state): State<Arc<WebApiState>>,
     Extension(auth): Extension<AuthResult>,
-    Path(id): Path<String>,
+    Query(q): Query<MemoryIdQuery>,
     request: Request,
 ) -> Result<Json<Value>, StatusCode> {
+    let id = q.id.trim();
+    if id.is_empty() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
     let confirm = request
         .headers()
         .get("X-Confirm")
@@ -770,7 +975,7 @@ async fn api_delete_memory(
         .get()
         .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
     let mem_ns: String = conn
-        .query_row("SELECT namespace FROM memories WHERE id = ?1", [&id], |r| {
+        .query_row("SELECT namespace FROM memories WHERE id = ?1", [id], |r| {
             r.get(0)
         })
         .map_err(|_| StatusCode::NOT_FOUND)?;
@@ -779,14 +984,14 @@ async fn api_delete_memory(
     }
 
     let n = conn
-        .execute("DELETE FROM memories WHERE id = ?1", [&id])
+        .execute("DELETE FROM memories WHERE id = ?1", [id])
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     if n == 0 {
         return Err(StatusCode::NOT_FOUND);
     }
     let _ = conn.execute(
         "DELETE FROM memory_relations WHERE source_id = ?1 OR target_id = ?1",
-        [&id],
+        [id],
     );
 
     Ok(Json(json!({"status": "deleted", "id": id})))

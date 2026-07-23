@@ -280,9 +280,11 @@ fn main() {
 
     // ── Web API 路由（替换 Python /stats /graph /decay_timeline）──
     {
+        let doc_dir = memoria_core::document::resolve_doc_root(&db_path);
         let ws = Arc::new(web_api::WebApiState {
             pool: state.pool.clone(),
             auth_pool: state.auth_pool.clone(),
+            doc_dir,
         });
         app = app.merge(web_api::build_web_api_routes(ws));
     }

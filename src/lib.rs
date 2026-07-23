@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 pub mod auth;
 pub mod backup;
+pub mod document;
 pub mod health;
 pub mod quota;
 pub mod search;

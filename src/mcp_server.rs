@@ -318,6 +318,15 @@ pub fn tools_list() -> Vec<serde_json::Value> {
             }),
         ),
         tool(
+            "ingest_document",
+            "部门共享文档入库（已抽文本）：写入 memory_type=document 清单+分块；默认 ns 可为 org/.../dept/...。二进制 PDF/DOCX 请用 HTTP POST /api/documents",
+            serde_json::json!({
+                "text": {"type": "string", "description": "已抽取的文档正文（必填）"},
+                "filename": {"type": "string", "description": "原文件名，如 report.pdf / 制度.docx（必填）"},
+                "namespace": {"type": "string", "description": "目标命名空间；部门共享例：org/cs-pufa-2nd-thermal/dept/gufei"}
+            }),
+        ),
+        tool(
             "memory",
             "写入记忆（memory_remember 薄别名）：支持 supersedes_id / relation / valid_*",
             serde_json::json!({
@@ -1211,6 +1220,46 @@ fn dispatch(
                 }
             };
             body
+        }
+        "ingest_document" => {
+            if let Some(err) = quota_gate(state, ns, memoria_core::quota::KIND_WRITE, &_auth.role) {
+                return err;
+            }
+            let text = args.get("text").and_then(|v| v.as_str()).unwrap_or("");
+            let filename = args
+                .get("filename")
+                .and_then(|v| v.as_str())
+                .unwrap_or("document.txt");
+            if text.trim().is_empty() {
+                return r#"{"status":"error","code":400,"message":"text required"}"#.to_string();
+            }
+            match memoria_core::document::ingest_plain_text(
+                &state.pool,
+                ns,
+                filename,
+                text,
+                &_auth.agent_id,
+            ) {
+                Ok(out) => serde_json::to_string(&serde_json::json!({
+                    "status": "ok",
+                    "doc_id": out.doc_id,
+                    "namespace": out.namespace,
+                    "filename": out.filename,
+                    "kind": out.kind,
+                    "raw_ref": out.raw_ref,
+                    "chars": out.chars,
+                    "chunk_count": out.chunk_count,
+                    "manifest_id": out.manifest_id,
+                    "chunk_ids": out.chunk_ids,
+                }))
+                .unwrap_or_else(|_| {
+                    r#"{"status":"error","message":"serialize"}"#.to_string()
+                }),
+                Err(e) => format!(
+                    r#"{{"status":"error","code":422,"message":"{}"}}"#,
+                    e.replace('"', "'")
+                ),
+            }
         }
         "memory_profile" => {
             // P0-3：profile_bucket 配额（每 ns ≤10/分钟，admin 豁免，见 §14.1 Q3）
