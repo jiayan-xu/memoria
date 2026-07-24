@@ -446,17 +446,24 @@ fn check_hnsw_index(hnsw: &HnswIndex, status: &str) -> CheckResult {
     let duration_ms = start.elapsed().as_millis() as u64;
 
     // 区分首跑（无索引文件，正常）/ 损坏回退（有文件但 load 失败）/ 空索引
+    let ef = hnsw.ef_search();
     let (st, msg) = match (status, count) {
         ("corrupted", _) => (
             "warn",
-            "HNSW 索引损坏已回退空索引 — 语义检索降级".to_string(),
+            format!("HNSW 索引损坏已回退空索引 — 语义检索降级 (ef_search={})", ef),
         ),
-        ("uninitialized", _) => (
+        // ⚠️ 空索引优先判定：无论 status 是什么，count==0 都说明语义检索无结果，
+        //    绝不能报“可用”（原 "uninitialized" 分支会掩盖 0 向量假象）。
+        (_, 0) => (
             "warn",
-            "HNSW 索引未初始化（首次运行）— 语义检索未启用".to_string(),
+            format!("HNSW 索引为空（status={}）— 语义检索无结果，请确认 memory_vectors 已重嵌并重启 memoria (ef_search={})", status, ef),
         ),
-        (_, 0) => ("warn", "HNSW 索引为空 — 语义检索无结果".to_string()),
-        (_, n) => ("pass", format!("{} vectors loaded", n)),
+        // 未初始化但有向量：首次运行从 memory_vectors 重建成功 → 实际可用
+        ("uninitialized", n) => (
+            "pass",
+            format!("HNSW 索引未初始化（首次运行），已从 memory_vectors 重建 {} 条 — 语义检索可用 (ef_search={})", n, ef),
+        ),
+        (_, n) => ("pass", format!("{} vectors loaded; ef_search={}", n, ef)),
     };
     CheckResult {
         name: "hnsw_index".to_string(),
