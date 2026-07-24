@@ -29,12 +29,13 @@
 - `src/mcp_server.rs`ï¼ˆ`ingest_document`ï¼‰
 - `web/index.html` + `web/dashboard.js`
 
-## ÑéÖ¤£¨2026-07-23 ±¾»úÔËÎ¬ÊµÀý£©
+## ï¿½ï¿½Ö¤ï¿½ï¿½2026-07-23 ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Î¬Êµï¿½ï¿½ï¿½ï¿½
 
-- [x] cargo check --bin memoria-server Í¨¹ý
-- [x] release ±à³ö²¢²¿Êðµ½ ops memoria-core/target/release/memoria-server.exe`n- [x] MCP ingest_document ¡ú ns=org/.../dept/gufei status=ok
-- [x] HTTP multipart DOCX upload ¡ú 200£¬aw_ref=documents/...`n- [x] GET /api/documents ¿É¼ûÇåµ¥
-- [x] Web index.html/dashboard.js ÒÑÍ¬²½µ½ ops web/`n
+- [x] cargo check --bin memoria-server Í¨ï¿½ï¿½
+- [x] release ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ ops memoria-core/target/release/memoria-server.exe`n- [x] MCP ingest_document ï¿½ï¿½ ns=org/.../dept/gufei status=ok
+- [x] HTTP multipart DOCX upload ï¿½ï¿½ 200ï¿½ï¿½
+aw_ref=documents/...`n- [x] GET /api/documents ï¿½É¼ï¿½ï¿½åµ¥
+- [x] Web index.html/dashboard.js ï¿½ï¿½Í¬ï¿½ï¿½ï¿½ï¿½ ops web/`n
 
-- [x] Excel .xlsx ³éÎÄ±¾Èë¿â£¨calamine£©+ agent-core/PFAiX ·ÅÐÐ£¨2026-07-23£©
+- [x] Excel .xlsx ï¿½ï¿½ï¿½Ä±ï¿½ï¿½ï¿½â£¨calamineï¿½ï¿½+ agent-core/PFAiX ï¿½ï¿½ï¿½Ð£ï¿½2026-07-23ï¿½ï¿½
 
