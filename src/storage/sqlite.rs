@@ -157,7 +157,7 @@ pub fn init_core_tables(pool: &SqlitePool) -> Result<(), String> {
         CREATE INDEX IF NOT EXISTS idx_rel_source ON memory_relations(source_id);
 
         -- P1-3：向量持久表（embedding 权威存储，跨重启可用）。
-        -- id = 记忆 id（content SHA-256 前 16 位）；vector 以 768×f32 little-endian BLOB 存储。
+        -- id = 记忆 id（content SHA-256 前 16 位）；vector 以 DIM×f32 little-endian BLOB 存储（DIM 见 src/vector/hnsw.rs，当前 1024）。
         -- HNSW 索引在启动时从本表重建，避免 QueryCache 进程内丢失导致近义去重弱化。
         CREATE TABLE IF NOT EXISTS memory_vectors (
             id TEXT PRIMARY KEY,

@@ -2,7 +2,7 @@
 //!
 //! Since hnsw_rs has lifetime constraints that complicate serde,
 //! we save vectors as a flat binary file and rebuild the HNSW
-//! graph on load. For ~10k 768-dim vectors this takes ~1-2s.
+//! graph on load. For ~10k dim vectors this takes ~1-2s.
 
 use hnsw_rs::hnsw::Hnsw;
 use hnsw_rs::prelude::*;
@@ -10,13 +10,13 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::RwLock;
 
-pub const DIM: usize = 768;
+pub const DIM: usize = 1024;
 const DEFAULT_M: usize = 16;
 const DEFAULT_EF_C: usize = 200;
-const DEFAULT_EF_S: usize = 50;
+const DEFAULT_EF_S: usize = 128;
 const MAX_CAPACITY: usize = 1_000_000;
 
-/// A vector entry: String ID + 768-dim embedding.
+/// A vector entry: String ID + dim embedding.
 #[derive(Debug, Clone)]
 pub struct VectorEntry {
     pub id: String,
@@ -118,8 +118,13 @@ impl HnswIndex {
         }
     }
 
+    /// 当前 ef_search（用于 /health 可观测）。
+    pub fn ef_search(&self) -> usize {
+        self.ef_search.read().map(|g| *g).unwrap_or(DEFAULT_EF_S)
+    }
+
     /// Save vectors + id_map to disk.
-    /// Format: binary flat file — [n_vectors][for each: id_len(u32), id_bytes, 768×f32]
+    /// Format: binary flat file — [n_vectors][for each: id_len(u32), id_bytes, DIM×f32]
     /// Plus: JSON index file for fast loading.
     /// The HNSW graph is NOT saved — rebuilt on load.
     pub fn save(&self, path: impl AsRef<Path>) -> Result<(), String> {
@@ -133,7 +138,7 @@ impl HnswIndex {
 
         // Save vectors as binary
         let bin_path = path.as_ref().with_extension("bin");
-        let mut buf: Vec<u8> = Vec::with_capacity(vectors.len() * (4 + 64 + 768 * 4));
+        let mut buf: Vec<u8> = Vec::with_capacity(vectors.len() * (4 + 64 + DIM * 4));
         let n: u32 = vectors.len() as u32;
         buf.extend_from_slice(&n.to_le_bytes());
         for v in vectors.iter() {
@@ -186,14 +191,14 @@ impl HnswIndex {
                     .map_err(|_| "bad id-len slice".to_string())?,
             ) as usize;
             offset += 4;
-            if offset + id_len + 768 * 4 > data.len() {
+            if offset + id_len + DIM * 4 > data.len() {
                 return Err("truncated at vector data".to_string());
             }
             let id = String::from_utf8(data[offset..offset + id_len].to_vec())
                 .map_err(|_| "invalid UTF-8 in ID")?;
             offset += id_len;
-            let mut vector = Vec::with_capacity(768);
-            for _ in 0..768 {
+            let mut vector = Vec::with_capacity(DIM);
+            for _ in 0..DIM {
                 let val = f32::from_le_bytes(
                     data[offset..offset + 4]
                         .try_into()

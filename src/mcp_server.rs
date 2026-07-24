@@ -78,30 +78,66 @@ pub fn spawn_audit_worker(
 ///
 /// 任何错误（未配置 / 服务不可用 / 超时 / 解析失败）均返回 `None` —— 优雅降级，
 /// 不影响既有 FTS5 + temporal + importance + category 信号。绝不抛错、绝不阻塞主链路。
+/// 云端嵌入服务（SiliconFlow）存在偶发超时/限流，故加 3 次重试 + 指数退避 + 更长超时，
+/// 避免单发失败导致语义通道整条查询恒空（本机 text2vec 不会触发，但云端会）。
 async fn embed_query(client: &reqwest::Client, url: &str, query: &str) -> Option<Vec<f32>> {
     let body = serde_json::json!({ "texts": [query] });
-    let resp = client
-        .post(url)
-        .timeout(std::time::Duration::from_secs(5))
-        .json(&body)
-        .send()
-        .await
-        .ok()?;
-    if !resp.status().is_success() {
-        return None;
+    let mut last_err: Option<String> = None;
+    for attempt in 0..3 {
+        if attempt > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(200 * (1 << (attempt - 1)))).await;
+        }
+        let resp = match client
+            .post(url)
+            .timeout(std::time::Duration::from_secs(10))
+            .json(&body)
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                last_err = Some(format!("send#{attempt}: {e}"));
+                continue;
+            }
+        };
+        if !resp.status().is_success() {
+            last_err = Some(format!("http{}", resp.status().as_u16()));
+            continue;
+        }
+        match resp.json::<serde_json::Value>().await {
+            Ok(v) => {
+                let arr = match v.get("embeddings").and_then(|a| a.as_array()) {
+                    Some(a) => a,
+                    None => {
+                        last_err = Some("no embeddings field".into());
+                        continue;
+                    }
+                };
+                let first = match arr.first().and_then(|f| f.as_array()) {
+                    Some(f) => f,
+                    None => {
+                        last_err = Some("embeddings[0] not array".into());
+                        continue;
+                    }
+                };
+                let vec: Vec<f32> = first
+                    .iter()
+                    .filter_map(|x| x.as_f64().map(|f| f as f32))
+                    .collect();
+                if vec.is_empty() {
+                    last_err = Some("empty vec".into());
+                    continue;
+                }
+                return Some(vec);
+            }
+            Err(e) => {
+                last_err = Some(format!("json#{attempt}: {e}"));
+                continue;
+            }
+        }
     }
-    let v: serde_json::Value = resp.json().await.ok()?;
-    let arr = v.get("embeddings")?.as_array()?;
-    let first = arr.first()?.as_array()?;
-    let vec: Vec<f32> = first
-        .iter()
-        .filter_map(|x| x.as_f64().map(|f| f as f32))
-        .collect();
-    if vec.is_empty() {
-        None
-    } else {
-        Some(vec)
-    }
+    eprintln!("[embed_query] FAILED after retries for q={:?}: {:?}", query, last_err);
+    None
 }
 
 /// 构建 axum Router
@@ -857,7 +893,9 @@ async fn handle_tool_call(
     // 导致 semantic_search 的 QueryCache 恒为空、HNSW 那 1174 个向量永不参与融合排序。
     // 此处异步调本地嵌入服务拿到向量写入共享 QueryCache，dispatch 内的 hybrid_search
     // 即可让语义信号真正参与 RRF 融合。未配置 MEMORIA_EMBEDDING_URL 或服务不可用 → 静默降级。
-    if (tool == "memory_search" || tool == "memory_search_v2") && !state.embedding_url.is_empty() {
+    if (tool == "memory_search" || tool == "memory_search_v2" || tool == "memory_recall")
+        && !state.embedding_url.is_empty()
+    {
         if let Some(q) = safe_args.get("query").and_then(|v| v.as_str()) {
             if !q.is_empty() {
                 if let Some(qvec) = embed_query(&state.http_client, &state.embedding_url, q).await {
@@ -1102,6 +1140,9 @@ fn dispatch(
                             "content": truncate(&r.content, 2000),
                             "rrf_score": r.rrf_score,
                             "source": r.source,
+                            "signal_scores": r.signal_scores,
+                            "sem_cos": r.sem_cos,
+                            "kw_bm25": r.kw_bm25,
                             "evolved_at": r.evolved_at,
                             "pending_evolution": r.pending_evolution,
                         })

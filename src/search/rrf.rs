@@ -37,53 +37,81 @@ pub struct FusedResult {
     pub rrf_score: f64,
     pub source: String,
     pub signal_scores: Vec<(String, f64)>,
+    /// A（两阶段重排）：语义通道原始 cosine 相似度（0..1，越大越相关）。
+    pub sem_cos: Option<f64>,
+    /// A（两阶段重排）：关键词通道原始 BM25 幅度（FTS rank 取反，越大越相关）。
+    pub kw_bm25: Option<f64>,
     /// PR4（Phase A 演化）：最近演化时间戳；None=待演化/脏标记。
     pub evolved_at: Option<String>,
     /// PR4：该 tip 是否尚未演化（evolved_at IS NULL）。recall 可据此降权/标注。
     pub pending_evolution: bool,
 }
 
+/// RRF 融合过程中累加的原始信号幅度（供两阶段重排使用）。
+struct Agg {
+    rrf: f64,
+    content: String,
+    source: String,
+    sigs: Vec<(String, f64)>,
+    sem: Option<f64>,
+    kw: Option<f64>,
+}
+
 /// Merge multiple ranked signal lists using RRF.
 pub fn rrf_merge(signals: &[Vec<SignalResult>], weights: &[f64], k: f64) -> Vec<FusedResult> {
-    let mut score_map: HashMap<String, (f64, String, String, Vec<(String, f64)>)> = HashMap::new();
+    let mut score_map: HashMap<String, Agg> = HashMap::new();
 
     for (signal_idx, results) in signals.iter().enumerate() {
         let weight = weights.get(signal_idx).copied().unwrap_or(1.0);
         for (rank, result) in results.iter().enumerate() {
             let rrf = weight / (k + rank as f64 + 1.0);
-            let entry = score_map.entry(result.memory_id.clone());
-            let (current_score, _, _, sigs) = entry.or_insert_with(|| {
-                (
-                    0.0,
-                    result.content.clone(),
-                    result.source.clone(),
-                    Vec::new(),
-                )
-            });
-            *current_score += rrf;
-            // 记录贡献通道（粗粒度），供评测的通道贡献度量使用
             let ch = channel_of(&result.source);
-            if let Some(existing) = sigs.iter_mut().find(|(n, _)| n == &ch) {
+            let entry = score_map.entry(result.memory_id.clone()).or_insert_with(|| Agg {
+                rrf: 0.0,
+                content: result.content.clone(),
+                source: result.source.clone(),
+                sigs: Vec::new(),
+                sem: None,
+                kw: None,
+            });
+            entry.rrf += rrf;
+            // 记录贡献通道（粗粒度），供评测的通道贡献度量使用
+            if let Some(existing) = entry.sigs.iter_mut().find(|(n, _)| n == &ch) {
                 existing.1 += rrf;
             } else {
-                sigs.push((ch, rrf));
+                entry.sigs.push((ch.clone(), rrf));
+            }
+            // 捕获原始幅度（用于 A 两阶段重排）：sem=cosine、kw=BM25 幅度
+            match ch.as_str() {
+                "semantic" => {
+                    if entry.sem.is_none() || result.score > entry.sem.unwrap() {
+                        entry.sem = Some(result.score);
+                    }
+                }
+                "keyword" => {
+                    let mag = -result.score; // FTS rank 为负，取反得正幅度
+                    if entry.kw.is_none() || mag > entry.kw.unwrap() {
+                        entry.kw = Some(mag);
+                    }
+                }
+                _ => {}
             }
         }
     }
 
     let mut fused: Vec<FusedResult> = score_map
         .into_iter()
-            .map(
-                |(memory_id, (rrf_score, content, source, signal_scores))| FusedResult {
-                    memory_id,
-                    content,
-                    rrf_score,
-                    source,
-                    signal_scores,
-                    evolved_at: None,
-                    pending_evolution: false,
-                },
-            )
+        .map(|(memory_id, a)| FusedResult {
+            memory_id,
+            content: a.content,
+            rrf_score: a.rrf,
+            source: a.source,
+            signal_scores: a.sigs,
+            sem_cos: a.sem,
+            kw_bm25: a.kw,
+            evolved_at: None,
+            pending_evolution: false,
+        })
         .collect();
 
     fused.sort_by(|a, b| {
@@ -160,6 +188,8 @@ pub fn graph_expand(
                             rrf_score: result.rrf_score * 0.5 * weight,
                             source: format!("graph_expand_{}", _rel_type),
                             signal_scores: vec![],
+                            sem_cos: None,
+                            kw_bm25: None,
                             evolved_at: None,
                             pending_evolution: false,
                         });

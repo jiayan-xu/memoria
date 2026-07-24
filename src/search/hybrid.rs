@@ -23,31 +23,45 @@ pub fn hybrid_search(
     as_of: Option<&str>,
     include_superseded: bool,
 ) -> Result<Vec<FusedResult>, String> {
-    let fts_limit = max_results * 3;
+    // A+C 配置（均可经 env 覆盖）
+    let recall_depth = env_u32("MEMORIA_RECALL_DEPTH", 50).max(8);
+    let w_keyword = env_f64("MEMORIA_WEIGHT_KEYWORD", 1.0);
+    let w_semantic = env_f64("MEMORIA_WEIGHT_SEMANTIC", 1.0);
+    // A/B 实测（2026-07-24，eval/nl_recall_bench.json + 权重扫描）：
+    // 原 0.2/0.5/0.3（语义主导）→ keyword 通道召回仅 14%（结构性 0% 经 tokenize_for_fts 拆词修复后）。
+    // 修复后扫描发现 kw 提到 0.5 全面最优：整体/semantic/keyword/hybrid recall@10 同步大涨
+    // （28%→53~59% / 35%→55~65% / 14%→43% / 20%→60%），且 semantic 不降反升（语义噪声被压）。
+    // 固化为 0.3/0.2/0.5（rrf/sem/kw）。
+    let rrf_w = env_f64("MEMORIA_RERANK_W_RRF", 0.3);
+    let sem_w = env_f64("MEMORIA_RERANK_W_SEM", 0.2);
+    let kw_w = env_f64("MEMORIA_RERANK_W_KW", 0.5);
+
+    let fts_limit = max_results * 3; // 辅助信号（temporal/importance）检索深度
+    let primary_limit = recall_depth.max(fts_limit); // 主信号（语义/关键词）宽召回深度
     let mut signals: Vec<Vec<SignalResult>> = Vec::new();
     let mut weights: Vec<f64> = Vec::new();
 
-    // S1: Keyword (FTS5 + LIKE)
-    if let Ok(kw) = search::keyword::keyword_search(pool, query, namespace, fts_limit) {
+    // S1: Keyword (FTS5 + LIKE) — 宽召回
+    if let Ok(kw) = search::keyword::keyword_search(pool, query, namespace, primary_limit) {
         if !kw.is_empty() {
             signals.push(kw);
-            weights.push(1.0);
+            weights.push(w_keyword);
         }
     }
 
-    // S2: Semantic (HNSW vector)
+    // S2: Semantic (HNSW vector) — 宽召回
     if let (Some(hnsw), Some(qc)) = (hnsw, query_cache) {
         if let Ok(sem) = search::semantic::semantic_search(
             query,
             namespace,
-            fts_limit,
+            primary_limit,
             Some(hnsw),
             Some(qc),
             Some(pool),
         ) {
             if !sem.is_empty() {
                 signals.push(sem);
-                weights.push(1.0);
+                weights.push(w_semantic);
             }
         }
     }
@@ -172,6 +186,12 @@ pub fn hybrid_search(
     // P2 / M2.1：text_signals 数字/日期重叠加成（可 MEMORIA_TEXT_SIGNALS_RERANK=0 关闭）
     search::text_signals::rerank_by_text_signals(query, &mut unique);
 
+    // A：两阶段重排 — 在宽候选池上用「幅度感知混合分」重排到 max_results。
+    // 第一阶=RRF 位置融合（rrf_merge 完成）；第二阶=对候选池用
+    // 归一化 RRF + 原始 cosine(sem_cos) + 原始 BM25(kw_bm25) 混合重排，显著降误召。
+    // cooccur/text_signals 加成已折入 rrf_score，归一化后相对序保留，不丢前序成果。
+    two_stage_rerank(&mut unique, rrf_w, sem_w, kw_w);
+
     let unique: Vec<FusedResult> = unique.into_iter().take(max_results as usize).collect();
 
     Ok(unique)
@@ -199,5 +219,61 @@ fn pending_downweight() -> f64 {
     match std::env::var("MEMORIA_PENDING_DOWNWEIGHT") {
         Ok(v) => v.trim().parse::<f64>().unwrap_or(1.0).clamp(0.0, 1.0),
         Err(_) => 1.0,
+    }
+}
+
+/// A：两阶段幅度感知重排。
+/// 在 RRF 融合 + cooccur/text_signals 加成之后的宽候选池上，
+/// 用「归一化 RRF + 原始 cosine(sem_cos) + 原始 BM25(kw_bm25)」的混合分重排，
+/// 再交回 `take(max_results)` 截断。cooccur/text_signals 的加成已折入 rrf_score，
+/// 归一化后相对序保留，故不丢失前序重排成果。
+fn two_stage_rerank(results: &mut Vec<FusedResult>, w_rrf: f64, w_sem: f64, w_kw: f64) {
+    if results.is_empty() {
+        return;
+    }
+    let rrf_max = results.iter().map(|r| r.rrf_score).fold(0.0_f64, f64::max);
+    let sem_max = results
+        .iter()
+        .map(|r| r.sem_cos.unwrap_or(0.0))
+        .fold(0.0_f64, f64::max);
+    let kw_max = results
+        .iter()
+        .map(|r| r.kw_bm25.unwrap_or(0.0))
+        .fold(0.0_f64, f64::max);
+    for r in results.iter_mut() {
+        let rrf_n = if rrf_max > 0.0 { r.rrf_score / rrf_max } else { 0.0 };
+        let sem_n = if sem_max > 0.0 {
+            r.sem_cos.unwrap_or(0.0) / sem_max
+        } else {
+            0.0
+        };
+        let kw_n = if kw_max > 0.0 {
+            r.kw_bm25.unwrap_or(0.0) / kw_max
+        } else {
+            0.0
+        };
+        r.rrf_score = w_rrf * rrf_n + w_sem * sem_n + w_kw * kw_n;
+        if !r.source.contains("rerank2") {
+            r.source = format!("{};rerank2", r.source);
+        }
+    }
+    results.sort_by(|a, b| {
+        b.rrf_score
+            .partial_cmp(&a.rrf_score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+}
+
+fn env_f64(key: &str, default: f64) -> f64 {
+    match std::env::var(key) {
+        Ok(v) => v.trim().parse::<f64>().unwrap_or(default),
+        Err(_) => default,
+    }
+}
+
+fn env_u32(key: &str, default: u32) -> u32 {
+    match std::env::var(key) {
+        Ok(v) => v.trim().parse::<u32>().unwrap_or(default),
+        Err(_) => default,
     }
 }

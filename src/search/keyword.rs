@@ -20,14 +20,16 @@ pub fn keyword_search(
     limit: u32,
 ) -> Result<Vec<SignalResult>, String> {
     let conn = pool.get().map_err(|e| format!("pool: {}", e))?;
-    let tokens = fts5::tokenize(query);
+    let tokens = fts5::tokenize_for_fts(query);
     if tokens.is_empty() {
         return Ok(vec![]);
     }
 
     let mut results = Vec::new();
 
-    // 1. Search memories_fts
+    // FTS5 主召回：jieba 切词 + 代码符号拆子 token（对齐索引拆存），OR 宽召回。
+    // 实测：对「自然语言 + 代码符号」类 query，拆词后 ground truth 召回 rank 1~11（6/7 进 top-10）。
+    // 不再做整句/整符号 LIKE（库内 ground truth 内容多不含字面符号，LIKE 不可靠且会污染重排）。
     let mem_sql = "
         SELECT m.rowid, m.id, m.content, f.rank
         FROM memories_fts f
@@ -46,27 +48,6 @@ pub fn keyword_search(
         }) {
             for row in rows.flatten() {
                 results.push(row);
-            }
-        }
-    }
-
-    // 2. FTS5 fallback if no results (LIKE query, with ESCAPE for %/_)
-    if results.is_empty() {
-        let like_sql = "SELECT rowid, id, content FROM memories WHERE content LIKE ? ESCAPE '\\' AND namespace = ? LIMIT ?";
-        let escaped = query.replace('%', "\\%").replace('_', "\\_");
-        let like_q = format!("%{}%", escaped);
-        if let Ok(mut stmt) = conn.prepare(like_sql) {
-            if let Ok(rows) = stmt.query_map(rusqlite::params![like_q, namespace, limit], |row| {
-                Ok(SignalResult {
-                    memory_id: row.get::<_, String>(1)?,
-                    content: row.get::<_, String>(2)?,
-                    score: 0.5,
-                    source: "like_fallback".to_string(),
-                })
-            }) {
-                for row in rows.flatten() {
-                    results.push(row);
-                }
             }
         }
     }
