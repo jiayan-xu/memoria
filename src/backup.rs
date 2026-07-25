@@ -348,19 +348,24 @@ pub struct BackupResult {
     pub integrity_ok: bool,
     pub rotation_deleted: usize,
     pub tier: String, // "daily" | "weekly" | "monthly"
+    /// 审计/鉴权库 (audit.db) 是否一并备份成功（A 修复：此前自动/MCP 备份漏掉它）
+    pub audit_backed_up: bool,
 }
 
-/// 执行一次完整备份（SQLite + HNSW 索引）
+/// 执行一次完整备份（SQLite + HNSW 索引 + 审计库）
 ///
 /// - `pool`: SQLite 连接池
 /// - `_db_path`: 主数据库路径（用于推断备份位置，备份目录由 backup_dir 指定）
 /// - `backup_dir`: 备份根目录 (如 "data/backups")
 /// - `vector_index_path`: HNSW 向量索引路径 (如 "data/vector_index/hnsw_vectors")
+/// - `auth_db_path`: 审计/鉴权库路径 (audit.db)；若提供且存在，则一并 VACUUM INTO 备份
+///   （与主库同时间戳、同 tier 目录，随 GFS 轮转一起清理）。
 pub fn perform_backup(
     pool: &SqlitePool,
     _db_path: &str,
     backup_dir: &str,
     vector_index_path: Option<&str>,
+    auth_db_path: Option<&str>,
 ) -> Result<BackupResult, String> {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -402,6 +407,24 @@ pub fn perform_backup(
         .map(|m| m.len())
         .unwrap_or(0);
 
+    // === 审计/鉴权库备份 (A 修复：此前自动 + MCP 备份漏掉 audit.db) ===
+    // audit.db 独立存放分身注册表(agent_registry)与审计历史；直接用 vacuum_into
+    // 按路径打开做一致性快照，与主库同时间戳、同 tier 目录，随 GFS 轮转一并清理。
+    let mut audit_backed_up = false;
+    if let Some(auth_db) = auth_db_path {
+        if Path::new(auth_db).exists() {
+            let audit_dst = tier_dir.join(format!("audit_{}.db", timestamp));
+            if vacuum_into(auth_db, &audit_dst.to_string_lossy()).is_ok() {
+                audit_backed_up = true;
+            } else {
+                eprintln!(
+                    "[Memoria][backup] WARN: audit.db VACUUM INTO failed ({}); main backup still intact.",
+                    auth_db
+                );
+            }
+        }
+    }
+
     // === HNSW 向量索引复制 ===
     if let Some(vec_path) = vector_index_path {
         let vec_src = Path::new(vec_path);
@@ -438,6 +461,7 @@ pub fn perform_backup(
         integrity_ok,
         rotation_deleted,
         tier: tier.to_string(),
+        audit_backed_up,
     })
 }
 

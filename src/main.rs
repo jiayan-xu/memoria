@@ -283,6 +283,7 @@ fn main() {
         db_path: db_path.clone(),
         backup_dir: backup_dir.clone(),
         vec_index_path: vec_path.to_string_lossy().to_string(),
+        auth_db_path: auth_db_path.clone(),
         audit_tx,
     });
     let mut app = mcp_server::build_app(state.clone());
@@ -324,6 +325,7 @@ fn main() {
     let backup_db_path = db_path.clone();
     let backup_dir_clone = backup_dir.clone();
     let backup_vec_path = vec_path.to_string_lossy().to_string();
+    let backup_auth_path = auth_db_path.clone();
     tokio::spawn(async move {
         // 启动后先等 60 秒，让服务稳定
         tokio::time::sleep(std::time::Duration::from_secs(60)).await;
@@ -333,14 +335,16 @@ fn main() {
             &backup_db_path,
             &backup_dir_clone,
             Some(&backup_vec_path),
+            Some(&backup_auth_path),
         ) {
             Ok(r) => println!(
-                "[Memoria] Auto-backup: {} ({} MB, integrity={}, deleted={}, tier={})",
+                "[Memoria] Auto-backup: {} ({} MB, integrity={}, deleted={}, tier={}, audit={})",
                 r.backup_path,
                 r.db_size_bytes / 1048576,
                 r.integrity_ok,
                 r.rotation_deleted,
-                r.tier
+                r.tier,
+                r.audit_backed_up
             ),
             Err(e) => eprintln!("[Memoria] Auto-backup FAILED: {}", e),
         }
@@ -353,14 +357,16 @@ fn main() {
                 &backup_db_path,
                 &backup_dir_clone,
                 Some(&backup_vec_path),
+                Some(&backup_auth_path),
             ) {
                 Ok(r) => println!(
-                    "[Memoria] Auto-backup: {} ({} MB, integrity={}, deleted={}, tier={})",
+                    "[Memoria] Auto-backup: {} ({} MB, integrity={}, deleted={}, tier={}, audit={})",
                     r.backup_path,
                     r.db_size_bytes / 1048576,
                     r.integrity_ok,
                     r.rotation_deleted,
-                    r.tier
+                    r.tier,
+                    r.audit_backed_up
                 ),
                 Err(e) => eprintln!("[Memoria] Auto-backup FAILED: {}", e),
             }

@@ -41,6 +41,8 @@ pub struct AppState {
     pub db_path: String,
     pub backup_dir: String,
     pub vec_index_path: String,
+    /// 审计/鉴权库路径 (audit.db)，供 `memory_backup` 一并备份（A 修复：此前自动/MCP 备份漏掉它）
+    pub auth_db_path: String,
     /// P2-12：审计事件有界通道（背压）。落库 worker 在 main.rs 启动。
     pub audit_tx: tokio::sync::mpsc::Sender<AuditEvent>,
 }
@@ -2215,14 +2217,16 @@ fn dispatch(
                 &state.db_path,
                 &state.backup_dir,
                 Some(&state.vec_index_path),
+                Some(&state.auth_db_path),
             ) {
                 Ok(r) => format!(
-                    r#"{{"status":"ok","backup_path":"{}","size_mb":{},"integrity_ok":{},"rotation_deleted":{},"tier":"{}"}}"#,
+                    r#"{{"status":"ok","backup_path":"{}","size_mb":{},"integrity_ok":{},"rotation_deleted":{},"tier":"{}","audit_backed_up":{}}}"#,
                     r.backup_path,
                     r.db_size_bytes / 1048576,
                     r.integrity_ok,
                     r.rotation_deleted,
-                    r.tier
+                    r.tier,
+                    r.audit_backed_up
                 ),
                 Err(e) => format!(r#"{{"status":"error","message":"{}"}}"#, e),
             }
@@ -2798,6 +2802,7 @@ mod tests {
             db_path: ":memory:".to_string(),
             backup_dir: ".".to_string(),
             vec_index_path: ":memory:".to_string(),
+            auth_db_path: "audit.db".to_string(),
             audit_tx,
         })
     }
