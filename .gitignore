@@ -72,3 +72,7 @@ eval/hyde_on.json
 !eval/A+C_implementation_report.md
 !eval/recall_rate_report.md
 !eval/hyde_eval_report.md
+
+# 召回回归守护生成物（运行期趋势日志，不入库）
+recall_trend.csv
+recall_guard_detail.json
