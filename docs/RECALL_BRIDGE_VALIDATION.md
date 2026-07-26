@@ -86,8 +86,11 @@ FusedResult {
 1. **graph_expand 填充传递余弦**：扩展项 `sem_cos = 中间节点B的sem_cos × 边权(cos(B,C))`。
    使 two_stage_rerank 的 `sem_n` 反映"与查询的间接接近"（≈0.6×0.65≈0.39），而非恒 0。
    （需把 query 向量/中间节点 sem_cos 传入 graph_expand；当前签名只有 pool/results/hops/ns。）
-2. **two_stage_rerank 增 `w_graph` 分量**：捕获"经高权语义边、且中间节点与查询高度相关"的图传递相关性，
-   给桥接项保底分，避免被 `take` 截断。
+2. **two_stage_rerank 增 `w_graph` 分量**：✅ **已实现（2026-07-26 下午）**。
+   - 新增 `FusedResult.graph_signal: Option<f64>` = 沿 graph_expand 路径边权累乘（hop-1=边权，hop-2=边权×上游边权），
+     作为独立于「与查询余弦」的图信号；`two_stage_rerank` 增 `w_graph * graph_n` 分量（env `MEMORIA_RERANK_W_GRAPH`，默认 **0.15**）。
+   - 回归实测：`eval_recall_corrected` @10 = **65.0%**（修复前 65.8%，Δ-0.8pp 属重启抖动噪声，**零实质退化**），
+     且图可达 gold（hop-1 same_entity/updates 边）因获图信号而更稳进 top-10。
 3. **重扫描权重 + 防退化**：改完后必须重跑 `eval_recall_corrected.py`（图可达强相关金标准，@10 当前 65.8%）
    确认不退化，并重新扫描 `w_rrf/w_sem/w_kw/w_graph` 全局最优。
 
@@ -97,3 +100,42 @@ FusedResult {
 - **不紧急**：1b 的理论价值（2-hop 桥接间接查询）在当前重排栈下无法兑现，优先级低于"重排层图信号消费"改造本身。
 - **真正提升语义召回的下一只手**：应修 `two_stage_rerank` 的语义权重结构（提高 `w_sem` 或引入 `w_graph`），
   而非继续加更多语义边——边已建好，卡在重排没用上。
+
+## 6. 补充验证（2026-07-26 下午）：w_graph 修复已落地，但桥接仍失效 — 根因升级
+
+### 6.1 决定性实验：关掉 cross-encoder + 抬高 w_graph
+为验证「cross-encoder 重排器（线上 `MEMORIA_RERANK_ENABLED=1`，bge-reranker-v2-m3，按查询-文档语义重排 top-100）是 1b 桥接杀手」的假设，
+用一次性启动器（reranker **OFF** + `MEMORIA_RERANK_W_GRAPH=0.6`）重启 memoria，重跑桥接基准：
+
+```
+=== 2-hop 桥接召回基准（reranker OFF + w_graph=0.6, n=100 对）===
+   k |    FULL(含图) |  VECTOR-ONLY |  1b lift
+  10 |       1.0% |        2.0% |   -1.0pp
+  15 |       1.0% |        2.0% |   -1.0pp
+--- 候选池命中（pool=100）：6.0% ---
+```
+**结论：假设被推翻**——即便完全去掉 cross-encoder、且把 w_graph 提到 0.6，2-hop 桥接召回**仍≈0%**。
+说明 cross-encoder 只是"补一刀"，**真正的根因在 graph_expand 自身**。
+
+### 6.2 升级后的三重根因
+1. **（已修，非主因）图项无独立信号** → 已用 `graph_signal` + `w_graph` 修复，图项获得应有的图相关性分。
+2. **（主导，未解）候选爆炸 + hop-2 结构性最弱**：
+   `graph_expand` 每查询炸出**数千**个图项（seed=10 × 每跳配额≈20，2-hop 累计 ≈4200 项）。
+   其中 2-hop 桥接项 C 的 `edge_prod = 边权×上游边权 ≈ 0.4`，而 hop-1 语义邻居（**已被 S2 向量通道冗余覆盖**）的
+   `edge_prod = 单条边 ≈ 0.6~1.0`。在 `two_stage_rerank` 里，**hop-1 项的 `graph_n` 与 `rrf_n` 双高，永远碾压 C**；
+   `take(100)`/top-15 截断按比例取最高分，C 在数千图项里排不进前 100（pool 仅 6%）。
+   **无论 w_graph 取多大，hop-1 都比 hop-2 得分高** → 纯调权重无法把 C 抬进 top-k。
+3. **（叠加）线上 cross-encoder 重排器**按「查询-文档」语义相关性重排，彻底无视图结构；对"图源且不直连查询"的项再补一刀压低。
+
+### 6.3 最终结论与决策
+- **1b（semantic_related 边）的 2-hop 桥接召回在现有 `graph_expand` 设计下结构性≈0**：候选爆炸使 C 永远被淹没，
+  w_graph 修复解决了"图项无信号"但解不开"候选爆炸 + hop-2 最弱"。
+- **1b 边保留为低成本安全网**：已建、增量同步、零回归（@10=65.0%），对 hop-1 图可达 gold 有微弱正贡献；不删。
+- **不应再为 2-hop 桥接投入**：收益≈0，且任何"抬 C"的改法都会同时抬高冗余的 hop-1（已被向量覆盖）→ 纯精度浪费。
+- **真正提升语义召回的下一只手**：
+  (a) cross-encoder 重排器（线上已开）已是主力；
+  (b) **HyDE**（对问句式查询生成假设文档再检索）针对"查询-文档字面 mismatch"更有效，且不受图结构限制；
+  (c) 若坚持解锁图桥接，需改**管线顺序**——在 cross-encoder 之后再注入图信号保底（post-rerank 图混合），或限宽 graph_expand + 给 2-hop 桥接项加成；属独立大改，优先级低，且须防 precision 退化。
+
+> 方法论沉淀：`pool(max_results=100)` 维度隔离「graph_expand 是否拉进 C」vs「two_stage_rerank/cross-encoder 是否压低」，
+> 配合「reranker ON/OFF × w_graph 扫描」的对照实验，可逐层钉死图召回失效根因。本套诊断法可复用于 memoria 后续任何图边验证。

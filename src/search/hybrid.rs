@@ -316,6 +316,13 @@ fn two_stage_rerank(results: &mut Vec<FusedResult>, w_rrf: f64, w_sem: f64, w_kw
         .iter()
         .map(|r| r.kw_bm25.unwrap_or(0.0))
         .fold(0.0_f64, f64::max);
+    // 1b 修复：图传递相关性分量（graph_signal）。默认 0.15 给图扩展项保底分，
+    // 抵消此前 sem_n/kw_n=0 导致的静默压低；由 MEMORIA_RERANK_W_GRAPH 配置。
+    let graph_max = results
+        .iter()
+        .map(|r| r.graph_signal.unwrap_or(0.0))
+        .fold(0.0_f64, f64::max);
+    let w_graph = env_f64("MEMORIA_RERANK_W_GRAPH", 0.15);
     // F1b：频率 + 新鲜度分量（env 可调权重，默认 0.1；为 0 时退化为现状）
     let w_freq = env_f64("MEMORIA_RERANK_W_FREQ", 0.1);
     let w_rec = env_f64("MEMORIA_RERANK_W_REC", 0.1);
@@ -334,6 +341,11 @@ fn two_stage_rerank(results: &mut Vec<FusedResult>, w_rrf: f64, w_sem: f64, w_kw
         } else {
             0.0
         };
+        let graph_n = if graph_max > 0.0 {
+            r.graph_signal.unwrap_or(0.0) / graph_max
+        } else {
+            0.0
+        };
         // F1b：频率饱和（access_count/(access_count+K)）+ 新鲜度指数衰减（按 last_recalled 距今年化）
         let c = r.access_count as f64;
         let freq_n = c / (c + k_freq);
@@ -347,8 +359,9 @@ fn two_stage_rerank(results: &mut Vec<FusedResult>, w_rrf: f64, w_sem: f64, w_kw
             }
             None => 0.5,
         };
-        r.rrf_score =
-            w_rrf * rrf_n + w_sem * sem_n + w_kw * kw_n + w_freq * freq_n + w_rec * recency_n;
+        r.rrf_score = w_rrf * rrf_n + w_sem * sem_n + w_kw * kw_n
+            + w_graph * graph_n
+            + w_freq * freq_n + w_rec * recency_n;
         if !r.source.contains("rerank2") {
             r.source = format!("{};rerank2", r.source);
         }

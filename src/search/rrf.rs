@@ -41,6 +41,9 @@ pub struct FusedResult {
     pub sem_cos: Option<f64>,
     /// A（两阶段重排）：关键词通道原始 BM25 幅度（FTS rank 取反，越大越相关）。
     pub kw_bm25: Option<f64>,
+    /// 1b 修复：图传递相关性信号（沿 graph_expand 路径边权累乘，0..1）。None=非图扩展项。
+    /// 独立于「与查询余弦」，供 two_stage_rerank 的 w_graph 分量使用，避免图项被静默压低。
+    pub graph_signal: Option<f64>,
     /// PR4（Phase A 演化）：最近演化时间戳；None=待演化/脏标记。
     pub evolved_at: Option<String>,
     /// PR4：该 tip 是否尚未演化（evolved_at IS NULL）。recall 可据此降权/标注。
@@ -127,6 +130,7 @@ pub fn rrf_merge(signals: &[Vec<SignalResult>], weights: &[f64], k: f64) -> Vec<
                 signal_scores: sigs,
                 sem_cos: a.sem,
                 kw_bm25: a.kw,
+                graph_signal: None,
                 evolved_at: None,
                 pending_evolution: false,
                 primary_channel,
@@ -218,17 +222,17 @@ pub fn graph_expand(
     let mut seen_ids: std::collections::HashSet<String> =
         results.iter().map(|r| r.memory_id.clone()).collect();
 
-    // 初始 frontier = top seed_n 种子
-    let mut frontier: Vec<(String, f64)> = results
+    // 初始 frontier = top seed_n 种子；edge_prod=1.0（种子本身非图扩展项，不参与图信号）
+    let mut frontier: Vec<(String, f64, f64)> = results
         .iter()
         .take(seed_n)
-        .map(|r| (r.memory_id.clone(), r.rrf_score))
+        .map(|r| (r.memory_id.clone(), r.rrf_score, 1.0))
         .collect();
 
     for hop in 1..=max_hops {
-        let mut next_frontier: Vec<(String, f64)> = Vec::new();
+        let mut next_frontier: Vec<(String, f64, f64)> = Vec::new();
         let hop_factor = decay.powi(hop as i32);
-        for (fid, _fscore) in &frontier {
+        for (fid, _fscore, fedge) in &frontier {
             let mut type_count: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
             let pickup = (fanout * 3).max(20);
             let hop_sql = format!(
@@ -279,6 +283,10 @@ pub fn graph_expand(
                             }
                             *cnt += 1;
                             let score = seed_rrf_max * hop_factor * weight.abs().max(0.1);
+                            // 1b 修复：图传递相关性 = 沿路径边权累乘（hop-1=边权；hop-2=边权×上游边权）。
+                            // 作为独立于「与查询余弦」的图信号，供 two_stage_rerank 的 w_graph 分量使用，
+                            // 避免图扩展项在重排里 sem_n/kw_n=0 被静默压低（此前 1b 边零收益的根因）。
+                            let edge_prod = *fedge * weight.abs();
                             expanded.push(FusedResult {
                                 memory_id: target_id.clone(),
                                 content,
@@ -287,6 +295,7 @@ pub fn graph_expand(
                                 signal_scores: vec![],
                                 sem_cos: None,
                                 kw_bm25: None,
+                                graph_signal: Some(edge_prod),
                                 evolved_at: None,
                                 pending_evolution: false,
                                 primary_channel: Some("graph_expand".to_string()),
@@ -299,7 +308,7 @@ pub fn graph_expand(
                                 last_recalled: None,
                                 time_status: None,
                             });
-                            next_frontier.push((target_id, score));
+                            next_frontier.push((target_id, score, edge_prod));
                         }
                     }
                 }
