@@ -95,9 +95,10 @@ fn load_memory_entities(
   }
   let conn = pool.get().ok()?;
   let ph = vec!["?"; memory_ids.len()].join(",");
-  let sql = format!(
+    let sql = format!(
     "SELECT memory_id, entity_id FROM entity_mentions \
-     WHERE namespace = ?1 AND memory_id IN ({})",
+     WHERE namespace = ?1 AND memory_id IN ({}) \
+     AND entity_id NOT IN (SELECT id FROM entities WHERE name = '')",
     ph
   );
   let mut stmt = conn.prepare(&sql).ok()?;

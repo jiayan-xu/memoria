@@ -2788,7 +2788,12 @@ fn dispatch(
                 .get("entity_type")
                 .and_then(|v| v.as_str())
                 .unwrap_or("other");
-            let name = args.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            let name_raw = args.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            let name_trimmed = name_raw.trim();
+            if name_trimmed.is_empty() {
+                return format!(r#"{{"status":"error","message":"empty entity name rejected"}}"#);
+            }
+            let name = name_trimmed.to_string();
             let aliases = args.get("aliases").and_then(|v| v.as_str()).unwrap_or("[]");
             let summary = args.get("summary").and_then(|v| v.as_str()).unwrap_or("");
             let conn = match state.pool.get() {

@@ -229,6 +229,8 @@ pub fn graph_expand(
         let mut next_frontier: Vec<(String, f64)> = Vec::new();
         let hop_factor = decay.powi(hop as i32);
         for (fid, _fscore) in &frontier {
+            let mut type_count: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+            let pickup = (fanout * 3).max(20);
             let hop_sql = format!(
                 "SELECT r.neighbor_id, r.weight, r.relation_type, m.content
                  FROM (
@@ -239,8 +241,16 @@ pub fn graph_expand(
                      FROM memory_relations WHERE target_id = ? AND namespace = ?
                  ) r
                  LEFT JOIN memories m ON r.neighbor_id = m.id
+                 WHERE r.weight > 0
+                 ORDER BY
+                   CASE r.relation_type
+                     WHEN 'semantic_related' THEN 0
+                     WHEN 'updates' THEN 1
+                     WHEN 'same_entity' THEN 2
+                     ELSE 3 END,
+                   r.weight DESC
                  LIMIT {}",
-                fanout
+                pickup
             );
             if let Ok(mut stmt) = conn.prepare(&hop_sql) {
                 if let Ok(rows) = stmt.query_map(
@@ -256,6 +266,18 @@ pub fn graph_expand(
                     for row in rows.flatten() {
                         let (target_id, weight, rel_type, content) = row;
                         if seen_ids.insert(target_id.clone()) {
+                            let cap: usize = match rel_type.as_str() {
+                                "semantic_related" => 6,
+                                "same_entity" => 4,
+                                "updates" => 8,
+                                "chronological" => 2,
+                                _ => 2,
+                            };
+                            let cnt = type_count.entry(rel_type.clone()).or_insert(0);
+                            if *cnt >= cap {
+                                continue;
+                            }
+                            *cnt += 1;
                             let score = seed_rrf_max * hop_factor * weight.abs().max(0.1);
                             expanded.push(FusedResult {
                                 memory_id: target_id.clone(),
