@@ -5,6 +5,7 @@ pub mod importance;
 pub mod keyword;
 pub mod rrf;
 pub mod semantic;
+pub mod semantic_edges;
 pub mod temporal;
 
 // Re-exports for use by lib.rs

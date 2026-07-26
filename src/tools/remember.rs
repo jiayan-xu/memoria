@@ -309,6 +309,10 @@ pub fn remember_with_dedup(
                             vector: qv.clone(),
                         }]);
                     }
+                    // 增量补 semantic_related 边（闭环 Phase 1b）
+                    let _ = crate::search::semantic_edges::upsert_semantic_edges_for(
+                        pool, hnsw_idx, &mem_id, namespace, qv,
+                    );
                 }
             }
 
@@ -333,21 +337,25 @@ pub fn remember_with_dedup(
                 rusqlite::params![tags_safe, mem_id],
             );
         }
-        if near_dup_enabled() {
-            if let (Some(hnsw_idx), Some(qv)) = (hnsw, &candidate_vector) {
-                if crate::vector::persist::get_stored_vector(pool, &mem_id).is_none() {
-                    let _ = crate::vector::persist::put_stored_vector(pool, &mem_id, namespace, qv);
-                    let _ = hnsw_idx.add(&[VectorEntry {
-                        id: mem_id.clone(),
-                        vector: qv.clone(),
-                    }]);
+            if near_dup_enabled() {
+                if let (Some(hnsw_idx), Some(qv)) = (hnsw, &candidate_vector) {
+                    if crate::vector::persist::get_stored_vector(pool, &mem_id).is_none() {
+                        let _ = crate::vector::persist::put_stored_vector(pool, &mem_id, namespace, qv);
+                        let _ = hnsw_idx.add(&[VectorEntry {
+                            id: mem_id.clone(),
+                            vector: qv.clone(),
+                        }]);
+                    }
+                    // 增量补 semantic_related 边（闭环 Phase 1b）
+                    let _ = crate::search::semantic_edges::upsert_semantic_edges_for(
+                        pool, hnsw_idx, &mem_id, namespace, qv,
+                    );
                 }
             }
-        }
 
-        return Ok(RememberResult {
-            id: mem_id,
-            action: "updated_exact".to_string(),
+            return Ok(RememberResult {
+                id: mem_id,
+                action: "updated_exact".to_string(),
             ..Default::default()
         });
     }
@@ -486,6 +494,10 @@ pub fn remember_with_dedup(
                 id: mem_id.clone(),
                 vector: qv.clone(),
             }]);
+            // 增量补 semantic_related 边（闭环 Phase 1b）
+            let _ = crate::search::semantic_edges::upsert_semantic_edges_for(
+                pool, hnsw_idx, &mem_id, namespace, qv,
+            );
         }
     }
 
