@@ -62,8 +62,13 @@ eval/restart_*.py
 eval/start_*.py
 eval/sweep_*.py
 eval/validate_recall_bm25.py
+# HyDE A/B 评测派生数据（含记忆内容样本 / 派生结果，不入库）
+eval/hyde_queries.json
+eval/hyde_off.json
+eval/hyde_on.json
 # 保留已提交的金标准评测与方案/实现文档
 !eval/eval_recall_corrected.py
 !eval/polish_plan_2026-07-25.md
 !eval/A+C_implementation_report.md
 !eval/recall_rate_report.md
+!eval/hyde_eval_report.md
