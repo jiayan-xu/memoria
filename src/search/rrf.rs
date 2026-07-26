@@ -163,72 +163,129 @@ fn channel_of(source: &str) -> String {
     }
 }
 
-/// 2-hop graph expansion via memory_relations table.
+/// 2-hop（可配置 max_hops）graph expansion via memory_relations table。
+///
+/// 真 BFS：以 top-N 融合结果为种子，逐跳沿 memory_relations 双向扩展至 max_hops 跳。
+/// 计分：hop-h 邻居 = `seed_rrf_max * decay^h * max(weight, 0.1)`，使图邻居以足够分数进入
+/// rerank 候选池（最终排序由 cross-encoder reranker 决定，图扩展只负责「拉入」而非「排序」）。
+///
+/// 开关（均可选 env 覆盖）：
+/// - MEMORIA_GRAPH_HOPS : 覆盖传入 max_hops（0=关闭图扩展，退化为纯向量/关键词召回）。
+/// - MEMORIA_GRAPH_SEED : 种子数（默认 10，原硬编码 5）。
+/// - MEMORIA_GRAPH_DECAY: 每跳衰减（默认 0.5）。
+/// - MEMORIA_GRAPH_FANOUT: 每个节点的邻居上限（默认 10）。
 pub fn graph_expand(
     pool: &SqlitePool,
     results: &[FusedResult],
-    _max_hops: u32,
+    max_hops: u32,
     namespace: &str,
 ) -> Result<Vec<FusedResult>, String> {
     if results.is_empty() {
         return Ok(vec![]);
     }
+    // MEMORIA_GRAPH_HOPS 覆盖传入 max_hops（0=关闭图扩展）
+    let cfg_hops = std::env::var("MEMORIA_GRAPH_HOPS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok());
+    let max_hops = cfg_hops.unwrap_or(max_hops).min(3);
+    if max_hops == 0 {
+        return Ok(vec![]);
+    }
+    let seed_n = std::env::var("MEMORIA_GRAPH_SEED")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .unwrap_or(10)
+        .max(1) as usize;
+    let decay = std::env::var("MEMORIA_GRAPH_DECAY")
+        .ok()
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .unwrap_or(0.5)
+        .clamp(0.05, 0.95);
+    let fanout = std::env::var("MEMORIA_GRAPH_FANOUT")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .unwrap_or(10)
+        .max(1) as usize;
 
     let conn = pool.get().map_err(|e| format!("pool: {}", e))?;
-    let mut expanded = Vec::new();
+    let seed_rrf_max = results
+        .iter()
+        .map(|r| r.rrf_score)
+        .fold(0.0_f64, f64::max)
+        .max(1e-6);
+
+    let mut expanded: Vec<FusedResult> = Vec::new();
     let mut seen_ids: std::collections::HashSet<String> =
         results.iter().map(|r| r.memory_id.clone()).collect();
 
-    for result in results.iter().take(5) {
-        // Bidirectional graph expansion with content from memories table
-        let hop_sql = "
-            SELECT r.neighbor_id, r.weight, r.relation_type, m.content
-            FROM (
-                SELECT target_id AS neighbor_id, weight, relation_type
-                FROM memory_relations WHERE source_id = ? AND namespace = ?
-                UNION
-                SELECT source_id AS neighbor_id, weight, relation_type
-                FROM memory_relations WHERE target_id = ? AND namespace = ?
-            ) r
-            LEFT JOIN memories m ON r.neighbor_id = m.id
-            LIMIT 10";
-        if let Ok(mut stmt) = conn.prepare(hop_sql) {
-            if let Ok(rows) = stmt.query_map(
-                rusqlite::params![result.memory_id, namespace, result.memory_id, namespace],
-                |row| {
-                    let target_id: String = row.get(0)?;
-                    let weight: f64 = row.get(1)?;
-                    let rel_type: String = row.get(2)?;
-                    let content: String = row.get::<_, Option<String>>(3)?.unwrap_or_default();
-                    Ok((target_id, weight, rel_type, content))
-                },
-            ) {
-                for row in rows.flatten() {
-                    let (target_id, weight, _rel_type, content) = row;
-                    if seen_ids.insert(target_id.clone()) {
-                        expanded.push(FusedResult {
-                            memory_id: target_id,
-                            content,
-                            rrf_score: result.rrf_score * 0.5 * weight,
-                            source: format!("graph_expand_{}", _rel_type),
-                            signal_scores: vec![],
-                            sem_cos: None,
-                            kw_bm25: None,
-                            evolved_at: None,
-                            pending_evolution: false,
-                            primary_channel: Some("graph_expand".to_string()),
-                            channel_scores: {
-                                let mut m = std::collections::HashMap::new();
-                                m.insert("graph_expand".to_string(), result.rrf_score * 0.5 * weight);
-                                m
-                            },
-                            access_count: 0,
-                            last_recalled: None,
-                            time_status: None,
-                        });
+    // 初始 frontier = top seed_n 种子
+    let mut frontier: Vec<(String, f64)> = results
+        .iter()
+        .take(seed_n)
+        .map(|r| (r.memory_id.clone(), r.rrf_score))
+        .collect();
+
+    for hop in 1..=max_hops {
+        let mut next_frontier: Vec<(String, f64)> = Vec::new();
+        let hop_factor = decay.powi(hop as i32);
+        for (fid, _fscore) in &frontier {
+            let hop_sql = format!(
+                "SELECT r.neighbor_id, r.weight, r.relation_type, m.content
+                 FROM (
+                     SELECT target_id AS neighbor_id, weight, relation_type
+                     FROM memory_relations WHERE source_id = ? AND namespace = ?
+                     UNION
+                     SELECT source_id AS neighbor_id, weight, relation_type
+                     FROM memory_relations WHERE target_id = ? AND namespace = ?
+                 ) r
+                 LEFT JOIN memories m ON r.neighbor_id = m.id
+                 LIMIT {}",
+                fanout
+            );
+            if let Ok(mut stmt) = conn.prepare(&hop_sql) {
+                if let Ok(rows) = stmt.query_map(
+                    rusqlite::params![fid, namespace, fid, namespace],
+                    |row| {
+                        let target_id: String = row.get(0)?;
+                        let weight: f64 = row.get(1)?;
+                        let rel_type: String = row.get(2)?;
+                        let content: String = row.get::<_, Option<String>>(3)?.unwrap_or_default();
+                        Ok((target_id, weight, rel_type, content))
+                    },
+                ) {
+                    for row in rows.flatten() {
+                        let (target_id, weight, rel_type, content) = row;
+                        if seen_ids.insert(target_id.clone()) {
+                            let score = seed_rrf_max * hop_factor * weight.abs().max(0.1);
+                            expanded.push(FusedResult {
+                                memory_id: target_id.clone(),
+                                content,
+                                rrf_score: score,
+                                source: format!("graph_expand_h{}_{}", hop, rel_type),
+                                signal_scores: vec![],
+                                sem_cos: None,
+                                kw_bm25: None,
+                                evolved_at: None,
+                                pending_evolution: false,
+                                primary_channel: Some("graph_expand".to_string()),
+                                channel_scores: {
+                                    let mut m = std::collections::HashMap::new();
+                                    m.insert("graph_expand".to_string(), score);
+                                    m
+                                },
+                                access_count: 0,
+                                last_recalled: None,
+                                time_status: None,
+                            });
+                            next_frontier.push((target_id, score));
+                        }
                     }
                 }
             }
+        }
+        frontier = next_frontier;
+        if frontier.is_empty() {
+            break;
         }
     }
 

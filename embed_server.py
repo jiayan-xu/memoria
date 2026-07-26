@@ -66,6 +66,18 @@ LOCAL_MODEL = os.environ.get("MEMORIA_EMBED_MODEL_LOCAL", "shibing624/text2vec-b
 SF_MODEL = os.environ.get("MEMORIA_EMBED_MODEL", "Qwen/Qwen3-VL-Embedding-8B")
 SF_API = os.environ.get("SILICONFLOW_API_URL", "https://api.siliconflow.cn/v1/embeddings")
 SF_KEY = os.environ.get("SILICONFLOW_API_KEY", "")
+# rerank（cross-encoder）后端：SiliconFlow /v1/rerank（BAAI/bge-reranker-v2-m3）。
+# 仅 siliconflow 后端支持（本地无 cross-encoder 模型）。
+RERANK_MODEL = os.environ.get("MEMORIA_RERANK_MODEL", "BAAI/bge-reranker-v2-m3")
+SF_RERANK_API = os.environ.get(
+    "SILICONFLOW_RERANK_URL", "https://api.siliconflow.cn/v1/rerank"
+)
+# HyDE（假设文档嵌入）后端：SiliconFlow /v1/chat/completions 生成假设答案文档，
+# 再用嵌入模型编码该文档，缩小「问句 vs 知识库文档」措辞 gap。仅 siliconflow 后端。
+SF_CHAT_API = os.environ.get(
+    "SILICONFLOW_CHAT_URL", "https://api.siliconflow.cn/v1/chat/completions"
+)
+HYDE_MODEL = os.environ.get("MEMORIA_HYDE_MODEL", "Qwen/Qwen2.5-7B-Instruct")
 # 输出维度：默认 768（与现有 hnsw.rs:DIM 对齐，零 Rust 改动）；
 # 可选 1024/4096（需同步改 hnsw.rs:DIM 并重编）。MRL 截断，精度损失极小。
 EMBED_DIM = int(os.environ.get("MEMORIA_EMBED_DIM", "768"))
@@ -170,6 +182,44 @@ def embed_texts(texts, normalize=False):
     return _embed_local(texts, normalize)
 
 
+def rerank_docs(query: str, docs: list) -> list:
+    """cross-encoder 重排：调 SiliconFlow /v1/rerank，返回 results 列表
+    （[{index, relevance_score}, ...]，已按分数降序），index 对应输入 docs 下标。
+    仅 siliconflow 后端支持；失败抛异常由调用方转 5xx。
+    """
+    if not IS_SF:
+        raise RuntimeError("rerank 仅支持 siliconflow 后端（本地无 cross-encoder 模型）")
+    import requests
+
+    if not SF_KEY:
+        raise RuntimeError("SILICONFLOW_API_KEY 未设置，无法使用 rerank")
+    headers = {"Authorization": f"Bearer {SF_KEY}", "Content-Type": "application/json"}
+    body = {
+        "model": RERANK_MODEL,
+        "query": query,
+        "documents": docs,
+        "return_documents": False,
+    }
+    last_err = None
+    for attempt in range(4):
+        try:
+            r = requests.post(SF_RERANK_API, headers=headers, json=body, timeout=20)
+            if r.status_code == 200:
+                return r.json().get("results", [])
+            elif r.status_code in (429, 503, 504):
+                time.sleep(min(2 ** attempt, 10))
+                last_err = f"http{r.status_code}"
+                continue
+            else:
+                raise RuntimeError(f"SiliconFlow {r.status_code}: {r.text[:240]}")
+        except requests.RequestException as e:
+            time.sleep(min(2 ** attempt, 10))
+            last_err = str(e)
+            if attempt == 3:
+                raise RuntimeError(f"SiliconFlow rerank 请求失败: {e}")
+    raise RuntimeError(f"rerank 重试耗尽: {last_err}")
+
+
 def _model_dim():
     if IS_SF:
         return EMBED_DIM
@@ -177,6 +227,53 @@ def _model_dim():
         return int(get_model().get_sentence_embedding_dimension())
     except Exception:
         return 768
+
+
+def hyde_generate(query: str) -> str:
+    """HyDE：用 LLM 生成一段可能出现在知识库中的假设答案文档（2-4 句，含具体事实/术语）。
+    仅 siliconflow 后端支持；失败抛异常（调用方退化为原查询嵌入）。
+    """
+    if not IS_SF:
+        raise RuntimeError("hyde 仅支持 siliconflow 后端")
+    if not SF_KEY:
+        raise RuntimeError("SILICONFLOW_API_KEY 未设置，无法使用 hyde")
+    import requests
+
+    sys_prompt = (
+        "你是一个知识库检索辅助器。给定用户的检索问句，请写一段简短的、可能出现在知识库中的"
+        "参考答案文本（2-4 句，包含具体事实与术语，不要解释、不要列要点、不要复述问题）。"
+        "只输出这段文本本身。"
+    )
+    headers = {"Authorization": f"Bearer {SF_KEY}", "Content-Type": "application/json"}
+    body = {
+        "model": HYDE_MODEL,
+        "messages": [
+            {"role": "system", "content": sys_prompt},
+            {"role": "user", "content": query},
+        ],
+        "max_tokens": 200,
+        "temperature": 0.3,
+        "stream": False,
+    }
+    last_err = None
+    for attempt in range(3):
+        try:
+            r = requests.post(SF_CHAT_API, headers=headers, json=body, timeout=30)
+            if r.status_code == 200:
+                data = r.json()
+                return data["choices"][0]["message"]["content"].strip()
+            elif r.status_code in (429, 503, 504):
+                time.sleep(min(2 ** attempt, 10))
+                last_err = f"http{r.status_code}"
+                continue
+            else:
+                raise RuntimeError(f"SiliconFlow chat {r.status_code}: {r.text[:200]}")
+        except requests.RequestException as e:
+            time.sleep(min(2 ** attempt, 10))
+            last_err = str(e)
+            if attempt == 2:
+                raise RuntimeError(f"hyde chat 请求失败: {e}")
+    raise RuntimeError(f"hyde 重试耗尽: {last_err}")
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -200,7 +297,11 @@ class Handler(BaseHTTPRequestHandler):
             self._send(404, {"error": "not found"})
 
     def do_POST(self):
-        if self.path.split("?")[0] != "/embed":
+        path = self.path.split("?")[0]
+        if path == "/rerank":
+            self._do_rerank()
+            return
+        if path != "/embed":
             self._send(404, {"error": "not found"})
             return
         try:
@@ -220,14 +321,50 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         normalize = bool(req.get("normalize", False))
+        use_hyde = bool(req.get("hyde", False))
         try:
-            embeddings = embed_texts(texts, normalize)
+            if use_hyde:
+                # HyDE：为每个查询生成假设文档，再嵌入该文档（失败则退化为原查询）
+                docs = []
+                for t in texts:
+                    try:
+                        docs.append(hyde_generate(t))
+                    except Exception:
+                        docs.append(t)
+                embeddings = embed_texts(docs, normalize)
+            else:
+                embeddings = embed_texts(texts, normalize)
         except Exception as e:
             self._send(500, {"error": f"encode failed: {e}"})
             return
 
         dim = len(embeddings[0]) if embeddings else 0
         self._send(200, {"embeddings": embeddings, "dim": dim, "model": MODEL_NAME})
+
+    def _do_rerank(self):
+        try:
+            length = int(self.headers.get("Content-Length", "0") or "0")
+            raw = self.rfile.read(length) if length > 0 else b"{}"
+            req = json.loads(raw.decode("utf-8") or "{}")
+        except Exception as e:
+            self._send(400, {"error": f"bad request: {e}"})
+            return
+        query = req.get("query")
+        docs = req.get("documents")
+        if not isinstance(query, str) or not isinstance(docs, list) or not all(
+            isinstance(d, str) for d in docs
+        ):
+            self._send(400, {"error": "`query`(str) 与 `documents`(list[str]) 必填"})
+            return
+        if not docs:
+            self._send(200, {"results": [], "model": RERANK_MODEL})
+            return
+        try:
+            results = rerank_docs(query, docs)
+        except Exception as e:
+            self._send(500, {"error": f"rerank failed: {e}"})
+            return
+        self._send(200, {"results": results, "model": RERANK_MODEL})
 
     def log_message(self, *args):
         pass  # 静默，避免刷屏

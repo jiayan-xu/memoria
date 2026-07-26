@@ -82,8 +82,25 @@ pub fn spawn_audit_worker(
 /// 不影响既有 FTS5 + temporal + importance + category 信号。绝不抛错、绝不阻塞主链路。
 /// 云端嵌入服务（SiliconFlow）存在偶发超时/限流，故加 3 次重试 + 指数退避 + 更长超时，
 /// 避免单发失败导致语义通道整条查询恒空（本机 text2vec 不会触发，但云端会）。
-async fn embed_query(client: &reqwest::Client, url: &str, query: &str) -> Option<Vec<f32>> {
-    let body = serde_json::json!({ "texts": [query] });
+/// P1-HyDE：是否对查询启用假设文档嵌入（env MEMORIA_HYDE）。
+/// 默认关闭；开启后 embed_query 会让 embed_server 先把查询改写成假设答案文档再嵌入，
+/// 缩小「问句 vs 知识库文档」的措辞 gap（仅对查询侧生效，写入侧恒为 false）。
+fn hyde_enabled() -> bool {
+    match std::env::var("MEMORIA_HYDE") {
+        Ok(v) => {
+            let s = v.trim().to_lowercase();
+            matches!(s.as_str(), "1" | "true" | "on" | "yes" | "y")
+        }
+        Err(_) => false,
+    }
+}
+
+async fn embed_query(client: &reqwest::Client, url: &str, query: &str, hyde: bool) -> Option<Vec<f32>> {
+    let body = if hyde {
+        serde_json::json!({ "texts": [query], "hyde": true })
+    } else {
+        serde_json::json!({ "texts": [query] })
+    };
     let mut last_err: Option<String> = None;
     for attempt in 0..3 {
         if attempt > 0 {
@@ -140,6 +157,121 @@ async fn embed_query(client: &reqwest::Client, url: &str, query: &str) -> Option
     }
     eprintln!("[embed_query] FAILED after retries for q={:?}: {:?}", query, last_err);
     None
+}
+
+/// P0-stage2：是否启用 cross-encoder 重排（env MEMORIA_RERANK_ENABLED）。
+/// 默认关闭；开启后 memory_recall 在宽候选池上用 cross-encoder 重排再截断。
+fn rerank_enabled() -> bool {
+    match std::env::var("MEMORIA_RERANK_ENABLED") {
+        Ok(v) => {
+            let s = v.trim().to_lowercase();
+            matches!(s.as_str(), "1" | "true" | "on" | "yes" | "y")
+        }
+        Err(_) => false,
+    }
+}
+
+/// stage-2 重排端点（本地 embed_server 的 /rerank，复用 SiliconFlow bge-reranker-v2-m3）。
+fn rerank_url() -> String {
+    std::env::var("MEMORIA_RERANK_URL")
+        .unwrap_or_else(|_| "http://127.0.0.1:8777/rerank".to_string())
+}
+
+fn env_u32_def(key: &str, default: u32) -> u32 {
+    match std::env::var(key) {
+        Ok(v) => v.trim().parse::<u32>().unwrap_or(default),
+        Err(_) => default,
+    }
+}
+
+/// 对候选文档集做 cross-encoder 重排，返回 (index, relevance_score) 列表（按分数降序）。
+/// 任何错误（未配置/服务不可用/超时/解析失败）返回 None —— 优雅降级，保留 hybrid 原序，
+/// 绝不抛错、绝不阻塞主链路。
+async fn rerank_query(
+    client: &reqwest::Client,
+    url: &str,
+    query: &str,
+    docs: &[String],
+) -> Option<Vec<(usize, f64)>> {
+    if docs.is_empty() || url.is_empty() {
+        return None;
+    }
+    let body = serde_json::json!({ "query": query, "documents": docs });
+    let mut last_err: Option<String> = None;
+    for attempt in 0..2 {
+        if attempt > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+        let resp = match client
+            .post(url)
+            .timeout(std::time::Duration::from_secs(5))
+            .json(&body)
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                last_err = Some(format!("send#{attempt}: {e}"));
+                continue;
+            }
+        };
+        if !resp.status().is_success() {
+            last_err = Some(format!("http{}", resp.status().as_u16()));
+            continue;
+        }
+        match resp.json::<serde_json::Value>().await {
+            Ok(v) => {
+                let arr = match v.get("results").and_then(|a| a.as_array()) {
+                    Some(a) => a,
+                    None => {
+                        last_err = Some("no results field".into());
+                        continue;
+                    }
+                };
+                let mut out: Vec<(usize, f64)> = Vec::new();
+                for item in arr {
+                    let i = match item.get("index").and_then(|x| x.as_u64()) {
+                        Some(i) => i as usize,
+                        None => continue,
+                    };
+                    let s = item
+                        .get("relevance_score")
+                        .and_then(|x| x.as_f64())
+                        .unwrap_or(0.0);
+                    out.push((i, s));
+                }
+                if out.is_empty() {
+                    last_err = Some("empty results".into());
+                    continue;
+                }
+                return Some(out);
+            }
+            Err(e) => {
+                last_err = Some(format!("json#{attempt}: {e}"));
+                continue;
+            }
+        }
+    }
+    eprintln!(
+        "[rerank_query] FAILED after retries for q={:?}: {:?}",
+        query, last_err
+    );
+    None
+}
+
+/// 阻塞包装：在 dispatch 的 spawn_blocking 上下文里用临时 current-thread 运行时执行 rerank_query。
+/// dispatch 是同步函数（被 spawn_blocking 调用），无法直接 .await；这里建一个轻量运行时 block_on。
+fn block_on_rerank(
+    client: &reqwest::Client,
+    url: &str,
+    query: &str,
+    docs: &[String],
+) -> Option<Vec<(usize, f64)>> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .ok()?;
+    rt.block_on(rerank_query(client, url, query, docs))
 }
 
 /// 构建 axum Router
@@ -900,7 +1032,7 @@ async fn handle_tool_call(
     {
         if let Some(q) = safe_args.get("query").and_then(|v| v.as_str()) {
             if !q.is_empty() {
-                if let Some(qvec) = embed_query(&state.http_client, &state.embedding_url, q).await {
+                if let Some(qvec) = embed_query(&state.http_client, &state.embedding_url, q, hyde_enabled()).await {
                     state.query_cache.put(q, qvec);
                 }
             }
@@ -914,7 +1046,7 @@ async fn handle_tool_call(
     if (tool == "memory_remember" || tool == "memory") && !state.embedding_url.is_empty() {
         if let Some(c) = safe_args.get("content").and_then(|v| v.as_str()) {
             if !c.is_empty() {
-                if let Some(cvec) = embed_query(&state.http_client, &state.embedding_url, c).await {
+                if let Some(cvec) = embed_query(&state.http_client, &state.embedding_url, c, false).await {
                     state.query_cache.put(c, cvec);
                 }
             }
@@ -1115,17 +1247,48 @@ fn dispatch(
                 .get("include_superseded")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
-            let fused = search::hybrid::hybrid_search(
+            // P0-stage2：cross-encoder 重排（env MEMORIA_RERANK_ENABLED）。
+            // 开启时用更大候选池(rerank_pool)调 hybrid，重排后再截断到 max_results。
+            let rerank_on = rerank_enabled();
+            let search_depth = if rerank_on {
+                env_u32_def("MEMORIA_RERANK_POOL", 100).max(max_results)
+            } else {
+                max_results
+            };
+            let mut fused = search::hybrid::hybrid_search(
                 &state.pool,
                 query,
                 ns,
-                max_results,
+                search_depth,
                 Some(&state.hnsw),
                 Some(&state.query_cache),
                 as_of,
                 include_superseded,
             )
             .unwrap_or_default();
+
+            // stage-2 重排：在宽候选池上用 cross-encoder 重排，再交回 tags 过滤 + take(max_results)。
+            // 仅改变相对序，不增删候选；失败则保留 hybrid 原序（优雅降级）。
+            if rerank_on && fused.len() > 1 {
+                let docs: Vec<String> = fused.iter().map(|r| r.content.clone()).collect();
+                if let Some(scored) = block_on_rerank(&state.http_client, &rerank_url(), query, &docs) {
+                    let mut order_score: Vec<f64> = vec![0.0; fused.len()];
+                    for (i, s) in scored {
+                        if i < order_score.len() {
+                            order_score[i] = s;
+                        }
+                    }
+                    let mut idxs: Vec<usize> = (0..fused.len()).collect();
+                    idxs.sort_by(|&a, &b| {
+                        order_score[b]
+                            .partial_cmp(&order_score[a])
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    });
+                    let reord: Vec<search::rrf::FusedResult> =
+                        idxs.into_iter().map(|i| fused[i].clone()).collect();
+                    fused = reord;
+                }
+            }
 
             // F1a：异步回写召回命中计数（access_count + last_recalled），不阻塞响应。
             record_recall_access(state, &fused);
@@ -2870,7 +3033,7 @@ mod tests {
             }
         });
         let client = reqwest::Client::new();
-        let v = super::embed_query(&client, &url, "hello").await;
+        let v = super::embed_query(&client, &url, "hello", false).await;
         h.join().unwrap();
         assert_eq!(v, Some(vec![0.1f32, 0.2, 0.3]), "应解析出 embeddings[0]");
     }
@@ -2890,7 +3053,7 @@ mod tests {
             }
         });
         let client = reqwest::Client::new();
-        let v = super::embed_query(&client, &url, "hello").await;
+        let v = super::embed_query(&client, &url, "hello", false).await;
         h.join().unwrap();
         assert_eq!(v, None, "500 应优雅降级为 None，而非报错");
     }
