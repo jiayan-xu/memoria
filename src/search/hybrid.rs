@@ -40,10 +40,14 @@ pub fn hybrid_search(
     let primary_limit = recall_depth.max(fts_limit); // 主信号（语义/关键词）宽召回深度
     let mut signals: Vec<Vec<SignalResult>> = Vec::new();
     let mut weights: Vec<f64> = Vec::new();
+    // 主召回通道原始结果，供「主通道保底」使用（见 take 前）
+    let mut sem_res: Option<Vec<SignalResult>> = None;
+    let mut kw_res: Option<Vec<SignalResult>> = None;
 
     // S1: Keyword (FTS5 + LIKE) — 宽召回
     if let Ok(kw) = search::keyword::keyword_search(pool, query, namespace, primary_limit) {
         if !kw.is_empty() {
+            kw_res = Some(kw.clone());
             signals.push(kw);
             weights.push(w_keyword);
         }
@@ -60,6 +64,7 @@ pub fn hybrid_search(
             Some(pool),
         ) {
             if !sem.is_empty() {
+                sem_res = Some(sem.clone());
                 signals.push(sem);
                 weights.push(w_semantic);
             }
@@ -267,6 +272,40 @@ pub fn hybrid_search(
     // 归一化 RRF + 原始 cosine(sem_cos) + 原始 BM25(kw_bm25) 混合重排，显著降误召。
     // cooccur/text_signals 加成已折入 rrf_score，归一化后相对序保留，不丢前序成果。
     two_stage_rerank(&mut unique, rrf_w, sem_w, kw_w);
+
+    // 主通道保底（P0 召回修复，2026-07-26）：semantic/keyword 是核心召回通道，
+    // 但 rrf_merge 把 temporal/importance/category 也作平等召回通道累加，而这三个软信号
+    // 条件宽松、覆盖几乎全库，其 rrf 普遍叠加在绝大多数记忆上，导致「仅强命中语义/关键词」
+    // 的纯单通道记忆在 take 截断时被多通道项淹没（实测最终 100 池仅 1 条 semantic）。
+    // 此处把两个主通道各自的 top-RESERVE 候选提到前部，确保它们优先入池，
+    // 不被全库软信号挤出；temporal/importance/category 仍作为 rerank 增益作用于保底项内部。
+    const RESERVE: usize = 50;
+    let mut reserve: std::collections::HashSet<String> = std::collections::HashSet::new();
+    if let Some(s) = &sem_res {
+        for r in s.iter().take(RESERVE) {
+            reserve.insert(r.memory_id.clone());
+        }
+    }
+    if let Some(k) = &kw_res {
+        for r in k.iter().take(RESERVE) {
+            reserve.insert(r.memory_id.clone());
+        }
+    }
+    if !reserve.is_empty() {
+        let mut reordered: Vec<FusedResult> = Vec::new();
+        let mut taken: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for r in unique.iter() {
+            if reserve.contains(&r.memory_id) && taken.insert(r.memory_id.clone()) {
+                reordered.push(r.clone());
+            }
+        }
+        for r in unique.iter() {
+            if taken.insert(r.memory_id.clone()) {
+                reordered.push(r.clone());
+            }
+        }
+        unique = reordered;
+    }
 
     let unique: Vec<FusedResult> = unique.into_iter().take(max_results as usize).collect();
 
