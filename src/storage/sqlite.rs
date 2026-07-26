@@ -255,7 +255,28 @@ pub fn init_core_tables(pool: &SqlitePool) -> Result<(), String> {
     migrate_extract_fields(pool)?;
     migrate_evolution(pool)?;
     migrate_memory_relation_types(pool)?;
+    migrate_access_count(pool)?;
 
+    Ok(())
+}
+
+/// F1a：为 `memories` 增加 `access_count` 列（召回命中计数）。
+/// 与 `recall_count`（写入/去重自增）解耦，避免污染历史指标与 `decay` 冷热判据（依赖 recall_count<3）。
+/// 幂等：列已存在则跳过。
+pub fn migrate_access_count(pool: &SqlitePool) -> Result<(), String> {
+    let conn = pool.get().map_err(|e| format!("pool get: {}", e))?;
+    let has: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('memories') WHERE name = 'access_count'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    if has == 0 {
+        conn.execute_batch("ALTER TABLE memories ADD COLUMN access_count INTEGER DEFAULT 0;")
+            .map_err(|e| format!("add memories.access_count: {}", e))?;
+        println!("[Memoria] Migration: added memories.access_count column");
+    }
     Ok(())
 }
 

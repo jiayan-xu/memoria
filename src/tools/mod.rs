@@ -5,6 +5,7 @@ pub mod evolve;
 pub mod graph;
 pub mod imp_exp;
 pub mod ledger;
+pub mod compress;
 pub mod observe;
 pub mod prefs;
 pub mod profile;

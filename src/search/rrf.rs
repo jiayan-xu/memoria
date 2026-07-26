@@ -45,6 +45,16 @@ pub struct FusedResult {
     pub evolved_at: Option<String>,
     /// PR4：该 tip 是否尚未演化（evolved_at IS NULL）。recall 可据此降权/标注。
     pub pending_evolution: bool,
+    /// F3（可解释性）：主导匹配通道（signal_scores 中幅度最大的通道，复用 channel_of 归一）。
+    pub primary_channel: Option<String>,
+    /// F3：各通道归一化 RRF 幅度（通道名 -> 幅度），与 signal_scores 同源。
+    pub channel_scores: HashMap<String, f64>,
+    /// F1b：召回命中计数（来自 memories.access_count），供跨通道频率加权。
+    pub access_count: i64,
+    /// F1b：最近召回时间（来自 memories.last_recalled），供新鲜度加权。
+    pub last_recalled: Option<String>,
+    /// F2：时间有效性状态（current / superseded / expired），None=未标注。
+    pub time_status: Option<String>,
 }
 
 /// RRF 融合过程中累加的原始信号幅度（供两阶段重排使用）。
@@ -101,16 +111,30 @@ pub fn rrf_merge(signals: &[Vec<SignalResult>], weights: &[f64], k: f64) -> Vec<
 
     let mut fused: Vec<FusedResult> = score_map
         .into_iter()
-        .map(|(memory_id, a)| FusedResult {
-            memory_id,
-            content: a.content,
-            rrf_score: a.rrf,
-            source: a.source,
-            signal_scores: a.sigs,
-            sem_cos: a.sem,
-            kw_bm25: a.kw,
-            evolved_at: None,
-            pending_evolution: false,
+        .map(|(memory_id, a)| {
+            let sigs = a.sigs;
+            let primary_channel = sigs
+                .iter()
+                .max_by(|x, y| x.1.partial_cmp(&y.1).unwrap_or(std::cmp::Ordering::Equal))
+                .map(|(n, _)| n.clone());
+            let channel_scores: std::collections::HashMap<String, f64> =
+                sigs.iter().cloned().collect();
+            FusedResult {
+                memory_id,
+                content: a.content,
+                rrf_score: a.rrf,
+                source: a.source,
+                signal_scores: sigs,
+                sem_cos: a.sem,
+                kw_bm25: a.kw,
+                evolved_at: None,
+                pending_evolution: false,
+                primary_channel,
+                channel_scores,
+                access_count: 0,
+                last_recalled: None,
+                time_status: None,
+            }
         })
         .collect();
 
@@ -192,6 +216,15 @@ pub fn graph_expand(
                             kw_bm25: None,
                             evolved_at: None,
                             pending_evolution: false,
+                            primary_channel: Some("graph_expand".to_string()),
+                            channel_scores: {
+                                let mut m = std::collections::HashMap::new();
+                                m.insert("graph_expand".to_string(), result.rrf_score * 0.5 * weight);
+                                m
+                            },
+                            access_count: 0,
+                            last_recalled: None,
+                            time_status: None,
                         });
                     }
                 }

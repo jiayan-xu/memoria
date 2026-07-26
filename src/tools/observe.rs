@@ -2,6 +2,7 @@
 //! Content is stored as-is (no prefix), matching Python side.
 
 use crate::storage::SqlitePool;
+use crate::tools::compress::distill;
 use sha2::{Digest, Sha256};
 
 pub fn observe(
@@ -21,11 +22,12 @@ pub fn observe(
     let mem_id = content_hash; // id == content_hash → identical content is ignored on re-observe
     let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S").to_string();
 
+    let (content, raw_ref) = distill(dialog);
     conn.execute(
         "INSERT OR IGNORE INTO memories (id, namespace, source, content, category, confidence,
-         recall_count, created_at, tier, importance, decay_factor)
-         VALUES (?, ?, ?, ?, 'observation', 0.5, 0, ?, 'warm', 2, 1.0)",
-        rusqlite::params![mem_id, namespace, source, dialog, now],
+         recall_count, created_at, tier, importance, decay_factor, raw_ref)
+         VALUES (?, ?, ?, ?, 'observation', 0.5, 0, ?, 'warm', 2, 1.0, ?)",
+        rusqlite::params![mem_id, namespace, source, content, now, raw_ref],
     )
     .map_err(|e| format!("insert: {}", e))?;
 

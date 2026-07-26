@@ -1035,6 +1035,39 @@ fn quota_gate(state: &Arc<AppState>, ns: &str, kind: &str, role: &str) -> Option
     }
 }
 
+/// F1a：召回命中后异步批量回写 access_count + last_recalled（不阻塞召回响应）。
+/// 克隆 pool 在 spawn_blocking 单事务提交；失败仅告警，不影响召回结果。
+/// 若不在 tokio runtime 内（如部分测试），退化为同步提交。
+fn record_recall_access(state: &Arc<AppState>, fused: &[search::rrf::FusedResult]) {
+    if fused.is_empty() {
+        return;
+    }
+    let ids: Vec<String> = fused.iter().map(|r| r.memory_id.clone()).collect();
+    let pool = state.pool.clone();
+    let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S").to_string();
+    let task = move || {
+        if let Ok(conn) = pool.get() {
+            if let Ok(tx) = conn.unchecked_transaction() {
+                for id in &ids {
+                    let _ = tx.execute(
+                        "UPDATE memories SET access_count = access_count + 1, last_recalled = ? WHERE id = ?",
+                        rusqlite::params![now.as_str(), id.as_str()],
+                    );
+                }
+                let _ = tx.commit();
+            }
+        }
+    };
+    match tokio::runtime::Handle::try_current() {
+        Ok(h) => {
+            let _ = h.spawn_blocking(move || task());
+        }
+        Err(_) => {
+            task();
+        }
+    }
+}
+
 fn dispatch(
     state: &Arc<AppState>,
     tool: &str,
@@ -1094,6 +1127,9 @@ fn dispatch(
             )
             .unwrap_or_default();
 
+            // F1a：异步回写召回命中计数（access_count + last_recalled），不阻塞响应。
+            record_recall_access(state, &fused);
+
             // Tags 过滤（如果有）
             let filtered: Vec<search::rrf::FusedResult> = if let Some(ref tags) = tags_filter {
                 if tags.is_empty() {
@@ -1147,6 +1183,11 @@ fn dispatch(
                             "kw_bm25": r.kw_bm25,
                             "evolved_at": r.evolved_at,
                             "pending_evolution": r.pending_evolution,
+                            "primary_channel": r.primary_channel,
+                            "channel_scores": r.channel_scores,
+                            "access_count": r.access_count,
+                            "last_recalled": r.last_recalled,
+                            "time_status": r.time_status,
                         })
                     })
                     .collect()

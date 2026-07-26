@@ -12,7 +12,7 @@ use crate::vector::{HnswIndex, QueryCache};
 /// - `Some("2026-01-02T00:00:00")` → `visible_as_of`：仅返回该时刻「有效」的记忆
 ///   （valid_from <= as_of 且 (valid_to IS NULL 或 valid_to >= as_of)），不查 superseded_by（时序真值优先）。
 /// - `None`（默认）→ `is_latest_now`：superseded_by IS NULL 且当前(now)有效（§14.1 Q2）。
-/// `include_superseded=true` 跳过整段 isLatest/visible_as_of 过滤（含时序），返回全部行。
+/// `include_superseded=true`（F2）` 不跳过过滤，而是把「仍有效(valid_at now)但被取代」的历史真值降权补回（标 time_status="superseded"）。
 pub fn hybrid_search(
     pool: &SqlitePool,
     query: &str,
@@ -108,13 +108,14 @@ pub fn hybrid_search(
         .filter(|r| seen.insert(r.memory_id.clone()))
         .collect();
 
-    // P0 + P1-5: isLatest / visible_as_of 过滤（§14.1 Q2）。
+    // P0 + P1-5 / F2：isLatest / visible_as_of / 历史降权过滤（§14.1 Q2）。
     // 统一在 dedup 后、take 前执行；graph_expand 邻居因已并入 unique 一并覆盖。
     // 规则：
-    //  - include_superseded=true → 不过滤（返回全部，含历史被取代行）
-    //  - as_of=Some(T)          → 仅 visible_as_of（valid_* 有效），不查 superseded_by（时序真值优先）
-    //  - as_of=None（默认 tip） → is_latest_now：superseded_by IS NULL 且当前(now)有效
-    if !include_superseded && !unique.is_empty() {
+    //  - as_of=Some(T)          → 仅 visible_as_of（valid_* 有效），忽略 superseded_by（时序真值优先）。
+    //  - as_of=None（默认 tip） → is_latest_now：superseded_by IS NULL 且当前(now)有效 = current。
+    //  - include_superseded=true（F2）→ 在 current 之外，补回「仍有效(valid_at now)但被取代」的历史真值，
+    //    标 time_status="superseded" 并乘 MEMORIA_HISTORY_DOWNWEIGHT 降权；过期(valid_to<now)仍剔除。
+    if !unique.is_empty() {
         if let Ok(conn) = pool.get() {
             let ids: Vec<String> = unique.iter().map(|r| r.memory_id.clone()).collect();
             let ph = vec!["?"; ids.len()].join(",");
@@ -140,15 +141,90 @@ pub fn hybrid_search(
                     .map(|rows| rows.flatten().collect())
                     .unwrap_or_default();
                 let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S").to_string();
-                unique.retain(|r| match info.get(&r.memory_id) {
-                    Some((sup, vf, vt)) => match as_of {
-                        Some(t) => valid_at(vf.as_deref(), vt.as_deref(), t), // visible_as_of
-                        None => {
-                            sup.is_none() && valid_at(vf.as_deref(), vt.as_deref(), now.as_str())
-                        } // is_latest_now
-                    },
-                    None => false,
+                let ref_time = as_of.unwrap_or_else(|| now.as_str());
+                let downweight = env_f64("MEMORIA_HISTORY_DOWNWEIGHT", 0.5).clamp(0.0, 1.0);
+                // 先算 keep 标记（与 unique 顺序一致）
+                let mut keep: Vec<bool> = Vec::with_capacity(unique.len());
+                for r in unique.iter() {
+                    match info.get(&r.memory_id) {
+                        Some((sup, vf, vt)) => {
+                            let valid = valid_at(vf.as_deref(), vt.as_deref(), ref_time);
+                            if as_of.is_some() {
+                                keep.push(valid); // 时序真值：仅看 valid_*, 忽略 superseded_by
+                            } else if sup.is_none() && valid {
+                                keep.push(true); // is_latest_now
+                            } else if include_superseded && sup.is_some() && valid {
+                                keep.push(true); // 历史真值仍有效 → 降权补回
+                            } else {
+                                keep.push(false);
+                            }
+                        }
+                        None => keep.push(false),
+                    }
+                }
+                // 应用 time_status + 降权（仅对保留项）
+                let mut idx = 0;
+                for r in unique.iter_mut() {
+                    let k = keep[idx];
+                    idx += 1;
+                    if !k {
+                        continue;
+                    }
+                    match info.get(&r.memory_id) {
+                        Some((sup, vf, vt)) => {
+                            let valid = valid_at(vf.as_deref(), vt.as_deref(), ref_time);
+                            if as_of.is_some() {
+                                r.time_status = if valid {
+                                    Some("current".to_string())
+                                } else {
+                                    None
+                                };
+                            } else if sup.is_none() && valid {
+                                r.time_status = Some("current".to_string());
+                            } else {
+                                r.time_status = Some("superseded".to_string());
+                                r.rrf_score *= downweight;
+                            }
+                        }
+                        None => r.time_status = None,
+                    }
+                }
+                // 剔除未保留项
+                let mut i = 0;
+                unique.retain(|_| {
+                    let k = keep[i];
+                    i += 1;
+                    k
                 });
+            }
+        }
+    }
+
+    // F1b：补全召回计数/时间元数据（access_count / last_recalled），供 two_stage_rerank 频率+新鲜度加权。
+    if !unique.is_empty() {
+        if let Ok(conn) = pool.get() {
+            let ids: Vec<String> = unique.iter().map(|r| r.memory_id.clone()).collect();
+            let ph = vec!["?"; ids.len()].join(",");
+            let sql = format!(
+                "SELECT id, access_count, last_recalled FROM memories WHERE id IN ({})",
+                ph
+            );
+            if let Ok(mut stmt) = conn.prepare(&sql) {
+                let meta: std::collections::HashMap<String, (i64, Option<String>)> = stmt
+                    .query_map(rusqlite::params_from_iter(ids.iter()), |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            (row.get::<_, i64>(1).unwrap_or(0), row.get::<_, Option<String>>(2)?),
+                        ))
+                    })
+                    .map(|rows| rows.flatten().collect())
+                    .unwrap_or_default();
+                for r in unique.iter_mut() {
+                    if let Some((c, t)) = meta.get(&r.memory_id) {
+                        r.access_count = *c;
+                        r.last_recalled = t.clone();
+                    }
+                }
             }
         }
     }
@@ -240,6 +316,12 @@ fn two_stage_rerank(results: &mut Vec<FusedResult>, w_rrf: f64, w_sem: f64, w_kw
         .iter()
         .map(|r| r.kw_bm25.unwrap_or(0.0))
         .fold(0.0_f64, f64::max);
+    // F1b：频率 + 新鲜度分量（env 可调权重，默认 0.1；为 0 时退化为现状）
+    let w_freq = env_f64("MEMORIA_RERANK_W_FREQ", 0.1);
+    let w_rec = env_f64("MEMORIA_RERANK_W_REC", 0.1);
+    let k_freq = env_f64("MEMORIA_FREQ_K", 10.0).max(1.0);
+    let lambda = env_f64("MEMORIA_RECENCY_LAMBDA", 0.01).max(0.0);
+    let now_secs = chrono::Utc::now().timestamp();
     for r in results.iter_mut() {
         let rrf_n = if rrf_max > 0.0 { r.rrf_score / rrf_max } else { 0.0 };
         let sem_n = if sem_max > 0.0 {
@@ -252,7 +334,21 @@ fn two_stage_rerank(results: &mut Vec<FusedResult>, w_rrf: f64, w_sem: f64, w_kw
         } else {
             0.0
         };
-        r.rrf_score = w_rrf * rrf_n + w_sem * sem_n + w_kw * kw_n;
+        // F1b：频率饱和（access_count/(access_count+K)）+ 新鲜度指数衰减（按 last_recalled 距今年化）
+        let c = r.access_count as f64;
+        let freq_n = c / (c + k_freq);
+        let recency_n = match &r.last_recalled {
+            Some(t) => {
+                let secs = chrono::NaiveDateTime::parse_from_str(t, "%Y-%m-%dT%H:%M:%S")
+                    .map(|d| d.and_utc().timestamp())
+                    .unwrap_or(now_secs);
+                let age_h = ((now_secs - secs) as f64 / 3600.0).max(0.0);
+                (-lambda * age_h).exp()
+            }
+            None => 0.5,
+        };
+        r.rrf_score =
+            w_rrf * rrf_n + w_sem * sem_n + w_kw * kw_n + w_freq * freq_n + w_rec * recency_n;
         if !r.source.contains("rerank2") {
             r.source = format!("{};rerank2", r.source);
         }

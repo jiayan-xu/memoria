@@ -528,6 +528,11 @@ mod unit_tests {
         kw_bm25: Some(0.5),
         evolved_at: None,
         pending_evolution: false,
+        primary_channel: None,
+        channel_scores: std::collections::HashMap::new(),
+        access_count: 0,
+        last_recalled: None,
+        time_status: None,
       },
       FusedResult {
         memory_id: "b".into(),
@@ -539,6 +544,11 @@ mod unit_tests {
         kw_bm25: Some(0.1),
         evolved_at: None,
         pending_evolution: false,
+        primary_channel: None,
+        channel_scores: std::collections::HashMap::new(),
+        access_count: 0,
+        last_recalled: None,
+        time_status: None,
       },
     ];
     rerank_by_text_signals("120 吨", &mut results);

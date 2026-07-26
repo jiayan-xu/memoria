@@ -4,6 +4,7 @@
 //! Returns the memory ID (existing or new).
 
 use crate::storage::SqlitePool;
+use crate::tools::compress::distill;
 use crate::vector::{HnswIndex, QueryCache, VectorEntry};
 use rusqlite::Connection;
 use sha2::{Digest, Sha256};
@@ -363,6 +364,10 @@ pub fn remember_with_dedup(
         .unchecked_transaction()
         .map_err(|e| format!("begin tx: {}", e))?;
 
+    let (content_to_store, raw_ref_to_store) = match raw_ref {
+        Some(r) => (content.to_string(), Some(r.to_string())),
+        None => distill(content),
+    };
     tx.execute(
         "INSERT INTO memories (id, namespace, source, content, category, confidence,
          recall_count, created_at, tier, importance, decay_factor, tags, valid_from, valid_to,
@@ -372,7 +377,7 @@ pub fn remember_with_dedup(
             mem_id,
             namespace,
             source,
-            content,
+            content_to_store,
             category,
             now,
             importance,
@@ -382,7 +387,7 @@ pub fn remember_with_dedup(
             actor,
             memory_type,
             parent_id,
-            raw_ref
+            raw_ref_to_store
         ],
     )
     .map_err(|e| format!("insert: {}", e))?;
