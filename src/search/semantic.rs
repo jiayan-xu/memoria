@@ -36,6 +36,14 @@ pub fn semantic_search(
         None => return Ok(vec![]), // No cached embedding — skip semantic signal
     };
 
+    // P0 防御：查询向量退化（NaN / 全零）则无法产生有效语义信号，提前返回空集。
+    // 全零向量在 DistCosine 下与任意记忆 distance≈0 → score≈1.0，会灌入 limit 条垃圾；
+    // NaN 则 score 非有限。add() 已拦退化向量入索引，此处对「查询向量」做双保险。
+    let norm_sq: f32 = vector.iter().map(|&x| x * x).sum();
+    if !norm_sq.is_finite() || norm_sq <= 0.0 {
+        return Ok(vec![]);
+    }
+
     // Search HNSW index.
     // 关键修复（2026-07-26）：HNSW 是全局索引、无 namespace 维度（语义检索 B2 修复说明）。
     // 若直接按 limit(=primary_limit) 取「全局 top-k」再按 ns 过滤，跨 ns 向量会占满名额，

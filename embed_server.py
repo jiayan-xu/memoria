@@ -371,6 +371,15 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
+    # 安全断言：嵌入服务仅允许回环监听。若误配 MEMORIA_EMBED_HOST 为非回环地址，
+    # 任意外部方可烧 SILICONFLOW_API_KEY（云端 embedding 计费）/ 触发本地模型推理，造成密钥外泄或资源滥用。
+    # 在绑定前硬性拒绝，从源头堵住该风险（不影响既有客户端契约）。
+    if HOST != "127.0.0.1":
+        sys.stderr.write(
+            "[embed] FATAL: 拒绝绑定非回环地址 {!r}（仅允许 127.0.0.1）。\n"
+            "          请设置 MEMORIA_EMBED_HOST=127.0.0.1 或移除该环境变量后重试。\n".format(HOST)
+        )
+        sys.exit(2)
     if IS_SF:
         print(f"[embed] provider=siliconflow model={SF_MODEL} dim={EMBED_DIM}", flush=True)
         print(f"[embed] key={'SET' if SF_KEY else 'MISSING!'} -> http://{HOST}:{PORT}/embed", flush=True)

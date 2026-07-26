@@ -833,6 +833,9 @@ async fn api_list_memories(
         }
     }
     if let Some(min_imp) = q.min_importance {
+        // 契约健壮性：importance 取值域为 1..=5。越界值（如 6 / 负数）会违背契约
+        // （返回空 / 返回全量），这里 clamp 到合法区间，避免前端误传导致静默错误结果。
+        let min_imp = min_imp.clamp(1, 5);
         let idx = params.len() + 1;
         sql.push_str(&format!(" AND importance >= ?{}", idx));
         params.push(Box::new(min_imp));

@@ -108,7 +108,7 @@ async fn embed_query(client: &reqwest::Client, url: &str, query: &str, hyde: boo
         }
         let resp = match client
             .post(url)
-            .timeout(std::time::Duration::from_secs(10))
+            .timeout(std::time::Duration::from_secs(60))
             .json(&body)
             .send()
             .await

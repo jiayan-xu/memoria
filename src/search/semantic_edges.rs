@@ -45,6 +45,14 @@ pub fn upsert_semantic_edges_for(
         return Ok(0);
     }
 
+    // P0 防御：落库原始向量退化（NaN / 全零）→ 在 HNSW 中与任意记忆 distance≈0
+    // → sim≈1.0 ≥ threshold → 误建 cap 个双向 semantic_related 边污染图谱。
+    // add() 已拦退化向量入索引，此处对「增量补边」的入参向量同样守卫。
+    let norm_sq: f32 = vec.iter().map(|&x| x * x).sum();
+    if !norm_sq.is_finite() || norm_sq <= 0.0 {
+        return Ok(0);
+    }
+
     let near = hnsw.search(vec, k).unwrap_or_default();
     if near.is_empty() {
         return Ok(0);
