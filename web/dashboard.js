@@ -203,16 +203,24 @@ async function search() {
 }
 
 var currentPage = 1;
+var currentLimit = 30;
 async function loadMemories(page) {
   page = page || 1;
   currentPage = page;
+  selectedIds.clear();
+  updateMergeToolbar();
   const tier = document.getElementById('filterTier').value;
   const category = document.getElementById('filterCategory').value;
   const searchQ = document.getElementById('filterSearch').value.trim();
-  const params = new URLSearchParams({ page: page, limit: 30, namespace: currentNs() });
+  const minImp = document.getElementById('filterMinImportance').value;
+  const sort = document.getElementById('filterSort').value;
+  const offset = (page - 1) * currentLimit;
+  const params = new URLSearchParams({ limit: currentLimit, offset: offset, namespace: currentNs() });
   if (tier) params.set('tier', tier);
   if (category) params.set('category', category);
-  if (searchQ) params.set('search', searchQ);
+  if (searchQ) params.set('q', searchQ);
+  if (minImp) params.set('min_importance', minImp);
+  if (sort) params.set('sort', sort);
   const container = document.getElementById('browseResults');
   container.innerHTML = '<div class="empty"><div class="icon">📂</div>加载中...</div>';
   try {
@@ -223,7 +231,7 @@ async function loadMemories(page) {
       return;
     }
     data.memories.forEach(function (m) { container.appendChild(createMemoryCard(m)); });
-    const totalPages = Math.ceil((data.total || data.memories.length) / (data.limit || 30));
+    const totalPages = Math.ceil((data.total || data.memories.length) / currentLimit);
     const pg = document.getElementById('pagination');
     pg.innerHTML = '';
     if (totalPages > 1) {
@@ -262,7 +270,52 @@ function createMemoryCard(m) {
     '<span style="color:var(--text2);margin-left:auto">' + escHtml(source) + '</span>' +
     '<span style="color:var(--text2)">' + escHtml(category) + '</span></div>' +
     '<div class="content-preview">' + escHtml(content) + '</div>';
+  // 2.3：多选合并复选框
+  const cb = document.createElement('input');
+  cb.type = 'checkbox';
+  cb.className = 'card-check';
+  cb.checked = selectedIds.has(mid);
+  if (cb.checked) card.classList.add('selected');
+  cb.onclick = function (e) { e.stopPropagation(); };
+  cb.onchange = function (e) {
+    e.stopPropagation();
+    if (cb.checked) { selectedIds.add(mid); card.classList.add('selected'); }
+    else { selectedIds.delete(mid); card.classList.remove('selected'); }
+    updateMergeToolbar();
+  };
+  card.appendChild(cb);
   return card;
+}
+
+/* ── 2.3：多选合并状态 ── */
+var selectedIds = new Set();
+function updateMergeToolbar() {
+  const tb = document.getElementById('mergeToolbar');
+  if (!tb) return;
+  const cnt = selectedIds.size;
+  document.getElementById('mergeCount').textContent = cnt;
+  tb.style.display = cnt >= 2 ? 'flex' : 'none';
+}
+function clearSelection() {
+  selectedIds.clear();
+  document.querySelectorAll('.memory-card.selected').forEach(function (c) {
+    c.classList.remove('selected');
+    const cb = c.querySelector('.card-check');
+    if (cb) cb.checked = false;
+  });
+  updateMergeToolbar();
+}
+function switchNs(ns) {
+  const input = document.getElementById('authNamespace');
+  if (input) input.value = ns;
+  document.querySelectorAll('.ns-btn').forEach(function (b) {
+    const call = b.getAttribute('onclick') || '';
+    b.classList.toggle('active', call.indexOf(ns) >= 0);
+  });
+  clearSelection();
+  loadMemories(1);
+  loadStats();
+  showToast('已切换命名空间 ' + ns, 'success');
 }
 
 function renderMemoryCards(container, items) {
@@ -303,9 +356,23 @@ async function openDetail(id) {
   try {
     const m = await fetchMemoryById(id);
     var cats = ['decision', 'preference', 'constraint', 'lesson', 'fact', 'conversation'];
+    var rawRef = m.raw_ref || '';
+    var src = m.source || '';
+    var refBlock = '';
+    if (rawRef || src) {
+      refBlock =
+        '<div class="field"><label>来源 / 原文引用</label>' +
+        (src ? '<div class="rawref-row"><code>📎 ' + escHtml(src) + '</code></div>' : '') +
+        (rawRef ? '<div class="rawref-row"><code id="rawRefCode">' + escHtml(rawRef) + '</code>' +
+          '<button class="mini-btn" onclick="copyRawRef()">复制</button>' +
+          (rawRef.indexOf('file://') === 0 ? '<button class="mini-btn" onclick="openRawRef()">打开原文</button>' : '') +
+          '</div>' : '') +
+        '</div>';
+    }
     content.innerHTML =
       '<button class="close-btn" onclick="closeModal()" style="position:static;float:right;background:none;border:none;color:var(--text2);font-size:1.3rem;cursor:pointer">✕</button>' +
       '<h3>' + escHtml((m.content || '').substring(0, 60)) + '...</h3>' +
+      refBlock +
       '<div class="field"><label>全文</label><textarea id="editContent">' + escHtml(m.content || '') + '</textarea></div>' +
       '<div class="field" style="display:flex;gap:8px">' +
       '<div style="flex:1"><label>分类</label><select id="editCategory">' +
@@ -318,12 +385,59 @@ async function openDetail(id) {
       [1, 2, 3, 4, 5].map(function (i) { return '<option value="' + i + '"' + (m.importance === i ? ' selected' : '') + '>⭐' + i + '</option>'; }).join('') +
       '</select></div></div>' +
       '<div class="field"><label>ID: ' + escHtml(id) + ' · NS: ' + escHtml(m.namespace || '') + '</label></div>' +
+      '<div class="field"><label>🔗 反链（被以下记忆引用）</label><div class="backlinks" id="backlinksBox"><span style="color:var(--text2);font-size:0.8rem">加载中…</span></div></div>' +
       '<div class="actions">' +
       '<button class="btn-danger" onclick="deleteMemory(\'' + escHtml(id) + '\')">删除</button>' +
       '<button class="btn-ghost" onclick="closeModal()">取消</button>' +
       '<button class="btn-save" onclick="saveMemory(\'' + escHtml(id) + '\')">保存</button></div>';
+    loadBacklinks(id);
   } catch (e) {
     content.innerHTML = '<p style="color:var(--danger)">错误: ' + escHtml(e.message) + '</p>';
+  }
+}
+
+function copyRawRef() {
+  const t = document.getElementById('rawRefCode');
+  if (!t) return;
+  const txt = t.textContent.trim();
+  if (navigator.clipboard) {
+    navigator.clipboard.writeText(txt).then(function () { showToast('已复制原文引用', 'success'); },
+      function () { showToast('复制失败', 'error'); });
+  } else {
+    showToast('当前环境不支持剪贴板', 'error');
+  }
+}
+
+function openRawRef() {
+  const t = document.getElementById('rawRefCode');
+  if (!t) return;
+  const url = t.textContent.trim();
+  if (url.indexOf('file://') === 0) {
+    showToast('浏览器安全限制：已提示路径，请在文件管理器打开', 'error');
+  } else if (url.indexOf('http') === 0) {
+    window.open(url, '_blank');
+  } else {
+    showToast('未知引用类型', 'error');
+  }
+}
+
+async function loadBacklinks(id) {
+  const box = document.getElementById('backlinksBox');
+  if (!box) return;
+  try {
+    const ns = encodeURIComponent(currentNs());
+    const data = await api('/relations?namespace=' + ns + '&limit=1000');
+    const rels = (data.relations || []).filter(function (r) { return r.target_id === id; });
+    if (!rels.length) {
+      box.innerHTML = '<span style="color:var(--text2);font-size:0.8rem">暂无反链</span>';
+      return;
+    }
+    box.innerHTML = rels.map(function (r) {
+      const sid = escHtml(r.source_id);
+      return '<a onclick="openDetail(\'' + sid + '\')">↩ ' + sid + ' <span style="color:var(--text2)">(' + escHtml(r.relation_type || '') + ')</span></a>';
+    }).join('');
+  } catch (e) {
+    box.innerHTML = '<span style="color:var(--danger);font-size:0.8rem">反链加载失败: ' + escHtml(e.message) + '</span>';
   }
 }
 
@@ -361,6 +475,72 @@ async function deleteMemory(id) {
     loadStats();
     if (document.getElementById('tab-browse').classList.contains('active')) loadMemories(currentPage);
   } catch (e) { showToast(e.message, 'error'); }
+}
+
+// 2.3：新建笔记（写入当前/指定命名空间）
+function openNewNote() {
+  const overlay = document.getElementById('modalOverlay');
+  const content = document.getElementById('modalContent');
+  const ns = currentNs();
+  var cats = ['decision', 'preference', 'constraint', 'lesson', 'fact', 'conversation'];
+  content.innerHTML =
+    '<button class="close-btn" onclick="closeModal()" style="position:static;float:right;background:none;border:none;color:var(--text2);font-size:1.3rem;cursor:pointer">✕</button>' +
+    '<h3>➕ 新建笔记</h3>' +
+    '<div class="field"><label>命名空间 (NS)</label><input id="newNs" value="' + escHtml(ns) + '"></div>' +
+    '<div class="field"><label>全文内容</label><textarea id="newContent" placeholder="输入记忆内容…"></textarea></div>' +
+    '<div class="field" style="display:flex;gap:8px">' +
+    '<div style="flex:2"><label>分类</label><select id="newCategory">' +
+    cats.map(function (c) { return '<option value="' + c + '">' + c + '</option>'; }).join('') +
+    '</select></div>' +
+    '<div style="flex:1"><label>重要性</label><select id="newImportance">' +
+    [1, 2, 3, 4, 5].map(function (i) { return '<option value="' + i + '"' + (i === 3 ? ' selected' : '') + '>⭐' + i + '</option>'; }).join('') +
+    '</select></div></div>' +
+    '<div class="field"><label>来源 (可选)</label><input id="newSource" placeholder="来源 URL / 文件名"></div>' +
+    '<div class="field"><label>原文引用 raw_ref (可选)</label><input id="newRawRef" placeholder="file://… 或原文链接"></div>' +
+    '<div class="actions">' +
+    '<button class="btn-ghost" onclick="closeModal()">取消</button>' +
+    '<button class="btn-save" onclick="createMemory()">保存笔记</button></div>';
+  overlay.classList.add('show');
+  setTimeout(function () { var el = document.getElementById('newContent'); if (el) el.focus(); }, 50);
+}
+
+async function createMemory() {
+  const ns = (document.getElementById('newNs').value.trim()) || currentNs();
+  const contentText = (document.getElementById('newContent').value || '').trim();
+  if (!contentText) { showToast('内容不能为空', 'error'); return; }
+  try {
+    await mcpCall('memory_remember', {
+      content: contentText,
+      namespace: ns,
+      category: document.getElementById('newCategory').value,
+      importance: parseInt(document.getElementById('newImportance').value, 10),
+      source: (document.getElementById('newSource').value.trim()) || 'dashboard',
+      raw_ref: (document.getElementById('newRawRef').value.trim()) || undefined
+    });
+    closeModal();
+    showToast('笔记已创建 · ' + ns, 'success');
+    loadStats();
+    const activeBrowse = document.getElementById('tab-browse').classList.contains('active');
+    if (activeBrowse) loadMemories(currentPage);
+  } catch (e) { showToast(e.message, 'error'); }
+}
+
+// 2.3：多选合并（首条 keep_id，其余依次 merge；需 admin 门禁）
+async function mergeSelected() {
+  if (selectedIds.size < 2) { showToast('至少选择 2 条记忆', 'error'); return; }
+  if (!confirmDanger('合并 ' + selectedIds.size + ' 条记忆（首条保留，其余并入并标记 superseded）')) return;
+  const ids = Array.from(selectedIds);
+  const keepId = ids[0];
+  const adminKey = (document.getElementById('authAgentKey')?.value || localStorage.getItem(AUTH_KEYS.key) || '').trim();
+  try {
+    for (let i = 1; i < ids.length; i++) {
+      await mcpCall('memory_merge', { keep_id: keepId, merge_id: ids[i], admin_key: adminKey });
+    }
+    showToast('已合并 ' + (ids.length - 1) + ' 条 → ' + keepId, 'success');
+    clearSelection();
+    loadMemories(currentPage);
+    loadStats();
+  } catch (e) { showToast('合并失败: ' + e.message, 'error'); }
 }
 
 // 图谱节点标签：取内容首行（避免原文里 'not found' 等短语霸屏）；空内容回退为「记忆<id前8位>」

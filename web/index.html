@@ -193,6 +193,33 @@ main { max-width: 1280px; margin: 0 auto; padding: 24px; }
   font-family: inherit; font-size: 0.85rem;
 }
 .pagination button.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+
+/* NS quick switch */
+.ns-btn {
+  padding: 5px 12px; border-radius: 8px; border: 1px solid var(--border);
+  background: var(--surface); color: var(--text2); font-family: inherit;
+  font-size: 0.78rem; cursor: pointer; transition: all 0.15s;
+}
+.ns-btn:hover { border-color: var(--accent); color: var(--text); }
+.ns-btn.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+
+/* Multi-select cards */
+.memory-card .card-check {
+  position: absolute; top: 12px; left: 12px; width: 18px; height: 18px;
+  cursor: pointer; accent-color: var(--accent); z-index: 5;
+}
+.memory-card .content-preview, .memory-card .meta { margin-left: 26px; }
+.memory-card.selected { border-color: var(--accent); background: rgba(124,92,252,0.07); }
+
+/* New note + backlinks */
+.field textarea#newContent, .field textarea#editContent { min-height: 130px; }
+.backlinks { margin-top: 8px; }
+.backlinks a { color: var(--accent2); cursor: pointer; text-decoration: none; display: block; padding: 3px 0; font-size: 0.85rem; }
+.backlinks a:hover { text-decoration: underline; }
+.rawref-row { display: flex; gap: 8px; align-items: center; margin-top: 4px; flex-wrap: wrap; }
+.rawref-row code { font-size: 0.78rem; color: var(--text2); word-break: break-all; }
+.mini-btn { padding: 3px 10px; border-radius: 6px; border: 1px solid var(--border); background: var(--surface); color: var(--text); font-family: inherit; font-size: 0.75rem; cursor: pointer; }
+.mini-btn:hover { border-color: var(--accent); }
 </style>
 </head>
 <body>
@@ -232,12 +259,23 @@ main { max-width: 1280px; margin: 0 auto; padding: 24px; }
     <div class="search-box">
       <input type="text" id="searchInput" placeholder="搜索记忆... (支持全文 + 语义搜索)" onkeydown="if(event.key==='Enter')search()">
       <button onclick="search()">搜索</button>
+      <button class="btn-save" onclick="openNewNote()" style="background:var(--accent);color:#fff;font-family:inherit;padding:12px 18px;border:none;border-radius:var(--radius);cursor:pointer;font-size:0.95rem;font-weight:600;white-space:nowrap">➕ 新建</button>
     </div>
     <div id="searchResults"></div>
   </div>
 
   <!-- Browse Tab -->
   <div class="tab" id="tab-browse">
+    <div class="browse-toolbar" style="display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:12px;flex-wrap:wrap">
+      <div class="ns-quick" style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
+        <span style="font-size:0.75rem;color:var(--text2)">知识库快切：</span>
+        <button class="ns-btn" onclick="switchNs('kb/gufei')">🗑️ 固废</button>
+        <button class="ns-btn" onclick="switchNs('kb/tech')">💡 技术</button>
+        <button class="ns-btn" onclick="switchNs('kb/code')">💻 代码</button>
+        <button class="ns-btn" onclick="switchNs('agent/xujiayan')">🧠 主库</button>
+      </div>
+      <button class="btn-save" onclick="openNewNote()" style="background:var(--accent);color:#fff;font-family:inherit;padding:8px 18px;border:none;border-radius:8px;cursor:pointer;font-weight:600;white-space:nowrap">➕ 新建笔记</button>
+    </div>
     <div class="filters">
       <select id="filterTier" onchange="loadMemories()">
         <option value="">全部层级</option>
@@ -255,8 +293,26 @@ main { max-width: 1280px; margin: 0 auto; padding: 24px; }
         <option value="fact">事实</option>
         <option value="conversation">对话</option>
       </select>
+      <select id="filterMinImportance" onchange="loadMemories()">
+        <option value="">全部重要性</option>
+        <option value="3">⭐⭐⭐ 及以上</option>
+        <option value="4">⭐⭐⭐⭐ 及以上</option>
+        <option value="5">⭐⭐⭐⭐⭐ 仅重要</option>
+      </select>
+      <select id="filterSort" onchange="loadMemories()">
+        <option value="">默认排序</option>
+        <option value="created">🕒 最新优先</option>
+        <option value="importance">⭐ 重要优先</option>
+        <option value="decay">📉 高衰减优先</option>
+      </select>
       <input type="text" id="filterSearch" placeholder="关键词..." onkeydown="if(event.key==='Enter')loadMemories()">
       <button class="btn-ghost" style="border:1px solid var(--border);padding:6px 14px;border-radius:8px;cursor:pointer;background:var(--surface);color:var(--text);font-family:inherit" onclick="loadMemories()">筛选</button>
+    </div>
+    <div id="mergeToolbar" style="display:none;align-items:center;gap:10px;margin-bottom:12px;padding:10px 14px;border:1px solid var(--accent);border-radius:8px;background:rgba(124,92,252,0.08)">
+      <span style="font-size:0.85rem">已选 <b id="mergeCount">0</b> 条记忆</span>
+      <button class="btn-save" onclick="mergeSelected()" style="background:var(--accent);color:#fff;font-family:inherit;padding:6px 16px;border:none;border-radius:8px;cursor:pointer;font-weight:600">🔀 合并选中</button>
+      <button class="btn-ghost" onclick="clearSelection()" style="background:var(--surface);color:var(--text);border:1px solid var(--border);font-family:inherit;padding:6px 14px;border-radius:8px;cursor:pointer">取消选择</button>
+      <span style="font-size:0.72rem;color:var(--text2)">（合并需 admin 凭证，首条作为保留记忆）</span>
     </div>
     <div id="browseResults"></div>
     <div class="pagination" id="pagination"></div>

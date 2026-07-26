@@ -781,6 +781,10 @@ pub struct MemoriesQuery {
     q: Option<String>,
     /// 精确按 id 取单条（规避部分部署上 `/api/memories/{id}` 路由未命中）
     id: Option<String>,
+    /// 2.3：仅返回 importance >= 该值的记忆（Dataview 式筛选）
+    min_importance: Option<i32>,
+    /// 2.3：排序方式 —— created（最新优先）/ importance（重要优先）/ decay（衰减升序=高衰减优先）
+    sort: Option<String>,
 }
 
 async fn api_list_memories(
@@ -809,7 +813,7 @@ async fn api_list_memories(
         .get()
         .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
 
-    let mut sql = "SELECT id, content, category, tier, importance, decay_factor, recall_count, created_at, namespace FROM memories WHERE namespace = ?1".to_string();
+    let mut sql = "SELECT id, content, category, tier, importance, decay_factor, recall_count, created_at, namespace, raw_ref, source FROM memories WHERE namespace = ?1".to_string();
     let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(ns.to_string())];
 
     if let Some(ref t) = q.tier {
@@ -828,8 +832,21 @@ async fn api_list_memories(
             params.push(Box::new(format!("%{}%", query)));
         }
     }
+    if let Some(min_imp) = q.min_importance {
+        let idx = params.len() + 1;
+        sql.push_str(&format!(" AND importance >= ?{}", idx));
+        params.push(Box::new(min_imp));
+    }
 
-    sql.push_str(" ORDER BY CASE tier WHEN 'hot' THEN 0 WHEN 'warm' THEN 1 ELSE 2 END, decay_factor DESC LIMIT ?");
+    // 2.3：动态排序（默认沿用 tier 优先级 + 衰减降序）
+    let order_clause = match q.sort.as_deref() {
+        Some("importance") => " ORDER BY importance DESC, decay_factor DESC",
+        Some("decay") => " ORDER BY decay_factor ASC, importance DESC",
+        Some("created") => " ORDER BY created_at DESC",
+        _ => " ORDER BY CASE tier WHEN 'hot' THEN 0 WHEN 'warm' THEN 1 ELSE 2 END, decay_factor DESC",
+    };
+    sql.push_str(order_clause);
+    sql.push_str(" LIMIT ?");
     let limit_idx = params.len() + 1;
     sql.push_str(&limit_idx.to_string());
     params.push(Box::new(limit));
@@ -855,8 +872,10 @@ async fn api_list_memories(
             let recall: i32 = r.get::<_, i32>(6).unwrap_or(0);
             let created: String = r.get::<_, String>(7).unwrap_or_default();
             let ns_val: String = r.get::<_, String>(8).unwrap_or_default();
+            let raw_ref: Option<String> = r.get(9).ok();
+            let source: Option<String> = r.get(10).ok();
             Ok((
-                id, content, category, tier, importance, decay, recall, created, ns_val,
+                id, content, category, tier, importance, decay, recall, created, ns_val, raw_ref, source,
             ))
         })
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -864,7 +883,7 @@ async fn api_list_memories(
     let memories: Vec<Value> = rows
         .filter_map(|r| r.ok())
         .map(
-            |(id, content, category, tier, importance, decay, recall, created, ns_val)| {
+            |(id, content, category, tier, importance, decay, recall, created, ns_val, raw_ref, source)| {
                 json!({
                     "id": id,
                     "content": content,
@@ -875,6 +894,8 @@ async fn api_list_memories(
                     "recall_count": recall,
                     "created_at": created,
                     "namespace": ns_val,
+                    "raw_ref": raw_ref,
+                    "source": source,
                 })
             },
         )
@@ -909,7 +930,7 @@ fn load_memory_by_id(
         return Err(StatusCode::FORBIDDEN);
     }
     conn.query_row(
-        "SELECT id, content, category, tier, importance, decay_factor, recall_count, created_at, namespace FROM memories WHERE id = ?1",
+        "SELECT id, content, category, tier, importance, decay_factor, recall_count, created_at, namespace, raw_ref, source FROM memories WHERE id = ?1",
         [id],
         |r| {
             let id: String = r.get(0)?;
@@ -921,10 +942,13 @@ fn load_memory_by_id(
             let recall: i32 = r.get::<_, i32>(6).unwrap_or(0);
             let created: String = r.get::<_, String>(7).unwrap_or_default();
             let ns: String = r.get::<_, String>(8).unwrap_or_default();
+            let raw_ref: Option<String> = r.get(9).ok();
+            let source: Option<String> = r.get(10).ok();
             Ok(json!({
                 "id": id, "content": content, "category": category, "tier": tier,
                 "importance": importance, "decay_factor": decay, "recall_count": recall,
                 "created_at": created, "namespace": ns,
+                "raw_ref": raw_ref, "source": source,
             }))
         },
     )
