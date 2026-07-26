@@ -173,6 +173,10 @@ fn channel_of(source: &str) -> String {
 /// 计分：hop-h 邻居 = `seed_rrf_max * decay^h * max(weight, 0.1)`，使图邻居以足够分数进入
 /// rerank 候选池（最终排序由 cross-encoder reranker 决定，图扩展只负责「拉入」而非「排序」）。
 ///
+/// 2026-07-26 图召回定论：召回路径**默认关闭**（调用方传 max_hops=0）。实测 58 问句冷态 A/B
+/// 同二进制下 ON(=2) 与 OFF(=0) 的 @10 均为 69.0%（Δ=0）；16/18 缺失 gold 结构上 2 跳不可达，
+/// 少数进池图项被主通道保底压在 33 名外、永不到 top-10。故默认禁用，仅留作 env 实验开关。
+///
 /// 开关（均可选 env 覆盖）：
 /// - MEMORIA_GRAPH_HOPS : 覆盖传入 max_hops（0=关闭图扩展，退化为纯向量/关键词召回）。
 /// - MEMORIA_GRAPH_SEED : 种子数（默认 10，原硬编码 5）。

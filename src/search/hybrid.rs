@@ -108,8 +108,12 @@ pub fn hybrid_search(
         search::rrf::rrf_merge(&signals, &weights, 60.0)
     };
 
-    // 2-hop graph expansion
-    if let Ok(expanded) = search::rrf::graph_expand(pool, &fused, 2, namespace) {
+    // 2-hop graph expansion —— 2026-07-26 图召回定论：默认关闭（max_hops=0）。
+    // 实测（58 问句冷态 A/B，同二进制）：图开(=2) vs 图关(=0) @10 均为 69.0%（Δ=0）；
+    // 16/18 缺失 gold 结构上 2 跳不可达，少数进池图项被主通道保底压在 33 名外、永不到 top-10。
+    // 图扩展每查询额外 ~80 次 DB 查找，零召回收益，故召回路径默认禁用；
+    // 仍可经 MEMORIA_GRAPH_HOPS>0 环境变量按需开启做实验。
+    if let Ok(expanded) = search::rrf::graph_expand(pool, &fused, 0, namespace) {
         fused.extend(expanded);
     }
 
