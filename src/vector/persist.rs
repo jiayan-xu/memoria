@@ -46,6 +46,13 @@ pub fn put_stored_vector(
     vector: &[f32],
 ) -> Result<(), String> {
     let conn = pool.get().map_err(|e| format!("pool: {}", e))?;
+    // P0 防御：拒绝退化（零 / 非有限）向量落库。历史嵌入失败的写入会在 memory_vectors
+    // 留下全 0 向量，污染 HNSW 语义召回（零向量被 DistCosine 误判为完美匹配）。
+    // 调用方均 `let _ =` 忽略返回值，故记忆仍照常写入、仅缺语义向量（退化为 keyword-only）。
+    let norm_sq: f64 = vector.iter().map(|x| (*x as f64) * (*x as f64)).sum();
+    if !norm_sq.is_finite() || norm_sq == 0.0 {
+        return Err("put_stored_vector: degenerate (zero/NaN) vector rejected".into());
+    }
     conn.execute(
         "INSERT OR REPLACE INTO memory_vectors (id, namespace, vector) VALUES (?, ?, ?)",
         rusqlite::params![id, namespace, encode_vector(vector)],

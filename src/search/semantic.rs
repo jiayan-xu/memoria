@@ -36,8 +36,17 @@ pub fn semantic_search(
         None => return Ok(vec![]), // No cached embedding — skip semantic signal
     };
 
-    // Search HNSW index
-    let results = hnsw.search(&vector, limit as usize)?;
+    // Search HNSW index.
+    // 关键修复（2026-07-26）：HNSW 是全局索引、无 namespace 维度（语义检索 B2 修复说明）。
+    // 若直接按 limit(=primary_limit) 取「全局 top-k」再按 ns 过滤，跨 ns 向量会占满名额，
+    // 导致目标 ns 内排名靠前（但全局排名靠后）的 gold 被砍掉 → 语义漏召（实测 ~67%）。
+    // 故先按远大于 limit 的窗口过取全局候选，再按 ns 过滤，保证目标 ns 拿到足够语义候选。
+    let cap = hnsw.len();
+    let overfetch = (limit as usize)
+        .saturating_mul(20)
+        .max(2048)
+        .min(cap.max(1));
+    let results = hnsw.search_with_ef(&vector, overfetch, overfetch)?;
     if results.is_empty() {
         return Ok(vec![]);
     }
@@ -88,7 +97,9 @@ pub fn semantic_search(
 
     for (memory_id, distance) in results {
         let score = 1.0 - distance; // Convert cosine distance to similarity
-        if score > 0.0 && allowed.contains(&memory_id) {
+        // P0 防御：丢弃非有限 / 非正的分数。零向量在 DistCosine 下 distance≈0 → score≈1.0，
+        // 会伪造「完美匹配」污染召回；add() 已拦截退化向量入索引，此处为双保险。
+        if score.is_finite() && score > 0.0 && allowed.contains(&memory_id) {
             let content = contents.get(&memory_id).cloned().unwrap_or_default();
             out.push(SignalResult {
                 memory_id,
@@ -98,6 +109,9 @@ pub fn semantic_search(
             });
         }
     }
+    // 恢复「每通道贡献 limit 条」设计：过取后按 ns 过滤，再截断到本 ns 内 top-limit，
+    // 避免把上千条跨 ns 候选灌进融合（既保平衡，又确保 gold 在正确的本 ns top 内）。
+    out.truncate(limit as usize);
     Ok(out)
 }
 

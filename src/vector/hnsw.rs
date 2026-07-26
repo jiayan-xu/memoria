@@ -77,6 +77,14 @@ impl HnswIndex {
                     entry.id
                 ));
             }
+            // P0 防御：跳过退化（零向量 / 非有限）向量。历史嵌入失败会在 memory_vectors
+            // 留下全 0 / NaN 向量，DistCosine 对零向量返回 distance≈0 → semantic_search
+            // 误判为「完美匹配」(sem_cos=1.0)，污染语义召回把真正的 gold 挤出 top-k。
+            // 退化的记忆仍可经 keyword/graph 通道召回，仅损失语义覆盖，绝不污染索引。
+            let norm_sq: f32 = entry.vector.iter().map(|x| x * x).sum();
+            if !norm_sq.is_finite() || norm_sq == 0.0 {
+                continue;
+            }
             if id_to_seq.contains_key(&entry.id) {
                 continue;
             }
@@ -95,6 +103,30 @@ impl HnswIndex {
         let inner = self.inner.read().map_err(|e| format!("inner: {}", e))?;
         let id_map = self.id_map.read().map_err(|e| format!("id_map: {}", e))?;
 
+        let results = inner.search(query, k, ef);
+        Ok(results
+            .iter()
+            .map(|n| {
+                let id = id_map
+                    .get(n.get_origin_id())
+                    .cloned()
+                    .unwrap_or_else(|| format!("<unknown:{}>", n.get_origin_id()));
+                (id, n.get_distance())
+            })
+            .collect())
+    }
+
+    /// 与 `search` 同，但允许调用方显式指定搜索宽度 `ef`（覆盖全局 `ef_search`）。
+    /// 用于语义检索的「过取」：全局 HNSW 索引无 namespace 维度，需先按大窗口取全局候选、
+    /// 再按 ns 过滤，避免跨 ns 向量占满 top-k 把目标 ns 内高排名的 gold 砍掉。
+    pub fn search_with_ef(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef: usize,
+    ) -> Result<Vec<(String, f32)>, String> {
+        let inner = self.inner.read().map_err(|e| format!("inner: {}", e))?;
+        let id_map = self.id_map.read().map_err(|e| format!("id_map: {}", e))?;
         let results = inner.search(query, k, ef);
         Ok(results
             .iter()
