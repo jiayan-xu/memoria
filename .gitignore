@@ -39,3 +39,31 @@ Thumbs.db
 .vscode/
 .idea/
 *.swp
+
+# ===== eval/ 本地 scratch 诊断脚本/启动器/日志（不进公开仓，仅本地调试用）=====
+# 这些是在召回调优过程中产生的一次性诊断/启动脚本，含本机硬编码路径，不入库。
+eval/*.cmd
+eval/*.err
+eval/*.sh
+eval/*.json
+eval/backfill_vectors.py
+eval/diag_*.py
+eval/diagnose_*.py
+eval/embed_*.py
+eval/eval_e2e_recall.py
+eval/eval_embed_ab.py
+eval/eval_recall.py
+eval/eval_recall_compare.py
+eval/finish_reembed.py
+eval/launch_*.py
+eval/memoria_*.py
+eval/probe_siliconflow.py
+eval/restart_*.py
+eval/start_*.py
+eval/sweep_*.py
+eval/validate_recall_bm25.py
+# 保留已提交的金标准评测与方案/实现文档
+!eval/eval_recall_corrected.py
+!eval/polish_plan_2026-07-25.md
+!eval/A+C_implementation_report.md
+!eval/recall_rate_report.md
