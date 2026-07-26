@@ -35,6 +35,13 @@ pub fn hybrid_search(
     let rrf_w = env_f64("MEMORIA_RERANK_W_RRF", 0.3);
     let sem_w = env_f64("MEMORIA_RERANK_W_SEM", 0.2);
     let kw_w = env_f64("MEMORIA_RERANK_W_KW", 0.5);
+    // 软信号权重（env 可配，默认保持原始值 1.0/1.0/0.5）。
+    // 2026-07-26 实测扫描（58 问句冷态）：0.2→67.2% / 0.5→69.0% / 1.0→69.0% @10。
+    // 降权反而劣化——软信号帮助「非强语义/关键词命中」的边界 gold 进入 top-100 候选池；
+    // 真正解决「软信号淹没纯语义」的是主通道保底(hybrid.rs:282)，而非降权。故默认维持原值。
+    let w_temporal = env_f64("MEMORIA_RERANK_W_TEMPORAL", 1.0);
+    let w_importance = env_f64("MEMORIA_RERANK_W_IMPORTANCE", 1.0);
+    let w_category = env_f64("MEMORIA_RERANK_W_CATEGORY", 0.5);
 
     let fts_limit = max_results * 3; // 辅助信号（temporal/importance）检索深度
     let primary_limit = recall_depth.max(fts_limit); // 主信号（语义/关键词）宽召回深度
@@ -75,7 +82,7 @@ pub fn hybrid_search(
     if let Ok(temp) = search::temporal::temporal_search(pool, namespace, fts_limit) {
         if !temp.is_empty() {
             signals.push(temp);
-            weights.push(1.0);
+            weights.push(w_temporal);
         }
     }
 
@@ -83,7 +90,7 @@ pub fn hybrid_search(
     if let Ok(imp) = search::importance::importance_search(pool, namespace, fts_limit) {
         if !imp.is_empty() {
             signals.push(imp);
-            weights.push(1.0);
+            weights.push(w_importance);
         }
     }
 
@@ -91,7 +98,7 @@ pub fn hybrid_search(
     if let Ok(cat) = search::importance::category_search(pool, query, namespace, max_results) {
         if !cat.is_empty() {
             signals.push(cat);
-            weights.push(0.5);
+            weights.push(w_category);
         }
     }
 
