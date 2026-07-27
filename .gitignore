@@ -17,6 +17,8 @@ data/
 
 # Auto-generated admin key (P0-2: never commit)
 admin_key.secret
+# 通用密钥文件（P0-3 强化：与 agent-core 对齐，避免任何 *.key 误提交）
+*.key
 
 # Local secrets (P0: never commit real .env)
 .env

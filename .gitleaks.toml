@@ -1,0 +1,22 @@
+# Gitleaks 配置 —— agent-core / memoria 公开仓密钥扫描
+# 采用 Gitleaks 默认规则集，并对已知测试占位符 / 构建产物 / 临时运行目录做豁免。
+[extend]
+useDefault = true
+
+[allowlist]
+description = "豁免单元测试占位密钥、构建产物、临时运行目录、评估脚本"
+paths = [
+  '''.*/target/.*''',
+  '''.*/temp_run/.*''',
+  '''.*/data/.*''',
+  '''.*/eval/.*''',
+  '''.*/tests/.*''',
+  '''.*/test_.*\.rs''',
+  '''.*_test\.rs''',
+]
+regexes = [
+  # 单元测试用的 deadbeef 占位 admin key
+  '''deadbeef[a-f0-9]*''',
+  # 本地评估脚本用的固定占位 badge（非真实生产密钥）
+  '''mem-admin-fixed-key-2026''',
+]
