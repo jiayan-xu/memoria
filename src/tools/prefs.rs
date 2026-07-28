@@ -115,16 +115,51 @@ pub fn user_prefs(pool: &SqlitePool, namespace: &str) -> Result<Vec<PreferenceEn
     Ok(entries)
 }
 
-/// Get recent decisions from `decisions` table (matching Python).
+/// Get recent decisions.
+///
+/// P1-2 产品化：主源改为 `memories(category='decision')`（与 Profile.dynamic 一致）；
+/// 遗留 `decisions` 表仅作兜底，避免历史旁路数据不可见。
 pub fn recent_decisions(
     pool: &SqlitePool,
     namespace: &str,
     limit: u32,
 ) -> Result<Vec<(String, String, String)>, String> {
     let conn = pool.get().map_err(|e| format!("pool: {}", e))?;
-    let mut stmt = conn.prepare(
-        "SELECT id, decision, created_at FROM decisions WHERE namespace = ? ORDER BY created_at DESC LIMIT ?"
-    ).map_err(|e| format!("prepare: {}", e))?;
+    let mut results = Vec::new();
+
+    // ── 主路径：标准 memories ──
+    {
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, content, created_at FROM memories \
+             WHERE namespace = ? AND category = 'decision' \
+             ORDER BY created_at DESC LIMIT ?",
+            )
+            .map_err(|e| format!("prepare memories decisions: {}", e))?;
+        let rows = stmt
+            .query_map(rusqlite::params![namespace, limit], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2).unwrap_or_default(),
+                ))
+            })
+            .map_err(|e| format!("query memories decisions: {}", e))?;
+        for row in rows.flatten() {
+            results.push(row);
+        }
+    }
+
+    if !results.is_empty() {
+        return Ok(results);
+    }
+
+    // ── 兜底：遗留 decisions 表 ──
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, decision, created_at FROM decisions WHERE namespace = ? ORDER BY created_at DESC LIMIT ?",
+        )
+        .map_err(|e| format!("prepare: {}", e))?;
 
     let rows = stmt
         .query_map(rusqlite::params![namespace, limit], |row| {
@@ -136,7 +171,6 @@ pub fn recent_decisions(
         })
         .map_err(|e| format!("query: {}", e))?;
 
-    let mut results = Vec::new();
     for row in rows.flatten() {
         results.push(row);
     }

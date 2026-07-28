@@ -449,6 +449,7 @@ pub fn tools_list() -> Vec<serde_json::Value> {
             "搜索记忆",
             serde_json::json!({
                 "query": {"type": "string", "description": "搜索关键词（必填）"},
+                "namespace": {"type": "string", "description": "命名空间（必填）；缺省时由 agent-core 注入调用者主 ns"},
                 "max_results": {"type": "number", "description": "最大返回结果数", "default": 5},
                 "tags": {"type": "string", "description": "标签过滤，JSON 数组字符串如 [\"a\",\"b\"]"},
                 "as_of": {"type": "string", "description": "P1-5 时序真值：仅返回该 ISO-8601 时刻有效的记忆；不传则默认 now，自动过滤已失效"}
@@ -459,6 +460,7 @@ pub fn tools_list() -> Vec<serde_json::Value> {
             "多信号融合搜索",
             serde_json::json!({
                 "query": {"type": "string", "description": "搜索关键词（必填）"},
+                "namespace": {"type": "string", "description": "命名空间（必填）；缺省时由 agent-core 注入调用者主 ns"},
                 "max_results": {"type": "number", "description": "最大返回结果数", "default": 5},
                 "tags": {"type": "string", "description": "标签过滤，JSON 数组字符串"},
                 "as_of": {"type": "string", "description": "P1-5 时序真值：仅返回该 ISO-8601 时刻有效的记忆；不传则默认返回「当前真值」（superseded_by IS NULL 且未失效）"},
@@ -545,6 +547,7 @@ pub fn tools_list() -> Vec<serde_json::Value> {
             "回忆检索（别名 memory_search_v2）：默认 isLatest，走 search 配额",
             serde_json::json!({
                 "query": {"type": "string", "description": "搜索关键词（必填）"},
+                "namespace": {"type": "string", "description": "命名空间（必填）；缺省时由 agent-core 注入调用者主 ns"},
                 "max_results": {"type": "number", "description": "最大返回结果数，默认 5"},
                 "tags": {"type": "string", "description": "标签过滤，JSON 数组字符串"},
                 "as_of": {"type": "string", "description": "P1-5 时序真值：仅返回该 ISO-8601 时刻有效的记忆；不传则默认返回当前真值"},
@@ -653,15 +656,43 @@ pub fn tools_list() -> Vec<serde_json::Value> {
     ];
     // Bridge 转发工具（圆桌 panel_discuss 已 native 进 agent-core，不再经 bridge）
     for name in BRIDGE_TOOLS {
-        let desc = match *name {
-            "cross_agent_query" => "向另一个Agent提问",
-            "system_status" => "检查各Agent连接状态",
-            "reasonix_dispatch" => "派发编码任务给Reasonix",
-            "continue_task" => "继续一个等待输入的任务",
-            "auto_route" => "动态路由查询到最佳Agent",
-            _ => "Bridge 转发工具",
+        let (desc, schema) = match *name {
+            "cross_agent_query" => (
+                "向另一个Agent提问",
+                serde_json::json!({
+                    "query": {"type": "string", "description": "要发送的问题（必填）"},
+                    "target_agent": {"type": "string", "description": "目标 Agent ID（必填）"},
+                    "namespace": {"type": "string", "description": "可选；调用者主 ns，缺省由引擎注入"}
+                }),
+            ),
+            "system_status" => (
+                "检查各Agent连接状态",
+                serde_json::json!({}),
+            ),
+            "reasonix_dispatch" => (
+                "派发编码任务给Reasonix",
+                serde_json::json!({
+                    "task": {"type": "string", "description": "任务描述"},
+                    "namespace": {"type": "string", "description": "可选命名空间"}
+                }),
+            ),
+            "continue_task" => (
+                "继续一个等待输入的任务",
+                serde_json::json!({
+                    "task_id": {"type": "string", "description": "任务 ID"},
+                    "input": {"type": "string", "description": "继续输入"}
+                }),
+            ),
+            "auto_route" => (
+                "动态路由查询到最佳Agent",
+                serde_json::json!({
+                    "query": {"type": "string", "description": "路由查询（必填）"},
+                    "namespace": {"type": "string", "description": "可选；调用者主 ns，缺省由引擎注入"}
+                }),
+            ),
+            _ => ("Bridge 转发工具", serde_json::json!({})),
         };
-        tools.push(tool(name, desc, serde_json::json!({})));
+        tools.push(tool(name, desc, schema));
     }
     // Skill Market 工具
     tools.push(tool(
@@ -972,19 +1003,29 @@ async fn handle_tool_call(
         Some(crate::permissions::NsPolicy::None) => {
             auth.allowed_ns.first().map(|s| s.as_str()).unwrap_or("default")
         }
-        // NamespaceArg 及其它需按 namespace 门控的变体：要求调用方显式传 namespace，缺失即拒绝
-        // （防静默落到 "default" 造成跨租户访问）
-        Some(_) => match safe_args.get("namespace").and_then(|v| v.as_str()) {
+        // NamespaceArg 及其它需按 namespace 门控的变体：要求调用方显式传 namespace；
+        // 若缺省则回退到调用者主授权 ns（禁止静默落到 "default" 造成跨租户串写）。
+        Some(_) => match safe_args.get("namespace").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
             Some(n) => n,
             None => {
-                spawn_audit(
-                    state,
-                    agent_id,
-                    tool,
-                    &serde_json::to_string(&args).unwrap_or_else(|_| format!("{:?}", args)),
-                    false,
-                );
-                return rpc_error(id, -32002, "Namespace argument required for this tool.");
+                match auth
+                    .allowed_ns
+                    .iter()
+                    .map(|s| s.as_str())
+                    .find(|s| !s.is_empty() && *s != "*")
+                {
+                    Some(primary) => primary,
+                    None => {
+                        spawn_audit(
+                            state,
+                            agent_id,
+                            tool,
+                            &serde_json::to_string(&args).unwrap_or_else(|_| format!("{:?}", args)),
+                            false,
+                        );
+                        return rpc_error(id, -32002, "Namespace argument required for this tool.");
+                    }
+                }
             }
         },
         // 未在矩阵登记的工具：维持历史行为（默认 default + 校验），避免误伤
