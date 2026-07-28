@@ -78,7 +78,12 @@ pub fn evolve_memory(
     };
 
     let now = now_iso();
-    conn.execute(
+    // 原子写入：UPDATE memories 与 INSERT evolution_log 必须同事务，
+    // 否则中途失败会留下「记忆已演化但无回滚日志」的半提交状态（evolve.rs 审计项）。
+    let tx = conn
+        .unchecked_transaction()
+        .map_err(|e| format!("begin evolve tx: {}", e))?;
+    tx.execute(
         "UPDATE memories SET evolved_context = ?, evolved_at = ?, link_count = ? \
          WHERE id = ? AND namespace = ?",
         params![evolved_context, now, links, target_id, namespace],
@@ -88,12 +93,13 @@ pub fn evolve_memory(
     let old_value = json!({ "evolved_context": old_ctx, "link_count": old_links }).to_string();
     let new_value = json!({ "evolved_context": evolved_context, "link_count": links }).to_string();
     let log_id = gen_id("ev");
-    conn.execute(
+    tx.execute(
         "INSERT INTO evolution_log (id, new_id, target_id, change_type, old_value, new_value, model, created_at, namespace)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         params![log_id, target_id, target_id, change_type, old_value, new_value, model, now, namespace],
     )
     .map_err(|e| format!("evolution_log insert: {}", e))?;
+    tx.commit().map_err(|e| format!("commit evolve tx: {}", e))?;
 
     Ok(json!({
         "status": "evolved",
@@ -131,18 +137,23 @@ pub fn evolution_rollback(pool: &SqlitePool, log_id: &str) -> Result<Value, Stri
         }
         None => (None, None),
     };
-    conn.execute(
+    // 原子回滚：恢复记忆内容与标记日志必须同事务，避免半回滚状态。
+    let tx = conn
+        .unchecked_transaction()
+        .map_err(|e| format!("begin rollback tx: {}", e))?;
+    tx.execute(
         "UPDATE memories SET evolved_context = ?, link_count = ? WHERE id = ?",
         params![old_ctx, old_links, target_id],
     )
     .map_err(|e| format!("rollback update: {}", e))?;
     // G3（HY3 硬门）：回滚同时把对应 evolution_log 行标记为 rolled_back，
     // 使 PR5 的 evolution_log_query 能采到负样本，元进化闭环连通。
-    conn.execute(
+    tx.execute(
         "UPDATE evolution_log SET change_type = 'rolled_back' WHERE id = ?",
         params![log_id],
     )
     .map_err(|e| format!("rollback log mark: {}", e))?;
+    tx.commit().map_err(|e| format!("commit rollback tx: {}", e))?;
     Ok(json!({
         "status": "rolled_back",
         "target_id": target_id,
