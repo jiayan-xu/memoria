@@ -21,9 +21,6 @@ pub fn keyword_search(
 ) -> Result<Vec<SignalResult>, String> {
     let conn = pool.get().map_err(|e| format!("pool: {}", e))?;
     let tokens = fts5::tokenize_for_fts(query);
-    if tokens.is_empty() {
-        return Ok(vec![]);
-    }
 
     let mut results = Vec::new();
     let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -34,16 +31,22 @@ pub fn keyword_search(
     // 对中文查询 FTS 常返回空/泛化噪音，旧版（memoria 0.2.x）用 LIKE 子串兜底 recall=1.00。
     // 此处恢复并**前置**：LIKE 是精确子串匹配，其命中应优先于 FTS OR 泛化召回（RRF 按 rank
     // 加权，前置可确保目标进入高权重位置）。仅对纯英文/代码查询（无 CJK）跳过，避免噪音。
+    // 注意：须在 tokens.is_empty() 早退之前执行——单 CJK 字查询（如「钱」）会被
+    // tokenize_for_fts 的 all_cjk && len<2 过滤导致 tokens 为空，此时 LIKE 兜底是唯一通道。
     let has_cjk = query.chars().any(|c| (0x4E00..=0x9FFF).contains(&(c as u32)));
-    if has_cjk {
+    if has_cjk && !query.trim().is_empty() {
         let mut like_q = query.trim();
         // 去掉 [pattern] 前缀标记（非内容词）
         let stripped = like_q.strip_prefix("[pattern]").unwrap_or(like_q).trim();
         like_q = stripped;
-        if like_q.len() > 24 {
-            like_q = &like_q[..24];
-        }
-        let escaped = like_q.replace('%', "\\%").replace('_', "\\_");
+        // 安全截断到 24 字符（char 边界，避免 UTF-8 字节切片 panic）
+        let truncated: String = like_q.chars().take(24).collect();
+        let like_q = truncated.as_str();
+        // 转义顺序：先 \ 再 % _（ESCAPE 字符自身须优先转义）
+        let escaped = like_q
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
         let like_pattern = format!("%{}%", escaped);
         let like_sql = "SELECT rowid, id, content FROM memories \
                         WHERE content LIKE ? ESCAPE '\\' AND namespace = ? \
@@ -72,6 +75,10 @@ pub fn keyword_search(
                 }
             }
         }
+    }
+
+    if tokens.is_empty() {
+        return Ok(results);
     }
 
     // FTS5 主召回：jieba 切词 + 代码符号拆子 token（对齐索引拆存），OR 宽召回。
