@@ -12,7 +12,7 @@
   {"content":"用户规定：所有对外文档必须用中文撰写，英文仅用于代码标识符。","category":"hard_rule","importance":5,"tags":"[\"hard_rule\"]","ns":"agent/default","created_offset_days":25},
   {"content":"agent-core 的 P0 加固包括默认监听 127.0.0.1、统一鉴权中间件、危险工具硬拒绝。","category":"fact","importance":4,"tags":"[\"fact\"]","ns":"agent/default","created_offset_days":12},
   {"content":"GitHub 个人访问令牌（PAT）scope 只需 repo 即可推送，不要授予 admin:tokens。","category":"fact","importance":4,"tags":"[\"fact\",\"security\"]","ns":"agent/default","created_offset_days":8},
-  {"content":"腾讯云轻量服务器 IP 为 124.223.188.126，系统为 OpenCloudOS 9.6，默认无 nginx。","category":"fact","importance":3,"tags":"[\"fact\"]","ns":"agent/default","created_offset_days":50},
+  {"content":"腾讯云轻量服务器 IP 为 203.0.113.86，系统为 OpenCloudOS 9.6，默认无 nginx。","category":"fact","importance":3,"tags":"[\"fact\"]","ns":"agent/default","created_offset_days":50},
   {"content":"用户偏好：提交代码前必须扫描密钥与绝对路径，公开仓推送前需用户确认。","category":"preference","importance":5,"tags":"[\"hard_rule\",\"security\"]","ns":"agent/default","created_offset_days":6},
   {"content":"记忆检索采用 5 信号 RRF 融合：关键词、语义、时序、重要性、类别，各权重 1.0 类别 0.5。","category":"fact","importance":3,"tags":"[\"fact\"]","ns":"agent/default","created_offset_days":35},
   {"content":"HNSW 向量索引损坏时禁止 panic，应软失败重建或禁用语义通道并上报 health。","category":"fact","importance":4,"tags":"[\"fact\"]","ns":"agent/default","created_offset_days":18},
