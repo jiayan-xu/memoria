@@ -24,6 +24,11 @@ admin_key.secret
 .env
 *.env.local
 *.env.*.local
+# env 备份/历史快照（含真实密钥，禁止提交）
+.env.bak.*
+.env.*.bak*
+# 通用备份/快照文件（*.bak* / *.bak_*，含密钥历史不得入库）
+*.bak*
 # but keep the documented example
 !.env.example
 
