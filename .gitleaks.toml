@@ -4,12 +4,11 @@
 useDefault = true
 
 [allowlist]
-description = "豁免单元测试占位密钥、构建产物、临时运行目录、评估脚本"
+description = "豁免单元测试占位密钥、构建产物、临时运行目录"
 paths = [
   '''.*/target/.*''',
   '''.*/temp_run/.*''',
   '''.*/data/.*''',
-  '''.*/eval/.*''',
   '''.*/tests/.*''',
   '''.*/test_.*\.rs''',
   '''.*_test\.rs''',
@@ -19,4 +18,6 @@ regexes = [
   '''deadbeef[a-f0-9]*''',
   # 本地评估脚本用的固定占位 badge（非真实生产密钥）
   '''mem-admin-fixed-key-2026''',
+  # eval 语料中的虚构测试串（negative 用例诱饵，非真实凭据）
+  '''prod-mem-9f3a2c''',
 ]
