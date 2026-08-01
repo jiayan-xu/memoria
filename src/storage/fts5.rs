@@ -47,7 +47,10 @@ pub fn tokenize_for_fts(text: &str) -> String {
     let mut out: Vec<String> = Vec::new();
     let mut seen = std::collections::HashSet::new();
     // 判断 token 是否值得作为 FTS OR 项：
-    // - 丢弃纯分隔符（. _ / -）与空串；
+    // - 丢弃纯分隔符/标点（. _ / - [ ] ( ) * : 等）与空串；
+    //   [pattern] 前缀被 jieba 切成 '[' 'pattern' ']' —— 方括号是全库 [pattern] 记忆
+    //   共有的泛化 token，OR 宽召回下 1240 条同质记忆全部命中，目标 BM25 rank 被挤出
+    //   keyword 通道 limit，导致 kw_bm25=None 融合被碾压（2026-08-01 召回率根因定位）。
     // - 丢弃单 CJK 字（jieba-rs 对未登录词会拆成单字，噪声爆棚，淹没有区分度词）；
     // - 其余（≥2 字符的中文/英文/数字/混合）保留。
     let keep = |t: &str| -> bool {
@@ -55,8 +58,20 @@ pub fn tokenize_for_fts(text: &str) -> String {
         if t.is_empty() {
             return false;
         }
-        if t.chars().all(|c| c == '_' || c == '.' || c == '/' || c == '-') {
-            return false; // 纯分隔符
+        // [pattern] 前缀的残留英文 token：jieba 切出 '[' 'pattern' ']'，标点已被上面过滤，
+        // 但 'pattern' 是英文词会漏过——它是全库 [pattern] 记忆共有的泛化 token，
+        // OR 宽召回下让同质记忆互相淹没（2026-08-01 召回率根因）。
+        if t.eq_ignore_ascii_case("pattern") {
+            return false;
+        }
+        if t.chars().all(|c| {
+            c == '_' || c == '.' || c == '/' || c == '-' || c == '['
+                || c == ']' || c == '(' || c == ')' || c == '*' || c == ':'
+                || c == '|' || c == '，' || c == '。' || c == '、' || c == '：'
+                || c == '（' || c == '）' || c == '“' || c == '”' || c == '；'
+                || c == '!' || c == '？' || c == '％' || c == '%'
+        }) {
+            return false; // 纯标点/分隔符
         }
         let chars: Vec<char> = t.chars().collect();
         let all_cjk = chars.iter().all(|c| (0x4E00..=0x9FFF).contains(&(*c as u32)));
