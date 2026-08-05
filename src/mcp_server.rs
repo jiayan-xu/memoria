@@ -2139,12 +2139,17 @@ fn dispatch(
                 Ok(conn) => {
                     // 仅允许删除自己收件箱的消息（namespace 强约束防越权删除）
                     let ns = format!("agent/{}", _auth.agent_id);
-                    let deleted = conn
-                        .execute(
-                            "DELETE FROM memories WHERE id = ? AND namespace = ? AND category = 'a2a_message'",
-                            rusqlite::params![msg_id, ns],
-                        )
-                        .unwrap_or(0);
+                    // ocr 门禁修复：传播 SQLite 错误（原 unwrap_or(0) 把 DB 故障误报成
+                    // "not found or not owned"，且无审计；与其他分支一致返回 status:error）
+                    let deleted = match conn.execute(
+                        "DELETE FROM memories WHERE id = ? AND namespace = ? AND category = 'a2a_message'",
+                        rusqlite::params![msg_id, ns],
+                    ) {
+                        Ok(n) => n,
+                        Err(e) => {
+                            return format!(r#"{{"status":"error","message":"a2a_delete db error: {}"}}"#, e);
+                        }
+                    };
                     if deleted > 0 {
                         auth::audit_log(
                             &state.auth_pool,
