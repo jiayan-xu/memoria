@@ -83,3 +83,15 @@ eval/hyde_on.json
 # 召回回归守护生成物（运行期趋势日志，不入库）
 recall_trend.csv
 recall_guard_detail.json
+
+# 本地工具/记忆目录（Agent 工作区状态，不进公开仓）
+.workbuddy/
+
+# recall_guard 修复产生的 legacy 备份（运行时产物，不入库）
+recall_trend*.legacy*
+
+# 本地生产启动脚本（含本机绝对路径，仅本地调试用，不进公开仓）
+start_memoria_prod.py
+
+# 本地召回探针（单查询诊断，eval/ 批量 scratch 规则外补充）
+eval/probe_single.py
