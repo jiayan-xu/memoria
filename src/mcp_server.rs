@@ -650,6 +650,13 @@ pub fn tools_list() -> Vec<serde_json::Value> {
             }),
         ),
         tool(
+            "a2a_delete",
+            "删除一条发给自己的消息（收件箱清理）",
+            serde_json::json!({
+                "id": {"type": "string", "description": "消息 ID（a2a_recv 返回的 id，必填）"}
+            }),
+        ),
+        tool(
             "agent_list",
             "列出已注册的Agent（需要Admin key）",
             serde_json::json!({
@@ -2118,6 +2125,37 @@ fn dispatch(
                     match result {
                         Ok(s) => s,
                         Err(e) => format!(r#"{{"status":"error","message":"{}"}}"#, e),
+                    }
+                }
+                Err(e) => format!(r#"{{"status":"error","message":"{}"}}"#, e),
+            }
+        }
+        "a2a_delete" => {
+            let msg_id = args.get("id").and_then(|v| v.as_str()).unwrap_or("");
+            if msg_id.is_empty() {
+                return r#"{"status":"error","message":"missing 'id'"}"#.to_string();
+            }
+            match state.pool.get() {
+                Ok(conn) => {
+                    // 仅允许删除自己收件箱的消息（namespace 强约束防越权删除）
+                    let ns = format!("agent/{}", _auth.agent_id);
+                    let deleted = conn
+                        .execute(
+                            "DELETE FROM memories WHERE id = ? AND namespace = ? AND category = 'a2a_message'",
+                            rusqlite::params![msg_id, ns],
+                        )
+                        .unwrap_or(0);
+                    if deleted > 0 {
+                        auth::audit_log(
+                            &state.auth_pool,
+                            &_auth.agent_id,
+                            "a2a_delete",
+                            &format!("id={}", msg_id),
+                            true,
+                        );
+                        format!(r#"{{"status":"ok","deleted":{}}}"#, deleted)
+                    } else {
+                        format!(r#"{{"status":"ok","deleted":0,"message":"not found or not owned"}}"#)
                     }
                 }
                 Err(e) => format!(r#"{{"status":"error","message":"{}"}}"#, e),

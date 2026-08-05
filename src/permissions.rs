@@ -380,6 +380,12 @@ pub const PERMISSION_MATRIX: &[Entry] = &[
         ns_policy: NsPolicy::SelfOnly,
         note: "仅自身收件箱",
     },
+    Entry {
+        tool: "a2a_delete",
+        min_role: MinRole::Agent,
+        ns_policy: NsPolicy::SelfOnly,
+        note: "仅自身收件箱消息",
+    },
     // ── 派生 NS 检查 ──
     Entry {
         tool: "memory_dedup_chain",
