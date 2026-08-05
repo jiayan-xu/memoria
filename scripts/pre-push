@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# pre-push 门禁（OpenCodeReview）—— 推送前审查本次要推的 commit 范围
+# 默认只报告(不拦截)；设置 OCR_GATE=1 或传 --gate 时，发现评论即拦截推送。
+# stdin: <local-ref> <local-oid> <remote-ref> <remote-oid>  （可有多行）
+set -uo pipefail
+
+ZERO="0000000000000000000000000000000000000000"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+RUNNER="$SCRIPT_DIR/ocr-review.sh"
+GATE_FLAG=""
+[ "${OCR_GATE:-0}" = "1" ] && GATE_FLAG="--gate"
+
+while read -r lref loid rref roid || [ -n "$lref" ]; do
+  # 只处理分支推送
+  case "$lref" in refs/heads/*) ;; *) continue;; esac
+  if [ "$roid" = "$ZERO" ]; then
+    # 新建分支：对比默认可达主干，否则跳过(避免一次性审全量历史)
+    base="$(git rev-parse --verify origin/main 2>/dev/null \
+        || git rev-parse --verify origin/master 2>/dev/null || echo "")"
+    if [ -z "$base" ]; then
+      echo "[ocr] 新分支且无 origin/main|master 可对比，跳过审查"; continue
+    fi
+    echo "[ocr] 新分支 -> 审查 $base..$loid"
+    range_args=(--from "$base" --to "$loid")
+  else
+    echo "[ocr] 审查推送范围 $roid..$loid"
+    range_args=(--from "$roid" --to "$loid")
+  fi
+  # 运行器内部已带默认 --exclude；门禁逻辑由 GATE 控制
+  "$RUNNER" $GATE_FLAG "${range_args[@]}" || {
+    rc=$?
+    if [ "$rc" = "1" ]; then
+      echo "[ocr] 门禁拦截推送（可用 'git push --no-verify' 强制，不推荐）"
+      exit 1
+    fi
+    # rc=2 为 ocr 异常，不阻断推送，仅告警
+    echo "[ocr] 审查运行异常(rc=$rc)，未阻断推送"
+  }
+done
+exit 0

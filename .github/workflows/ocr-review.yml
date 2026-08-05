@@ -1,0 +1,61 @@
+name: ocr-review
+
+# OpenCodeReview 代码审查门禁
+# - PR：审查 base..head 的 diff
+# - 推送到默认分支：审查 HEAD~1..HEAD
+# 需要仓库 Secret：DEEPSEEK_API_KEY（在 Settings > Secrets 添加）
+# 默认门禁：发现评论即 fail CI（见 scripts/ocr-review.sh 的 --gate）
+
+on:
+  pull_request:
+  push:
+    branches: [main, master]
+
+jobs:
+  ocr:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install OpenCodeReview
+        run: npm install -g @alibaba-group/open-code-review
+
+      - name: Configure LLM (DeepSeek)
+        env:
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+        run: |
+          if [ -z "$DEEPSEEK_API_KEY" ]; then
+            echo "::error::缺少 Secret DEEPSEEK_API_KEY，请在仓库 Settings > Secrets 配置"
+            exit 1
+          fi
+          ocr config set provider deepseek
+          ocr config set model deepseek-v4-flash
+          ocr config set providers.deepseek.api_key "$DEEPSEEK_API_KEY"
+
+      - name: Run review (gate)
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            BASE="${{ github.event.pull_request.base.sha }}"
+            HEAD="${{ github.event.pull_request.head.sha }}"
+          else
+            BASE="HEAD~1"
+            HEAD="HEAD"
+          fi
+          echo "审查范围: $BASE..$HEAD"
+          OUT=$(ocr review --from "$BASE" --to "$HEAD" \
+            --exclude '.github/**,**/__pycache__/**,**/*.bak,**/*.exe,**/*.csv,**/target/**' 2>&1)
+          echo "$OUT"
+          FINDINGS=$(echo "$OUT" | grep -oE '[0-9]+ finding\(s\)' | grep -oE '[0-9]+' | head -1)
+          FINDINGS="${FINDINGS:-0}"
+          echo "评论数 = $FINDINGS"
+          if [ "$FINDINGS" -gt 0 ]; then
+            echo "::error::OpenCodeReview 发现 $FINDINGS 条评论，门禁拦截合并"
+            exit 1
+          fi
+          echo "[ocr] 未发现评论"
