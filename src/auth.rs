@@ -135,6 +135,67 @@ pub fn register_agent(
     })
 }
 
+fn get_agent_badge(conn: &rusqlite::Connection, agent_id: &str) -> Result<AgentBadge, String> {
+    conn.query_row(
+        "SELECT agent_id, display_name, namespace, badge_token, permission, allowed_skills, expires_at
+         FROM agent_registry WHERE agent_id = ?",
+        rusqlite::params![agent_id],
+        |row| {
+            Ok(AgentBadge {
+                agent_id: row.get(0)?,
+                display_name: row.get(1)?,
+                namespace: row.get(2)?,
+                badge_token: row.get(3)?,
+                permission: row.get(4)?,
+                allowed_skills: serde_json::from_str(&row.get::<_, String>(5).unwrap_or_default()).unwrap_or_default(),
+                expires_at: row.get(6)?,
+            })
+        },
+    )
+    .map_err(|e| format!("agent 不存在或读取失败: {}", e))
+}
+
+/// 更新已注册 Agent 的展示名/命名空间/权限；不触碰 badge_token（避免客户端凭证失效）。
+pub fn update_agent(
+    pool: &SqlitePool,
+    agent_id: &str,
+    display_name: Option<&str>,
+    namespaces: Option<&[&str]>,
+    permission: Option<&str>,
+) -> Result<AgentBadge, String> {
+    let conn = pool.get().map_err(|e| format!("pool: {}", e))?;
+    let mut badge = get_agent_badge(&conn, agent_id)?;
+
+    if let Some(d) = display_name.map(str::trim).filter(|s| !s.is_empty()) {
+        conn.execute(
+            "UPDATE agent_registry SET display_name = ?1 WHERE agent_id = ?2",
+            rusqlite::params![d, agent_id],
+        )
+        .map_err(|e| format!("update display_name: {}", e))?;
+        badge.display_name = d.to_string();
+    }
+    if let Some(ns_list) = namespaces {
+        let ns = ns_list.join(",");
+        if !ns.trim().is_empty() {
+            conn.execute(
+                "UPDATE agent_registry SET namespace = ?1 WHERE agent_id = ?2",
+                rusqlite::params![ns, agent_id],
+            )
+            .map_err(|e| format!("update namespace: {}", e))?;
+            badge.namespace = ns;
+        }
+    }
+    if let Some(p) = permission.map(str::trim).filter(|s| !s.is_empty()) {
+        conn.execute(
+            "UPDATE agent_registry SET permission = ?1 WHERE agent_id = ?2",
+            rusqlite::params![p, agent_id],
+        )
+        .map_err(|e| format!("update permission: {}", e))?;
+        badge.permission = p.to_string();
+    }
+    Ok(badge)
+}
+
 /// 注册个人登录账号（本地账密）：以 `user_id` 为身份，命名空间 `agent/{user_id}`，
 /// `badge_token` 存 `SHA256(password || user_id)`（口令哈希即令牌，客户端登录时自行算）。
 /// 已存在同名账号则拒绝（避免无提示覆盖口令）。返回名牌但 `badge_token` 留空（不回显哈希）。

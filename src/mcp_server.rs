@@ -583,6 +583,17 @@ pub fn tools_list() -> Vec<serde_json::Value> {
             }),
         ),
         tool(
+            "agent_update",
+            "更新已注册 Agent 的 display_name/namespace/permission（需要 Admin key；不更换 badge）",
+            serde_json::json!({
+                "agent_id": {"type": "string", "description": "目标 Agent ID（必填）"},
+                "display_name": {"type": "string", "description": "可选：新显示名"},
+                "namespace": {"type": "string", "description": "可选：新命名空间（逗号分隔多个）"},
+                "permission": {"type": "string", "description": "可选：新权限"},
+                "admin_key": {"type": "string", "description": "Admin Key"}
+            }),
+        ),
+        tool(
             "register_user",
             "注册个人登录账号（本地账密）：user_id + password，命名空间默认 agent/{user_id}（可选 namespace 覆盖）",
             serde_json::json!({
@@ -1748,6 +1759,49 @@ fn dispatch(
                     serde_json::to_string(&serde_json::json!({"status":"registered","badge":badge}))
                         .unwrap_or_default()
                 }
+                Err(e) => format!(r#"{{"status":"error","message":"{}"}}"#, e),
+            }
+        }
+        "agent_update" => {
+            let target = args.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
+            if target.is_empty() {
+                return r#"{"status":"error","message":"missing agent_id"}"#.to_string();
+            }
+            let admin_key = args.get("admin_key").and_then(|v| v.as_str()).unwrap_or("");
+            if !crate::permissions::require_admin(&_auth, admin_key, &state.admin_key) {
+                return r#"{"status":"error","message":"admin required"}"#.to_string();
+            }
+            let display_name = args
+                .get("display_name")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            let namespace = args
+                .get("namespace")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            let permission = args
+                .get("permission")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            let ns_list = namespace.map(|ns| vec![ns]);
+            match auth::update_agent(
+                &state.auth_pool,
+                target,
+                display_name,
+                ns_list.as_deref(),
+                permission,
+            ) {
+                Ok(badge) => serde_json::to_string(&serde_json::json!({
+                    "status": "updated",
+                    "agent_id": badge.agent_id,
+                    "display_name": badge.display_name,
+                    "namespace": badge.namespace,
+                    "permission": badge.permission
+                }))
+                .unwrap_or_default(),
                 Err(e) => format!(r#"{{"status":"error","message":"{}"}}"#, e),
             }
         }

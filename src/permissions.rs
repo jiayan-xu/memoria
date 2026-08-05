@@ -221,6 +221,12 @@ pub const PERMISSION_MATRIX: &[Entry] = &[
         note: "创建 Agent（admin）",
     },
     Entry {
+        tool: "agent_update",
+        min_role: MinRole::Admin,
+        ns_policy: NsPolicy::None,
+        note: "更新 Agent 展示名/命名空间/权限（admin；不改 badge）",
+    },
+    Entry {
         tool: "import_install_memories",
         min_role: MinRole::Admin,
         ns_policy: NsPolicy::None,
