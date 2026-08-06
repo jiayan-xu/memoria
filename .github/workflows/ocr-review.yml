@@ -54,8 +54,10 @@ jobs:
           FINDINGS=$(echo "$OUT" | grep -oE '[0-9]+ finding\(s\)' | grep -oE '[0-9]+' | head -1)
           FINDINGS="${FINDINGS:-0}"
           echo "评论数 = $FINDINGS"
-          if [ "$FINDINGS" -gt 0 ]; then
+          # 2026-08-06 决策：门禁仅对 PR 生效；直推 main 仅审查报告不拦截
+          # （此前直推 main 任何 AI 评论即 exit 1，导致 CI 恒红、门禁形同虚设）
+          if [ "${{ github.event_name }}" = "pull_request" ] && [ "$FINDINGS" -gt 0 ]; then
             echo "::error::OpenCodeReview 发现 $FINDINGS 条评论，门禁拦截合并"
             exit 1
           fi
-          echo "[ocr] 未发现评论"
+          echo "[ocr] 审查完成（评论 $FINDINGS 条，push 模式仅报告）"
