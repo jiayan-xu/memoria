@@ -159,6 +159,12 @@ pub const PERMISSION_MATRIX: &[Entry] = &[
         note: "（PR4）演化写回，记 evolution_log",
     },
     Entry {
+        tool: "memory_evolve_auto",
+        min_role: MinRole::Agent,
+        ns_policy: NsPolicy::NamespaceArg,
+        note: "（PR4）自动演化写回（agent-core consolidate 批量调用，与 memory_evolve 同权）",
+    },
+    Entry {
         tool: "evolution_rollback",
         min_role: MinRole::Admin,
         ns_policy: NsPolicy::NamespaceArg,
@@ -249,6 +255,12 @@ pub const PERMISSION_MATRIX: &[Entry] = &[
         min_role: MinRole::Admin,
         ns_policy: NsPolicy::None,
         note: "吊销 Agent（admin）",
+    },
+    Entry {
+        tool: "agent_registry_cleanup",
+        min_role: MinRole::Admin,
+        ns_policy: NsPolicy::None,
+        note: "G4 硬门：保守幂等清理 agent_registry 死行（admin）",
     },
     Entry {
         tool: "memory_backup",

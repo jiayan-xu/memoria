@@ -129,8 +129,10 @@ pub fn hybrid_search(
     // 规则：
     //  - as_of=Some(T)          → 仅 visible_as_of（valid_* 有效），忽略 superseded_by（时序真值优先）。
     //  - as_of=None（默认 tip） → is_latest_now：superseded_by IS NULL 且当前(now)有效 = current。
-    //  - include_superseded=true（F2）→ 在 current 之外，补回「仍有效(valid_at now)但被取代」的历史真值，
-    //    标 time_status="superseded" 并乘 MEMORIA_HISTORY_DOWNWEIGHT 降权；过期(valid_to<now)仍剔除。
+    //  - include_superseded=true（F2）→ 在 current 之外，补回「被取代」的历史真值（含 valid_to
+    //    已关闭的旧版本），标 time_status="superseded" 并乘 MEMORIA_HISTORY_DOWNWEIGHT 降权。
+    //    （2026-08-06 修复：此前仅补回 valid_at now 仍有效的，与 F2「跳过时序过滤」语义不符，
+    //    as_of 集成测试 include_superseded 断言失败。）
     if !unique.is_empty() {
         if let Ok(conn) = pool.get() {
             let ids: Vec<String> = unique.iter().map(|r| r.memory_id.clone()).collect();
@@ -165,12 +167,12 @@ pub fn hybrid_search(
                     match info.get(&r.memory_id) {
                         Some((sup, vf, vt)) => {
                             let valid = valid_at(vf.as_deref(), vt.as_deref(), ref_time);
-                            if as_of.is_some() {
+                            if include_superseded {
+                                keep.push(true); // F2：跳过整段时序/superseded 过滤，全部补回
+                            } else if as_of.is_some() {
                                 keep.push(valid); // 时序真值：仅看 valid_*, 忽略 superseded_by
                             } else if sup.is_none() && valid {
                                 keep.push(true); // is_latest_now
-                            } else if include_superseded && sup.is_some() && valid {
-                                keep.push(true); // 历史真值仍有效 → 降权补回
                             } else {
                                 keep.push(false);
                             }
