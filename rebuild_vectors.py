@@ -99,6 +99,31 @@ def main():
         print("[dry-run] 未写库")
         return
 
+    # 安全闸（2026-08-06 教训：连续高负载下嵌入服务可能静默退化，返回错误向量
+    # 导致全量污染。写回前抽样验证「新向量 vs 单条实时嵌入」一致性，均值<0.9 则中止）。
+    import random as _rnd
+    _rnd.seed(42)
+    probe = _rnd.sample(new_vectors, min(20, len(new_vectors)))
+    bad = 0
+    for mid, v in probe:
+        content = next((c for m, c in rows if m == mid), "")
+        if not content:
+            continue
+        vecs = embed_batch([content[:1500]])
+        if vecs is None:
+            bad += 1
+            continue
+        lv = np.array(vecs[0], dtype=np.float32)
+        sv = np.array(v, dtype=np.float32)
+        s = float(sv @ lv / (np.linalg.norm(sv) * np.linalg.norm(lv) + 1e-9))
+        if s < 0.9:
+            bad += 1
+    if bad > max(1, len(probe) * 0.2):
+        print(f"❌ 安全闸拦截: 抽样 {len(probe)} 条中 {bad} 条一致性<0.9 —— "
+              f"嵌入服务输出不可信，中止写回（数据未改动）")
+        sys.exit(3)
+    print(f"✅ 安全闸通过: 抽样 {len(probe)} 条, {len(probe)-bad} 条一致性>=0.9")
+
     # 写回（单事务）
     con = sqlite3.connect(DB, timeout=120)
     con.execute("PRAGMA busy_timeout=120000")
