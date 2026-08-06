@@ -295,10 +295,11 @@ mod tests {
     #[test]
     fn concurrent_search_stable() {
         let h = std::sync::Arc::new(HnswIndex::new());
+        // i+1：避开 i=0 的全零向量（add 的 P0 防御会跳过零向量，导致返回 19 而非 20）
         let entries: Vec<VectorEntry> = (0..20)
             .map(|i| VectorEntry {
                 id: format!("v{}", i),
-                vector: vec![(i as f32) / 20.0; DIM],
+                vector: vec![(i as f32 + 1.0) / 20.0; DIM],
             })
             .collect();
         assert_eq!(h.add(&entries).expect("add"), 20);
