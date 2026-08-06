@@ -149,6 +149,8 @@ fn poll_once_blocking(
                         "session_watcher",
                         &p.to_string_lossy(),
                         "default",
+                        None,
+                        None,
                     );
                     total += 1;
                 }

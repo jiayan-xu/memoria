@@ -1102,8 +1102,16 @@ async fn handle_tool_call(
     // 使 remember_with_dedup 能正常落表 + 入 HNSW。这是「写入侧从不嵌入、HNSW 恒空」根因的
     // 另一半修复——benchmark / 独立 HTTP 部署只传 content，从不预缓存向量，导致记忆写入后
     // 索引里永远没有它的向量。此处异步调本地嵌入服务补齐，未配置/不可用则静默降级。
-    if (tool == "memory_remember" || tool == "memory") && !state.embedding_url.is_empty() {
-        if let Some(c) = safe_args.get("content").and_then(|v| v.as_str()) {
+    // 2026-08-06：扩展到 memory_observe（其近义去重依赖写入侧向量，防观察流相似变体堆积）。
+    if (tool == "memory_remember" || tool == "memory" || tool == "memory_observe")
+        && !state.embedding_url.is_empty()
+    {
+        let text = if tool == "memory_observe" {
+            safe_args.get("dialog").and_then(|v| v.as_str())
+        } else {
+            safe_args.get("content").and_then(|v| v.as_str())
+        };
+        if let Some(c) = text {
             if !c.is_empty() {
                 if let Some(cvec) = embed_query(&state.http_client, &state.embedding_url, c, false).await {
                     state.query_cache.put(c, cvec);
@@ -1646,7 +1654,16 @@ fn dispatch(
                 .get("session_id")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            match tools::observe::observe(&state.pool, dialog, role, src, sid, ns) {
+            match tools::observe::observe(
+                &state.pool,
+                dialog,
+                role,
+                src,
+                sid,
+                ns,
+                Some(&state.hnsw),
+                Some(&state.query_cache),
+            ) {
                 Ok(id) => format!(r#"{{"status":"observed","id":"{}"}}"#, id),
                 Err(e) => format!(r#"{{"status":"error","message":"{}"}}"#, e),
             }

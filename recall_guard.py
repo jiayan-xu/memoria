@@ -158,12 +158,17 @@ def extract_keywords(content, tags):
 
 
 def sample_memories(db, n):
+    """抽样仅限「当前活跃」记忆：排除已被 supersede 及已过期(valid_to<=now)的记忆。
+    （2026-08-06 治理配套：此前抽样未过滤失效记忆，抽到已失效样本 self-recall 永远
+    miss，人为压低命中率 ~12.6pp；与检索层 is_latest_now 口径保持一致。）"""
     con = sqlite3.connect(db, timeout=30)
     con.execute("PRAGMA busy_timeout=30000")
     cur = con.cursor()
     cur.execute(
         """SELECT id, content, tags FROM memories
            WHERE namespace=? AND length(coalesce(content,''))>0
+             AND superseded_by IS NULL
+             AND (valid_to IS NULL OR valid_to = '' OR valid_to > datetime('now'))
            ORDER BY RANDOM() LIMIT ?""", (NS, n))
     rows = cur.fetchall()
     con.close()
