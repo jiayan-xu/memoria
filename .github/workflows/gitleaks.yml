@@ -16,8 +16,23 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+      # 直接下载 gitleaks 二进制跑 detect（显式 --config，避免 action 层配置加载不确定）。
+      # PR/push 两种事件统一扫全部历史 + 工作树；allowlist 见 .gitleaks.toml。
       - name: gitleaks
-        uses: gitleaks/gitleaks-action@v2
-        env:
-          GITLEAKS_CONFIG: .gitleaks.toml
-          GITLEAKS_ENABLE_UPLOAD_ARTIFACT: "false"
+        shell: bash
+        run: |
+          set -euo pipefail
+          GITLEAKS_VERSION="8.18.4"
+          mkdir -p /tmp/gitleaks
+          curl -sL -o /tmp/gitleaks/gitleaks.tar.gz \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          tar -xzf /tmp/gitleaks/gitleaks.tar.gz -C /tmp/gitleaks
+          chmod +x /tmp/gitleaks/gitleaks
+          /tmp/gitleaks/gitleaks detect \
+            --source . \
+            --config .gitleaks.toml \
+            --no-banner \
+            --redact || {
+              echo "::error::gitleaks 检测到疑似密钥泄露，请检查（allowlist 见 .gitleaks.toml）"
+              exit 1
+            }
