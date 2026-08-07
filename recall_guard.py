@@ -51,6 +51,9 @@ MCP_URL = "http://127.0.0.1:9003/mcp"
 NS = os.environ.get("MEMORIA_GUARD_NS", "agent/xujiayan")
 K = 10                       # 拉取条数（判定 top-5 命中，多取几条便于诊断）
 SAMPLE_N = int(os.environ.get("RECALL_SAMPLE_N", "40"))
+# 全局墙钟上限：整个守护最多跑 10 分钟。单条 recall 已 timeout=90，但 40×2 条在 memoria
+# 极端卡顿时会逼近 2 小时；加此硬上限，超时即提前结束并据已测样本出结论，避免 run 拖死。
+GLOBAL_CAP = int(os.environ.get("RECALL_GLOBAL_CAP", "600"))
 TREND = os.environ.get("RECALL_TREND_CSV", os.path.join(HERE, "recall_trend.csv"))
 EXPECTED_HEADER = "timestamp,full_r5,kw_r5,n_full,n_kw,status\n"
 
@@ -201,6 +204,9 @@ def main():
     detail = []
     t0 = time.time()
     for mid, content, tags in rows:
+        if time.time() - t0 > GLOBAL_CAP:
+            print(f"  [guard] 触达全局上限 {GLOBAL_CAP}s，提前结束（已测 {n_full} 条完整 / {n_kw} 条关键词）")
+            break
         n_attempt_full += 1
         # 完整内容查询（self-recall 检索上限）
         full_q = (content or "")[:4000]
