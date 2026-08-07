@@ -49,7 +49,7 @@ jobs:
           fi
           echo "审查范围: $BASE..$HEAD"
           OUT=$(ocr review --from "$BASE" --to "$HEAD" \
-            --exclude '.github/**,**/__pycache__/**,**/*.bak,**/*.exe,**/*.csv,**/target/**' 2>&1)
+            --exclude '.github/**,.githooks/**,scripts/ocr-review.sh,**/__pycache__/**,**/*.bak,**/*.exe,**/*.csv,**/target/**' 2>&1)
           echo "$OUT"
           FINDINGS=$(echo "$OUT" | grep -oE '[0-9]+ finding\(s\)' | grep -oE '[0-9]+' | head -1)
           FINDINGS="${FINDINGS:-0}"

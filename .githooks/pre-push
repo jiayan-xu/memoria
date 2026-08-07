@@ -22,7 +22,7 @@ if [ -f "$repo_root/.NO_PUSH" ]; then
   exit 1
 fi
 
-DEFAULT_BRANCH="main"
+# 2026-08-07: PR 流程后 DEFAULT_BRANCH 不再被 case 使用（case 硬编码 refs/heads/main），移除死代码
 CANONICAL_REMOTE_SUBSTR="github.com/jiayan-xu/memoria"
 
 while read local_ref local_oid remote_ref remote_oid; do
@@ -33,13 +33,25 @@ while read local_ref local_oid remote_ref remote_oid; do
       exit 1 ;;
   esac
 
-  # Block pushing to any non-default branch
-  branch="${remote_ref#refs/heads/}"
-  if [ "$remote_ref" != "refs/heads/$DEFAULT_BRANCH" ]; then
-    echo "BLOCKED: pushing to branch '$branch' is not allowed." >&2
-    echo "         Canonical default branch is '$DEFAULT_BRANCH'. Aborting." >&2
-    exit 1
-  fi
+  # 2026-08-07: 走 PR 流程后，直推 main 被拦截；仅放行 feat/* 分支（见 docs/PR_PROCESS.md）
+  case "$remote_ref" in
+    refs/tags/*)
+      echo "BLOCKED: tag push is disabled by repository policy." >&2
+      echo "         Only feat/* branches may be pushed (see docs/PR_PROCESS.md). Aborting." >&2
+      exit 1 ;;
+    refs/heads/main)
+      echo "BLOCKED: pushing directly to 'main' is disabled by repository policy." >&2
+      echo "         All changes must go through a Pull Request (see docs/PR_PROCESS.md)." >&2
+      echo "         Push to a feature branch (feat/*) and open a PR instead. Aborting." >&2
+      exit 1 ;;
+    refs/heads/feat/*)
+      : ;;  # 放行
+    *)
+      branch="${remote_ref#refs/heads/}"
+      echo "BLOCKED: pushing to branch '$branch' is not allowed." >&2
+      echo "         Only feat/* branches may be pushed (see docs/PR_PROCESS.md). Aborting." >&2
+      exit 1 ;;
+  esac
 
   # Block pushing to a non-canonical remote
   remote_url=$(git remote get-url "$remote_name" 2>/dev/null || true)

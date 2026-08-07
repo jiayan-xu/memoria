@@ -42,15 +42,16 @@ Do NOT `git pull` / `merge` there, and never commit in `memoria\` (a `pre-commit
 message pointing you to `memoria-open`.
 
 ## Hard rules (P0)
-1. **Before ANY `git push`:** confirm (a) `git remote -v` shows the canonical GitHub URL, and
-   (b) the target branch is `main`. If unsure, STOP and ask the user.
-2. **Never push to a branch other than `main`.** A `pre-push` hook enforces this mechanically.
+1. **ALL changes go through Pull Requests.** Direct push to `main` is BLOCKED by the `pre-push`
+   hook (see `docs/PR_PROCESS.md` for the full workflow). Push to a `feat/*` branch and open a PR.
+2. **Before ANY `git push`:** confirm `git remote -v` shows the canonical GitHub URL. If unsure,
+   STOP and ask the user.
 3. **Never push secrets or private data.** No hardcoded API keys, tokens, passwords, or
    `C:/Users/<name>/...` absolute paths. Keep `.env` gitignored; read keys from env vars only.
 4. **Rotate, don't commit.** If a secret must change, write it to `.env` (gitignored) or env vars —
    never into tracked files or commit messages.
 5. A safety `pre-push` hook ships in `.githooks/pre-push`. After cloning, run
-   `git config core.hooksPath .githooks` to activate it. It blocks wrong-branch, wrong-remote,
+   `git config core.hooksPath .githooks` to activate it. It blocks direct-to-main, wrong-remote,
    branch-deletion, and `.NO_PUSH` checkouts.
 
 ## Build provenance (version carries git SHA)
