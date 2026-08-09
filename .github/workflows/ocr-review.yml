@@ -3,10 +3,12 @@ name: ocr-review
 # OpenCodeReview 代码审查门禁
 # - PR：审查 base..head 的 diff
 # - 推送到默认分支：审查 HEAD~1..HEAD
-# 需要仓库 Secret：ARK_API_KEY（火山方舟 AgentPlan，在 Settings > Secrets 添加）
-# LLM provider：自定义 volcengine-ark-plan，指向火山 AgentPlan 端点
-#   url = https://ark.cn-beijing.volces.com/api/plan/v3（OpenAI Responses API 兼容）
-#   protocol = openai-responses
+# 需要仓库 Secret：OPCODE_API_KEY（opencode Zen 网关，在 Settings > Secrets 添加）
+# LLM provider：自定义 opencode-zen，指向 opencode.ai Zen API
+#   url = https://opencode.ai/zen/go/v1（OpenAI Chat Completions 兼容）
+#   protocol = openai
+# 模型：deepseek-v4-flash（轻量快，实测可扛 ~174k token 大 diff 不超时）
+#   —— 优于火山方舟 ark-code-latest（大 diff 稳定 context deadline exceeded）
 # 默认门禁：发现评论即 fail CI（见 scripts/ocr-review.sh 的 --gate）
 
 on:
@@ -37,21 +39,21 @@ jobs:
       - name: Install OpenCodeReview
         run: npm install -g @alibaba-group/open-code-review
 
-      - name: Configure LLM (Volcengine Ark AgentPlan)
+      - name: Configure LLM (opencode Zen)
         env:
-          ARK_API_KEY: ${{ secrets.ARK_API_KEY }}
+          OPCODE_API_KEY: ${{ secrets.OPCODE_API_KEY }}
         run: |
-          if [ -z "$ARK_API_KEY" ]; then
-            echo "::error::缺少 Secret ARK_API_KEY，请在仓库 Settings > Secrets 配置"
+          if [ -z "$OPCODE_API_KEY" ]; then
+            echo "::error::缺少 Secret OPCODE_API_KEY，请在仓库 Settings > Secrets 配置"
             exit 1
           fi
-          # 自定义 provider：火山 AgentPlan 端点（OpenAI Responses API 兼容）
-          ocr config set provider volcengine-ark-plan
-          ocr config set custom_providers.volcengine-ark-plan.url https://ark.cn-beijing.volces.com/api/plan/v3
-          ocr config set custom_providers.volcengine-ark-plan.protocol openai-responses
-          # 模型 ID：ark-code-latest
-          ocr config set custom_providers.volcengine-ark-plan.model "ark-code-latest"
-          ocr config set custom_providers.volcengine-ark-plan.api_key "$ARK_API_KEY"
+          # 自定义 provider：opencode Zen API（OpenAI Chat Completions 兼容）
+          ocr config set provider opencode-zen
+          ocr config set custom_providers.opencode-zen.url https://opencode.ai/zen/go/v1
+          ocr config set custom_providers.opencode-zen.protocol openai
+          # 模型 ID：deepseek-v4-flash（轻量快，实测可扛 ~174k token 大 diff 不超时）
+          ocr config set custom_providers.opencode-zen.model "deepseek-v4-flash"
+          ocr config set custom_providers.opencode-zen.api_key "$OPCODE_API_KEY"
 
       - name: Run review (gate)
         run: |
