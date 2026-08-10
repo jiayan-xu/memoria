@@ -34,10 +34,22 @@ while read local_ref local_oid remote_ref remote_oid; do
   esac
 
   # 2026-08-07: 走 PR 流程后，直推 main 被拦截；仅放行 feat/* 分支（见 docs/PR_PROCESS.md）
+  # 2026-08-10: 放开 annotated 语义化版本 tag（refs/tags/v*，发版锚点）；其余 tag 仍拦截。
   case "$remote_ref" in
+    refs/tags/v*)
+      # 仅放行 annotated tag（git object type == tag），防 lightweight tag 滥用。
+      # 发版纪律见 docs/RELEASING.md（bump + tag + CHANGELOG 三步绑定）。
+      if git cat-file -t "$local_oid" 2>/dev/null | grep -qx 'tag'; then
+        : # 放行 annotated v* 版本 tag
+      else
+        echo "BLOCKED: tag '$local_ref' is not an annotated tag." >&2
+        echo "         Version tags must be annotated (git tag -a vX.Y.Z -m msg). Aborting." >&2
+        exit 1
+      fi
+      ;;
     refs/tags/*)
-      echo "BLOCKED: tag push is disabled by repository policy." >&2
-      echo "         Only feat/* branches may be pushed (see docs/PR_PROCESS.md). Aborting." >&2
+      echo "BLOCKED: tag push is restricted to annotated version tags (refs/tags/v*)." >&2
+      echo "         Only feat/* branches and annotated v* tags may be pushed." >&2
       exit 1 ;;
     refs/heads/main)
       echo "BLOCKED: pushing directly to 'main' is disabled by repository policy." >&2
