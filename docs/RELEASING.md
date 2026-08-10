@@ -48,3 +48,10 @@
 
 - `v0.2.0` = `7245341`（2026-07-05 初始发布）
 - `v0.3.0` = `f4428bf`（2026-07-21 bump，当前 HEAD 基线）
+
+## tag 推送策略（2026-08-10 起生效）
+
+- `.githooks/pre-push` 已放开 **annotated 语义化版本 tag（`refs/tags/v*`）** 推送，
+  作为发版锚点；**其余 tag 仍拦截**（防 lightweight tag 滥用）。
+- tag 必须用 annotated 创建：`git tag -a vX.Y.Z -m "说明"`。
+- 推送：`git push origin refs/tags/vX.Y.Z`（或 `git push --tags` 一并推送）。
