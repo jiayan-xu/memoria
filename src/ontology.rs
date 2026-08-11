@@ -163,9 +163,25 @@ pub fn materialize(
     // source_ttl 相同，data_dir 若含换行/引号/分号会逃逸双引号注入额外 batch 指令——
     // 必须用同一套规则校验，否则 #115/#117 的注入防线被 data_dir 这道口子绕过。
     // 此前注释"data_dir 由唯一名自生成不含危险字符"是错的：唯一名只是后缀，前缀是用户可控。
+    // #R4-4 前缀：**所有**危险输入校验（data_dir/profile/source_ttl）都必须在
+    // create_dir_all 之前完成——否则恶意输入会先创建目录（副作用）再被拒绝，
+    // 违背"任何注入/危险输入在产生任何文件系统足迹前就被拒绝"的不变式（#5 第8轮 security/low）。
     let data_dir_str = cfg.data_dir.to_string_lossy();
     if data_dir_str.contains(['\n', '\r', '"', ';']) {
         return Err("invalid data_dir: control chars / quote / semicolon not allowed".to_string());
+    }
+    // 安全校验（#115/#117 命令注入）：profile 白名单 + source 拒绝危险字符。
+    // 换行会注入额外的 load/reason/save 指令；profile 含空白/;/" 会向 batch 注入额外参数。
+    // 未来经 MCP/web 触发时 profile/source 是租户可控输入，必须严格白名单。
+    if !VALID_PROFILES.contains(&profile) {
+        return Err(format!(
+            "invalid profile: {:?} (allowed: {})",
+            profile,
+            VALID_PROFILES.join(", ")
+        ));
+    }
+    if source_ttl.contains(['\n', '\r', '"', ';']) {
+        return Err("invalid source_ttl: control chars / quote / semicolon not allowed".to_string());
     }
     // #R4-4：create_dir_all 失败必须传播（此前 `let _ =` 吞错，data_dir 不可写时
     // 后续 write batch/out 会以更令人困惑的路径错误暴露）。未显式创建会造成写临时
@@ -180,20 +196,6 @@ pub fn materialize(
     let out_ttl = cfg.data_dir.join(format!("materialized_{}.ttl", uniq));
     // RAII：batch 脚本 + 物化 TTL 在任意退出路径（spawn 失败/超时/解析失败…）都被删除。#R3-6/#R4-2
     let temp_guard = TempFileGuard::new(batch_file.clone(), out_ttl.clone());
-
-    // 安全校验（#115/#117 命令注入）：profile 白名单 + source 拒绝危险字符。
-    // 换行会注入额外的 load/reason/save 指令；profile 含空白/;/" 会向 batch 注入额外参数。
-    // 未来经 MCP/web 触发时 profile/source 是租户可控输入，必须严格白名单。
-    if !VALID_PROFILES.contains(&profile) {
-        return Err(format!(
-            "invalid profile: {:?} (allowed: {})",
-            profile,
-            VALID_PROFILES.join(", ")
-        ));
-    }
-    if source_ttl.contains(['\n', '\r', '"', ';']) {
-        return Err("invalid source_ttl: control chars / quote / semicolon not allowed".to_string());
-    }
     // 物化前解析源 TTL 的显式目标关系边集，供物化后 diff 出真正的新增推断边（#113）。
     // #6（第7轮 bug/medium）：schema TTL 也被 load 进同一图参与推理，其显式受控关系边
     // （如 `ex:docX ex:belongsTo ex:tenantA`）会出现在物化输出里。若只减 source_edges，
@@ -349,6 +351,17 @@ pub fn materialize(
     }
 
     // 解析导出 TTL 提取全部目标关系边（显式 + 推断，顺序无关）。
+    // #2（第8轮 security/high）：out_ttl 路径 `materialized_{pid}_{seq}.ttl` 可预测，且由
+    // 子进程的 save 命令创建（batch 脚本的 O_EXCL 只保护 batch 文件本身，不保护 out_ttl）。
+    // 能写进 data_dir（来自用户可控 env OPEN_ONTOLOGIES_DATA）的本地攻击者可预置同路径
+    // 符号链接，子进程 save 会沿链接把 TTL 内容写到任意可写文件（CWE-377）。读取前用
+    // `symlink_metadata`（不跟随链接）确认它是常规文件；文件本身由子进程以全新建出，
+    // 我们只读不写，故核验比换不可预测名更贴合现有 RAII 清理设计。
+    let out_meta = std::fs::symlink_metadata(&out_ttl)
+        .map_err(|e| format!("stat materialized ttl: {}", e))?;
+    if out_meta.file_type().is_symlink() || !out_meta.is_file() {
+        return Err("out_ttl is not a regular file (possible symlink attack)".to_string());
+    }
     let ttl = std::fs::read_to_string(&out_ttl)
         .map_err(|e| format!("read materialized ttl: {}", e))?;
     let all_edges = parse_ttl_edges(&ttl);
@@ -698,6 +711,26 @@ fn tokenize_ttl(line: &str) -> Vec<String> {
             if !found {
                 break; // 未闭合引号，丢弃行剩余部分
             }
+            // #3（第8轮 bug/medium）：类型化字面量 `"..."^^<datatype>` 与语言标签
+            // `"..."@en`。字面量闭合后紧跟的 `^^<datatype>` 是一个整体术语——datatype
+            // 是字面量的类型标注，不是三元组的对象。若 `^^` 与 `<datatype>` 各自被当
+            // 普通 token，`<datatype>` 会被 parse_ttl_edges 展开为 IRI 并当作当前谓词的
+            // 对象，产出伪边 (s, p, <datatype-IRI>)，且因 datatype 不在 source_edges 而
+            // 误入 inferred_edges 写回为垃圾实体。故闭合后把 `^^<datatype>` 或 `@lang`
+            // 一并吞掉（不产出 token）。
+            if rest.starts_with("^^") {
+                // `^^<datatype>`：吞到 `>`。漏 `>` 视作行尾废弃。
+                match rest.find('>') {
+                    Some(end) => rest = &rest[end + 1..],
+                    None => break,
+                }
+            } else if rest.starts_with('@') {
+                // `@lang`：吞到下一个空白/分隔符。
+                let next = rest
+                    .find([' ', '\t', ';', ',', '.'])
+                    .unwrap_or(rest.len());
+                rest = &rest[next..];
+            }
         } else if b == b';' || b == b',' {
             out.push(rest[..1].to_string());
             rest = &rest[1..];
@@ -793,6 +826,15 @@ pub fn write_back_edges(
                 skipped += 1;
                 continue;
             }
+            // #6（第8轮 bug/low）：blank node 端点（`_:b0`，或 `[ ... ]` 属性列表主语被
+            // parse_ttl_edges 保留为 `[...]` 字符串）是 **document-scoped**、非全局唯一——
+            // 不同命名空间/多次运行的同名 blank node 会坍缩成一个实体（ON CONFLICT DO NOTHING
+            // 静默合并），在语义图里产生垃圾实体/边。物化后的 TTL 里 blank node 是推理器
+            // skolemize 的临时节点，对下游无语义价值。写回前过滤掉 `_:` 与 `[` 端点。
+            if s.starts_with("_:") || o.starts_with("_:") || s.starts_with('[') || o.starts_with('[') {
+                skipped += 1;
+                continue;
+            }
             // 实体 id = 完整 IRI（区分命名空间）；name = 局部名（可读）。
             let sname = iri_local_name(s);
             let oname = iri_local_name(o);
@@ -819,7 +861,8 @@ pub fn write_back_edges(
                 "INSERT INTO entity_edges(namespace, source_entity_id, target_entity_id, relation_type, weight, evidence)
                  VALUES(?1, ?2, ?3, ?4, 1.0, 'ontology:materialized')
                  ON CONFLICT(namespace, source_entity_id, target_entity_id, relation_type)
-                 DO UPDATE SET evidence=excluded.evidence",
+                 DO UPDATE SET evidence=excluded.evidence
+                 WHERE entity_edges.evidence IS NULL OR entity_edges.evidence='ontology:materialized'",
                 rusqlite::params![namespace, s, o, rtype],
             )
             .map_err(|e| format!("insert edge {} {} {}: {}", s, rtype, o, e))?;
@@ -1194,6 +1237,72 @@ _:b0 <http://example.org/supersedes> :docA .
         );
         // 引号字面量内 `#` 不是注释起点
         assert_eq!(strip_inline_comment("\"a#b\" <p> <o> ."), "\"a#b\" <p> <o> .");
+    }
+
+    #[test]
+    fn ttl_parse_typed_literal_datatype_not_an_object() {
+        // #3（第8轮 bug/medium）：类型化字面量 `"..."^^<datatype>` 中 datatype 是字面量的
+        // 类型标注，不是三元组对象。若 `<datatype>` 被当对象，会产出伪边 (s, p, <datatype>)
+        // 且因 datatype 不在 source_edges 而误入 inferred_edges 写回为垃圾实体。
+        let ttl = r#"@prefix : <http://example.org/> .
+<http://example.org/docA> <http://example.org/createdBy> "2024-01-01"^^<http://www.w3.org/2001/XMLSchema#date> .
+<http://example.org/docB> <http://example.org/createdBy> "alice"@en .
+"#;
+        let all = parse_ttl_edges(ttl);
+        // 两个字面量对象（类型化 + 语言标签）都不应产出边，因为对象不是 IRI
+        assert_eq!(all.len(), 0, "typed literal datatype emitted a spurious edge: got {:?}", all);
+    }
+
+    #[test]
+    fn ttl_parse_typed_literal_keeps_other_relations() {
+        // 类型化字面量不该吞掉同一行后续的 IRI 关系边。
+        let ttl = r#"@prefix : <http://example.org/> .
+<http://example.org/docA> <http://example.org/createdBy> "2024-01-01"^^<http://www.w3.org/2001/XMLSchema#date> ; <http://example.org/supersedes> <http://example.org/docB> .
+"#;
+        let all = parse_ttl_edges(ttl);
+        assert_eq!(all.len(), 1, "got {:?}", all);
+        assert!(all.contains(&(
+            "http://example.org/docA".to_string(),
+            "http://example.org/supersedes".to_string(),
+            "http://example.org/docB".to_string()
+        )));
+    }
+
+    #[test]
+    fn write_back_filters_blank_node_endpoints() {
+        // #6（第8轮 bug/low）：blank node 端点（`_:b0` / `[ ... ]`）是 document-scoped、
+        // 非全局唯一，写回会坍缩成同一实体污染全局 entities 表。write_back_edges 应过滤。
+        let conn = rusqlite::Connection::open_in_memory().expect("in-memory conn");
+        // 建 entity_edges 所需的最小表结构（与 storage/sqlite.rs 对齐）
+        conn.execute_batch(
+            "CREATE TABLE entities(
+                id TEXT PRIMARY KEY, namespace TEXT, entity_type TEXT,
+                name TEXT, aliases TEXT, summary TEXT
+            );
+            CREATE TABLE entity_edges(
+                namespace TEXT, source_entity_id TEXT, target_entity_id TEXT,
+                relation_type TEXT, weight REAL, evidence TEXT,
+                PRIMARY KEY(namespace, source_entity_id, target_entity_id, relation_type)
+            );",
+        )
+        .expect("create tables");
+        // blank node 端点的边应被过滤（skipped=1, written=0）
+        let edges = vec![(
+            "_:b0".to_string(),
+            "http://example.org/supersedes".to_string(),
+            "http://example.org/docA".to_string(),
+        )];
+        let (written, skipped) = write_back_edges(&conn, "test", &edges).expect("write");
+        assert_eq!(written, 0, "blank node source should be filtered");
+        assert_eq!(skipped, 1, "blank node source should count as skipped");
+        // 正常 IRI 端点仍应写入
+        let edges2 = vec![(
+            "http://example.org/docB".to_string(),
+            "http://example.org/supersedes".to_string(),
+            "http://example.org/docA".to_string(),
+        )];
+        let (w2, _) = write_back_edges(&conn, "test", &edges2).expect("write");
+        assert_eq!(w2, 1, "normal IRI edge should be written");
     }
 }
 

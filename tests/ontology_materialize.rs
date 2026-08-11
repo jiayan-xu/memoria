@@ -69,8 +69,16 @@ fn locate_bin() -> Option<String> {
         } else {
             dir.join("open-ontologies")
         };
-        if exe.is_file() && probe_help(exe.to_str()?) {
-            return Some(exe.to_str()?.to_string());
+        // #1（第8轮 bug/medium）：`to_str()?` 在循环内对非 UTF-8 路径会**中止整个扫描**
+        // 返回 None，而非跳过该候选继续后续 PATH 项——这与"重写避免 where 的编码坑"的
+        // 意图直接矛盾（首个非 UTF-8 PATH 目录即触发假绿 skip 或 REQUIRE=1 假红）。
+        // 改用 `if let` 只跳过该候选，继续扫描后续目录。
+        if exe.is_file() {
+            if let Some(s) = exe.to_str() {
+                if probe_help(s) {
+                    return Some(s.to_string());
+                }
+            }
         }
     }
     None
