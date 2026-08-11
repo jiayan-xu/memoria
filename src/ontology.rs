@@ -83,21 +83,42 @@ pub fn materialize(
 ) -> Result<MaterializeResult, String> {
     let start = Instant::now();
     let _ = std::fs::create_dir_all(&cfg.data_dir);
-    let batch_file = cfg.data_dir.join("materialize.batch");
-    let out_ttl = cfg.data_dir.join("materialized.ttl");
+    // 每次调用用唯一文件名（pid + 纳秒时间戳），避免并发调用（CLI + 定时任务 / 未来
+    // MCP/web 触发）互相覆盖 script/output，导致读到他方半写文件（#7）。
+    let uniq = format!("{}_{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0));
+    let batch_file = cfg.data_dir.join(format!("materialize_{}.batch", uniq));
+    let out_ttl = cfg.data_dir.join(format!("materialized_{}.ttl", uniq));
+
+    // 安全校验（#115 命令注入）：profile/source 不允许换行，路径含空格用引号包裹。
+    // 换行会注入额外的 load/reason/save 指令；未引号路径会破坏 batch 解析。
+    if profile.contains(['\n', '\r']) || source_ttl.contains(['\n', '\r']) {
+        return Err("invalid profile/source_ttl: newline not allowed".to_string());
+    }
+    // 物化前解析源 TTL 的显式目标关系边集，供物化后 diff 出真正的新增推断边（#113）。
+    let source_edges: std::collections::HashSet<(String, String, String)> = {
+        let src = std::fs::read_to_string(source_ttl)
+            .map_err(|e| format!("read source ttl: {}", e))?;
+        parse_ttl_edges(&src).into_iter().collect()
+    };
 
     // 剧本：load schema（含 OWL 传递/对称属性声明）→ load 数据 → reason → save。
     // OWL 推理需要本体声明（TransitiveProperty 等）在场，否则 supersedes 等只是普通属性，
     // 不会产生传递闭包推断（P0 验证实锤：schema 未 load 时 inferred=0）。
     let mut script = String::new();
     if cfg.schema_path.exists() {
-        script.push_str(&format!("load {}\n", win_path(&cfg.schema_path)));
+        script.push_str(&format!("load {}\n", win_path_quoted(&cfg.schema_path)));
+    } else {
+        // 低危：#8 schema 缺失静默——显式告警，避免误以为推理已正确运行。
+        eprintln!(
+            "WARN: ontology schema not found at {} — OWL inference will produce 0 inferred edges",
+            cfg.schema_path.display()
+        );
     }
     script.push_str(&format!(
         "load {}\nreason --profile {}\nsave {}\n",
-        win_path(std::path::Path::new(source_ttl)),
+        win_path_quoted(std::path::Path::new(source_ttl)),
         profile,
-        win_path(&out_ttl)
+        win_path_quoted(&out_ttl)
     ));
     std::fs::write(&batch_file, script)
         .map_err(|e| format!("write batch script: {}", e))?;
@@ -112,10 +133,29 @@ pub fn materialize(
         .spawn()
         .map_err(|e| format!("spawn open-ontologies: {}", e))?;
 
+    // 并发 drain stdout/stderr：子进程在等待期间持续写管道，若不在运行中读取，
+    // 超过 OS 管道缓冲（~64KB）后子进程会阻塞在 write 上、永远无法退出。
+    // 用 reader 线程立即读取，避免"健康运行被超时误杀"。
+    use std::io::Read;
+    let so = child.stdout.take();
+    let se = child.stderr.take();
+    let stdout_reader = std::thread::spawn(move || {
+        let mut buf = String::new();
+        if let Some(mut o) = so {
+            let _ = o.read_to_string(&mut buf);
+        }
+        buf
+    });
+    let stderr_reader = std::thread::spawn(move || {
+        let mut buf = String::new();
+        if let Some(mut e) = se {
+            let _ = e.read_to_string(&mut buf);
+        }
+        buf
+    });
+
     // 超时护栏：推理最坏指数复杂度，防止卡死。
     let timeout = Duration::from_secs(cfg.timeout_secs);
-    let mut stdout = String::new();
-    let mut stderr = String::new();
     let wait_start = Instant::now();
     let status = loop {
         if let Some(st) = child.try_wait().map_err(|e| format!("wait: {}", e))? {
@@ -123,6 +163,9 @@ pub fn materialize(
         }
         if wait_start.elapsed() > timeout {
             let _ = child.kill();
+            let _ = child.wait(); // 收割子进程，避免僵尸（Unix）
+            let _ = stdout_reader.join();
+            let _ = stderr_reader.join();
             return Err(format!(
                 "ontology materialize timed out after {}s (killed)",
                 cfg.timeout_secs
@@ -130,13 +173,9 @@ pub fn materialize(
         }
         std::thread::sleep(Duration::from_millis(50));
     };
-    use std::io::Read;
-    if let Some(mut o) = child.stdout.take() {
-        let _ = o.read_to_string(&mut stdout);
-    }
-    if let Some(mut e) = child.stderr.take() {
-        let _ = e.read_to_string(&mut stderr);
-    }
+    // 子进程已退出：join reader 线程，拿到完整输出。
+    let stdout = stdout_reader.join().unwrap_or_default();
+    let stderr = stderr_reader.join().unwrap_or_default();
     if !status.success() {
         return Err(format!(
             "open-ontologies batch failed: {} (stderr: {})",
@@ -147,7 +186,6 @@ pub fn materialize(
     // 解析 batch JSON 输出，提取 load/reason 的 triple 计数
     let mut triples_before = 0u64;
     let mut triples_after = 0u64;
-    let mut inferred_count = 0u64;
     let mut used_profile = profile.to_string();
     for line in stdout.lines() {
         if let Ok(v) = parse_json_line(line) {
@@ -160,10 +198,6 @@ pub fn materialize(
                             .unwrap_or(0);
                     } else if cmd == "reason" {
                         triples_after = res.get("final_triples").and_then(|n| n.as_u64()).unwrap_or(0);
-                        inferred_count = res
-                            .get("inferred_count")
-                            .and_then(|n| n.as_u64())
-                            .unwrap_or(0);
                         if let Some(p) = res.get("profile_used").and_then(|p| p.as_str()) {
                             used_profile = p.to_string();
                         }
@@ -173,15 +207,18 @@ pub fn materialize(
         }
     }
 
-    // 解析导出 TTL 提取边。推断边 = reason 报告的 inferred_count 条（物化 TTL 中推断边排最前）。
+    // 解析导出 TTL 提取全部目标关系边（显式 + 推断，顺序无关）。
     let ttl = std::fs::read_to_string(&out_ttl)
         .map_err(|e| format!("read materialized ttl: {}", e))?;
-    let (all_edges, mut inferred_edges) = parse_ttl_edges(&ttl, triples_before);
-    // 用 reason 的 inferred_count 修正推断边数量（parse 的 before 是三元组数，非边数，量纲不同）
-    if inferred_count > 0 {
-        let n = (inferred_count as usize).min(all_edges.len());
-        inferred_edges = all_edges.iter().take(n).cloned().collect();
-    }
+    let all_edges = parse_ttl_edges(&ttl);
+    // 推断边 = 物化后边集 ∖ 物化前显式边集（集合差，顺序无关）。
+    // 不用 reason 报告的 inferred_count，也不假设"推断边排最前"——那些跨版本都不可靠（#113）。
+    let materialized_set: std::collections::HashSet<(String, String, String)> =
+        all_edges.iter().cloned().collect();
+    let inferred_edges: Vec<(String, String, String)> = materialized_set
+        .difference(&source_edges)
+        .cloned()
+        .collect();
 
     Ok(MaterializeResult {
         output_path: out_ttl.to_string_lossy().to_string(),
@@ -204,6 +241,16 @@ fn win_path(p: &std::path::Path) -> String {
     p.to_string_lossy().replace('\\', "/")
 }
 
+/// 同 `win_path`，但路径含空格时用双引号包裹（batch 脚本解析需要，#115）。
+fn win_path_quoted(p: &std::path::Path) -> String {
+    let s = win_path(p);
+    if s.contains(' ') {
+        format!("\"{}\"", s)
+    } else {
+        s
+    }
+}
+
 /// 轻量 TTL 三元组解析器（目标谓词扫描版）。
 ///
 /// 只解析本骨架需要的子集：提取「主语 → 目标关系谓词 → 对象」三元组。
@@ -212,15 +259,20 @@ fn win_path(p: &std::path::Path) -> String {
 ///
 /// 处理 open-ontologies 导出的 Turtle 子集：
 /// - 主语块行：`<s> <p> <o> , <o2> ; <p2> <o3> .`（对象用 `,` 分隔，谓词用 `;` 分隔）
+/// - **跨行续行**：前一行以 `;`/`,` 结尾时，当前行以 `<` 开头是谓词/对象续行而非新主语，
+///   subj/pred 状态跨行保留（用 `prev_cont` 跟踪）。
 /// - 类型续行 `a <Type> .`（无主语，跳过）
 /// - 忽略 `@prefix` / `#` 注释 / 空行
 ///
-/// 返回 (全部目标关系边, 推断边)。推断边 = 物化后比物化前多出的边（顺序靠前）。
-/// P0 验证实锤：物化 TTL 中推断边排最前（docC supersedes docA 在 docB supersedes docA 前）。
-fn parse_ttl_edges(ttl: &str, before: u64) -> (Vec<(String, String, String)>, Vec<(String, String, String)>) {
+/// 返回全部目标关系边（显式 + 推断）。推断边由调用方对源 TTL 与物化 TTL 的
+/// 边集做集合差得出（见 `materialize`），避免依赖导出器"推断边排最前"这一不稳稿假设。
+fn parse_ttl_edges(ttl: &str) -> Vec<(String, String, String)> {
     let mut all: Vec<(String, String, String)> = Vec::new();
     let mut subj: Option<String> = None;
     let mut pred: Option<String> = None;
+    // 上一行结尾的分隔符：Some(';') = 下行首个 IRI 是新谓词；Some(',') = 下行首个 IRI 是新对象。
+    // None = 上一行是完整语句（以 `.` 结尾），下行若以 `<` 开头是新主语块。
+    let mut prev_sep: Option<char> = None;
 
     for raw in ttl.lines() {
         let line_trimmed = raw.trim();
@@ -238,10 +290,13 @@ fn parse_ttl_edges(ttl: &str, before: u64) -> (Vec<(String, String, String)>, Ve
             .starts_with("a ")
             || line_trimmed.trim_start().starts_with("a <");
         if type_only {
+            // 类型声明行以 `.` 结尾，会被跳过；但必须重置 prev_sep，
+            // 否则上一行的 `;` 续行状态会污染下一主语块（把新主语误判为续行谓词）。
+            prev_sep = None;
             continue;
         }
 
-        // 剥掉行尾续行标记；若行以 `;` 结尾（谓词续行）需保留 subj。
+        // 剥掉行尾续行标记；记录本行结尾分隔符供下轮使用。
         let line = line_trimmed.trim_end_matches([';', ',', '.']);
         let line = line.trim();
 
@@ -249,14 +304,22 @@ fn parse_ttl_edges(ttl: &str, before: u64) -> (Vec<(String, String, String)>, Ve
         let tokens = tokenize_ttl(line);
 
         let mut i = 0;
-        // 若行以 `<` 开头且当前无 subj 或前一行以 `;` 结束 → 新主语
-        let new_block = line.starts_with('<');
+        // 仅当行首是 `<` 且上一行不是续行 → 新主语块。
+        let new_block = line.starts_with('<') && prev_sep.is_none();
         if new_block {
             // 主语
             if let Some(t) = tokens.get(0) {
                 if t.starts_with('<') {
                     subj = Some(t[1..t.len() - 1].to_string());
                     pred = None;
+                    i = 1;
+                }
+            }
+        } else if line.starts_with('<') && prev_sep == Some(';') {
+            // 续行且上一行以 `;` 结尾：行首 IRI 是新谓词（沿用 subj）。
+            if let Some(t) = tokens.get(0) {
+                if t.starts_with('<') {
+                    pred = Some(t[1..t.len() - 1].to_string());
                     i = 1;
                 }
             }
@@ -293,16 +356,17 @@ fn parse_ttl_edges(ttl: &str, before: u64) -> (Vec<(String, String, String)>, Ve
                 }
             }
         }
+        // 记录本行结尾分隔符：`;` 谓词续行 / `,` 对象续行 / `.` 或其它 → None
+        prev_sep = if line_trimmed.ends_with(';') {
+            Some(';')
+        } else if line_trimmed.ends_with(',') {
+            Some(',')
+        } else {
+            None
+        };
     }
 
-    // 推断边 = 物化后多出的边（顺序靠前）
-    let inferred: Vec<(String, String, String)> = if all.len() as u64 > before && before > 0 {
-        let extra = (all.len() as u64 - before) as usize;
-        all.iter().take(extra).cloned().collect()
-    } else {
-        Vec::new()
-    };
-    (all, inferred)
+    all
 }
 
 /// 把一行 TTL 切成 token：`<iri>` 整体 + `;``,` 分隔符。
@@ -336,14 +400,6 @@ fn tokenize_ttl(line: &str) -> Vec<String> {
     out
 }
 
-/// 从一行中提取第一个 `<iri>` 内容（兼容测试用）。
-fn extract_iri(line: &str) -> Option<String> {
-    tokenize_ttl(line)
-        .into_iter()
-        .find(|t| t.starts_with('<'))
-        .map(|t| t[1..t.len() - 1].to_string())
-}
-
 /// 物化完成后，把推断边 / 全部边写回 entity_edges（幂等 upsert）。
 ///
 /// 关系类型映射：TTL 的完整 IRI → RELATION_TYPES 短名。未知关系跳过（防垃圾边）。
@@ -351,8 +407,9 @@ fn extract_iri(line: &str) -> Option<String> {
 ///
 /// 外键约束（storage/sqlite.rs:213）：`entity_edges.source/target_entity_id`
 /// REFERENCES entities(id)。故写边前须先确保两端实体已存在（幂等 upsert）。
-/// 实体 id 取 IRI 末段（如 `http://memoria.ai/onto/docA` → `docA`），
-/// entity_type 用合法 CHECK 值 `concept`，name 同 id。
+/// 实体 id 取**完整 IRI**（如 `http://memoria.ai/onto/docA`），避免两个不同命名空间
+/// 共享局部名（`http://ns1/docA` vs `http://ns2/docA`）时坍缩成同一实体（#6）；
+/// name 字段取局部名供展示，entity_type 用合法 CHECK 值 `concept`。
 pub fn write_back_edges(
     pool: &rusqlite::Connection,
     namespace: &str,
@@ -372,30 +429,35 @@ pub fn write_back_edges(
             skipped += 1;
             continue;
         }
-        let sid = iri_local_name(s);
-        let oid = iri_local_name(o);
-        if sid.is_empty() || oid.is_empty() {
+        if s.is_empty() || o.is_empty() {
             skipped += 1;
             continue;
         }
-        // 幂等 upsert 两端实体（满足外键约束）
-        for (eid, ename) in [(&sid, sid.as_str()), (&oid, oid.as_str())] {
-            let _ = pool.execute(
+        // 实体 id = 完整 IRI（区分命名空间）；name = 局部名（可读）。
+        let sname = iri_local_name(s);
+        let oname = iri_local_name(o);
+        // 幂等 upsert 两端实体（满足外键约束）——错误必须传播，不静默吞掉（#9），
+        // 否则 INSERT 失败会被掩盖，直到边插入时才暴露为令人困惑的 FK 冲突。
+        for (eid, ename) in [(s.as_str(), sname.as_str()), (o.as_str(), oname.as_str())] {
+            pool.execute(
                 "INSERT INTO entities(id, namespace, entity_type, name, aliases, summary)
                  VALUES(?1, ?2, 'concept', ?3, '[]', NULL)
                  ON CONFLICT(id) DO NOTHING",
                 rusqlite::params![eid, namespace, ename],
             )
-            .map_err(|e| format!("upsert entity: {}", e))?;
+            .map_err(|e| format!(
+                "upsert entity {}: {}",
+                eid, e
+            ))?;
         }
         pool.execute(
             "INSERT INTO entity_edges(namespace, source_entity_id, target_entity_id, relation_type, weight, evidence)
              VALUES(?1, ?2, ?3, ?4, 1.0, 'ontology:materialized')
              ON CONFLICT(namespace, source_entity_id, target_entity_id, relation_type)
              DO UPDATE SET evidence=excluded.evidence",
-            rusqlite::params![namespace, sid, oid, rtype],
+            rusqlite::params![namespace, s, o, rtype],
         )
-        .map_err(|e| format!("insert edge: {}", e))?;
+        .map_err(|e| format!("insert edge {} {} {}: {}", s, rtype, o, e))?;
         written += 1;
     }
     Ok((written, skipped))
@@ -473,13 +535,29 @@ mod tests {
 <http://example.org/docA> <http://example.org/createdBy> <http://example.org/alice> ;
     a <http://example.org/Document> .
 "#;
-        let (all, _) = parse_ttl_edges(ttl, 0);
+        let all = parse_ttl_edges(ttl);
         // 4 条显式边（docC supersedes docA, docC supersedes docB, docB supersedes docA, docA createdBy alice）
         assert_eq!(all.len(), 4);
         assert!(all.contains(&(
             "http://example.org/docC".to_string(),
             "http://example.org/supersedes".to_string(),
             "http://example.org/docA".to_string()
+        )));
+    }
+
+    #[test]
+    fn ttl_parse_handles_predicate_continuation() {
+        // #116：一拍子一行（谓词续行）应沿用上一行 subj，不得误判为新主语。
+        let ttl = r#"@prefix : <http://example.org/> .
+<http://example.org/docC> <http://example.org/supersedes> <http://example.org/docB> ;
+    <http://example.org/createdBy> <http://example.org/alice> .
+"#;
+        let all = parse_ttl_edges(ttl);
+        assert_eq!(all.len(), 2, "got {:?}", all);
+        assert!(all.contains(&(
+            "http://example.org/docC".to_string(),
+            "http://example.org/createdBy".to_string(),
+            "http://example.org/alice".to_string()
         )));
     }
 
@@ -494,6 +572,9 @@ mod tests {
     #[test]
     fn win_path_normalizes() {
         assert_eq!(win_path(std::path::Path::new("D:\\data\\a.ttl")), "D:/data/a.ttl");
+        // #115：含空格路径用引号包裹
+        assert_eq!(win_path_quoted(std::path::Path::new("D:\\my data\\a.ttl")), "\"D:/my data/a.ttl\"");
+        assert_eq!(win_path_quoted(std::path::Path::new("D:\\data\\a.ttl")), "D:/data/a.ttl");
     }
 }
 

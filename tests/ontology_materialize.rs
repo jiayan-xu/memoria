@@ -26,24 +26,30 @@ const DATA_TTL: &str = r#"@prefix : <http://memoria.ai/onto/> .
 "#;
 
 /// 定位 open-ontologies 二进制；缺失则 None（测试跳过）。
-/// 仅当显式设置了 OPEN_ONTOLOGIES_BIN 或二进制确定在 PATH 上时才返回 Some，
+/// 仅当显式设置了 OPEN_ONTOLOGIES_BIN 且路径存在、或二进制确定在 PATH 上时才返回 Some，
 /// 避免在无二进制的环境（如 CI runner）误判后 spawn 失败。
 fn find_bin() -> Option<String> {
+    // env 值先做 is_file() 校验：指向失效/不存在路径时视为无二进制 → 跳过，
+    // 避免后续 materialize(...).expect(...) 因 spawn 失败而 panic。
     if let Ok(b) = std::env::var("OPEN_ONTOLOGIES_BIN") {
-        if !b.is_empty() {
+        if !b.is_empty() && std::path::Path::new(&b).is_file() {
             return Some(b);
         }
     }
-    // 用 `which` 探测 PATH（Windows 上 where）；找不到则视为无二进制 → 跳过
+    // 用 `which`/`where` 探测 PATH。输出可能多行（同名二进制在多个 PATH 条目），
+    // 只取第一条匹配路径；找不到则视为无二进制 → 跳过。
     let locator = if cfg!(windows) { "where" } else { "which" };
-    let hit = std::process::Command::new(locator)
+    let out = std::process::Command::new(locator)
         .arg("open-ontologies")
         .output()
         .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .filter(|s| !s.is_empty());
-    hit
+        .filter(|o| o.status.success())?;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    stdout
+        .lines()
+        .map(str::trim)
+        .find(|s| !s.is_empty() && std::path::Path::new(s).is_file())
+        .map(str::to_string)
 }
 
 fn temp_dir(tag: &str) -> std::path::PathBuf {
