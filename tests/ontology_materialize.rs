@@ -47,19 +47,26 @@ const DATA_TTL: &str = r#"@prefix : <http://memoria.ai/onto/> .
 fn find_bin() -> Option<String> {
     // REQUIRE_ONTOLOGIES_BIN 接受常见真值（1/true/yes/on），非只认字面量 "1"——"true"/"yes" 等
     // CI 常见写法此前被静默当作未设置，硬失败门禁悄悄失效、套件静默 skip（防假绿工具自身成了
-    // 假绿源）。空/"0"/"false"/"no"/"off" 视为未要求；其它未知值警示（既不强真也不静默忽略）。
+    // 假绿源）。空/"0"/"false"/"no"/"off" 视为未要求；**任何已设置的其它非空值都视为要求**——
+    // 本文件唯一目的是 fail-closed（找不到二进制就 panic），unrecognized 值（CI typo "ture"、
+    // 尾随空格 "true "）若静默当 unset 会让门禁 fail-open，正是要防的假绿。值先 trim 再判定，
+    // 容忍 "true "/"TRUE" 等书写；无法识别的识别为 require（宁可误报不可漏报）。
     let require = match std::env::var("REQUIRE_ONTOLOGIES_BIN") {
-        Ok(v) => match v.to_ascii_lowercase().as_str() {
-            "" | "0" | "false" | "no" | "off" => false,
-            "1" | "true" | "yes" | "on" => true,
-            other => {
-                eprintln!(
-                    "WARN: REQUIRE_ONTOLOGIES_BIN={:?} unrecognized, treating as unset",
-                    other
-                );
-                false
+        Ok(v) => {
+            let t = v.trim().to_ascii_lowercase();
+            match t.as_str() {
+                "" | "0" | "false" | "no" | "off" => false,
+                "1" | "true" | "yes" | "on" => true,
+                other => {
+                    eprintln!(
+                        "WARN: REQUIRE_ONTOLOGIES_BIN={:?} unrecognized, treating as REQUIRED \
+                         (fail-closed: unrecognized value must not silently disable the gate)",
+                        other
+                    );
+                    true
+                }
             }
-        },
+        }
         Err(_) => false,
     };
     // #R19（第19轮 maintainability/low）：OPEN_ONTOLOGIES_BIN **只读一次**（此处），沿调用链传给
@@ -312,8 +319,8 @@ fn assert_persisted_doc_c_supersedes_doc_a(conn: &rusqlite::Connection, ns: &str
         )
         .unwrap();
     assert!(
-        found >= 1,
-        "inferred edge docC supersedes docA must persist in entity_edges"
+        found == 1,
+        "inferred edge docC supersedes docA must persist exactly once in entity_edges (got {found})"
     );
 }
 
