@@ -180,8 +180,19 @@ pub fn materialize(
             VALID_PROFILES.join(", ")
         ));
     }
-    if source_ttl.contains(['\n', '\r', '"', ';']) {
-        return Err("invalid source_ttl: control chars / quote / semicolon not allowed".to_string());
+    // #6（第11轮 security/medium）：source_ttl 拒绝字符集**在 Unix 上**必须含 `\\`。Unix 上
+    // `win_path` 保留反斜杠（不替换），若 source_ttl 以 `\` 结尾，`win_path_quoted` 产出
+    // `"path\"`——尾随反斜杠会转义 batch 脚本里闭合的双引号（`load "...\"`），让后续字符被
+    // 解析为额外 batch 指令或破坏引号闭合，与已防的 `\n`/`"`/`;` 是同一注入面。source_ttl
+    // 租户可控，必须拒绝。**Windows 上不能拒绝 `\`**：`win_path` 会把盘符分隔符 `\` 统一转成
+    // `/`，正常 `C:\...` 路径必含反斜杠，拒绝会误拦合法路径（#11 实测）。
+    // 因此在非 Windows 才把 `\\` 加入拒绝集。
+    let mut forbidden: Vec<char> = vec!['\n', '\r', '"', ';'];
+    if !cfg!(windows) {
+        forbidden.push('\\');
+    }
+    if source_ttl.contains(forbidden.as_slice()) {
+        return Err("invalid source_ttl: control chars / quote / semicolon (and backslash on Unix) not allowed".to_string());
     }
     // #6（第10轮 security/medium）：schema_path 的危险字符校验必须**前移到 create_dir_all
     // 之前**（与 data_dir/source_ttl 同处）。此前它在下方 batch 脚本构建处才做（create_dir_all
@@ -190,8 +201,15 @@ pub fn materialize(
     // 在才有机会校验（可用性漏洞）。这里统一前置，任何危险输入在产生文件系统足迹前被拒绝。
     if cfg.schema_path.exists() {
         let sp = cfg.schema_path.to_string_lossy();
-        if sp.contains(['\n', '\r', '"', ';']) {
-            return Err("invalid schema_path: control chars / quote / semicolon not allowed".to_string());
+        // #6（第11轮 security/medium）：与 source_ttl 同，schema_path **在 Unix 上**拒绝 `\`
+        // （可能尾随 `\` 逃逸 batch 引号注入）。Windows 上 `win_path` 会把 `\` 转成 `/`，正常
+        // `C:\...` 必含反斜杠，不能拒绝（#11 实测）。schema_path 租户可控（OPEN_ONTOLOGIES_SCHEMA env）。
+        let mut forbidden: Vec<char> = vec!['\n', '\r', '"', ';'];
+        if !cfg!(windows) {
+            forbidden.push('\\');
+        }
+        if sp.contains(forbidden.as_slice()) {
+            return Err("invalid schema_path: control chars / quote / semicolon (and backslash on Unix) not allowed".to_string());
         }
     }
     // #R4-4：create_dir_all 失败必须传播（此前 `let _ =` 吞错，data_dir 不可写时
@@ -212,6 +230,24 @@ pub fn materialize(
     // （如 `ex:docX ex:belongsTo ex:tenantA`）会出现在物化输出里。若只减 source_edges，
     // 这些 schema 显式边会被误标为推断边写回（evidence=ontology:materialized）。
     // 故把 schema（若存在）的受控边也并入 source_edges 一起减，只留真正由推理新增的边。
+    // #1（第11轮 bug/high）：source_ttl/schema_path 在 read_to_string 前必须确认是**常规文件**。
+    // 只做字符校验（拒绝危险字符）挡不住 FIFO/命名管道：若路径指向 FIFO（或 exists() 后被换
+    // 成管道），read_to_string 会在 pipe 无数据时永久阻塞调用线程——可用性 DoS。未来这些路径
+    // 经 MCP/web 成为租户可控输入时尤其危险，违背模块"子进程必须超时"的不变式（连子进程都
+    // 有超时，主线程自身更不能无限阻塞）。在读取前用 fs::metadata 检查 is_file()，非正则拒绝。
+    fn reject_non_regular_file(path: &std::path::Path, what: &str) -> Result<(), String> {
+        let md = std::fs::metadata(path)
+            .map_err(|e| format!("stat {} {}: {}", what, path.display(), e))?;
+        if !md.is_file() {
+            return Err(format!(
+                "{} {} is not a regular file (dir/fifo rejected; would block on read)",
+                what,
+                path.display()
+            ));
+        }
+        Ok(())
+    }
+    reject_non_regular_file(std::path::Path::new(source_ttl), "source_ttl")?;
     let mut source_edges: std::collections::HashSet<(String, String, String)> = {
         let src = std::fs::read_to_string(source_ttl)
             .map_err(|e| format!("read source ttl: {}", e))?;
@@ -224,6 +260,8 @@ pub fn materialize(
         // 存在但不可读（权限/瞬时 I/O），其显式受控边缺失，物化后集合差会把 schema 边误标为
         // 推断边写回（evidence=ontology:materialized），正是 #6 要防的误分类。错误必须传播，
         // 与模块"错误传播而非静默吞掉"纪律一致。
+        // #1（第11轮 bug/high）：schema_path 同样在读取前拒绝 FIFO/管道，防永久阻塞。
+        reject_non_regular_file(&cfg.schema_path, "schema_path")?;
         let schema_src = std::fs::read_to_string(&cfg.schema_path)
             .map_err(|e| format!("read schema ttl {}: {}", cfg.schema_path.display(), e))?;
         source_edges.extend(parse_ttl_edges(&schema_src));
@@ -368,42 +406,68 @@ pub fn materialize(
     }
 
     // 解析 batch JSON 输出，提取 load/reason 的 triple 计数
+    // #4（第11轮 maintainability/low）：若 open-ontologies 改了输出格式/混入非 JSON 日志行/
+    // 省略字段，计数会静默落 0，报告 "triples: 0 -> 0 (inferred 0)" 误导运维与下游自动化。
+    // 显式跟踪是否看到 load/reason 结果，未看到则告警，避免"物化成功但计数全 0"的假象。
     let mut triples_before = 0u64;
     let mut triples_after = 0u64;
     let mut used_profile = profile.to_string();
+    let mut saw_load_result = false;
+    let mut saw_reason_result = false;
+    let mut unparsed_lines = 0usize;
     for line in stdout.lines() {
-        if let Ok(v) = parse_json_line(line) {
-            if let Some(cmd) = v.get("command").and_then(|c| c.as_str()) {
-                if let Some(res) = v.get("result") {
-                    if cmd == "load" {
-                        triples_before += res
-                            .get("triples_loaded")
-                            .and_then(|n| n.as_u64())
-                            .unwrap_or(0);
-                    } else if cmd == "reason" {
-                        triples_after = res.get("final_triples").and_then(|n| n.as_u64()).unwrap_or(0);
-                        if let Some(p) = res.get("profile_used").and_then(|p| p.as_str()) {
-                            used_profile = p.to_string();
-                        }
+        match parse_json_line(line) {
+            Ok(v) => {
+                let Some(cmd) = v.get("command").and_then(|c| c.as_str()) else {
+                    continue;
+                };
+                let Some(res) = v.get("result") else {
+                    continue;
+                };
+                if cmd == "load" {
+                    saw_load_result = true;
+                    triples_before += res
+                        .get("triples_loaded")
+                        .and_then(|n| n.as_u64())
+                        .unwrap_or(0);
+                } else if cmd == "reason" {
+                    saw_reason_result = true;
+                    triples_after = res.get("final_triples").and_then(|n| n.as_u64()).unwrap_or(0);
+                    if let Some(p) = res.get("profile_used").and_then(|p| p.as_str()) {
+                        used_profile = p.to_string();
                     }
                 }
             }
+            Err(_) => unparsed_lines += 1,
         }
+    }
+    if !saw_load_result {
+        eprintln!(
+            "WARN: no 'load' result in open-ontologies batch output ({} unparsed line(s)); \
+             triples count may be inaccurate",
+            unparsed_lines
+        );
+    }
+    if !saw_reason_result {
+        eprintln!(
+            "WARN: no 'reason' result in open-ontologies batch output ({} unparsed line(s)); \
+             triples count may be inaccurate",
+            unparsed_lines
+        );
     }
 
     // 解析导出 TTL 提取全部目标关系边（显式 + 推断，顺序无关）。
     // #2（第8/9轮 security/high）：out_ttl 路径 `materialized_{pid}_{seq}.ttl` 可预测，攻击者可
     // 预置符号链接让子进程 save 沿链接写任意文件（CWE-377）。第9轮已改为**预防**：spawn 前用
     // create_new(O_EXCL) 把 out_ttl 预占成常规文件（见上方），路径已被非符号链接占据，攻击者
-    // 无法再预置链接。此处 `symlink_metadata` 检查保留为**纵深防御**——确认 save 后仍是常规
-    // 文件（子进程自身理论上可能被诱导替换为链接），并核实非空以免读到半写/空文件。
-    let out_meta = std::fs::symlink_metadata(&out_ttl)
-        .map_err(|e| format!("stat materialized ttl: {}", e))?;
-    if out_meta.file_type().is_symlink() || !out_meta.is_file() {
-        return Err("out_ttl is not a regular file (possible symlink attack)".to_string());
-    }
-    let ttl = std::fs::read_to_string(&out_ttl)
-        .map_err(|e| format!("read materialized ttl: {}", e))?;
+    // 无法再预置链接。
+    // #3（第11轮 security/low）：此前 `symlink_metadata` 常规文件检查与 `read_to_string(&out_ttl)`
+    // 之间存在 TOCTOU——攻击者可在两者间把 out_ttl 换成符号链接/FIFO，其内容被当 TTL 解析并
+    // diff。O_EXCL 预占收窄了竞态但没关死。正确做法：用 `O_NOFOLLOW`（Unix）打开 out_ttl、
+    // 在**已打开的句柄**上 fstat 校验常规文件，并通过该句柄读取——符号链接在 open 时即被拒绝，
+    // 后续路径替换不再影响（读的是已打开的真实文件），TOCTOU 关闭。Windows 无 O_NOFOLLOW，
+    // 用 create_new 预占 + 此处常规检查兜底（Windows 上符号链接创建需管理员权限，风险已收窄）。
+    let ttl = read_ttl_no_follow(&out_ttl)?;
     let all_edges = parse_ttl_edges(&ttl);
     // 推断边 = 物化后边集 ∖ 物化前显式边集（集合差，顺序无关）。
     // 不用 reason 报告的 inferred_count，也不假设"推断边排最前"——那些跨版本都不可靠（#113）。
@@ -430,6 +494,48 @@ pub fn materialize(
 /// 解析 batch 输出的单行 JSON（容错：跳过错行）。
 fn parse_json_line(line: &str) -> Result<serde_json::Value, serde_json::Error> {
     serde_json::from_str(line)
+}
+
+/// 以 `O_NOFOLLOW` 打开并读取 TTL 文件，关闭 symlink 检查与读取之间的 TOCTOU（#3 第11轮）。
+///
+/// Unix：open 时 `O_NOFOLLOW` 直接拒绝符号链接，随后在已打开的句柄上 fstat 校验常规文件
+/// （拒绝 FIFO/设备，防阻塞读），再通过句柄读取——路径替换不影响已打开的真实文件。
+/// Windows 无 `O_NOFOLLOW`：符号链接创建需管理员权限（风险已由 create_new 预占收窄），
+/// 此处用 `symlink_metadata` + `metadata` 双重校验兜底。
+#[cfg(unix)]
+fn read_ttl_no_follow(path: &std::path::Path) -> Result<String, String> {
+    use std::io::Read;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let mut f = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|e| format!("open materialized ttl (O_NOFOLLOW): {}", e))?;
+    let md = f
+        .metadata()
+        .map_err(|e| format!("fstat materialized ttl: {}", e))?;
+    if !md.is_file() {
+        return Err("out_ttl is not a regular file (possible symlink/fifo attack)".to_string());
+    }
+    let mut s = String::new();
+    f.read_to_string(&mut s)
+        .map_err(|e| format!("read materialized ttl: {}", e))?;
+    Ok(s)
+}
+
+/// Windows 版本：无 `O_NOFOLLOW`，用 `symlink_metadata`（不跟随链接）确认非符号链接，
+/// 再 `metadata`（跟随链接）确认常规文件，最后读取。create_new 预占已收窄竞态。
+#[cfg(windows)]
+fn read_ttl_no_follow(path: &std::path::Path) -> Result<String, String> {
+    let sm = std::fs::symlink_metadata(path)
+        .map_err(|e| format!("lstat materialized ttl: {}", e))?;
+    if sm.file_type().is_symlink() {
+        return Err("out_ttl is a symlink (possible attack)".to_string());
+    }
+    if !sm.is_file() {
+        return Err("out_ttl is not a regular file (possible fifo/device)".to_string());
+    }
+    std::fs::read_to_string(path).map_err(|e| format!("read materialized ttl: {}", e))
 }
 
 /// 把路径规范为 open-ontologies 可识别的形式。
