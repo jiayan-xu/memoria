@@ -31,7 +31,7 @@ const DATA_TTL: &str = r#"@prefix : <http://memoria.ai/onto/> .
 /// 仅当显式设置了 OPEN_ONTOLOGIES_BIN 且路径存在、或二进制确定在 PATH 上时才返回 Some，
 /// 避免在无二进制的环境（如 CI runner）误判后 spawn 失败。
 ///
-/// #R4-6：所有探测（env 路径 --help、`which`/`where`）都带超时，避免挂死的二进制
+/// #R4-6：所有探测（env 路径 --help、PATH 遍历）都带超时，避免挂死的二进制
 /// / 无响应的 PATH 探测卡住测试进程（与主模块"子进程必须超时"规矩一致）。
 /// #R4-7：设置 `REQUIRE_ONTOLOGIES_BIN=1` 时，找不到二进制直接 panic（CI 硬要求），
 /// 而不是静默 skip——防止 CI 上"测试绿了但实际没跑真实物化"的假绿通过门禁。
@@ -58,22 +58,22 @@ fn locate_bin() -> Option<String> {
             return Some(b);
         }
     }
-    // 用 `which`/`where` 探测 PATH。输出可能多行（同名二进制在多个 PATH 条目），
-    // 只取第一条匹配路径；找不到则视为无二进制 → 跳过。
-    // #1（第5轮 test/medium）：PATH 分支此前只查 is_file() 不跑 probe_help，且 which/where
-    // 本身无超时——stale/不可执行的 open-ontologies 会通过 find_bin，后期 materialize() 才 panic，
-    // 违背 #R3-1"应跳过而非崩溃"；which/where 挂死也会卡死测试（违背 #R4-6"所有探测带超时"）。
-    // 故：对 which/where 用带超时的 probe_locate 封装，并对定位到的路径再跑一次 probe_help。
-    let locator = if cfg!(windows) { "where" } else { "which" };
-    let out = probe_locate(locator)?;
-    let stdout = String::from_utf8_lossy(&out);
-    stdout
-        .lines()
-        .map(str::trim)
-        .find(|s| {
-            !s.is_empty() && std::path::Path::new(s).is_file() && probe_help(s)
-        })
-        .map(str::to_string)
+    // #2（第7轮 bug/low）：不再 shell 到 `where`/`which`——(a) Windows 的 `where` 用控制台
+    // 代码页（如 GBK）输出，非 ASCII 安装路径会被 from_utf8_lossy 乱码，误判"未找到"；
+    // (b) `where` 会顺带搜 CWD，可能选中过时/无关的同名文件。改为直接遍历 `split_paths(PATH)`
+    // 并对每个候选 dir 里的 `open-ontologies(.exe)` 用 probe_help 探测（无编码问题、不搜 CWD）。
+    let path_var = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path_var) {
+        let exe = if cfg!(windows) {
+            dir.join("open-ontologies.exe")
+        } else {
+            dir.join("open-ontologies")
+        };
+        if exe.is_file() && probe_help(exe.to_str()?) {
+            return Some(exe.to_str()?.to_string());
+        }
+    }
+    None
 }
 
 /// 探活子进程超时（秒）。
@@ -88,52 +88,6 @@ fn probe_timeout() -> std::time::Duration {
         .and_then(|v| v.parse::<u64>().ok())
         .map(std::time::Duration::from_secs)
         .unwrap_or(PROBE_TIMEOUT)
-}
-
-/// 带超时的 `which`/`where` 探测（#1）。spawn 失败 / 非零退出 / 超时都返回 None。
-/// #2（第6轮 bug/low）：stdout 用 reader 线程在子进程运行期间并发 drain，避免 which/where
-/// 输出超过 OS 管道缓冲（~64KB）时子进程阻塞在 write 上、被超时误杀成"假未找到"。
-/// （与 src/ontology.rs 生产代码的并发 reader 模式一致。）
-fn probe_locate(locator: &str) -> Option<Vec<u8>> {
-    let mut child = std::process::Command::new(locator)
-        .arg("open-ontologies")
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .ok()?;
-    use std::io::Read;
-    let so = child.stdout.take();
-    // reader 线程并发 drain stdout；子进程退出后拿到完整输出。
-    let reader = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        if let Some(mut o) = so {
-            let _ = o.read_to_end(&mut buf);
-        }
-        buf
-    });
-    let deadline = std::time::Instant::now() + probe_timeout();
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(st)) => break Some(st),
-            Ok(None) => {}
-            Err(_) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return None;
-            }
-        }
-        if std::time::Instant::now() > deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            return None;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    };
-    let buf = reader.join().unwrap_or_default();
-    match status {
-        Some(st) if st.success() => Some(buf),
-        _ => None,
-    }
 }
 
 /// 带超时的 `--help` 可执行探测（#R4-6）。spawn 失败、超时、非零退出都视为不可用。

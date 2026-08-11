@@ -56,6 +56,30 @@ impl Drop for TempFileGuard {
     }
 }
 
+/// 有界 join reader 线程（#4 第7轮 bug/medium）。
+///
+/// 若子进程（或其继承 stdout/stderr 写端的孙进程）在 kill 后仍持有管道写端，`read_to_string`
+/// 不会 EOF，无界 `join()` 会永久阻塞，使"必须超时"的保证失效。有界 join：在 `bound` 内
+/// 等到线程结束则返回其值；超时则 detach（线程必然在管道关闭后自然结束），本函数照常返回默认值，
+/// 不阻塞调用方。
+fn join_bounded<T: Send + 'static>(
+    handle: std::thread::JoinHandle<T>,
+    bound: Duration,
+    default: T,
+) -> T {
+    let deadline = Instant::now() + bound;
+    loop {
+        if handle.is_finished() {
+            return handle.join().unwrap_or(default);
+        }
+        if Instant::now() >= deadline {
+            // 超时：detach，让线程在管道关闭后自行结束；不阻塞调用方。
+            return default;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 /// 物化结果：从 TTL 解析出的推断边（全部显式边 + 推断边统计）。
 #[derive(Debug, Default)]
 pub struct MaterializeResult {
@@ -131,11 +155,9 @@ pub fn materialize(
     profile: &str,
 ) -> Result<MaterializeResult, String> {
     let start = Instant::now();
-    // #R4-4：create_dir_all 失败必须传播（此前 `let _ =` 吞错，data_dir 不可写时
-    // 后续 write batch/out 会以更令人困惑的路径错误暴露）。未显式创建会造成写临时
-    // 文件失败，且那发生在校验之后、spawn 之前，正是最该早期暴露的位置。
-    std::fs::create_dir_all(&cfg.data_dir)
-        .map_err(|e| format!("create data dir {}: {}", cfg.data_dir.display(), e))?;
+    // #7（第7轮 security/low）：data_dir 校验必须在 create_dir_all 之前——否则恶意
+    // OPEN_ONTOLOGIES_DATA 会先创建目录（副作用）再被拒绝。把校验提到最前，任何注入
+    // /危险输入在产生任何文件系统足迹前就被拒绝。
     // #5（第5轮 security/medium）：data_dir 来自 OPEN_ONTOLOGIES_DATA env（用户可控），
     // 且被拼进 out_ttl 后经 win_path_quoted 插进 batch 脚本的 `save` 行。与 schema_path/
     // source_ttl 相同，data_dir 若含换行/引号/分号会逃逸双引号注入额外 batch 指令——
@@ -145,6 +167,11 @@ pub fn materialize(
     if data_dir_str.contains(['\n', '\r', '"', ';']) {
         return Err("invalid data_dir: control chars / quote / semicolon not allowed".to_string());
     }
+    // #R4-4：create_dir_all 失败必须传播（此前 `let _ =` 吞错，data_dir 不可写时
+    // 后续 write batch/out 会以更令人困惑的路径错误暴露）。未显式创建会造成写临时
+    // 文件失败，且那发生在校验之后、spawn 之前，正是最该早期暴露的位置。
+    std::fs::create_dir_all(&cfg.data_dir)
+        .map_err(|e| format!("create data dir {}: {}", cfg.data_dir.display(), e))?;
     // 每次调用用唯一文件名（pid + 单调序列），避免并发调用（CLI + 定时任务 / 未来
     // MCP/web 触发）互相覆盖 script/output，导致读到他方半写文件（#7/#R3-8）。
     let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -168,11 +195,22 @@ pub fn materialize(
         return Err("invalid source_ttl: control chars / quote / semicolon not allowed".to_string());
     }
     // 物化前解析源 TTL 的显式目标关系边集，供物化后 diff 出真正的新增推断边（#113）。
-    let source_edges: std::collections::HashSet<(String, String, String)> = {
+    // #6（第7轮 bug/medium）：schema TTL 也被 load 进同一图参与推理，其显式受控关系边
+    // （如 `ex:docX ex:belongsTo ex:tenantA`）会出现在物化输出里。若只减 source_edges，
+    // 这些 schema 显式边会被误标为推断边写回（evidence=ontology:materialized）。
+    // 故把 schema（若存在）的受控边也并入 source_edges 一起减，只留真正由推理新增的边。
+    let mut source_edges: std::collections::HashSet<(String, String, String)> = {
         let src = std::fs::read_to_string(source_ttl)
             .map_err(|e| format!("read source ttl: {}", e))?;
         parse_ttl_edges(&src).into_iter().collect()
     };
+    if cfg.schema_path.exists() {
+        // #6：schema 的受控边并入 source_edges 一起减。schema_path 的危险字符校验
+        // 在下方的 batch 脚本构建处统一做（此处只读不写，早于任何注入面）。
+        if let Ok(schema_src) = std::fs::read_to_string(&cfg.schema_path) {
+            source_edges.extend(parse_ttl_edges(&schema_src));
+        }
+    }
 
     // 剧本：load schema（含 OWL 传递/对称属性声明）→ load 数据 → reason → save。
     // OWL 推理需要本体声明（TransitiveProperty 等）在场，否则 supersedes 等只是普通属性，
@@ -200,7 +238,19 @@ pub fn materialize(
         profile,
         win_path_quoted(&out_ttl)
     ));
-    std::fs::write(temp_guard.batch_path(), script)
+    // #5（第7轮 security/medium）：临时文件名 `materialize_{pid}_{seq}.batch` 可预测 + 用普通
+    // std::fs::write（跟随符号链接、无 O_EXCL）。能写进 data_dir 的本地攻击者可预置符号链接，
+    // 把 batch 脚本写入重定向到任意路径。改用 `create_new`（O_EXCL，独家创建）——若路径已存在
+    // （含符号链接）则失败，杜绝"预置路径劫持写入"。out_ttl 由子进程以 save 创建，本模块只读，
+    // 目标攻击面已由 batch 写的 O_EXCL 收窄。
+    use std::io::Write;
+    let mut batch_f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(temp_guard.batch_path())
+        .map_err(|e| format!("create batch script (exclusive): {}", e))?;
+    batch_f
+        .write_all(script.as_bytes())
         .map_err(|e| format!("write batch script: {}", e))?;
 
     let mut child = Command::new(&cfg.bin)
@@ -244,18 +294,19 @@ pub fn materialize(
             Err(e) => {
                 // try_wait 出错（EINTR / Windows handle）：必须 kill + wait + join reader，
                 // 否则子进程继续跑、reader 线程阻塞在 read_to_string，泄漏失控进程（#R3-3）。
+                // join 用有界版本（#4），防止孙进程持管道导致永久阻塞。
                 let _ = child.kill();
                 let _ = child.wait();
-                let _ = stdout_reader.join();
-                let _ = stderr_reader.join();
+                let _ = join_bounded(stdout_reader, Duration::from_secs(2), String::new());
+                let _ = join_bounded(stderr_reader, Duration::from_secs(2), String::new());
                 return Err(format!("wait: {}", e));
             }
         }
         if wait_start.elapsed() > timeout {
             let _ = child.kill();
             let _ = child.wait(); // 收割子进程，避免僵尸（Unix）
-            let _ = stdout_reader.join();
-            let _ = stderr_reader.join();
+            let _ = join_bounded(stdout_reader, Duration::from_secs(2), String::new());
+            let _ = join_bounded(stderr_reader, Duration::from_secs(2), String::new());
             return Err(format!(
                 "ontology materialize timed out after {}s (killed)",
                 cfg.timeout_secs
@@ -263,9 +314,9 @@ pub fn materialize(
         }
         std::thread::sleep(Duration::from_millis(50));
     };
-    // 子进程已退出：join reader 线程，拿到完整输出。
-    let stdout = stdout_reader.join().unwrap_or_default();
-    let stderr = stderr_reader.join().unwrap_or_default();
+    // 子进程已退出：join reader 线程，拿到完整输出（有界，防孙进程持管道卡死，#4）。
+    let stdout = join_bounded(stdout_reader, Duration::from_secs(2), String::new());
+    let stderr = join_bounded(stderr_reader, Duration::from_secs(2), String::new());
     if !status.success() {
         return Err(format!(
             "open-ontologies batch failed: {} (stderr: {})",
@@ -330,11 +381,20 @@ fn parse_json_line(line: &str) -> Result<serde_json::Value, serde_json::Error> {
 
 /// 把路径规范为 open-ontologies 可识别的形式。
 ///
-/// 仅 Windows（或含盘符前缀的 Windows 风格路径）时把 `\` 替换为 `/`；
+/// 仅 Windows（或严格盘符前缀的 Windows 风格路径）时把 `\` 替换为 `/`；
 /// Unix 上合法文件名自带的反斜杠不改写（#122，避免跨平台路径损坏）。
+/// #9（第7轮 bug/low）：盘符启发式 `X:` 必须后跟 `/` 或 `\` 才判定为盘符——仅 `X:` 两字符
+/// 会误匹配 Unix 相对路径 `a:b.ttl`（冒号与反斜杠在 Unix 都是合法文件名字符），导致其反斜杠被改坏。
 fn win_path(p: &std::path::Path) -> String {
     let s = p.to_string_lossy();
-    if cfg!(windows) || s.starts_with(|c: char| c.is_ascii_alphabetic()) && s.as_bytes().get(1) == Some(&b':') {
+    let is_drive = {
+        let b = s.as_bytes();
+        b.len() >= 2
+            && b[0].is_ascii_alphabetic()
+            && b[1] == b':'
+            && b.get(2).map(|c| *c == b'/' || *c == b'\\').unwrap_or(false)
+    };
+    if cfg!(windows) || is_drive {
         s.replace('\\', "/")
     } else {
         s.into_owned()
@@ -534,13 +594,26 @@ fn strip_inline_comment(line: &str) -> &str {
                 return &line[..i]; // 未闭合 `<`，其后到行尾视为注释
             }
         } else if b == b'"' || b == b'\'' {
-            // 跳过引号字面量（简单配对，不处理转义——字面量内 `#` 不是注释）
+            // #10（第7轮 bug/low）：跳过引号字面量时处理转义——`\"` 是字面量内的转义引号，
+            // 不是闭合引号。此前 `find(quote)` 会把 `"...\"..."` 里的 `\"` 误当闭合，之后的
+            // `#`/`;`/`,` 被误判，可能截断行或伪造边。逐字节扫描，遇 `\` 跳过下一位。
             let quote = b;
-            if let Some(end) = line[i + 1..].find(quote as char) {
-                i += end + 2;
-                continue;
-            } else {
-                return &line[..i];
+            let mut j = i + 1;
+            let mut found = false;
+            while j < bytes.len() {
+                if bytes[j] == b'\\' {
+                    j += 2; // 跳过转义序列（含转义引号）
+                    continue;
+                }
+                if bytes[j] == quote {
+                    i = j + 1;
+                    found = true;
+                    break;
+                }
+                j += 1;
+            }
+            if !found {
+                return &line[..i]; // 未闭合引号，其后到行尾视为注释
             }
         } else if b == b'#' {
             return &line[..i];
@@ -603,12 +676,27 @@ fn tokenize_ttl(line: &str) -> Vec<String> {
                 break;
             }
         } else if b == b'"' || b == b'\'' {
-            // 引号字面量：跳到配对的闭合引号（简单处理，不处理转义 —— 字面量内分隔符直接略过）
+            // #10（第7轮 bug/low）：跳过引号字面量时处理转义——`\"` 是字面量内转义引号，
+            // 不是闭合引号。此前 `find(quote)` 会把 `"...\"..."` 里的 `\"` 误当闭合，之后的
+            // `;`/`,` 被误判，可能伪造边。逐字节扫描，遇 `\` 跳过下一位。
             let quote = b;
-            if let Some(end) = rest[1..].find(quote as char) {
-                rest = &rest[end + 2..];
-            } else {
-                break;
+            let bytes = rest.as_bytes();
+            let mut j = 1;
+            let mut found = false;
+            while j < bytes.len() {
+                if bytes[j] == b'\\' {
+                    j += 2;
+                    continue;
+                }
+                if bytes[j] == quote {
+                    rest = &rest[j + 1..];
+                    found = true;
+                    break;
+                }
+                j += 1;
+            }
+            if !found {
+                break; // 未闭合引号，丢弃行剩余部分
             }
         } else if b == b';' || b == b',' {
             out.push(rest[..1].to_string());
@@ -620,6 +708,9 @@ fn tokenize_ttl(line: &str) -> Vec<String> {
             // #5（第6轮 bug/medium）：把整个 `[...]` 跨度作为一个**不透明 token** 保留（而非
             // 丢弃），使 `[ ... ] <p> <o>` 这类 blank node 属性列表主语能在解析层被识别为
             // blank node 主语（见 #5 分支），避免 `<p>` 被误读为新主语、真实边丢失。
+            // 已知局限（#10 第7轮 bug/low）：跨行 blank node（`[ a <Doc> ; <pred> <obj> ]`
+            // 的 `]` 在下一行）本骨架不处理——无 `]` 时丢弃本行剩余、后续行重新附着到外层主语。
+            // 这是轻量 TTL 扫描器的取舍；生产级多行 blank node 需跨行状态机（超出本期范围）。
             if let Some(end) = rest.find(']') {
                 out.push(rest[..=end].to_string());
                 rest = &rest[end + 1..];
@@ -707,15 +798,16 @@ pub fn write_back_edges(
             let oname = iri_local_name(o);
             // 幂等 upsert 两端实体（满足外键约束）——错误必须传播，不静默吞掉（#9），
             // 否则 INSERT 失败会被掩盖，直到边插入时才暴露为令人困惑的 FK 冲突。
-            // #9（第6轮 bug/low）跨租户一致性：entities.id 是全局主键（无命名空间维度），
-            // 仅 `DO NOTHING` 会让第一个命名空间"拥有"该 IRI 的实体行；后续其它命名空间引用
-            // 同一 IRI 时，entity_edges.namespace 与 entities.namespace 会分叉。改为冲突时
-            // 刷新 namespace，使实体行归属最近一次写它的命名空间，抑制跨租户分歧。
+            // #3（第7轮 bug/medium）：entities.id 是全局主键（无命名空间维度），entity_edges
+            // 却按行带 namespace。若 `DO UPDATE SET namespace=excluded.namespace`，两个命名空间
+            // 引用同一 IRI 时实体行会"翻动"到最后写它的命名空间，而既有边仍带各自 namespace，
+            // 分歧只是从"首个拥有者"变成"最后写入者"，查询 join 仍不一致。故保持 DO NOTHING
+            // （首个拥有者语义），不静默改租户归属；实体 id 用完整 IRI 已尽量降低撞名概率（#6）。
             for (eid, ename) in [(s.as_str(), sname.as_str()), (o.as_str(), oname.as_str())] {
                 tx.execute(
                     "INSERT INTO entities(id, namespace, entity_type, name, aliases, summary)
                      VALUES(?1, ?2, 'concept', ?3, '[]', NULL)
-                     ON CONFLICT(id) DO UPDATE SET namespace=excluded.namespace",
+                     ON CONFLICT(id) DO NOTHING",
                     rusqlite::params![eid, namespace, ename],
                 )
                 .map_err(|e| format!(
@@ -850,8 +942,8 @@ pub fn status(cfg: &OntologyConfig) -> Result<String, String> {
         }
         std::thread::sleep(Duration::from_millis(50));
     };
-    let stdout_txt = stdout_reader.join().unwrap_or_default();
-    let stderr_txt = stderr_reader.join().unwrap_or_default();
+    let stdout_txt = join_bounded(stdout_reader, Duration::from_secs(2), String::new());
+    let stderr_txt = join_bounded(stderr_reader, Duration::from_secs(2), String::new());
     let detected = if stdout_txt.contains("serve-http") || stderr_txt.contains("serve-http") {
         "serve-http 可用"
     } else {
@@ -1073,6 +1165,36 @@ _:b0 <http://example.org/supersedes> :docA .
             "http://example.org/docA".to_string()
         )));
     }
+
+    #[test]
+    fn win_path_drive_heuristic_strict() {
+        // #9（第7轮 bug/low）：盘符启发式必须严格（X: 后跟 / 或 \）。
+        // 在非 Windows 上，Unix 相对路径 `a:b.ttl`（含反斜杠）不得被改写。
+        if !cfg!(windows) {
+            // 仅冒号、后随非 / \ 的路径，不是盘符 → 保留反斜杠
+            assert_eq!(
+                win_path(std::path::Path::new("a:b.ttl")),
+                "a:b.ttl"
+            );
+            // 严格盘符（X:/ 或 X:\）→ 反斜杠转正斜杠
+            assert_eq!(
+                win_path(std::path::Path::new("D:\\data\\a.ttl")),
+                "D:/data/a.ttl"
+            );
+        }
+    }
+
+    #[test]
+    fn strip_inline_comment_handles_escaped_quotes() {
+        // #10（第7轮 bug/low）：`\"` 是字面量内转义引号，不是闭合引号，其后的 `#` 是注释起点。
+        // 若误把 `\"` 当闭合，`#` 会被吞进字面量、注释不剥离。
+        assert_eq!(
+            strip_inline_comment("\"a\\\"b\" <p> <o> . # see"),
+            "\"a\\\"b\" <p> <o> . "
+        );
+        // 引号字面量内 `#` 不是注释起点
+        assert_eq!(strip_inline_comment("\"a#b\" <p> <o> ."), "\"a#b\" <p> <o> .");
+    }
 }
 
 // 供外部（web_api / mcp_server）复用的通用入口
@@ -1129,12 +1251,20 @@ pub fn run_ontology_cli(args: &[String]) -> Result<String, String> {
 /// 健康探测需 MCP 握手（本期未实现）。本命令仅验证进程能起、端口能绑，
 /// 打印启动信息后退出（不维持长驻进程，避免与 memoria 主服务端口冲突）。
 fn serve_http_placeholder(cfg: &OntologyConfig, args: &[String]) -> Result<String, String> {
-    // 解析 --port N
-    let port = args
-        .windows(2)
-        .find(|w| w[0] == "--port")
-        .and_then(|w| w[1].parse::<u16>().ok())
-        .unwrap_or(18080);
+    // 解析 --port N（#8 第7轮 maintainability/low）：非法值不再静默回退 18080——
+    // 操作者以为配了自定义端口实际跑了默认端口，会引发困惑。`--port abc`、`--port 0` 显式报错；
+    // 未提供 --port 才用默认 18080。
+    let mut port: u16 = 18080;
+    if let Some(idx) = args.iter().position(|a| a == "--port") {
+        let raw = args.get(idx + 1).ok_or("--port requires a value")?;
+        let parsed: u16 = raw
+            .parse()
+            .map_err(|_| format!("invalid --port value {:?} (expected 1..=65535)", raw))?;
+        if parsed == 0 {
+            return Err("invalid --port value 0 (0 means ephemeral; specify 1..=65535)".to_string());
+        }
+        port = parsed;
+    }
     let start = Instant::now();
     let mut child = Command::new(&cfg.bin)
         .arg("serve-http")
@@ -1172,8 +1302,8 @@ fn serve_http_placeholder(cfg: &OntologyConfig, args: &[String]) -> Result<Strin
         Err(e) => {
             let _ = child.kill();
             let _ = child.wait();
-            let _ = stdout_reader.join();
-            let _ = stderr_reader.join();
+            let _ = join_bounded(stdout_reader, Duration::from_secs(2), String::new());
+            let _ = join_bounded(stderr_reader, Duration::from_secs(2), String::new());
             return Err(format!("wait: {}", e));
         }
     };
@@ -1181,9 +1311,9 @@ fn serve_http_placeholder(cfg: &OntologyConfig, args: &[String]) -> Result<Strin
         // #8（第6轮 maintainability/low）：退出路径也要 join 两个 reader（此前只 join
         // stderr_reader，stdout_reader 的 JoinHandle 被 drop 不 join——若子进程延迟关 stdout，
         // 该 reader 线程会长期阻塞在 read_to_string）。与成功路径 / materialize/status 的
-        // kill+wait+join 纪律一致。
-        let _ = stdout_reader.join();
-        let err = stderr_reader.join().unwrap_or_default();
+        // kill+wait+join 纪律一致。用有界 join（#4）防孙进程持管道永久阻塞。
+        let _ = join_bounded(stdout_reader, Duration::from_secs(2), String::new());
+        let err = join_bounded(stderr_reader, Duration::from_secs(2), String::new());
         return Err(format!(
             "serve-http exited immediately (code {}): {}",
             st, err
@@ -1193,8 +1323,8 @@ fn serve_http_placeholder(cfg: &OntologyConfig, args: &[String]) -> Result<Strin
     // 避免 Unix 下遗留僵尸进程（#121，与 materialize 超时路径的 kill+wait 一致）。
     let _ = child.kill();
     let _ = child.wait();
-    let _ = stdout_reader.join();
-    let _ = stderr_reader.join();
+    let _ = join_bounded(stdout_reader, Duration::from_secs(2), String::new());
+    let _ = join_bounded(stderr_reader, Duration::from_secs(2), String::new());
     Ok(format!(
         "serve-http 在线通道占位 OK\nport: {} (进程存活>800ms, 未实测端口监听)\nstorage: persistent\nverification_ms: {}\n(注: serve-http 为 MCP Streamable HTTP, 健康探测需 MCP 握手, 本期未接客户端; '端口已绑定'未实测, 仅验证进程可启动)",
         port,
