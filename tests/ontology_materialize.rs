@@ -26,20 +26,24 @@ const DATA_TTL: &str = r#"@prefix : <http://memoria.ai/onto/> .
 "#;
 
 /// 定位 open-ontologies 二进制；缺失则 None（测试跳过）。
+/// 仅当显式设置了 OPEN_ONTOLOGIES_BIN 或二进制确定在 PATH 上时才返回 Some，
+/// 避免在无二进制的环境（如 CI runner）误判后 spawn 失败。
 fn find_bin() -> Option<String> {
     if let Ok(b) = std::env::var("OPEN_ONTOLOGIES_BIN") {
         if !b.is_empty() {
             return Some(b);
         }
     }
-    // PATH 探测（open-ontologies 需在 PATH 中；集成测试本地跑时用 OPEN_ONTOLOGIES_BIN 显式指定）
-    let candidates = ["open-ontologies"];
-    for c in candidates {
-        if std::path::Path::new(&c.replace('/', "\\")).exists() || c == "open-ontologies" {
-            return Some(c.to_string());
-        }
-    }
-    None
+    // 用 `which` 探测 PATH（Windows 上 where）；找不到则视为无二进制 → 跳过
+    let locator = if cfg!(windows) { "where" } else { "which" };
+    let hit = std::process::Command::new(locator)
+        .arg("open-ontologies")
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .filter(|s| !s.is_empty());
+    hit
 }
 
 fn temp_dir(tag: &str) -> std::path::PathBuf {
