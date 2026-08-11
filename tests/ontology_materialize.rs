@@ -48,16 +48,23 @@ fn find_bin() -> Option<String> {
 }
 
 fn locate_bin() -> Option<String> {
-    // env 值先做 is_file() 校验 + 可执行探测（--help 能 spawn），缺失/不可执行则跳过，
-    // 避免后续 materialize(...).expect(...) 因 spawn 失败而 panic（#R3-1）。
-    if let Ok(b) = std::env::var("OPEN_ONTOLOGIES_BIN") {
-        if !b.is_empty()
-            && std::path::Path::new(&b).is_file()
-            && probe_help(&b)
-        {
+    // #1（第9轮 maintainability/low）：`OPEN_ONTOLOGIES_BIN` 是显式 override，一旦设置就必须
+    // 权威——若校验失败（非文件 / --help 探测失败或超时），直接返回 None（REQUIRE=1 下
+    // find_bin 会 panic），**绝不静默回退到 PATH 扫描**。否则 CI 里一个 stale/损坏的 pinned
+    // 路径会被 PATH 上恰好存在的另一个 open-ontologies 二进制掩盖，产出"跑错了可执行文件"
+    // 的假绿（或对错误版本报错，令人困惑）。
+    if let Some(b) = std::env::var("OPEN_ONTOLOGIES_BIN").ok() {
+        if b.is_empty() {
+            return None; // 显式空值 = 明确禁用，不回退
+        }
+        // env 值先做 is_file() 校验 + 可执行探测（--help 能 spawn），失败即权威地返回 None，
+        // 避免后续 materialize(...).expect(...) 因 spawn 失败而 panic 或跑错二进制（#R3-1）。
+        if std::path::Path::new(&b).is_file() && probe_help(&b) {
             return Some(b);
         }
+        return None; // 显式设置但校验失败 → 权威失败，不回退 PATH
     }
+    // 未显式设置：才走 PATH 遍历。不在 PATH 上则 None（测试跳过）。
     // #2（第7轮 bug/low）：不再 shell 到 `where`/`which`——(a) Windows 的 `where` 用控制台
     // 代码页（如 GBK）输出，非 ASCII 安装路径会被 from_utf8_lossy 乱码，误判"未找到"；
     // (b) `where` 会顺带搜 CWD，可能选中过时/无关的同名文件。改为直接遍历 `split_paths(PATH)`

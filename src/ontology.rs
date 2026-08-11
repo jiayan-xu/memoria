@@ -209,9 +209,13 @@ pub fn materialize(
     if cfg.schema_path.exists() {
         // #6：schema 的受控边并入 source_edges 一起减。schema_path 的危险字符校验
         // 在下方的 batch 脚本构建处统一做（此处只读不写，早于任何注入面）。
-        if let Ok(schema_src) = std::fs::read_to_string(&cfg.schema_path) {
-            source_edges.extend(parse_ttl_edges(&schema_src));
-        }
+        // #3（第9轮 bug/medium）：schema 读取失败不能再被 `if let Ok` 静默吞掉——若 schema_path
+        // 存在但不可读（权限/瞬时 I/O），其显式受控边缺失，物化后集合差会把 schema 边误标为
+        // 推断边写回（evidence=ontology:materialized），正是 #6 要防的误分类。错误必须传播，
+        // 与模块"错误传播而非静默吞掉"纪律一致。
+        let schema_src = std::fs::read_to_string(&cfg.schema_path)
+            .map_err(|e| format!("read schema ttl {}: {}", cfg.schema_path.display(), e))?;
+        source_edges.extend(parse_ttl_edges(&schema_src));
     }
 
     // 剧本：load schema（含 OWL 传递/对称属性声明）→ load 数据 → reason → save。
@@ -254,6 +258,23 @@ pub fn materialize(
     batch_f
         .write_all(script.as_bytes())
         .map_err(|e| format!("write batch script: {}", e))?;
+
+    // #2（第9轮 security/high）：**预防**而非**事后检测**符号链接攻击。out_ttl 路径
+    // `materialized_{pid}_{seq}.ttl` 可预测，且由子进程的 save 命令创建——若攻击者在 spawn
+    // 前预置同路径符号链接，子进程 save 会沿链接把 TTL 写到任意文件（CWE-377）。symlink_metadata
+    // 事后检查只在写入后检测，挡不住写入本身。正确做法：spawn 前用 `create_new`（O_EXCL）把
+    // out_ttl 预占成一个**常规文件**——若路径已被（符号链接）占据则 create_new 失败，杜绝
+    // 预置链接；子进程 save 会以写模式覆盖这个常规文件（open-ontologies save 是覆盖写）。
+    // 预占文件随后被 TempFileGuard 在任意退出路径清理。
+    {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&out_ttl)
+            .map_err(|e| format!("pre-create out_ttl (exclusive, anti-symlink): {}", e))?;
+        // 清空到 0 字节（新建文件本就为空），确保子进程 save 从干净状态开始（open-ontologies 覆盖写）。
+        let _ = f.write_all(b"");
+    }
 
     let mut child = Command::new(&cfg.bin)
         .arg("batch")
@@ -316,9 +337,14 @@ pub fn materialize(
         }
         std::thread::sleep(Duration::from_millis(50));
     };
-    // 子进程已退出：join reader 线程，拿到完整输出（有界，防孙进程持管道卡死，#4）。
-    let stdout = join_bounded(stdout_reader, Duration::from_secs(2), String::new());
-    let stderr = join_bounded(stderr_reader, Duration::from_secs(2), String::new());
+    // 子进程已退出：join reader 线程，拿到完整输出。
+    // #5（第9轮 bug/low）：**成功路径用无界 join**——子进程已退出，pipes 必达 EOF，reader 线程
+    // 会自然结束；有界 join（2s）在输出量大（慢盘/慢管道 drain）时可能静默返回空串，丢失
+    // 解析 triples_before/triples_after 所需的 JSON 行，调用方误报 0→0。孙进程持管道卡死的
+    // 场景只发生在 kill/timeout/error 路径（子进程被强杀后 read_to_string 才可能阻塞），
+    // 那里保留 join_bounded（见上方错误/超时分支）。
+    let stdout = stdout_reader.join().unwrap_or_default();
+    let stderr = stderr_reader.join().unwrap_or_default();
     if !status.success() {
         return Err(format!(
             "open-ontologies batch failed: {} (stderr: {})",
@@ -351,12 +377,11 @@ pub fn materialize(
     }
 
     // 解析导出 TTL 提取全部目标关系边（显式 + 推断，顺序无关）。
-    // #2（第8轮 security/high）：out_ttl 路径 `materialized_{pid}_{seq}.ttl` 可预测，且由
-    // 子进程的 save 命令创建（batch 脚本的 O_EXCL 只保护 batch 文件本身，不保护 out_ttl）。
-    // 能写进 data_dir（来自用户可控 env OPEN_ONTOLOGIES_DATA）的本地攻击者可预置同路径
-    // 符号链接，子进程 save 会沿链接把 TTL 内容写到任意可写文件（CWE-377）。读取前用
-    // `symlink_metadata`（不跟随链接）确认它是常规文件；文件本身由子进程以全新建出，
-    // 我们只读不写，故核验比换不可预测名更贴合现有 RAII 清理设计。
+    // #2（第8/9轮 security/high）：out_ttl 路径 `materialized_{pid}_{seq}.ttl` 可预测，攻击者可
+    // 预置符号链接让子进程 save 沿链接写任意文件（CWE-377）。第9轮已改为**预防**：spawn 前用
+    // create_new(O_EXCL) 把 out_ttl 预占成常规文件（见上方），路径已被非符号链接占据，攻击者
+    // 无法再预置链接。此处 `symlink_metadata` 检查保留为**纵深防御**——确认 save 后仍是常规
+    // 文件（子进程自身理论上可能被诱导替换为链接），并核实非空以免读到半写/空文件。
     let out_meta = std::fs::symlink_metadata(&out_ttl)
         .map_err(|e| format!("stat materialized ttl: {}", e))?;
     if out_meta.file_type().is_symlink() || !out_meta.is_file() {
@@ -857,16 +882,23 @@ pub fn write_back_edges(
                     eid, e
                 ))?;
             }
-            tx.execute(
-                "INSERT INTO entity_edges(namespace, source_entity_id, target_entity_id, relation_type, weight, evidence)
-                 VALUES(?1, ?2, ?3, ?4, 1.0, 'ontology:materialized')
-                 ON CONFLICT(namespace, source_entity_id, target_entity_id, relation_type)
-                 DO UPDATE SET evidence=excluded.evidence
-                 WHERE entity_edges.evidence IS NULL OR entity_edges.evidence='ontology:materialized'",
-                rusqlite::params![namespace, s, o, rtype],
-            )
-            .map_err(|e| format!("insert edge {} {} {}: {}", s, rtype, o, e))?;
-            written += 1;
+            // #4（第9轮 bug/low）：`tx.execute` 返回受影响行数。conflict 且 WHERE 不满足
+            // （既有 evidence 既非 NULL 也非 ontology:materialized，即用户手工/其它管线 curated）
+            // 时是 no-op（0 行），不应计入 written——否则返回的 (written, skipped) 虚高，误导
+            // CLI 输出与调用方。仅当确实插入/更新了行才 written += 1。
+            let affected = tx
+                .execute(
+                    "INSERT INTO entity_edges(namespace, source_entity_id, target_entity_id, relation_type, weight, evidence)
+                     VALUES(?1, ?2, ?3, ?4, 1.0, 'ontology:materialized')
+                     ON CONFLICT(namespace, source_entity_id, target_entity_id, relation_type)
+                     DO UPDATE SET evidence=excluded.evidence
+                     WHERE entity_edges.evidence IS NULL OR entity_edges.evidence='ontology:materialized'",
+                    rusqlite::params![namespace, s, o, rtype],
+                )
+                .map_err(|e| format!("insert edge {} {} {}: {}", s, rtype, o, e))?;
+            if affected > 0 {
+                written += 1;
+            }
         }
         Ok(())
     })();
