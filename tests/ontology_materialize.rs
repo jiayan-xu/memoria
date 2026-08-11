@@ -18,11 +18,13 @@ const SCHEMA_TTL: &str = r#"@prefix : <http://memoria.ai/onto/> .
 "#;
 
 /// 测试用数据：docB supersedes docA, docC supersedes docB → 应推断 docC supersedes docA。
+/// 用完整 `<...>` IRI（非前缀名），使 `parse_ttl_edges` 能解析出 source_edges，
+/// 从而 `inferred_edges = materialized_set - source_edges` 真正只含推断边（#123）。
 const DATA_TTL: &str = r#"@prefix : <http://memoria.ai/onto/> .
 @prefix owl: <http://www.w3.org/2002/07/owl#> .
-:docA :createdBy :alice .
-:docB :createdBy :alice ; :supersedes :docA .
-:docC :createdBy :alice ; :supersedes :docB .
+<http://memoria.ai/onto/docA> <http://memoria.ai/onto/createdBy> <http://memoria.ai/onto/alice> .
+<http://memoria.ai/onto/docB> <http://memoria.ai/onto/createdBy> <http://memoria.ai/onto/alice> ; <http://memoria.ai/onto/supersedes> <http://memoria.ai/onto/docA> .
+<http://memoria.ai/onto/docC> <http://memoria.ai/onto/createdBy> <http://memoria.ai/onto/alice> ; <http://memoria.ai/onto/supersedes> <http://memoria.ai/onto/docB> .
 "#;
 
 /// 定位 open-ontologies 二进制；缺失则 None（测试跳过）。
@@ -52,11 +54,23 @@ fn find_bin() -> Option<String> {
         .map(str::to_string)
 }
 
-fn temp_dir(tag: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!("memoria_onto_{}_{}", std::process::id(), tag));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+/// RAII 临时目录守卫（#123）：drop 时自动清理，panic 也不泄漏临时文件。
+struct TempDir(std::path::PathBuf);
+impl TempDir {
+    fn new(tag: &str) -> Self {
+        let dir = std::env::temp_dir().join(format!("memoria_onto_{}_{}", std::process::id(), tag));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        TempDir(dir)
+    }
+    fn path(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 #[test]
@@ -68,7 +82,8 @@ fn materialize_infers_transitive_supersedes() {
             return;
         }
     };
-    let dir = temp_dir("materialize");
+    let _guard = TempDir::new("materialize");
+    let dir = _guard.path();
     let schema = dir.join("schema.ttl");
     let data = dir.join("data.ttl");
     std::fs::write(&schema, SCHEMA_TTL).unwrap();
@@ -81,7 +96,7 @@ fn materialize_infers_transitive_supersedes() {
         timeout_secs: 60,
     };
 
-    let res = materialize(&cfg, data.to_str().unwrap(), "owl-rl").expect("materialize");
+    let res = materialize(&cfg, &data.to_string_lossy(), "owl-rl").expect("materialize");
     // OWL TransitiveProperty：docC supersedes docA 应被推断
     assert!(res.triples_after > res.triples_before, "expected inference");
     assert!(
@@ -92,15 +107,15 @@ fn materialize_infers_transitive_supersedes() {
         res.inferred_edges
     );
     println!("inferred_edges: {:?}", res.inferred_edges);
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
 fn write_back_edges_upserts_into_entity_edges() {
     // 不依赖 open-ontologies 二进制，直接测写回逻辑。
-    let dir = temp_dir("writeback");
+    let _guard = TempDir::new("writeback");
+    let dir = _guard.path();
     let db = dir.join("mem.db");
-    let engine = memoria_core::MemoriaEngine::new(db.to_str().unwrap()).expect("engine");
+    let engine = memoria_core::MemoriaEngine::new(&db.to_string_lossy()).expect("engine");
     let conn = engine.pool.get().unwrap();
     let ns = "agent/onto";
 
@@ -139,8 +154,6 @@ fn write_back_edges_upserts_into_entity_edges() {
         )
         .unwrap();
     assert_eq!(count, 2, "idempotent upsert, no duplicates");
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// 完整闭环：物化 → 写回 entity_edges，验证推断边真正进库。
@@ -153,7 +166,8 @@ fn end_to_end_materialize_and_writeback() {
             return;
         }
     };
-    let dir = temp_dir("e2e");
+    let _guard = TempDir::new("e2e");
+    let dir = _guard.path();
     let schema = dir.join("schema.ttl");
     let data = dir.join("data.ttl");
     std::fs::write(&schema, SCHEMA_TTL).unwrap();
@@ -165,24 +179,30 @@ fn end_to_end_materialize_and_writeback() {
         schema_path: schema,
         timeout_secs: 60,
     };
-    let res = materialize(&cfg, data.to_str().unwrap(), "owl-rl").expect("materialize");
+    let res = materialize(&cfg, &data.to_string_lossy(), "owl-rl").expect("materialize");
 
     let db = dir.join("mem.db");
-    let engine = memoria_core::MemoriaEngine::new(db.to_str().unwrap()).expect("engine");
+    let engine = memoria_core::MemoriaEngine::new(&db.to_string_lossy()).expect("engine");
     let conn = engine.pool.get().unwrap();
     let ns = "agent/onto";
     let (written, _) = write_back_edges(&conn, ns, &res.inferred_edges).expect("write_back");
     assert!(written >= 1, "at least 1 inferred edge written");
 
-    // 验证推断边 docC supersedes docA 在库里
+    // 验证**具体推断边** docC supersedes docA 在库里（#123）：
+    // 因 DATA_TTL 用完整 IRI，inferred_edges 只含真正新增的推断边，
+    // 若传递推理回归（docC supersedes docA 不再被推断）则此断言失败。
     let found: i64 = conn
         .query_row(
-            "SELECT COUNT(*) FROM entity_edges WHERE namespace=?1 AND relation_type='supersedes'",
+            "SELECT COUNT(*) FROM entity_edges
+             WHERE namespace=?1 AND relation_type='supersedes'
+               AND source_entity_id LIKE '%docC' AND target_entity_id LIKE '%docA'",
             params![ns],
             |r| r.get(0),
         )
         .unwrap();
-    assert!(found >= 1, "inferred supersedes edge persisted in entity_edges");
-    println!("end-to-end: written={written}, persisted supersedes edges={found}");
-    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        found >= 1,
+        "inferred edge docC supersedes docA must persist in entity_edges"
+    );
+    println!("end-to-end: written={written}, persisted docC-supersedes-docA edges={found}");
 }
