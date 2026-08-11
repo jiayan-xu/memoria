@@ -53,14 +53,19 @@ fn locate_bin() -> Option<String> {
     // find_bin 会 panic），**绝不静默回退到 PATH 扫描**。否则 CI 里一个 stale/损坏的 pinned
     // 路径会被 PATH 上恰好存在的另一个 open-ontologies 二进制掩盖，产出"跑错了可执行文件"
     // 的假绿（或对错误版本报错，令人困惑）。
-    if let Some(b) = std::env::var("OPEN_ONTOLOGIES_BIN").ok() {
+    // #1（第10轮 bug/low）：必须用 `var_os`（OsString）检测"是否设置"，而非 `var().ok()`——
+    // 后者对非 UTF-8 值返回 `Err(NotUnicode)` → `.ok()` 映射为 None，与"未设置"无法区分，
+    // 会静默回退到 PATH 扫描，恰好重新打开上面要防的假绿场景。用 var_os 后，非 UTF-8 值用
+    // to_string_lossy 也能参与校验，且依旧权威失败不回退。
+    if let Some(b_os) = std::env::var_os("OPEN_ONTOLOGIES_BIN") {
+        let b = b_os.to_string_lossy();
         if b.is_empty() {
             return None; // 显式空值 = 明确禁用，不回退
         }
         // env 值先做 is_file() 校验 + 可执行探测（--help 能 spawn），失败即权威地返回 None，
         // 避免后续 materialize(...).expect(...) 因 spawn 失败而 panic 或跑错二进制（#R3-1）。
-        if std::path::Path::new(&b).is_file() && probe_help(&b) {
-            return Some(b);
+        if std::path::Path::new(&*b).is_file() && probe_help(&b) {
+            return Some(b.into_owned());
         }
         return None; // 显式设置但校验失败 → 权威失败，不回退 PATH
     }
@@ -70,7 +75,22 @@ fn locate_bin() -> Option<String> {
     // (b) `where` 会顺带搜 CWD，可能选中过时/无关的同名文件。改为直接遍历 `split_paths(PATH)`
     // 并对每个候选 dir 里的 `open-ontologies(.exe)` 用 probe_help 探测（无编码问题、不搜 CWD）。
     let path_var = std::env::var_os("PATH")?;
+    // #3（第10轮 performance/low）：PATH 探测需要**整体预算**，否则单个挂死候选阻塞 N×10s
+    // （N = PATH 条目数），与文件自身"#R4-6 所有探测必须带超时"的规则只约束了单次探测、
+    // 未约束整体相矛盾。用共享 deadline 在循环内检查，到点即放弃扫描返回 None（REQUIRE=1 下
+    // find_bin panic，CI 不会无限等）。
+    let scan_deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     for dir in std::env::split_paths(&path_var) {
+        // #2（第10轮 bug/low）：split_paths 对空 PATH 条目（前导/尾随/连续冒号）产出空分量，
+        // 在 POSIX 语义上表示 CWD。`dir.join("open-ontologies")` 对空 dir 得到相对路径
+        // `open-ontologies`，`is_file()` 会按进程 CWD 解析——恰好选中 CWD 里过时/无关的同名
+        // 二进制，违背"不搜 CWD"承诺。显式跳过空分量。
+        if dir.as_os_str().is_empty() {
+            continue;
+        }
+        if std::time::Instant::now() > scan_deadline {
+            return None; // 整体探测超时，放弃扫描（REQUIRE=1 下 find_bin panic）
+        }
         let exe = if cfg!(windows) {
             dir.join("open-ontologies.exe")
         } else {
@@ -159,36 +179,35 @@ impl Drop for TempDir {
     }
 }
 
-#[test]
-fn materialize_infers_transitive_supersedes() {
-    let bin = match find_bin() {
-        Some(b) => b,
-        None => {
-            eprintln!("SKIP: OPEN_ONTOLOGIES_BIN not found");
-            return;
-        }
-    };
-    let _guard = TempDir::new("materialize");
-    let dir = _guard.path();
+/// #4（第10轮 maintainability/low）：materialize 相关集成测试共享的 fixture 搭建——
+/// 定位二进制（缺失则跳过）+ 写 schema/data TTL + 构造 OntologyConfig。此前两个测试
+/// 各自重复这段，fixture 或 skip 行为一变就得两处同步改，容易漂移。
+/// 返回 `(guard, cfg, data_path)`；guard 保持 TempDir 存活到测试结束。
+fn setup_bin_and_fixtures(
+    tag: &str,
+) -> Option<(TempDir, OntologyConfig, std::path::PathBuf)> {
+    let bin = find_bin()?; // 缺失则 None → 调用方 SKIP
+    let guard = TempDir::new(tag);
+    let dir = guard.path().to_path_buf();
     let schema = dir.join("schema.ttl");
     let data = dir.join("data.ttl");
     std::fs::write(&schema, SCHEMA_TTL).unwrap();
     std::fs::write(&data, DATA_TTL).unwrap();
-
     let cfg = OntologyConfig {
         bin: bin.into(),
         data_dir: dir.join("out"),
         schema_path: schema,
         timeout_secs: 60,
     };
+    Some((guard, cfg, data))
+}
 
-    let res = materialize(&cfg, &data.to_string_lossy(), "owl-rl").expect("materialize");
-    // OWL TransitiveProperty：docC supersedes docA 应被推断
-    assert!(res.triples_after > res.triples_before, "expected inference");
-    // #2（第5轮 test/low）：与 e2e 测试一致，用**精确 IRI 相等**而非 suffix 匹配断言推断边，
-    // 避免 `s.ends_with("docC")` 误接受 `.../notdocC` 等错误 IRI，让 URI/存储格式回归在此暴露。
+/// #4（第10轮 maintainability/low）：共享的"docC supersedes docA 被推断"精确 IRI 断言。
+/// 用**精确 IRI 相等**而非 suffix 匹配，避免 `s.ends_with("docC")` 误接受 `.../notdocC`
+/// 等错误 IRI，让 URI/存储格式回归在此暴露（#2 第5轮 test/low）。
+fn assert_inferred_doc_c_supersedes_doc_a(inferred: &[(String, String, String)]) {
     assert!(
-        res.inferred_edges
+        inferred
             .iter()
             .any(|(s, p, o)| {
                 s == "http://memoria.ai/onto/docC"
@@ -196,8 +215,41 @@ fn materialize_infers_transitive_supersedes() {
                     && o == "http://memoria.ai/onto/docA"
             }),
         "expected docC supersedes docA in inferred_edges, got {:?}",
-        res.inferred_edges
+        inferred
     );
+}
+
+/// #4（第10轮 maintainability/low）：共享的"在库中查到 docC supersedes docA"断言。
+fn assert_persisted_doc_c_supersedes_doc_a(conn: &rusqlite::Connection, ns: &str) {
+    let found: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM entity_edges
+             WHERE namespace=?1 AND relation_type='supersedes'
+               AND source_entity_id='http://memoria.ai/onto/docC'
+               AND target_entity_id='http://memoria.ai/onto/docA'",
+            params![ns],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(
+        found >= 1,
+        "inferred edge docC supersedes docA must persist in entity_edges"
+    );
+}
+
+#[test]
+fn materialize_infers_transitive_supersedes() {
+    let (_guard, cfg, data) = match setup_bin_and_fixtures("materialize") {
+        Some(x) => x,
+        None => {
+            eprintln!("SKIP: OPEN_ONTOLOGIES_BIN not found");
+            return;
+        }
+    };
+    let res = materialize(&cfg, &data.to_string_lossy(), "owl-rl").expect("materialize");
+    // OWL TransitiveProperty：docC supersedes docA 应被推断
+    assert!(res.triples_after > res.triples_before, "expected inference");
+    assert_inferred_doc_c_supersedes_doc_a(&res.inferred_edges);
     println!("inferred_edges: {:?}", res.inferred_edges);
 }
 
@@ -251,26 +303,14 @@ fn write_back_edges_upserts_into_entity_edges() {
 /// 完整闭环：物化 → 写回 entity_edges，验证推断边真正进库。
 #[test]
 fn end_to_end_materialize_and_writeback() {
-    let bin = match find_bin() {
-        Some(b) => b,
+    let (guard, cfg, data) = match setup_bin_and_fixtures("e2e") {
+        Some(x) => x,
         None => {
             eprintln!("SKIP: OPEN_ONTOLOGIES_BIN not found");
             return;
         }
     };
-    let _guard = TempDir::new("e2e");
-    let dir = _guard.path();
-    let schema = dir.join("schema.ttl");
-    let data = dir.join("data.ttl");
-    std::fs::write(&schema, SCHEMA_TTL).unwrap();
-    std::fs::write(&data, DATA_TTL).unwrap();
-
-    let cfg = OntologyConfig {
-        bin: bin.into(),
-        data_dir: dir.join("out"),
-        schema_path: schema,
-        timeout_secs: 60,
-    };
+    let dir = guard.path().to_path_buf();
     let res = materialize(&cfg, &data.to_string_lossy(), "owl-rl").expect("materialize");
 
     let db = dir.join("mem.db");
@@ -281,22 +321,7 @@ fn end_to_end_materialize_and_writeback() {
     assert!(written >= 1, "at least 1 inferred edge written");
 
     // 验证**具体推断边** docC supersedes docA 在库里（#123/#R3-10）：
-    // 因 DATA_TTL 用完整 IRI，inferred_edges 只含真正新增的推断边；
-    // 用精确 IRI 相等（而非 LIKE）钉死实体 id 存完整 IRI 的契约，若传递推理或
-    // 存储格式回归则失败。
-    let found: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM entity_edges
-             WHERE namespace=?1 AND relation_type='supersedes'
-               AND source_entity_id='http://memoria.ai/onto/docC'
-               AND target_entity_id='http://memoria.ai/onto/docA'",
-            params![ns],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert!(
-        found >= 1,
-        "inferred edge docC supersedes docA must persist in entity_edges"
-    );
-    println!("end-to-end: written={written}, persisted docC-supersedes-docA edges={found}");
+    // 因 DATA_TTL 用完整 IRI，inferred_edges 只含真正新增的推断边。
+    assert_persisted_doc_c_supersedes_doc_a(&conn, ns);
+    println!("end-to-end: written={written}");
 }
