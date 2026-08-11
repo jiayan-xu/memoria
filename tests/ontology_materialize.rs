@@ -31,15 +31,18 @@ const DATA_TTL: &str = r#"@prefix : <http://memoria.ai/onto/> .
 /// 仅当显式设置了 OPEN_ONTOLOGIES_BIN 且路径存在、或二进制确定在 PATH 上时才返回 Some，
 /// 避免在无二进制的环境（如 CI runner）误判后 spawn 失败。
 ///
-/// #R4-6：所有探测（env 路径 --help、PATH 遍历）都带超时，避免挂死的二进制
-/// / 无响应的 PATH 探测卡住测试进程（与主模块"子进程必须超时"规矩一致）。
-/// #R4-7：设置 `REQUIRE_ONTOLOGIES_BIN=1` 时，找不到二进制直接 panic（CI 硬要求），
-/// 而不是静默 skip——防止 CI 上"测试绿了但实际没跑真实物化"的假绿通过门禁。
+/// 设计不变式（why，非过程记录）：
+/// - 所有探测（env 路径 --help、PATH 遍历）都带超时，避免挂死的二进制 / 无响应的 PATH
+///   探测卡住测试进程（与主模块"子进程必须超时"纪律一致）。
+/// - 权威配置 > 隐式回退：显式设置 OPEN_ONTOLOGIES_BIN 即表达"必须用它"，校验失败（非文件/
+///   --help 探测失败/超时）绝不回退 PATH 扫描，由 find_bin 硬失败——防止 stale/误配的 pinned
+///   路径被 PATH 上另一个二进制掩盖，让套件假绿通过而不跑真实物化。
+/// - FAIL OPEN 关闭：`REQUIRE_ONTOLOGIES_BIN=1` 时找不到二进制直接 panic（CI 硬要求），而非
+///   静默 skip——防止 CI 上"测试绿了但实际没跑真实物化"的假绿通过门禁。
 fn find_bin() -> Option<String> {
-    // #R15（第15轮 test/low）：REQUIRE_ONTOLOGIES_BIN 接受常见真值（1/true/yes/on），
-    // 而非只认字面量 "1"——"true"/"yes" 等 CI 常见写法此前被静默当作未设置，硬失败门禁
-    // 悄悄失效、套件静默 skip（防假绿工具自身成了假绿源）。空/"0"/"false"/"no"/"off" 视为
-    // 未要求；其它未知值发出警示（既不强真也不静默忽略）。
+    // REQUIRE_ONTOLOGIES_BIN 接受常见真值（1/true/yes/on），非只认字面量 "1"——"true"/"yes" 等
+    // CI 常见写法此前被静默当作未设置，硬失败门禁悄悄失效、套件静默 skip（防假绿工具自身成了
+    // 假绿源）。空/"0"/"false"/"no"/"off" 视为未要求；其它未知值警示（既不强真也不静默忽略）。
     let require = match std::env::var("REQUIRE_ONTOLOGIES_BIN") {
         Ok(v) => match v.to_ascii_lowercase().as_str() {
             "" | "0" | "false" | "no" | "off" => false,
@@ -59,16 +62,11 @@ fn find_bin() -> Option<String> {
     // explicit_bin 后读，两次观测可发散（其它线程改 env），check-then-act 窗口复燃。
     let env_bin = std::env::var_os("OPEN_ONTOLOGIES_BIN");
     let found = locate_bin(&env_bin);
-    // #R15（第15轮 test/low）：任何显式设置 OPEN_ONTOLOGIES_BIN 的 CI，若路径无效（非文件/
-    // --help 探测失败/超时），套件必须在 REQUIRE=1 之外也硬失败——否则一个 stale/误配的
-    // pinned 路径会让套件静默绿色通过而不跑真实物化，正是 R4-7 要防的假绿。显式设置本身
-    // 即表达"必须用这个二进制"的意图，校验失败即 panic（权威配置>隐式回退）。
-    // #R16（第16轮 maintainability/low）：OPEN_ONTOLOGIES_BIN 只读一次，避免两次 var_os 造成
-    // check-then-act 不一致与可读性差。
-    // #R17（第17轮 bug/medium）：空值语义须与 locate_bin 统一——一旦 set（含空串）即表达
-    // "必须用这个二进制"，`.is_some()` 而非 `!is_empty()`。否则 `OPEN_ONTOLOGIES_BIN=''`（CI
-    // 模板未填、export 后未赋值等常见情形）会让 explicit_bin=false，套件静默 skip 而不跑真实
-    // 物化——正是 R4-7 要封死的假绿路径。空串校验必失败（is_file false），安全走下方硬失败。
+    // 显式设置 OPEN_ONTOLOGIES_BIN 的 CI，若路径无效（非文件/--help 探测失败/超时），套件必须
+    // 在 REQUIRE=1 之外也硬失败——否则一个 stale/误配的 pinned 路径会让套件静默绿过而不跑真实
+    // 物化。显式设置本身即表达"必须用这个二进制"，校验失败即 panic（权威配置>隐式回退）。
+    // "是否设置"用 var_os 判定（`.is_some()` 而非 `!is_empty()`）：空串（CI 模板未填、export 后
+    // 未赋值）也表达"必须用它"，校验必失败（is_file false）走下方硬失败，避免静默 skip 复燃假绿。
     let explicit_bin = env_bin.is_some();
     if found.is_none() && explicit_bin {
         panic!(
@@ -86,22 +84,19 @@ fn find_bin() -> Option<String> {
 }
 
 fn locate_bin(_env_bin: &Option<std::ffi::OsString>) -> Option<String> {
-    // 设计不变式（#R15 汇总，替代逐轮审查注释）：
+    // 设计不变式：
     // 1. 权威 override：显式设置 OPEN_ONTOLOGIES_BIN 即表达"必须用它"，校验失败（非文件/
     //    --help 探测失败/超时）绝**不**回退 PATH 扫描，由 find_bin 硬失败（防 stale pinned
     //    路径被 PATH 上另一个二进制掩盖造成假绿）。
     // 2. 用 var_os 检测"是否设置"而非 var().ok()——后者对非 UTF-8 值与"未设置"无法区分，
     //    会静默回退重新打开假绿。非 UTF-8 值经 to_string_lossy 参与校验，仍权威失败。
-    // #R17（第17轮 maintainability/low）：probe_timeout 在入口解析一次，沿调用链传给
-    // probe_help，避免每次探测重复 var_os 读 PROBE_TIMEOUT_SECS（check-then-act 窗口）。
-    // #R19（第19轮 maintainability/low）：OPEN_ONTOLOGIES_BIN 由 find_bin 读一次后经 `_env_bin`
-    // 传入，本函数不再 `var_os("OPEN_ONTOLOGIES_BIN")` 重读——消除 find_bin/locate_bin 双读
-    // 造成的 check-then-act 窗口（find_bin 先跑 locate_bin 再算 explicit_bin，两次观测可发散）。
+    // 3. 环境只读一次：probe_timeout 与 OPEN_ONTOLOGIES_BIN 均在入口读一次，沿调用链传参，
+    //    消除 find_bin/locate_bin 双读与循环内重复 var_os 造成的 check-then-act 窗口。
     let pt = probe_timeout();
     if let Some(b_os) = _env_bin {
         let b = b_os.to_string_lossy();
-        // #R17：空串与其它无效值同语义——一旦 set 即"必须用它"，空串 is_file 必 false，
-        // 校验失败返回 None，由 find_bin 硬失败（拒绝静默跳过），绝不回退 PATH 掩盖假绿。
+        // 空串与其它无效值同语义——一旦 set 即"必须用它"，is_file 必 false，校验失败返回 None，
+        // 由 find_bin 硬失败（拒绝静默跳过），绝不回退 PATH 掩盖假绿。
         if b.is_empty() {
             return None;
         }

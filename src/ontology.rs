@@ -278,6 +278,22 @@ pub fn materialize(
     };
     std::fs::create_dir_all(&cfg.data_dir)
         .map_err(|e| format!("create data dir {}: {}", cfg.data_dir.display(), e))?;
+    // data_dir 可能是攻击者预置的符号链接：create_dir_all 会沿链接创建/写入，把本模块的临时
+    // 文件（batch 脚本、源/schema 副本、预占 out_ttl）重定向进攻击者选定的目录。O_EXCL 预占 +
+    // 随机名只防"覆盖已知文件"，挡不住"写进攻击者目录"。创建后校验最终 data_dir 非链接。
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::symlink_metadata;
+        if symlink_metadata(&cfg.data_dir)
+            .map(|m| m.file_type().is_symlink())
+            .unwrap_or(false)
+        {
+            return Err(format!(
+                "data dir {} is a symlink (possible attack); refusing to write temp artifacts",
+                cfg.data_dir.display()
+            ));
+        }
+    }
     // 每次调用用唯一文件名（pid + 单调序列 + 一次性随机数），避免并发调用（CLI + 定时任务 /
     // 未来 MCP/web 触发）互相覆盖 script/output，导致读到他方半写文件（#7/#R3-8）。
     let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -349,10 +365,7 @@ pub fn materialize(
     // （含符号链接）则失败，杜绝"预置路径劫持写入"。out_ttl 由子进程以 save 创建，本模块只读，
     // 目标攻击面已由 batch 写的 O_EXCL 收窄。
     use std::io::Write;
-    let mut batch_f = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(temp_guard.batch_path())
+    let mut batch_f = open_exclusive_0600(temp_guard.batch_path())
         .map_err(|e| format!("create batch script (exclusive): {}", e))?;
     batch_f
         .write_all(script.as_bytes())
@@ -366,10 +379,7 @@ pub fn materialize(
     // 预置链接；子进程 save 会以写模式覆盖这个常规文件（open-ontologies save 是覆盖写）。
     // 预占文件随后被 TempFileGuard 在任意退出路径清理。
     {
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&out_ttl)
+        let mut f = open_exclusive_0600(&out_ttl)
             .map_err(|e| format!("pre-create out_ttl (exclusive, anti-symlink): {}", e))?;
         // 清空到 0 字节（新建文件本就为空），确保子进程 save 从干净状态开始（open-ontologies 覆盖写）。
         let _ = f.write_all(b"");
@@ -450,6 +460,12 @@ pub fn materialize(
     // 进程持管道时快速返回（不阻塞调用方、不丢已读部分）。
     let stdout = join_bounded(stdout_reader, Duration::from_secs(2), String::new());
     let stderr = join_bounded(stderr_reader, Duration::from_secs(2), String::new());
+    // 若 2s 内未 join 完（孙进程持管道写端），join_bounded 返回空默认，已读缓冲被丢弃，
+    // load/reason 的 JSON 行不会被解析、triples_before/after 静默 collapse 成 0。这里告警，
+    // 避免"物化成功但计数全 0"的误导性报告（计数仅供监控，边解析直接读 TTL 文件不受影响）。
+    if stdout.is_empty() {
+        eprintln!("WARN: stdout reader not drained within 2s; triples counts may be 0");
+    }
     if !status.success() {
         return Err(format!(
             "open-ontologies batch failed: {} (stderr: {})",
@@ -538,6 +554,16 @@ pub fn materialize(
     // 用 create_new 预占 + 此处常规检查兜底（Windows 上符号链接创建需管理员权限，风险已收窄）。
     let ttl = read_ttl_no_follow(&out_ttl)?;
     let all_edges = parse_ttl_edges(&ttl);
+    // 子进程退出 0 不代表 save 真的产出了图：open-ontologies 输出格式改名/版本漂移/配置变化时
+    // save 可能静默 no-op，导致 all_edges 为空而 CLI 仍报 "materialize OK ... inferred_edges: 0"，
+    // 运维误读为"无新推断"而非"管线坏了"。load/reason 的 JSON 行告警覆盖不到 save 路径，这里补。
+    if all_edges.is_empty() && !source_edges.is_empty() {
+        eprintln!(
+            "WARN: materialized TTL produced 0 relation edges while source had {} — \
+             save may have no-opped; treat inferred_edges=0 as suspect",
+            source_edges.len()
+        );
+    }
     // 推断边 = 物化后边集 ∖ 物化前显式边集（集合差，顺序无关）。
     // 不用 reason 报告的 inferred_count，也不假设"推断边排最前"——那些跨版本都不可靠（#113）。
     // #R17（第17轮 bug/medium）：比较前对集合两边做**轻量 IRI 归一**（尾部 #/ 归一），对齐
@@ -570,6 +596,11 @@ pub fn materialize(
 
     // batch 脚本与 out_ttl 均由 TempFileGuard 在函数返回时自动删除（含成功路径，#R3-6/#R4-2）。
     // 边已全部解析进内存（all_edges/inferred_edges），out_ttl 无需保留，防磁盘耗尽（#5-high）。
+    // all_edges 与 inferred_edges 同出一源（parse_ttl_edges / 集合差），返回前对 all_edges 也归一，
+    // 保证两者 IRI 形式一致（尾部 #/ 归一）——否则未来调用方按 struct 文档写回 raw all_edges，
+    // 会用 `http://x/docA#` 建实体行，与归一后的 `http://x/docA` 重复，破坏集合差 provenance。
+    let all_edges: Vec<(String, String, String)> =
+        all_edges.iter().map(normalize_edge).collect();
 
     Ok(MaterializeResult {
         inferred_edges,
@@ -697,13 +728,31 @@ fn win_path_quoted(p: &std::path::Path) -> String {
 /// 关闭"模块读出后、子进程 load 前文件被换"的 TOCTOU。
 fn write_ttl_copy(path: &std::path::Path, content: &str) -> Result<(), String> {
     use std::io::Write;
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
+    let mut f = open_exclusive_0600(path)
         .map_err(|e| format!("create ttl copy (exclusive): {}", e))?;
     f.write_all(content.as_bytes())
         .map_err(|e| format!("write ttl copy {}: {}", path.display(), e))
+}
+
+/// `create_new`（O_EXCL）打开并独占创建；Unix 上以 0600 权限（避免临时本体数据被同机他用户
+/// 读取）。`#[cfg]` 不能夹在链式调用中间，故封成辅助函数，两平台共用同一调用点。
+fn open_exclusive_0600(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+    }
 }
 
 /// 轻量 TTL 三元组解析器（目标谓词扫描版）。
@@ -830,7 +879,10 @@ fn parse_ttl_edges(ttl: &str) -> Vec<(String, String, String)> {
             // 若后面紧跟 `;`，这是续行（后续可能有关系边），置 i 于 `;` 处交给状态机；
             // 否则本行无目标关系边，按纯类型行处理。
             if i < tokens.len() && tokens[i] == ";" {
-                i += 1; // 从 `;` 后继续（状态机见 `;` 会清 pred）
+                // 不能跳过 `;`：跳过会绕过状态机 `;` 分支（清 pred），遗留上一行 stale pred，
+                // 续行首个 `<pred>` 会被误当上一 stale 谓词的对象产出伪边。显式清空再前进。
+                pred = None;
+                i += 1;
             } else {
                 // 纯类型行（或仅对象列表）：无目标关系边。
                 prev_sep = if line_trimmed.ends_with(';') {
@@ -1040,7 +1092,20 @@ fn expand_term(tok: &str, prefixes: &HashMap<String, String>, base: &Option<Stri
     if tok.starts_with('<') && tok.ends_with('>') && tok.len() >= 2 {
         let inner = &tok[1..tok.len() - 1];
         // 相对 IRI（无 scheme 且非 `//`、非绝对路径空根）：需 base 解析，否则受控谓词无法命中。
-        let is_absolute = inner.contains("://") || inner.starts_with("//");
+        // 绝对判定用 RFC3986 scheme `ALPHA *( ALPHA / DIGIT / "+" / "-" / "." )` 加尾随 `:`。
+        // 仅 `contains("://")` 会漏掉 `urn:`/`mailto:`/`file:`/`tel:` 等无 `//` 的合法 scheme，
+        // 被误并入 @base 产生 `http://base/mailto:foo@bar` 类垃圾实体 id。
+        let has_valid_scheme = inner.split_once(':').map_or(false, |(scheme, rest)| {
+            !rest.is_empty()
+                && scheme
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_ascii_alphabetic())
+                && scheme
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || "+-.".contains(c))
+        });
+        let is_absolute = has_valid_scheme || inner.starts_with("//");
         if !is_absolute {
             if let Some(b) = base {
                 return Some(resolve_iri(b, inner));
@@ -1451,7 +1516,10 @@ pub fn status(cfg: &OntologyConfig) -> Result<String, String> {
         if let Some(mut e) = se { let _ = e.read_to_string(&mut b); }
         b
     });
-    let timeout = Duration::from_secs(cfg.timeout_secs.min(MAX_TIMEOUT_SECS));
+    // `--help` 探测用固定短超时，与物化超时解耦：若二进制在 --help 上挂死，
+    // status 是健康检查命令，必须快速失败而非按物化超时（可达 86400s）阻塞近一天。
+    const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+    let timeout = PROBE_TIMEOUT;
     let wait_start = Instant::now();
     let status = loop {
         match child.try_wait() {
@@ -1647,6 +1715,42 @@ mod tests {
             "http://memoria.ai/onto/supersedes".to_string(),
             "http://memoria.ai/onto/docA".to_string()
         )), "got {:?}", all);
+    }
+
+    #[test]
+    fn ttl_parse_type_continuation_clears_stale_pred() {
+        // #R20（第20轮 bug/high）：类型声明行 `a <T> ;` 的 `;` **不能**被跳过——若前一续行在
+        // `pred` 里留有 stale 值（如 partOf），跳过 `;` 会让状态机 `;` 分支（清 pred）永不执行，
+        // 续行 `<supersedes> <docC>` 被误当 stale 谓词的对象，产出伪边 (docA, partOf, supersedes)
+        // 与 (docA, partOf, docC)，且真实边 (docA, supersedes, docC) 丢失。物化 diff 会把丢失的
+        // 显式边误标为推断边写库（evidence=ontology:materialized），污染 provenance。
+        let ttl = r#"@prefix : <http://memoria.ai/onto/> .
+:docA :partOf :docB ;
+    a :Document ; :supersedes :docC .
+"#;
+        let all = parse_ttl_edges(ttl);
+        // 期望 2 条真实边：(docA, partOf, docB)（前一续行）与 (docA, supersedes, docC)（类型行后）。
+        // 若 `;` 被跳过导致 stale pred 残留，会多出 (docA, partOf, supersedes)/(docA, partOf, docC)
+        // 伪边（共 4 条）且 (docA, supersedes, docC) 丢失。断言精确计数 + 无 partOf 伪边。
+        assert_eq!(all.len(), 2, "got {:?}", all);
+        assert!(
+            all.contains(&(
+                "http://memoria.ai/onto/docA".to_string(),
+                "http://memoria.ai/onto/supersedes".to_string(),
+                "http://memoria.ai/onto/docC".to_string()
+            )),
+            "got {:?}",
+            all
+        );
+        // partOf 只应有合法对象 docB；若 stale pred 残留会把 supersedes/docC 也塞成 partOf 对象。
+        assert!(
+            !all
+                .iter()
+                .any(|(_, p, o)| p == "http://memoria.ai/onto/partOf"
+                    && o != "http://memoria.ai/onto/docB"),
+            "stale pred partOf must not capture supersedes/docC as objects: got {:?}",
+            all
+        );
     }
 
     #[test]
