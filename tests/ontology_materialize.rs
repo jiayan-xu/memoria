@@ -60,18 +60,59 @@ fn locate_bin() -> Option<String> {
     }
     // 用 `which`/`where` 探测 PATH。输出可能多行（同名二进制在多个 PATH 条目），
     // 只取第一条匹配路径；找不到则视为无二进制 → 跳过。
+    // #1（第5轮 test/medium）：PATH 分支此前只查 is_file() 不跑 probe_help，且 which/where
+    // 本身无超时——stale/不可执行的 open-ontologies 会通过 find_bin，后期 materialize() 才 panic，
+    // 违背 #R3-1"应跳过而非崩溃"；which/where 挂死也会卡死测试（违背 #R4-6"所有探测带超时"）。
+    // 故：对 which/where 用带超时的 probe_locate 封装，并对定位到的路径再跑一次 probe_help。
     let locator = if cfg!(windows) { "where" } else { "which" };
-    let out = std::process::Command::new(locator)
-        .arg("open-ontologies")
-        .output()
-        .ok()
-        .filter(|o| o.status.success())?;
-    let stdout = String::from_utf8_lossy(&out.stdout);
+    let out = probe_locate(locator)?;
+    let stdout = String::from_utf8_lossy(&out);
     stdout
         .lines()
         .map(str::trim)
-        .find(|s| !s.is_empty() && std::path::Path::new(s).is_file())
+        .find(|s| {
+            !s.is_empty() && std::path::Path::new(s).is_file() && probe_help(s)
+        })
         .map(str::to_string)
+}
+
+/// 带超时的 `which`/`where` 探测（#1）。spawn 失败 / 非零退出 / 超时都返回 None。
+fn probe_locate(locator: &str) -> Option<Vec<u8>> {
+    let mut child = std::process::Command::new(locator)
+        .arg("open-ontologies")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    loop {
+        match child.try_wait() {
+            Ok(Some(st)) => {
+                if !st.success() {
+                    let _ = child.wait();
+                    return None;
+                }
+                use std::io::Read;
+                let mut buf = Vec::new();
+                if let Some(mut so) = child.stdout.take() {
+                    let _ = so.read_to_end(&mut buf);
+                }
+                return Some(buf);
+            }
+            Ok(None) => {}
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+        if std::time::Instant::now() > deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
 }
 
 /// 带超时的 `--help` 可执行探测（#R4-6）。spawn 失败、超时、非零退出都视为不可用。
@@ -90,7 +131,9 @@ fn probe_help(bin: &str) -> bool {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
     loop {
         match child.try_wait() {
-            Ok(Some(_st)) => return true,
+            // #3（第5轮 test/low）：--help 非零退出也视为不可用（此前任何退出码都返回 true，
+            // 与 doc 注释"非零退出视为不可用"矛盾）。
+            Ok(Some(st)) => return st.success(),
             Ok(None) => {}
             Err(_) => {
                 let _ = child.kill();
@@ -152,10 +195,16 @@ fn materialize_infers_transitive_supersedes() {
     let res = materialize(&cfg, &data.to_string_lossy(), "owl-rl").expect("materialize");
     // OWL TransitiveProperty：docC supersedes docA 应被推断
     assert!(res.triples_after > res.triples_before, "expected inference");
+    // #2（第5轮 test/low）：与 e2e 测试一致，用**精确 IRI 相等**而非 suffix 匹配断言推断边，
+    // 避免 `s.ends_with("docC")` 误接受 `.../notdocC` 等错误 IRI，让 URI/存储格式回归在此暴露。
     assert!(
         res.inferred_edges
             .iter()
-            .any(|(s, _p, o)| s.ends_with("docC") && o.ends_with("docA")),
+            .any(|(s, p, o)| {
+                s == "http://memoria.ai/onto/docC"
+                    && p == "http://memoria.ai/onto/supersedes"
+                    && o == "http://memoria.ai/onto/docA"
+            }),
         "expected docC supersedes docA in inferred_edges, got {:?}",
         res.inferred_edges
     );
