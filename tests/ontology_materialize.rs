@@ -128,17 +128,43 @@ fn locate_bin() -> Option<String> {
 /// Defender 扫描下会把"反应慢但正常"的二进制误判为缺失（假绿跳过 或 REQUIRE=1 假红）。放大到
 /// 10s 并可用 PROBE_TIMEOUT_SECS env 覆盖，兼顾 CI 慢 runner 与本地快速失败。
 const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// 探测超时硬上界（秒）。镜像 PATH 扫描的 30s 整体预算（scan_deadline），防止误配的
+/// `PROBE_TIMEOUT_SECS`（如 3600）配合挂死的子进程把测试套件拖住几个小时。
+/// #R14（第14轮 test/low）：`probe_timeout()` 此前无上界，`OPEN_ONTOLOGIES_BIN` 分支把完整值当
+/// `budget` 传入 `probe_help`，而 30s `scan_deadline` 只守卫扫描循环——clamp 只处理 0→1s 无最大。
+const PROBE_TIMEOUT_MAX_SECS: u64 = 30;
 
 fn probe_timeout() -> std::time::Duration {
     // #8（第11轮 test/low + 第12轮 other/low）：与生产 `OntologyConfig::from_env` 约定一致——
     // 显式 `PROBE_TIMEOUT_SECS=0` 视为误配，**clamp 到 1s**（拒绝 0 导致的"所有探测立即失败、
     // 测试静默跳/panic"），而非回退到 10s 默认。此前实现用 `.filter(|n| *n > 0)` 回退默认，
     // 与生产的 clamp（0→1s）语义不一致，注释宣称"统一"却未真正统一——改为真正的 clamp。
-    std::env::var("PROBE_TIMEOUT_SECS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .map(|n| std::time::Duration::from_secs(n.max(1)))
-        .unwrap_or(PROBE_TIMEOUT)
+    // #R14（第14轮 test/low）：补上界 clamp（>30s 拉回 30s）并在不可解析/超范围时 `eprintln!`
+    // 告警，而非静默回退——镜像生产 `from_env` 的 WARN 行为，避免"配了长超时实际没生效"的误导。
+    match std::env::var("PROBE_TIMEOUT_SECS") {
+        Ok(v) => match v.parse::<u64>() {
+            Ok(n) if n == 0 => {
+                eprintln!("WARN: PROBE_TIMEOUT_SECS={:?} is 0/invalid, clamped to 1s", v);
+                std::time::Duration::from_secs(1)
+            }
+            Ok(n) if n > PROBE_TIMEOUT_MAX_SECS => {
+                eprintln!(
+                    "WARN: PROBE_TIMEOUT_SECS={:?} exceeds hard max {}s, clamped to {}s",
+                    v, PROBE_TIMEOUT_MAX_SECS, PROBE_TIMEOUT_MAX_SECS
+                );
+                std::time::Duration::from_secs(PROBE_TIMEOUT_MAX_SECS)
+            }
+            Ok(n) => std::time::Duration::from_secs(n),
+            Err(_) => {
+                eprintln!(
+                    "WARN: PROBE_TIMEOUT_SECS={:?} not parseable, falling back to default {}s",
+                    v, PROBE_TIMEOUT.as_secs()
+                );
+                PROBE_TIMEOUT
+            }
+        },
+        Err(_) => PROBE_TIMEOUT,
+    }
 }
 
 /// 带超时的 `--help` 可执行探测（#R4-6）。spawn 失败、超时、非零退出都视为不可用。
