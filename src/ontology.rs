@@ -215,41 +215,15 @@ pub fn materialize(
     // #R4-4：create_dir_all 失败必须传播（此前 `let _ =` 吞错，data_dir 不可写时
     // 后续 write batch/out 会以更令人困惑的路径错误暴露）。未显式创建会造成写临时
     // 文件失败，且那发生在校验之后、spawn 之前，正是最该早期暴露的位置。
-    std::fs::create_dir_all(&cfg.data_dir)
-        .map_err(|e| format!("create data dir {}: {}", cfg.data_dir.display(), e))?;
-    // 每次调用用唯一文件名（pid + 单调序列），避免并发调用（CLI + 定时任务 / 未来
-    // MCP/web 触发）互相覆盖 script/output，导致读到他方半写文件（#7/#R3-8）。
-    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let uniq = format!("{}_{}", std::process::id(), seq);
-    let batch_file = cfg.data_dir.join(format!("materialize_{}.batch", uniq));
-    let out_ttl = cfg.data_dir.join(format!("materialized_{}.ttl", uniq));
-    // RAII：batch 脚本 + 物化 TTL 在任意退出路径（spawn 失败/超时/解析失败…）都被删除。#R3-6/#R4-2
-    let temp_guard = TempFileGuard::new(batch_file.clone(), out_ttl.clone());
-    // 物化前解析源 TTL 的显式目标关系边集，供物化后 diff 出真正的新增推断边（#113）。
-    // #6（第7轮 bug/medium）：schema TTL 也被 load 进同一图参与推理，其显式受控关系边
-    // （如 `ex:docX ex:belongsTo ex:tenantA`）会出现在物化输出里。若只减 source_edges，
-    // 这些 schema 显式边会被误标为推断边写回（evidence=ontology:materialized）。
-    // 故把 schema（若存在）的受控边也并入 source_edges 一起减，只留真正由推理新增的边。
-    // #1（第11轮 bug/high）：source_ttl/schema_path 在 read_to_string 前必须确认是**常规文件**。
-    // 只做字符校验（拒绝危险字符）挡不住 FIFO/命名管道：若路径指向 FIFO（或 exists() 后被换
-    // 成管道），read_to_string 会在 pipe 无数据时永久阻塞调用线程——可用性 DoS。未来这些路径
-    // 经 MCP/web 成为租户可控输入时尤其危险，违背模块"子进程必须超时"的不变式（连子进程都
-    // 有超时，主线程自身更不能无限阻塞）。在读取前用 fs::metadata 检查 is_file()，非正则拒绝。
-    fn reject_non_regular_file(path: &std::path::Path, what: &str) -> Result<(), String> {
-        let md = std::fs::metadata(path)
-            .map_err(|e| format!("stat {} {}: {}", what, path.display(), e))?;
-        if !md.is_file() {
-            return Err(format!(
-                "{} {} is not a regular file (dir/fifo rejected; would block on read)",
-                what,
-                path.display()
-            ));
-        }
-        Ok(())
-    }
-    reject_non_regular_file(std::path::Path::new(source_ttl), "source_ttl")?;
+    // #5（第12轮 security/medium）：source_ttl/schema_path 的读取必须**在 create_dir_all 之前**
+    // 完成——否则 crafted FIFO 路径会先创建 data_dir（文件系统足迹）才被拒绝，违背 #R4-4
+    // "任何危险输入在产生文件系统足迹前就被拒绝"的不变式。故把 source_edges 解析整体前移。
+    // #5（第12轮 security/medium 续）：source_ttl/schema 读取复用 `read_ttl_no_follow`
+    // （O_NOFOLLOW 打开 + fstat 校验常规文件 + 持句柄读），关闭 metadata 检查与 read_to_string
+    // 按名重开之间的 TOCTOU——与 out_ttl 的防御一致（此前用 `metadata().is_file()` + 按名重开，
+    // 检查与读之间路径可被换成 FIFO 永久阻塞，可用性 DoS）。
     let mut source_edges: std::collections::HashSet<(String, String, String)> = {
-        let src = std::fs::read_to_string(source_ttl)
+        let src = read_ttl_no_follow(std::path::Path::new(source_ttl))
             .map_err(|e| format!("read source ttl: {}", e))?;
         parse_ttl_edges(&src).into_iter().collect()
     };
@@ -260,12 +234,22 @@ pub fn materialize(
         // 存在但不可读（权限/瞬时 I/O），其显式受控边缺失，物化后集合差会把 schema 边误标为
         // 推断边写回（evidence=ontology:materialized），正是 #6 要防的误分类。错误必须传播，
         // 与模块"错误传播而非静默吞掉"纪律一致。
-        // #1（第11轮 bug/high）：schema_path 同样在读取前拒绝 FIFO/管道，防永久阻塞。
-        reject_non_regular_file(&cfg.schema_path, "schema_path")?;
-        let schema_src = std::fs::read_to_string(&cfg.schema_path)
+        // #1（第11轮 bug/high + #5 第12轮）：schema_path 用 read_ttl_no_follow（O_NOFOLLOW+fstat+
+        // 持句柄读），拒绝 FIFO/管道且无 TOCTOU。
+        let schema_src = read_ttl_no_follow(&cfg.schema_path)
             .map_err(|e| format!("read schema ttl {}: {}", cfg.schema_path.display(), e))?;
         source_edges.extend(parse_ttl_edges(&schema_src));
     }
+    std::fs::create_dir_all(&cfg.data_dir)
+        .map_err(|e| format!("create data dir {}: {}", cfg.data_dir.display(), e))?;
+    // 每次调用用唯一文件名（pid + 单调序列），避免并发调用（CLI + 定时任务 / 未来
+    // MCP/web 触发）互相覆盖 script/output，导致读到他方半写文件（#7/#R3-8）。
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let uniq = format!("{}_{}", std::process::id(), seq);
+    let batch_file = cfg.data_dir.join(format!("materialize_{}.batch", uniq));
+    let out_ttl = cfg.data_dir.join(format!("materialized_{}.ttl", uniq));
+    // RAII：batch 脚本 + 物化 TTL 在任意退出路径（spawn 失败/超时/解析失败…）都被删除。#R3-6/#R4-2
+    let temp_guard = TempFileGuard::new(batch_file.clone(), out_ttl.clone());
 
     // 剧本：load schema（含 OWL 传递/对称属性声明）→ load 数据 → reason → save。
     // OWL 推理需要本体声明（TransitiveProperty 等）在场，否则 supersedes 等只是普通属性，
@@ -415,6 +399,10 @@ pub fn materialize(
     let mut saw_load_result = false;
     let mut saw_reason_result = false;
     let mut unparsed_lines = 0usize;
+    // #7（第12轮 bug/low）：load/reason 结果行存在但**预期数字字段**缺失/改名时，计数会静默
+    // 落 0，而 WARN 只在整行缺失时才触发。需在字段缺失时也告警，避免 "triples: N -> 0" 误导。
+    let mut load_missing_field = false;
+    let mut reason_missing_field = false;
     for line in stdout.lines() {
         match parse_json_line(line) {
             Ok(v) => {
@@ -426,13 +414,16 @@ pub fn materialize(
                 };
                 if cmd == "load" {
                     saw_load_result = true;
-                    triples_before += res
-                        .get("triples_loaded")
-                        .and_then(|n| n.as_u64())
-                        .unwrap_or(0);
+                    match res.get("triples_loaded").and_then(|n| n.as_u64()) {
+                        Some(n) => triples_before += n,
+                        None => load_missing_field = true,
+                    }
                 } else if cmd == "reason" {
                     saw_reason_result = true;
-                    triples_after = res.get("final_triples").and_then(|n| n.as_u64()).unwrap_or(0);
+                    match res.get("final_triples").and_then(|n| n.as_u64()) {
+                        Some(n) => triples_after = n,
+                        None => reason_missing_field = true,
+                    }
                     if let Some(p) = res.get("profile_used").and_then(|p| p.as_str()) {
                         used_profile = p.to_string();
                     }
@@ -447,12 +438,22 @@ pub fn materialize(
              triples count may be inaccurate",
             unparsed_lines
         );
+    } else if load_missing_field {
+        eprintln!(
+            "WARN: 'load' result present but 'triples_loaded' field missing/renamed; \
+             triples_before set to 0"
+        );
     }
     if !saw_reason_result {
         eprintln!(
             "WARN: no 'reason' result in open-ontologies batch output ({} unparsed line(s)); \
              triples count may be inaccurate",
             unparsed_lines
+        );
+    } else if reason_missing_field {
+        eprintln!(
+            "WARN: 'reason' result present but 'final_triples' field missing/renamed; \
+             triples_after set to 0"
         );
     }
 
@@ -496,12 +497,14 @@ fn parse_json_line(line: &str) -> Result<serde_json::Value, serde_json::Error> {
     serde_json::from_str(line)
 }
 
-/// 以 `O_NOFOLLOW` 打开并读取 TTL 文件，关闭 symlink 检查与读取之间的 TOCTOU（#3 第11轮）。
+/// 以 `O_NOFOLLOW` 打开并读取一个 TTL 文件，关闭 symlink/类型检查与读取之间的 TOCTOU
+/// （#3 第11轮引入，第12轮扩展复用于 source_ttl/schema_path）。
 ///
+/// 用于所有"读取前需确认是常规文件"的 TTL 输入（out_ttl / source_ttl / schema_path）：
 /// Unix：open 时 `O_NOFOLLOW` 直接拒绝符号链接，随后在已打开的句柄上 fstat 校验常规文件
 /// （拒绝 FIFO/设备，防阻塞读），再通过句柄读取——路径替换不影响已打开的真实文件。
-/// Windows 无 `O_NOFOLLOW`：符号链接创建需管理员权限（风险已由 create_new 预占收窄），
-/// 此处用 `symlink_metadata` + `metadata` 双重校验兜底。
+/// Windows 无 `O_NOFOLLOW`：符号链接创建需管理员权限（风险已收窄），此处用 `symlink_metadata`
+/// 校验兜底。
 #[cfg(unix)]
 fn read_ttl_no_follow(path: &std::path::Path) -> Result<String, String> {
     use std::io::Read;
@@ -510,32 +513,38 @@ fn read_ttl_no_follow(path: &std::path::Path) -> Result<String, String> {
         .read(true)
         .custom_flags(libc::O_NOFOLLOW)
         .open(path)
-        .map_err(|e| format!("open materialized ttl (O_NOFOLLOW): {}", e))?;
+        .map_err(|e| format!("open ttl (O_NOFOLLOW): {}", e))?;
     let md = f
         .metadata()
-        .map_err(|e| format!("fstat materialized ttl: {}", e))?;
+        .map_err(|e| format!("fstat ttl: {}", e))?;
     if !md.is_file() {
-        return Err("out_ttl is not a regular file (possible symlink/fifo attack)".to_string());
+        return Err(format!(
+            "{} is not a regular file (possible symlink/fifo attack)",
+            path.display()
+        ));
     }
     let mut s = String::new();
     f.read_to_string(&mut s)
-        .map_err(|e| format!("read materialized ttl: {}", e))?;
+        .map_err(|e| format!("read ttl {}: {}", path.display(), e))?;
     Ok(s)
 }
 
 /// Windows 版本：无 `O_NOFOLLOW`，用 `symlink_metadata`（不跟随链接）确认非符号链接，
-/// 再 `metadata`（跟随链接）确认常规文件，最后读取。create_new 预占已收窄竞态。
+/// 再确认常规文件，最后读取。create_new 预占已收窄竞态。
 #[cfg(windows)]
 fn read_ttl_no_follow(path: &std::path::Path) -> Result<String, String> {
     let sm = std::fs::symlink_metadata(path)
-        .map_err(|e| format!("lstat materialized ttl: {}", e))?;
+        .map_err(|e| format!("lstat ttl {}: {}", path.display(), e))?;
     if sm.file_type().is_symlink() {
-        return Err("out_ttl is a symlink (possible attack)".to_string());
+        return Err(format!("{} is a symlink (possible attack)", path.display()));
     }
     if !sm.is_file() {
-        return Err("out_ttl is not a regular file (possible fifo/device)".to_string());
+        return Err(format!(
+            "{} is not a regular file (possible fifo/device)",
+            path.display()
+        ));
     }
-    std::fs::read_to_string(path).map_err(|e| format!("read materialized ttl: {}", e))
+    std::fs::read_to_string(path).map_err(|e| format!("read ttl {}: {}", path.display(), e))
 }
 
 /// 把路径规范为 open-ontologies 可识别的形式。
@@ -625,8 +634,30 @@ fn parse_ttl_edges(ttl: &str) -> Vec<(String, String, String)> {
         }
         // 剥掉行尾续行标记。
         let line = line_trimmed.trim_end_matches([';', ',', '.']).trim();
+        // #11（第12轮 bug/high）：Turtle 允许续行分隔符出现在**行首**：
+        //     :docC :supersedes :docA
+        //       , :docB ;
+        //       :createdBy :alice .
+        // 此时行首 token 是 `,`/`;`。若直接按"行首首个 IRI 决定主语/续行"处理，
+        // `expand_term` 对 `,`/`;` 返回 None，且 prev_sep（仅由上一行结尾推导）可能为 None，
+        // 会落入 `first_term.is_none() && prev_sep.is_none()` 分支重置 subj/pred，
+        // 静默丢弃续行的三元组（docB/createdBy 边）→ source_edges 漏算 → 物化 diff 误标为推断
+        // 并写回（evidence=ontology:materialized），污染推断记账。行首分隔符 = 显式续行标记，
+        // 必须把它的语义并入 prev_sep 并跳过该 token，让后续 IRI 按续行处理。
+        let leading_sep = if line_trimmed.starts_with(';') {
+            Some(';')
+        } else if line_trimmed.starts_with(',') {
+            Some(',')
+        } else {
+            None
+        };
         // 提取本行所有 <iri> token 及分隔符（; , 区分谓词/对象续行）
         let tokens = tokenize_ttl(line);
+        // 若行首有分隔符，它是续行标记，不参与 token 索引（跳过它）；把 prev_sep 设为该分隔符
+        // 的语义。行首 `;` → 下行首个 IRI 是新谓词；行首 `,` → 下行首个 IRI 是新对象。
+        if leading_sep.is_some() {
+            prev_sep = leading_sep;
+        }
 
         // #6（第6轮 bug/medium）：`a <Type>` 是 rdf:type 简写，不产出目标关系边。
         // 但只有**纯类型声明行**（`a <Type>` 是整行唯一内容，无后续谓词/对象）才能整行跳过；
@@ -1229,6 +1260,31 @@ mod tests {
     }
 
     #[test]
+    fn ttl_parse_handles_leading_separator_continuation() {
+        // #4（第12轮 bug/high）：Turtle 允许续行分隔符 `,`/`;` 出现在**行首**。此前状态机只认
+        // 行尾分隔符，行首分隔符会落入 `first_term.is_none() && prev_sep.is_none()` 分支重置
+        // subj/pred，静默丢弃续行三元组 → source_edges 漏算 → 物化 diff 误标为推断并写回。
+        let ttl = r#"@prefix : <http://example.org/> .
+<http://example.org/docC> <http://example.org/supersedes> <http://example.org/docA>
+    , <http://example.org/docB> ;
+    <http://example.org/createdBy> <http://example.org/alice> .
+"#;
+        let all = parse_ttl_edges(ttl);
+        // 3 条显式边：docC supersedes docA, docC supersedes docB, docC createdBy alice
+        assert_eq!(all.len(), 3, "got {:?}", all);
+        assert!(all.contains(&(
+            "http://example.org/docC".to_string(),
+            "http://example.org/supersedes".to_string(),
+            "http://example.org/docB".to_string()
+        )));
+        assert!(all.contains(&(
+            "http://example.org/docC".to_string(),
+            "http://example.org/createdBy".to_string(),
+            "http://example.org/alice".to_string()
+        )));
+    }
+
+    #[test]
     fn relation_iri_mapping() {
         assert_eq!(map_relation_iri("http://example.org/supersedes").as_deref(), Some("supersedes"));
         assert_eq!(map_relation_iri("http://example.org/createdBy").as_deref(), Some("created_by"));
@@ -1525,6 +1581,39 @@ _:b0 <http://example.org/supersedes> :docA .
         )];
         let (w2, _) = write_back_edges(&conn, "test", &edges2).expect("write");
         assert_eq!(w2, 1, "normal IRI edge should be written");
+    }
+
+    #[test]
+    fn map_relation_iri_outputs_in_rel_types() {
+        // #6（第12轮 maintainability/low）：map_relation_iri 硬编码的短名白名单必须与
+        // RELATION_TYPES（tools/graph.rs）保持同步。若未来 RELATION_TYPES 改名/删除某短名，
+        // map_relation_iri 仍产出旧短名 → is_valid_relation_type 拒绝 → 写回被静默丢弃，
+        // 且无编译/测试信号。此测试断言 map_relation_iri 的每个输出都落在 RELATION_TYPES 内，
+        // 把耦合变成显式约束。
+        let ns = "http://memoria.ai/onto/";
+        let locals = [
+            "references",
+            "supersedes",
+            "createdBy",
+            "created_by",
+            "conflictsWith",
+            "conflicts_with",
+            "dependsOn",
+            "depends_on",
+            "partOf",
+            "part_of",
+            "belongsTo",
+            "belongs_to",
+        ];
+        for local in locals {
+            let iri = format!("{ns}{local}");
+            let short = map_relation_iri(&iri)
+                .unwrap_or_else(|| panic!("map_relation_iri({iri}) should map"));
+            assert!(
+                RELATION_TYPES.contains(&short.as_str()),
+                "map_relation_iri short name '{short}' (from '{local}') not in RELATION_TYPES"
+            );
+        }
     }
 }
 

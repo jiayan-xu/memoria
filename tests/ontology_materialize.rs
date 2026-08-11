@@ -64,7 +64,7 @@ fn locate_bin() -> Option<String> {
         }
         // env 值先做 is_file() 校验 + 可执行探测（--help 能 spawn），失败即权威地返回 None，
         // 避免后续 materialize(...).expect(...) 因 spawn 失败而 panic 或跑错二进制（#R3-1）。
-        if std::path::Path::new(&*b).is_file() && probe_help(&b) {
+        if std::path::Path::new(&*b).is_file() && probe_help(&b, probe_timeout()) {
             return Some(b.into_owned());
         }
         return None; // 显式设置但校验失败 → 权威失败，不回退 PATH
@@ -101,14 +101,13 @@ fn locate_bin() -> Option<String> {
         // 意图直接矛盾（首个非 UTF-8 PATH 目录即触发假绿 skip 或 REQUIRE=1 假红）。
         // 改用 `if let` 只跳过该候选，继续扫描后续目录。
         if exe.is_file() {
-            // #7（第11轮 other/low）：deadline 只在 PATH 循环顶检查，但单个挂死候选在 deadline
-            // 前一刻被发现仍可耗尽整个 PROBE_TIMEOUT（默认 10s），使注释宣称的"整体探测超时，
-            // 放弃扫描"硬预算形同虚设。在每次 probe_help 前再查一次，把预算做成真实上界。
-            if std::time::Instant::now() > scan_deadline {
-                return None;
-            }
+            // #7（第11轮 other/low → 第12轮 bug/low）：deadline 只在 PATH 循环顶检查，但单个
+            // 挂死候选在 deadline 前一刻被发现仍可耗尽整个 PROBE_TIMEOUT（默认 10s），使注释
+            // 宣称的"整体探测超时，放弃扫描"硬预算形同虚设。第12轮把**剩余预算**传给 probe_help
+            // （deadline=min(PROBE_TIMEOUT, 剩余)），探测不会超过剩余预算，30s 整体预算成为真实上界。
+            let remaining = scan_deadline.saturating_duration_since(std::time::Instant::now());
             if let Some(s) = exe.to_str() {
-                if probe_help(s) {
+                if probe_help(s, remaining) {
                     return Some(s.to_string());
                 }
             }
@@ -124,20 +123,25 @@ fn locate_bin() -> Option<String> {
 const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 fn probe_timeout() -> std::time::Duration {
-    // #8（第11轮 test/low）：拒绝 0——`PROBE_TIMEOUT_SECS=0` 会让每次探测立即 kill 子进程，
-    // 所有测试静默跳（或 REQUIRE=1 下 panic），与 OntologyConfig::from_env 显式 clamp 0→1s 的
-    // 生产约定不一致。filter 掉 0 后回退到 PROBE_TIMEOUT，行为统一。
+    // #8（第11轮 test/low + 第12轮 other/low）：与生产 `OntologyConfig::from_env` 约定一致——
+    // 显式 `PROBE_TIMEOUT_SECS=0` 视为误配，**clamp 到 1s**（拒绝 0 导致的"所有探测立即失败、
+    // 测试静默跳/panic"），而非回退到 10s 默认。此前实现用 `.filter(|n| *n > 0)` 回退默认，
+    // 与生产的 clamp（0→1s）语义不一致，注释宣称"统一"却未真正统一——改为真正的 clamp。
     std::env::var("PROBE_TIMEOUT_SECS")
         .ok()
-        .and_then(|v| v.parse::<u64>().ok().filter(|n| *n > 0))
-        .map(std::time::Duration::from_secs)
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(|n| std::time::Duration::from_secs(n.max(1)))
         .unwrap_or(PROBE_TIMEOUT)
 }
 
 /// 带超时的 `--help` 可执行探测（#R4-6）。spawn 失败、超时、非零退出都视为不可用。
 /// 用 `std::process::Child::wait_timeout` 无法直接获得（std 无此 API），故用
 /// `spawn` + 轮询 `try_wait` + 超时 kill 的既有模式。
-fn probe_help(bin: &str) -> bool {
+/// #2（第12轮 bug/low）：`budget` 为调用方传入的**剩余整体探测预算**；本次探测的 deadline =
+/// `min(probe_timeout, budget)`。这样 PATH 扫描中在 scan_deadline 前一刻发现的候选，其探测
+/// 不会超过剩余预算，把 30s 整体预算做成真实硬上界（此前探测只要在 deadline 前启动就跑满
+/// 整个 PROBE_TIMEOUT，最坏 ~40s，注释宣称的"硬预算"名不副实）。
+fn probe_help(bin: &str, budget: std::time::Duration) -> bool {
     let mut child = match std::process::Command::new(bin)
         .arg("--help")
         .stdout(std::process::Stdio::null())
@@ -147,7 +151,8 @@ fn probe_help(bin: &str) -> bool {
         Ok(c) => c,
         Err(_) => return false,
     };
-    let deadline = std::time::Instant::now() + probe_timeout();
+    let cap = probe_timeout().min(budget);
+    let deadline = std::time::Instant::now() + cap;
     loop {
         match child.try_wait() {
             // #3（第5轮 test/low）：--help 非零退出也视为不可用（此前任何退出码都返回 true，
@@ -169,23 +174,15 @@ fn probe_help(bin: &str) -> bool {
     }
 }
 
-/// RAII 临时目录守卫（#123）：drop 时自动清理，panic 也不泄漏临时文件。
-struct TempDir(std::path::PathBuf);
-impl TempDir {
-    fn new(tag: &str) -> Self {
-        let dir = std::env::temp_dir().join(format!("memoria_onto_{}_{}", std::process::id(), tag));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        TempDir(dir)
-    }
-    fn path(&self) -> &std::path::Path {
-        &self.0
-    }
-}
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
+/// RAII 临时目录守卫（#1 第12轮 security/low）：改用 `tempfile::TempDir`——随机名 + O_EXCL
+/// 独占创建，消除此前 `memoria_onto_{pid}_{tag}` 可预测路径的符号链接 TOCTOU 与 PID 复用
+/// 误删风险。drop 时自动清理，panic 也不泄漏临时文件。
+/// `tag` 作目录名前缀，便于测试失败时定位。
+fn temp_dir(tag: &str) -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix(&format!("memoria_onto_{tag}_"))
+        .tempdir()
+        .expect("create unique temp dir")
 }
 
 /// #4（第10轮 maintainability/low）：materialize 相关集成测试共享的 fixture 搭建——
@@ -194,9 +191,9 @@ impl Drop for TempDir {
 /// 返回 `(guard, cfg, data_path)`；guard 保持 TempDir 存活到测试结束。
 fn setup_bin_and_fixtures(
     tag: &str,
-) -> Option<(TempDir, OntologyConfig, std::path::PathBuf)> {
+) -> Option<(tempfile::TempDir, OntologyConfig, std::path::PathBuf)> {
     let bin = find_bin()?; // 缺失则 None → 调用方 SKIP
-    let guard = TempDir::new(tag);
+    let guard = temp_dir(tag);
     let dir = guard.path().to_path_buf();
     let schema = dir.join("schema.ttl");
     let data = dir.join("data.ttl");
@@ -281,7 +278,7 @@ fn materialize_infers_transitive_supersedes() {
 #[test]
 fn write_back_edges_upserts_into_entity_edges() {
     // 不依赖 open-ontologies 二进制，直接测写回逻辑。
-    let _guard = TempDir::new("writeback");
+    let _guard = temp_dir("writeback");
     let dir = _guard.path();
     let db = dir.join("mem.db");
     let engine = memoria_core::MemoriaEngine::new(&db.to_string_lossy()).expect("engine");
