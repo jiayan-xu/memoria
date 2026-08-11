@@ -64,7 +64,14 @@ jobs:
           fi
           # 显式校验产物存在：cp 失败时 set -e 会中断，而非静默带入测试阶段假失败
           ls -la "$HOME"/.local/bin/
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          # GITHUB_PATH 追加必须用原生路径：Git Bash 的 $HOME 是 MSYS 形式（/c/Users/...），
+          # 直接追加会让 Windows PATH 里是 MSYS 路径，Rust 的 split_paths/is_file 无法解析。
+          # 用 cygpath -w 转成 C:\... 形式（非 Windows 平台 cygpath 可能不存在，保持原样）。
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            echo "$(cygpath -w "$HOME"/.local/bin)" >> "$GITHUB_PATH"
+          else
+            echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          fi
 
       - name: Run tests (ontology tests hard-required)
         shell: bash
