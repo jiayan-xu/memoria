@@ -93,7 +93,25 @@ impl OntologyConfig {
                 .unwrap_or_else(|_| data_dir.join("schema.ttl")),
             timeout_secs: std::env::var("OPEN_ONTOLOGIES_TIMEOUT_SECS")
                 .ok()
-                .and_then(|v| v.parse::<u64>().ok())
+                .and_then(|v| {
+                    // #7（第6轮 bug/low）：解析失败不能静默回退 60s 默认——操作者以为配了短超时、
+                    // 实际却让挂死的物化跑满一分钟。打印告警。0 会被接受但无文档且语义怪（首轮
+                    // ~50ms 即杀），统一拒绝为 1s 下限。
+                    match v.parse::<u64>() {
+                        Ok(n) if n > 0 => Some(n),
+                        Ok(_) => {
+                            eprintln!("WARN: OPEN_ONTOLOGIES_TIMEOUT_SECS={:?} is 0/invalid, clamped to 1s", v);
+                            Some(1)
+                        }
+                        Err(_) => {
+                            eprintln!(
+                                "WARN: OPEN_ONTOLOGIES_TIMEOUT_SECS={:?} not parseable, falling back to default {}s",
+                                v, DEFAULT_TIMEOUT_SECS
+                            );
+                            None
+                        }
+                    }
+                })
                 .unwrap_or(DEFAULT_TIMEOUT_SECS),
         }
     }
@@ -351,6 +369,10 @@ fn win_path_quoted(p: &std::path::Path) -> String {
 /// 边集做集合差得出（见 `materialize`），避免依赖导出器"推断边排最前"这一不稳稿假设。
 fn parse_ttl_edges(ttl: &str) -> Vec<(String, String, String)> {
     let mut all: Vec<(String, String, String)> = Vec::new();
+    // #10（第6轮 bug/low）：剥离 UTF-8 BOM（\u{FEFF}）。许多 TTL 导出器会在首行前加 BOM，
+    // 使首行 `\u{FEFF}@prefix ...` 既匹配不上 parse_prefix_decl 的 `@prefix`、也不以 `@` 开头
+    // 被跳过，导致默认/声明前缀永不注册、后续 `:local` 无法展开、source_edges 少算。
+    let ttl = ttl.strip_prefix('\u{FEFF}').unwrap_or(ttl);
     // 前缀表：`p:local` → 完整 IRI。#R4-3 前缀展开。默认前缀 `:` 也在此表。
     let mut prefixes: HashMap<String, String> = HashMap::new();
     let mut subj: Option<String> = None;
@@ -382,18 +404,25 @@ fn parse_ttl_edges(ttl: &str) -> Vec<(String, String, String)> {
             // 其它 @ 指令（@base 等）本骨架不处理，跳过。
             continue;
         }
-        // 类型续行 `<subject> a <Type>` 或 `a <Type>`：无目标关系边，跳过类型声明。
-        // 需 trim 后判断（真实 TTL 用 tab 缩进，`a <Type>` 前有空白）。
-        let type_only = line_trimmed
-            .trim_start_matches([',', ';'])
-            .trim_start()
-            .starts_with("a ")
-            || line_trimmed.trim_start().starts_with("a <");
-        if type_only {
-            // 类型声明行（`a <Type>`）无目标关系边，跳过内容。
+        // 剥掉行尾续行标记。
+        let line = line_trimmed.trim_end_matches([';', ',', '.']).trim();
+        // 提取本行所有 <iri> token 及分隔符（; , 区分谓词/对象续行）
+        let tokens = tokenize_ttl(line);
+
+        // #6（第6轮 bug/medium）：`a <Type>` 是 rdf:type 简写，不产出目标关系边。
+        // 但只有**纯类型声明行**（`a <Type>` 是整行唯一内容，无后续谓词/对象）才能整行跳过；
+        // `a <Type> ; <pred> <obj>`（同一行以 `;` 分隔出关系边）不是纯类型，整行跳过会
+        // 静默丢失 `<pred> <obj>` 边——该边从 source_edges 与 all_edges 双双消失，物化 diff
+        // 会把既有链接误报为推断或漏写回。故：非纯类型行只跳过前导 `a <Type>` 两个 token。
+        // 谓词 `a` 在 tokenize 中作为 token 捕获（`a ` 分支）。
+        let type_pred_at_0 = tokens.first().map(|t| t.as_str()) == Some("a");
+        let has_type_target = tokens.get(1).is_some();
+        let is_pure_type = type_pred_at_0 && has_type_target && tokens.len() == 2;
+        if is_pure_type {
+            // 纯类型声明行（`a <Type>`）：无目标关系边，跳过内容。
             // 但必须保留行尾续行标记：块中间的 `a <Type> ;` 后可能还有 `<pred> <obj>` 续行，
             // 直接置 None 会把后续续行误判为新主语块，导致真实语义边被静默丢弃（#118）。
-            // 若本行以 `.` 结尾则重置为 None（下行为新主语块）。
+            // 本行以 `.` 结尾则重置为 None（下行为新主语块）。
             prev_sep = if line_trimmed.ends_with(';') {
                 Some(';')
             } else if line_trimmed.ends_with(',') {
@@ -403,39 +432,46 @@ fn parse_ttl_edges(ttl: &str) -> Vec<(String, String, String)> {
             };
             continue;
         }
+        // 非纯类型：跳过前导 `a <Type>` 两个 token（若有），继续处理其余关系边（#6）。
+        let mut i = if type_pred_at_0 && has_type_target { 2 } else { 0 };
 
-        // 剥掉行尾续行标记；记录本行结尾分隔符供下轮使用。
-        let line = line_trimmed.trim_end_matches([';', ',', '.']);
-        let line = line.trim();
-
-        // 提取本行所有 <iri> token 及分隔符（; , 区分谓词/对象续行）
-        let tokens = tokenize_ttl(line);
-
-        let mut i = 0;
         // 行首首个 token 若能展开为 IRI，且上一行不是续行 → 新主语块。
         // 同时兼容 `<iri>` 与 `p:local`/`:local`（#R4-3 前缀展开）。
-        let first_term = tokens.first().and_then(|t| expand_term(t, &prefixes));
+        let first_term = tokens.get(i).and_then(|t| expand_term(t, &prefixes));
         // 仅当上一行不是续行（`;`/`,`）且本行首 token 是 IRI 时，才视为新主语块。
         let new_block = prev_sep.is_none() && first_term.is_some();
         if new_block {
-            // 主语
+            // 主语（i 可能已跳过前导 `a <Type>`，故用 i+1 而非硬编码 1）
             if let Some(s) = first_term {
                 subj = Some(s);
                 pred = None;
-                i = 1;
+                i += 1;
             }
         } else if prev_sep == Some(';') && first_term.is_some() {
             // 续行且上一行以 `;` 结尾：行首 IRI 是新谓词（沿用 subj）。
             if let Some(p) = first_term {
                 pred = Some(p);
-                i = 1;
+                i += 1;
             }
         } else if first_term.is_none() && prev_sep.is_none() {
-            // 行首不是 IRI 且非续行：blank node 主语（`_:b0 ...` / `[...] ...`）
-            // 或其它非 IRI 主语。若沿用上一块的 stale subj/pred 会产出错误边，
-            // 因此重置 subj/pred，避免 `(prevSubj, supersedes, docA)` 这类伪边（#R3-2）。
-            subj = None;
-            pred = None;
+            // 行首不是可展开 IRI 且非续行。可能是 blank node 主语（`_:b0 <p> <o>` /
+            // `[ ... ] <p> <o>`）或其它非 IRI 主语。
+            // #5（第6轮 bug/medium）：blank node 主语不能直接把表示边丢弃——否则
+            // `source_edges` 少算这些边，物化后若推理器对 blank node skolemize 成 IRIs，
+            // "物化−源"集合差会把显式边误标为推断边并写库（evidence=ontology:materialized），
+            // 污染推断记账。故对 `_:label` / `[...]` 主语：保留 subj 为 blank node 占位，
+            // 让后续 `<pred> <obj>` 正常产出边（blank node 主语本身不展开，仅作占位）。
+            // 仅对确实无法识别的主语（既非 IRI 也非 blank node）才重置，避免 stale 伪边（#R3-2）。
+            let first_tok = tokens.first().map(|t| t.as_str()).unwrap_or("");
+            let is_bnode = first_tok.starts_with("_:") || first_tok.starts_with('[');
+            if is_bnode {
+                subj = Some(first_tok.to_string());
+                pred = None;
+                i = 1;
+            } else {
+                subj = None;
+                pred = None;
+            }
         }
         while i < tokens.len() {
             let tok = &tokens[i];
@@ -581,7 +617,11 @@ fn tokenize_ttl(line: &str) -> Vec<String> {
             // #8（第5轮 bug/medium）：blank node 对象 `[ a <Document> ]`。必须把整个 `[...]`
             // 跨度当作不透明 token 跳过（不产出任何 out token），否则内层 `<Document>` 会被
             // 当作外层谓词的对象，产生伪边 (docA, partOf, Document)。OWL 推理 TTL 常见这种结构。
+            // #5（第6轮 bug/medium）：把整个 `[...]` 跨度作为一个**不透明 token** 保留（而非
+            // 丢弃），使 `[ ... ] <p> <o>` 这类 blank node 属性列表主语能在解析层被识别为
+            // blank node 主语（见 #5 分支），避免 `<p>` 被误读为新主语、真实边丢失。
             if let Some(end) = rest.find(']') {
+                out.push(rest[..=end].to_string());
                 rest = &rest[end + 1..];
             } else {
                 // 未闭合 `[`：丢弃整行剩余部分（视为不完整 blank node）
@@ -667,11 +707,15 @@ pub fn write_back_edges(
             let oname = iri_local_name(o);
             // 幂等 upsert 两端实体（满足外键约束）——错误必须传播，不静默吞掉（#9），
             // 否则 INSERT 失败会被掩盖，直到边插入时才暴露为令人困惑的 FK 冲突。
+            // #9（第6轮 bug/low）跨租户一致性：entities.id 是全局主键（无命名空间维度），
+            // 仅 `DO NOTHING` 会让第一个命名空间"拥有"该 IRI 的实体行；后续其它命名空间引用
+            // 同一 IRI 时，entity_edges.namespace 与 entities.namespace 会分叉。改为冲突时
+            // 刷新 namespace，使实体行归属最近一次写它的命名空间，抑制跨租户分歧。
             for (eid, ename) in [(s.as_str(), sname.as_str()), (o.as_str(), oname.as_str())] {
                 tx.execute(
                     "INSERT INTO entities(id, namespace, entity_type, name, aliases, summary)
                      VALUES(?1, ?2, 'concept', ?3, '[]', NULL)
-                     ON CONFLICT(id) DO NOTHING",
+                     ON CONFLICT(id) DO UPDATE SET namespace=excluded.namespace",
                     rusqlite::params![eid, namespace, ename],
                 )
                 .map_err(|e| format!(
@@ -733,14 +777,22 @@ const CONTROLLED_NS: &[&str] = &[
 /// 且局部名命中显式白名单，才映射成语义边。其它命名空间的局部名撞名亦拒绝，
 /// 严格符合"防垃圾边"意图（与文档一致）。
 fn map_relation_iri(pred: &str) -> Option<String> {
-    // 先校验命名空间，再取局部名匹配白名单。
-    if !CONTROLLED_NS.iter().any(|ns| pred.starts_with(ns)) {
-        return None;
-    }
-    let short = pred
-        .rsplit(['/', '#'])
-        .next()
-        .unwrap_or(pred);
+    // #4（第6轮 security/high）：精确前缀门禁——谓词必须是 `<受控前缀> + 单个局部名`。
+    // 此前 `starts_with` + `rsplit` 取末段，`http://example.org/vendor/private/supersedes` 之类
+    // 深层 IRI 会被误认为受控关系（只要末段撞白名单），使攻击者/租户可在受控前缀下注入任意
+    // 深度的白名单局部名进 entity_edges，违背 #R4-1 防垃圾边意图。
+    // 修正：匹配前缀后，剩余部分必须是单个局部名（不含 '/' 或 '#'），否则拒绝。
+    let ns = CONTROLLED_NS.iter().find(|ns| pred.starts_with(**ns));
+    let short = match ns {
+        Some(ns) => {
+            let rest = &pred[ns.len()..];
+            if rest.is_empty() || rest.contains(['/', '#']) {
+                return None;
+            }
+            rest
+        }
+        None => return None,
+    };
     match short {
         "references" => Some("references".to_string()),
         "supersedes" => Some("supersedes".to_string()),
@@ -960,6 +1012,67 @@ mod tests {
         // partOf 是受控关系，但对象是 blank node（无实 IRI），不应产出任何边。
         assert_eq!(all.len(), 0, "got {:?}", all);
     }
+
+    #[test]
+    fn relation_iri_mapping_exact_prefix() {
+        // #4（第6轮 security/high）：前缀匹配必须是"受控前缀+单个局部名"，
+        // 深层 IRI（前缀后仍含 / 或 #）即使末段撞白名单也必须拒绝。
+        assert_eq!(map_relation_iri("http://example.org/supersedes").as_deref(), Some("supersedes"));
+        // 深层路径：前缀后含 '/'，必须拒绝（防注入白名单局部名）
+        assert_eq!(map_relation_iri("http://example.org/vendor/private/supersedes").as_deref(), None);
+        assert_eq!(map_relation_iri("http://memoria.ai/onto/foo/createdBy").as_deref(), None);
+        // 前缀后含 '#' 也拒绝
+        assert_eq!(map_relation_iri("http://example.org/sub#supersedes").as_deref(), None);
+        // 空局部名拒绝
+        assert_eq!(map_relation_iri("http://example.org/").as_deref(), None);
+    }
+
+    #[test]
+    fn ttl_parse_keeps_blank_node_subject_edges() {
+        // #5（第6轮 bug/medium）：blank node 主语 `_:b0 <p> <o>` 的边不能被丢弃，
+        // 否则 source_edges 少算，物化 diff 会把显式边误标为推断边。
+        let ttl = r#"@prefix : <http://example.org/> .
+_:b0 <http://example.org/supersedes> :docA .
+"#;
+        let all = parse_ttl_edges(ttl);
+        // blank node 主语不展开，但边应保留（subj=_:b0 占位）
+        assert_eq!(all.len(), 1, "got {:?}", all);
+        assert!(all.contains(&(
+            "_:b0".to_string(),
+            "http://example.org/supersedes".to_string(),
+            "http://example.org/docA".to_string()
+        )));
+    }
+
+    #[test]
+    fn ttl_parse_mixed_type_and_relation_line() {
+        // #6（第6轮 bug/medium）：`a <Type> ; <pred> <obj>` 不是纯类型行，整行跳过会丢边。
+        // 应只跳过前导 `a <Type>`，仍产出后续 `<pred> <obj>` 边。
+        let ttl = r#"@prefix : <http://example.org/> .
+<http://example.org/docC> a <http://example.org/Document> ; <http://example.org/supersedes> <http://example.org/docA> .
+"#;
+        let all = parse_ttl_edges(ttl);
+        // 应产出 1 条边（docC supersedes docA）；纯类型 `a <Type>` 不产出边
+        assert_eq!(all.len(), 1, "got {:?}", all);
+        assert!(all.contains(&(
+            "http://example.org/docC".to_string(),
+            "http://example.org/supersedes".to_string(),
+            "http://example.org/docA".to_string()
+        )));
+    }
+
+    #[test]
+    fn ttl_parse_strips_bom() {
+        // #10（第6轮 bug/low）：首行带 UTF-8 BOM 时前缀仍能注册、默认前缀展开仍工作。
+        let ttl = "\u{FEFF}@prefix : <http://example.org/> .\n:docC <http://example.org/supersedes> :docA .\n";
+        let all = parse_ttl_edges(ttl);
+        assert_eq!(all.len(), 1, "got {:?}", all);
+        assert!(all.contains(&(
+            "http://example.org/docC".to_string(),
+            "http://example.org/supersedes".to_string(),
+            "http://example.org/docA".to_string()
+        )));
+    }
 }
 
 // 供外部（web_api / mcp_server）复用的通用入口
@@ -1065,6 +1178,11 @@ fn serve_http_placeholder(cfg: &OntologyConfig, args: &[String]) -> Result<Strin
         }
     };
     if let Some(st) = status {
+        // #8（第6轮 maintainability/low）：退出路径也要 join 两个 reader（此前只 join
+        // stderr_reader，stdout_reader 的 JoinHandle 被 drop 不 join——若子进程延迟关 stdout，
+        // 该 reader 线程会长期阻塞在 read_to_string）。与成功路径 / materialize/status 的
+        // kill+wait+join 纪律一致。
+        let _ = stdout_reader.join();
         let err = stderr_reader.join().unwrap_or_default();
         return Err(format!(
             "serve-http exited immediately (code {}): {}",
