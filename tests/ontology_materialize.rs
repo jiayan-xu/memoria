@@ -47,13 +47,15 @@ const DATA_TTL: &str = r#"@prefix : <http://memoria.ai/onto/> .
 fn find_bin() -> Option<String> {
     // REQUIRE_ONTOLOGIES_BIN 接受常见真值（1/true/yes/on），非只认字面量 "1"——"true"/"yes" 等
     // CI 常见写法此前被静默当作未设置，硬失败门禁悄悄失效、套件静默 skip（防假绿工具自身成了
-    // 假绿源）。空/"0"/"false"/"no"/"off" 视为未要求；**任何已设置的其它非空值都视为要求**——
+    // 假绿源）。空/"0"/"false"/"no"/"off" 视为未要求；**任何已设置的其它值都视为要求**——
     // 本文件唯一目的是 fail-closed（找不到二进制就 panic），unrecognized 值（CI typo "ture"、
-    // 尾随空格 "true "）若静默当 unset 会让门禁 fail-open，正是要防的假绿。值先 trim 再判定，
-    // 容忍 "true "/"TRUE" 等书写；无法识别的识别为 require（宁可误报不可漏报）。
-    let require = match std::env::var("REQUIRE_ONTOLOGIES_BIN") {
-        Ok(v) => {
-            let t = v.trim().to_ascii_lowercase();
+    // 尾随空格 "true "）若静默当 unset 会让门禁 fail-open，正是要防的假绿。用 var_os + lossy 转换
+    // 区分"未设置"(None) 与"设为非 UTF-8 值"(Some)——后者也按 fail-closed 处理（非 UTF-8 值经
+    // lossy 后无法识别 → require），与下方 OPEN_ONTOLOGIES_BIN 的 var_os 检测语义一致。
+    let require = match std::env::var_os("REQUIRE_ONTOLOGIES_BIN") {
+        None => false,
+        Some(v) => {
+            let t = v.to_string_lossy().trim().to_ascii_lowercase();
             match t.as_str() {
                 "" | "0" | "false" | "no" | "off" => false,
                 "1" | "true" | "yes" | "on" => true,
@@ -67,7 +69,6 @@ fn find_bin() -> Option<String> {
                 }
             }
         }
-        Err(_) => false,
     };
     // #R19（第19轮 maintainability/low）：OPEN_ONTOLOGIES_BIN **只读一次**（此处），沿调用链传给
     // locate_bin，不再在 find_bin/locate_bin 各读一次——否则 `let found = locate_bin()` 先执行、
