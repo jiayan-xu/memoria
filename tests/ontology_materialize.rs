@@ -113,9 +113,11 @@ fn locate_bin(env_bin: &Option<std::ffi::OsString>) -> Option<String> {
         if b.is_empty() {
             return None;
         }
-        // env 值先做 is_file() 校验 + 可执行探测（--help 能 spawn），失败即权威地返回 None，
-        // 避免后续 materialize(...).expect(...) 因 spawn 失败而 panic 或跑错二进制（#R3-1）。
-        if std::path::Path::new(&*b).is_file() && probe_help(&b, pt) {
+        // env 值先做 is_file() 校验 + 可执行探测（--help 能 spawn + --version 身份校验），失败即
+        // 权威地返回 None，避免后续 materialize(...).expect(...) 因 spawn 失败而 panic 或跑错
+        // 二进制（#R3-1）。#R26（第25轮 other/low）：explicit 路径本就 fail-closed，此处补上
+        // `probe_identity` 身份校验——确认它真是 open-ontologies 而非同名其它工具，保持 fail-closed。
+        if std::path::Path::new(&*b).is_file() && probe_help(&b, pt) && probe_identity(&b, pt) {
             return Some(b.into_owned());
         }
         return None; // 显式设置但校验失败 → 权威失败，不回退 PATH
@@ -162,7 +164,11 @@ fn locate_bin(env_bin: &Option<std::ffi::OsString>) -> Option<String> {
             }
             if let Some(s) = exe.to_str() {
                 // #R17：budget = min(单次探测超时, 剩余整体预算)，与 probe_help 的 deadline 语义一致
-                if probe_help(s, pt.min(remaining)) {
+                // #R26（第25轮 other/low）：PATH 候选仅凭 `--help` 探测出"可执行"不足以确认它就是
+                // open-ontologies——一个更早 PATH 上的 stale/同名二进制会静默被选中，违背本文件中心的
+                // 防假绿意图。追加 `probe_identity`（`--version` 输出含 open-ontologies 标识）才接受。
+                // 注意：命名按 `--version` 就近读一次剩余预算，避免与扫描预算解耦引入新边界竞态。
+                if probe_help(s, pt.min(remaining)) && probe_identity(s, pt.min(remaining)) {
                     return Some(s.to_string());
                 }
             }
@@ -189,29 +195,37 @@ fn probe_timeout() -> std::time::Duration {
     // 与生产的 clamp（0→1s）语义不一致，注释宣称"统一"却未真正统一——改为真正的 clamp。
     // #R14（第14轮 test/low）：补上界 clamp（>30s 拉回 30s）并在不可解析/超范围时 `eprintln!`
     // 告警，而非静默回退——镜像生产 `from_env` 的 WARN 行为，避免"配了长超时实际没生效"的误导。
-    match std::env::var("PROBE_TIMEOUT_SECS") {
-        Ok(v) => match v.parse::<u64>() {
-            Ok(n) if n == 0 => {
-                eprintln!("WARN: PROBE_TIMEOUT_SECS={:?} is 0/invalid, clamped to 1s", v);
-                std::time::Duration::from_secs(1)
+    // #R26（第25轮 bug/low）：`std::env::var` 的 `Err(_)` 无法区分"未设置"(NotPresent) 与
+    // "设为非 UTF-8 值"(NotUnicode)——后者会静默落到最后分支回退默认、不带 WARN，与 doc 注释
+    // 宣称的"不可解析值告警"相悖，也和文件其它 env（REQUIRE_ONTOLOGIES_BIN/OPEN_ONTOLOGIES_BIN）
+    // 用 `var_os` 区分 set-非UTF-8 与 unset 的 fail-closed 语义不一致。改用 `var_os`：`None`(未设置)
+    // → 默认；`Some(非UTF-8)` → WARN + 回退默认（"set 了但读不出"是异常，必须告警而非装没看见）。
+    match std::env::var_os("PROBE_TIMEOUT_SECS") {
+        None => PROBE_TIMEOUT,
+        Some(os) => {
+            let v = os.to_string_lossy();
+            match v.parse::<u64>() {
+                Ok(n) if n == 0 => {
+                    eprintln!("WARN: PROBE_TIMEOUT_SECS={:?} is 0/invalid, clamped to 1s", v);
+                    std::time::Duration::from_secs(1)
+                }
+                Ok(n) if n > PROBE_TIMEOUT_MAX_SECS => {
+                    eprintln!(
+                        "WARN: PROBE_TIMEOUT_SECS={:?} exceeds hard max {}s, clamped to {}s",
+                        v, PROBE_TIMEOUT_MAX_SECS, PROBE_TIMEOUT_MAX_SECS
+                    );
+                    std::time::Duration::from_secs(PROBE_TIMEOUT_MAX_SECS)
+                }
+                Ok(n) => std::time::Duration::from_secs(n),
+                Err(_) => {
+                    eprintln!(
+                        "WARN: PROBE_TIMEOUT_SECS={:?} (non-UTF-8 or unparseable), falling back to default {}s",
+                        v, PROBE_TIMEOUT.as_secs()
+                    );
+                    PROBE_TIMEOUT
+                }
             }
-            Ok(n) if n > PROBE_TIMEOUT_MAX_SECS => {
-                eprintln!(
-                    "WARN: PROBE_TIMEOUT_SECS={:?} exceeds hard max {}s, clamped to {}s",
-                    v, PROBE_TIMEOUT_MAX_SECS, PROBE_TIMEOUT_MAX_SECS
-                );
-                std::time::Duration::from_secs(PROBE_TIMEOUT_MAX_SECS)
-            }
-            Ok(n) => std::time::Duration::from_secs(n),
-            Err(_) => {
-                eprintln!(
-                    "WARN: PROBE_TIMEOUT_SECS={:?} not parseable, falling back to default {}s",
-                    v, PROBE_TIMEOUT.as_secs()
-                );
-                PROBE_TIMEOUT
-            }
-        },
-        Err(_) => PROBE_TIMEOUT,
+        }
     }
 }
 
@@ -254,6 +268,66 @@ fn probe_help(bin: &str, budget: std::time::Duration) -> bool {
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
+}
+
+/// `--version` 身份校验（#R26 第25轮 other/low）：确认候选二进制**确实是 open-ontologies**，而非
+/// 任何碰巧通过 `--help` probe 的同名/无关工具。PATH 兜底路径此前只做可执行探测（fail-open 于
+/// "跑哪个二进制"），a stale/更早 PATH 上的同名二进制会被静默选中，违背文件中心的防假绿意图。
+/// 语义：spawn 失败、超时、非零退出、stdout 不包含 `open-ontologies` 标识 → 视为身份不符，返回
+/// false。与 `probe_help` 共用相同的超时语义（budget 已含剩余预算 clamp），保持"所有探测必超时"纪律。
+/// 注意：真实 `open-ontologies --version` 若输出带版本号（如 `open-ontologies 0.1.0`），子串匹配
+/// `open-ontologies` 既兼容纯名也兼容带版本号；大小写不敏感以兼容 `Open-Ontologies` 等变体字形。
+/// 实现纪律：**先 wait 再读 stdout**——`--version` 输出极小（远小于管道缓冲 64KB），子进程不会
+/// 因管道未消费而阻塞写，轮询 try_wait 能正常拿到退出状态；进程退出后管道 EOF，read_to_end 立即
+/// 返回。若在轮询中先阻塞 read_to_end，子进程挂死（不退出不关 stdout）时超时检查将永远执行不到
+/// ——必须避免。预算为调用方传入的剩余整体探测预算（与 probe_help 的 deadline 语义一致）。
+fn probe_identity(bin: &str, budget: std::time::Duration) -> bool {
+    let mut child = match std::process::Command::new(bin)
+        .arg("--version")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    let deadline = std::time::Instant::now() + budget;
+    // 阶段一：先轮询等退出（不读管道，靠"输出小不填缓冲"保证不阻塞写）。
+    loop {
+        match child.try_wait() {
+            Ok(Some(st)) => {
+                if !st.success() {
+                    return false;
+                }
+                break;
+            }
+            Ok(None) => {}
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+        }
+        if std::time::Instant::now() > deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    // 阶段二：进程已退出，管道 EOF，此时读 stdout 不会阻塞。
+    use std::io::Read;
+    let mut out = Vec::new();
+    if let Some(mut stdout) = child.stdout.take() {
+        let _ = stdout.read_to_end(&mut out);
+    }
+    let text = String::from_utf8_lossy(&out);
+    let lower = text.to_ascii_lowercase();
+    if !lower.contains("open-ontologies") {
+        eprintln!("WARN: candidate binary {bin:?} --version output lacks 'open-ontologies' identity: {text:?}");
+        return false;
+    }
+    true
 }
 
 /// RAII 临时目录守卫（#1 第12轮 security/low）：改用 `tempfile::TempDir`——随机名 + O_EXCL
