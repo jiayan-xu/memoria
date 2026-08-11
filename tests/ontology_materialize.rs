@@ -59,10 +59,12 @@ fn find_bin() -> Option<String> {
     // --help 探测失败/超时），套件必须在 REQUIRE=1 之外也硬失败——否则一个 stale/误配的
     // pinned 路径会让套件静默绿色通过而不跑真实物化，正是 R4-7 要防的假绿。显式设置本身
     // 即表达"必须用这个二进制"的意图，校验失败即 panic（权威配置>隐式回退）。
-    if found.is_none()
-        && std::env::var_os("OPEN_ONTOLOGIES_BIN").is_some()
-        && !std::env::var_os("OPEN_ONTOLOGIES_BIN").map(|v| v.is_empty()).unwrap_or(false)
-    {
+    // #R16（第16轮 maintainability/low）：OPEN_ONTOLOGIES_BIN 只读一次，避免两次 var_os 造成
+    // check-then-act 不一致与可读性差；与 locate_bin 的单次读取风格一致。非空即视为显式设置。
+    let explicit_bin = std::env::var_os("OPEN_ONTOLOGIES_BIN")
+        .map(|v| !v.is_empty())
+        .unwrap_or(false);
+    if found.is_none() && explicit_bin {
         panic!(
             "OPEN_ONTOLOGIES_BIN is set but invalid (not a file or --help probe failed); \
              refusing to silently skip materialization tests"
@@ -420,7 +422,7 @@ fn end_to_end_materialize_and_writeback() {
     // #R15（第15轮 test/low）：必须断言**精确计数**而非 `>=1`。DATA_TTL 的传递闭包只应推断
     // 恰好 1 条新 supersedes 边（docC supersedes docA）；重复插入或部分写入回归（如同一推断边
     // 写两次）会通过 `>=1` 却违反精确语义。查库数 supersedes 边数须 ==1，与单测级严格度一致。
-    assert_eq!(written, 1, "exactly 1 inferred supersedes edge written (DAT_TTL closure)");
+    assert_eq!(written, 1, "exactly 1 inferred supersedes edge written (DATA_TTL closure)");
     let supersedes_count: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM entity_edges WHERE namespace=?1 AND relation_type='supersedes'",
