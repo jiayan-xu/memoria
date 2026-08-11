@@ -54,7 +54,11 @@ fn find_bin() -> Option<String> {
         },
         Err(_) => false,
     };
-    let found = locate_bin();
+    // #R19（第19轮 maintainability/low）：OPEN_ONTOLOGIES_BIN **只读一次**（此处），沿调用链传给
+    // locate_bin，不再在 find_bin/locate_bin 各读一次——否则 `let found = locate_bin()` 先执行、
+    // explicit_bin 后读，两次观测可发散（其它线程改 env），check-then-act 窗口复燃。
+    let env_bin = std::env::var_os("OPEN_ONTOLOGIES_BIN");
+    let found = locate_bin(&env_bin);
     // #R15（第15轮 test/low）：任何显式设置 OPEN_ONTOLOGIES_BIN 的 CI，若路径无效（非文件/
     // --help 探测失败/超时），套件必须在 REQUIRE=1 之外也硬失败——否则一个 stale/误配的
     // pinned 路径会让套件静默绿色通过而不跑真实物化，正是 R4-7 要防的假绿。显式设置本身
@@ -65,7 +69,7 @@ fn find_bin() -> Option<String> {
     // "必须用这个二进制"，`.is_some()` 而非 `!is_empty()`。否则 `OPEN_ONTOLOGIES_BIN=''`（CI
     // 模板未填、export 后未赋值等常见情形）会让 explicit_bin=false，套件静默 skip 而不跑真实
     // 物化——正是 R4-7 要封死的假绿路径。空串校验必失败（is_file false），安全走下方硬失败。
-    let explicit_bin = std::env::var_os("OPEN_ONTOLOGIES_BIN").is_some();
+    let explicit_bin = env_bin.is_some();
     if found.is_none() && explicit_bin {
         panic!(
             "OPEN_ONTOLOGIES_BIN is set but invalid (not a file or --help probe failed); \
@@ -81,7 +85,7 @@ fn find_bin() -> Option<String> {
     found
 }
 
-fn locate_bin() -> Option<String> {
+fn locate_bin(_env_bin: &Option<std::ffi::OsString>) -> Option<String> {
     // 设计不变式（#R15 汇总，替代逐轮审查注释）：
     // 1. 权威 override：显式设置 OPEN_ONTOLOGIES_BIN 即表达"必须用它"，校验失败（非文件/
     //    --help 探测失败/超时）绝**不**回退 PATH 扫描，由 find_bin 硬失败（防 stale pinned
@@ -90,8 +94,11 @@ fn locate_bin() -> Option<String> {
     //    会静默回退重新打开假绿。非 UTF-8 值经 to_string_lossy 参与校验，仍权威失败。
     // #R17（第17轮 maintainability/low）：probe_timeout 在入口解析一次，沿调用链传给
     // probe_help，避免每次探测重复 var_os 读 PROBE_TIMEOUT_SECS（check-then-act 窗口）。
+    // #R19（第19轮 maintainability/low）：OPEN_ONTOLOGIES_BIN 由 find_bin 读一次后经 `_env_bin`
+    // 传入，本函数不再 `var_os("OPEN_ONTOLOGIES_BIN")` 重读——消除 find_bin/locate_bin 双读
+    // 造成的 check-then-act 窗口（find_bin 先跑 locate_bin 再算 explicit_bin，两次观测可发散）。
     let pt = probe_timeout();
-    if let Some(b_os) = std::env::var_os("OPEN_ONTOLOGIES_BIN") {
+    if let Some(b_os) = _env_bin {
         let b = b_os.to_string_lossy();
         // #R17：空串与其它无效值同语义——一旦 set 即"必须用它"，空串 is_file 必 false，
         // 校验失败返回 None，由 find_bin 硬失败（拒绝静默跳过），绝不回退 PATH 掩盖假绿。
@@ -263,16 +270,16 @@ fn setup_bin_and_fixtures(
     let guard = temp_dir(tag);
     let dir = guard.path().to_path_buf();
     let schema = dir.join("schema.ttl");
-    let data = dir.join("data.ttl");
+    let data_path = dir.join("data.ttl");
     std::fs::write(&schema, SCHEMA_TTL).unwrap();
-    std::fs::write(&data, DATA_TTL).unwrap();
+    std::fs::write(&data_path, DATA_TTL).unwrap();
     let cfg = OntologyConfig {
         bin: bin.into(),
         data_dir: dir.join("out"),
         schema_path: schema,
         timeout_secs: 60,
     };
-    Some((guard, cfg, data))
+    Some((guard, cfg, data_path))
 }
 
 /// #4（第10轮 maintainability/low）：共享的"docC supersedes docA 被推断"精确 IRI 断言。
@@ -312,7 +319,7 @@ fn assert_persisted_doc_c_supersedes_doc_a(conn: &rusqlite::Connection, ns: &str
 
 #[test]
 fn materialize_infers_transitive_supersedes() {
-    let (_guard, cfg, data) = match setup_bin_and_fixtures("materialize") {
+    let (_guard, cfg, data_path) = match setup_bin_and_fixtures("materialize") {
         Some(x) => x,
         None => {
             eprintln!(
@@ -322,7 +329,11 @@ fn materialize_infers_transitive_supersedes() {
             return;
         }
     };
-    let res = materialize(&cfg, &data.to_string_lossy(), "owl-rl").expect("materialize");
+    // #R19（第19轮 other/low）：fixture 路径本地生成，用 `to_str().expect` 显式失败而非
+    // `to_string_lossy()` 静默替换非 UTF-8 字节（否则 materialize 会打开不同的、不存在的文件，
+    // 报令人困惑的 "read source ttl" 错误）。变量名 data_path 明确其为路径而非 TTL 内容。
+    let res = materialize(&cfg, data_path.to_str().expect("fixture path must be UTF-8"), "owl-rl")
+        .expect("materialize");
     // OWL TransitiveProperty：docC supersedes docA 应被推断
     assert!(res.triples_after > res.triples_before, "expected inference");
     assert_inferred_doc_c_supersedes_doc_a(&res.inferred_edges);
@@ -410,7 +421,7 @@ fn write_back_edges_upserts_into_entity_edges() {
 /// 完整闭环：物化 → 写回 entity_edges，验证推断边真正进库。
 #[test]
 fn end_to_end_materialize_and_writeback() {
-    let (guard, cfg, data) = match setup_bin_and_fixtures("e2e") {
+    let (guard, cfg, data_path) = match setup_bin_and_fixtures("e2e") {
         Some(x) => x,
         None => {
             eprintln!(
@@ -421,7 +432,10 @@ fn end_to_end_materialize_and_writeback() {
         }
     };
     let dir = guard.path().to_path_buf();
-    let res = materialize(&cfg, &data.to_string_lossy(), "owl-rl").expect("materialize");
+    // #R19：同 materialize_infers_transitive_supersedes——to_str().expect 显式失败，非静默替换。
+    let res =
+        materialize(&cfg, data_path.to_str().expect("fixture path must be UTF-8"), "owl-rl")
+            .expect("materialize");
 
     let db = dir.join("mem.db");
     let engine = memoria_core::MemoriaEngine::new(&db.to_string_lossy()).expect("engine");
