@@ -285,8 +285,13 @@ pub fn materialize(
     // spawn 时刻路径已被符号链接占据；load+reason 窗口可能很长，能写 data_dir 的本地攻击者可在
     // 预占后 unlink 常规文件并预置符号链接，子进程 save 按路径覆盖写会沿链接写到任意可写文件。
     // 追加 8 字节不可预测随机数（getrandom），使攻击者无法预知路径，配合 O_NOFOLLOW 读兜底。
+    // #R18（第18轮 security/high）：getrandom 失败（EINTR/seccomp/旧内核）必须**传播错误**而非
+    // `let _ =` 静默丢弃——否则 rand_buf 保持全零，临时名退化回可预测的 `pid_seq_000...`，#R17
+    // 的 CWE-377 防御被静默架空（无日志无告警）。fail closed：熵不可得就不继续物化，与模块
+    // "错误必须传播"纪律一致。
     let mut rand_buf = [0u8; 8];
-    let _ = getrandom::getrandom(&mut rand_buf);
+    getrandom::getrandom(&mut rand_buf)
+        .map_err(|e| format!("getrandom failed (temp name entropy): {}", e))?;
     let uniq = format!(
         "{}_{}_{:016x}",
         std::process::id(),
@@ -402,7 +407,10 @@ pub fn materialize(
     });
 
     // 超时护栏：推理最坏指数复杂度，防止卡死。
-    let timeout = Duration::from_secs(cfg.timeout_secs);
+    // #R18（第18轮 bug/medium）：timeout_secs 是 pub 字段，调用方可直接构造 OntologyConfig 绕过
+    // from_env 的 clamp。此处 use 点再 clamp 一次，保证 `Instant::now() + bound` 不因溢出 panic
+    // （std::Add<Duration> 溢出会 expect panic），无论配置如何构造 no-panic 不变式都成立。
+    let timeout = Duration::from_secs(cfg.timeout_secs.min(MAX_TIMEOUT_SECS));
     let wait_start = Instant::now();
     let status = loop {
         match child.try_wait() {
@@ -433,21 +441,15 @@ pub fn materialize(
     };
     // 子进程已退出：join reader 线程，拿到完整输出。
     // #5（第9轮 bug/low + 第10轮 bug/medium）：成功路径既不能无界 join，也不能用太小的有界值。
-    // 第9轮曾改无界 join（担心 2s 有界值在慢管道 drain 时静默丢 JSON 行），但第10轮指出：
-    // 孙进程如果继承了 stdout/stderr 写端，即使直接子进程正常退出，read_to_string 仍不会撞 EOF，
-    // 无界 join 会永久阻塞，违背模块"子进程必须超时"的不变式（未来 MCP/web 触发时永久占用
-    // worker 线程）。正确折中：用 `cfg.timeout_secs` 作为 bound——足够大以覆盖慢盘/慢管道 drain
-    // （不会误丢正常输出），又保留超时护栏（孙进程持管道时不会永久挂起）。
-    let stdout = join_bounded(
-        stdout_reader,
-        Duration::from_secs(cfg.timeout_secs.max(1)),
-        String::new(),
-    );
-    let stderr = join_bounded(
-        stderr_reader,
-        Duration::from_secs(cfg.timeout_secs.max(1)),
-        String::new(),
-    );
+    // 第9轮曾改无界 join（担心慢管道 drain 时静默丢 JSON 行），但第10轮指出：孙进程如果继承了
+    // stdout/stderr 写端，即使直接子进程正常退出，read_to_string 仍不会撞 EOF，无界 join 会永久
+    // 阻塞（未来 MCP/web 触发时永久占用 worker 线程）。
+    // #R18（第18轮 bug/medium）：此前用 `cfg.timeout_secs.max(1)`（可达 86400s）作 bound——孙进程
+    // 持管道时该 join 会阻塞近一天才超时，实际近于无界，违背"子进程必须超时"。直接子进程已退出，
+    // 输出只需 drain，用固定小上界（2s，与其它错误路径一致）即可：既覆盖正常输出 flush，又在孙
+    // 进程持管道时快速返回（不阻塞调用方、不丢已读部分）。
+    let stdout = join_bounded(stdout_reader, Duration::from_secs(2), String::new());
+    let stderr = join_bounded(stderr_reader, Duration::from_secs(2), String::new());
     if !status.success() {
         return Err(format!(
             "open-ontologies batch failed: {} (stderr: {})",
@@ -623,9 +625,15 @@ fn read_ttl_no_follow(path: &std::path::Path) -> Result<String, String> {
 }
 
 /// Windows 版本：无 `O_NOFOLLOW`，用 `symlink_metadata`（不跟随链接）确认非符号链接，
-/// 再确认常规文件，最后读取。create_new 预占已收窄竞态。
+/// 再确认常规文件，最后**通过已打开的句柄**读取。create_new 预占已收窄竞态。
+/// #R18（第18轮 security/medium）：此前 `symlink_metadata` 检查后 `std::fs::read_to_string(path)`
+/// 按名重开——check-read 之间路径可被换成 symlink/junction（目录 junction/reparse point 创建不
+/// 需管理员；dev/CI 常提权运行），使 FIFO 阻塞 DoS 与内容替换在 Windows 上仍部分敞开。改为
+/// `File::open` 打开一次句柄，在句柄上 fstat 校验 + 通过句柄读：路径在 open 后被替换不影响
+/// 已打开的真实文件，与 Unix 的持句柄读一致。
 #[cfg(windows)]
 fn read_ttl_no_follow(path: &std::path::Path) -> Result<String, String> {
+    use std::io::Read;
     let sm = std::fs::symlink_metadata(path)
         .map_err(|e| format!("lstat ttl {}: {}", path.display(), e))?;
     if sm.file_type().is_symlink() {
@@ -637,7 +645,22 @@ fn read_ttl_no_follow(path: &std::path::Path) -> Result<String, String> {
             path.display()
         ));
     }
-    std::fs::read_to_string(path).map_err(|e| format!("read ttl {}: {}", path.display(), e))
+    // 打开一次句柄，之后全部经句柄操作（fstat + 读），不按名重开——关闭 check-read TOCTOU。
+    let mut f = std::fs::File::open(path)
+        .map_err(|e| format!("open ttl {}: {}", path.display(), e))?;
+    let md = f
+        .metadata()
+        .map_err(|e| format!("fstat ttl {}: {}", path.display(), e))?;
+    if !md.is_file() {
+        return Err(format!(
+            "{} is not a regular file (possible fifo/device)",
+            path.display()
+        ));
+    }
+    let mut s = String::new();
+    f.read_to_string(&mut s)
+        .map_err(|e| format!("read ttl {}: {}", path.display(), e))?;
+    Ok(s)
 }
 
 /// 把路径规范为 open-ontologies 可识别的形式。
@@ -1237,7 +1260,32 @@ pub fn write_back_edges(
             // 引用同一 IRI 时实体行会"翻动"到最后写它的命名空间，而既有边仍带各自 namespace，
             // 分歧只是从"首个拥有者"变成"最后写入者"，查询 join 仍不一致。故保持 DO NOTHING
             // （首个拥有者语义），不静默改租户归属；实体 id 用完整 IRI 已尽量降低撞名概率（#6）。
+            // #R18（第18轮 security/medium）：es.entities.id 是全局 PK，entity_edges 按行带
+            // namespace——多租户引用同一 IRI 时，第二个租户的边 FK 指向第一个租户的 entity 行，
+            // 该行的 name/aliases/summary 经共享行对第二个租户可见，且第二个租户按 namespace 统计
+            // 实体时该行不计入（graph build_graph 分歧）。完整修复需把 namespace 并入 entities
+            // 复合主键（跨 schema 迁移 + entity_mentions/entity_edges 复合 FK），属独立数据模型
+            // 任务，不在本骨架热循环内强改（避免大范围迁移引入回归）。此处做**防御性检测**：
+            // 当实体 id 已存在但 namespace 不同（跨租户撞名）时显式告警，暴露此前被 ON CONFLICT
+            // DO NOTHING 静默掩盖的串扰，供运维/后续迁移决策；实体行保持首个 owner 语义。
             for (eid, ename) in [(s.as_str(), sname.as_str()), (o.as_str(), oname.as_str())] {
+                let existing_ns: Option<String> = tx
+                    .query_row(
+                        "SELECT namespace FROM entities WHERE id = ?1",
+                        rusqlite::params![eid],
+                        |r| r.get(0),
+                    )
+                    .ok();
+                if let Some(existing) = existing_ns {
+                    if existing != namespace {
+                        eprintln!(
+                            "WARN: entity {} already owned by namespace {:?}, cannot re-owner as {:?}; \
+                             share row but per-namespace graph isolation may be lossy (see R18)",
+                            eid, existing, namespace
+                        );
+                        continue; // 跳过 upsert，保持首个 owner；不静默覆盖
+                    }
+                }
                 tx.execute(
                     "INSERT INTO entities(id, namespace, entity_type, name, aliases, summary)
                      VALUES(?1, ?2, 'concept', ?3, '[]', NULL)
@@ -1403,7 +1451,7 @@ pub fn status(cfg: &OntologyConfig) -> Result<String, String> {
         if let Some(mut e) = se { let _ = e.read_to_string(&mut b); }
         b
     });
-    let timeout = Duration::from_secs(cfg.timeout_secs);
+    let timeout = Duration::from_secs(cfg.timeout_secs.min(MAX_TIMEOUT_SECS));
     let wait_start = Instant::now();
     let status = loop {
         match child.try_wait() {
