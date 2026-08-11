@@ -31,10 +31,16 @@ const DATA_TTL: &str = r#"@prefix : <http://memoria.ai/onto/> .
 /// 仅当显式设置了 OPEN_ONTOLOGIES_BIN 且路径存在、或二进制确定在 PATH 上时才返回 Some，
 /// 避免在无二进制的环境（如 CI runner）误判后 spawn 失败。
 fn find_bin() -> Option<String> {
-    // env 值先做 is_file() 校验：指向失效/不存在路径时视为无二进制 → 跳过，
-    // 避免后续 materialize(...).expect(...) 因 spawn 失败而 panic。
+    // env 值先做 is_file() 校验 + 可执行探测（--help 能 spawn），缺失/不可执行则跳过，
+    // 避免后续 materialize(...).expect(...) 因 spawn 失败而 panic（#R3-1）。
     if let Ok(b) = std::env::var("OPEN_ONTOLOGIES_BIN") {
-        if !b.is_empty() && std::path::Path::new(&b).is_file() {
+        if !b.is_empty()
+            && std::path::Path::new(&b).is_file()
+            && std::process::Command::new(&b)
+                .arg("--help")
+                .output()
+                .is_ok()
+        {
             return Some(b);
         }
     }
@@ -188,14 +194,16 @@ fn end_to_end_materialize_and_writeback() {
     let (written, _) = write_back_edges(&conn, ns, &res.inferred_edges).expect("write_back");
     assert!(written >= 1, "at least 1 inferred edge written");
 
-    // 验证**具体推断边** docC supersedes docA 在库里（#123）：
-    // 因 DATA_TTL 用完整 IRI，inferred_edges 只含真正新增的推断边，
-    // 若传递推理回归（docC supersedes docA 不再被推断）则此断言失败。
+    // 验证**具体推断边** docC supersedes docA 在库里（#123/#R3-10）：
+    // 因 DATA_TTL 用完整 IRI，inferred_edges 只含真正新增的推断边；
+    // 用精确 IRI 相等（而非 LIKE）钉死实体 id 存完整 IRI 的契约，若传递推理或
+    // 存储格式回归则失败。
     let found: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM entity_edges
              WHERE namespace=?1 AND relation_type='supersedes'
-               AND source_entity_id LIKE '%docC' AND target_entity_id LIKE '%docA'",
+               AND source_entity_id='http://memoria.ai/onto/docC'
+               AND target_entity_id='http://memoria.ai/onto/docA'",
             params![ns],
             |r| r.get(0),
         )

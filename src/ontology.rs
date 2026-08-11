@@ -29,6 +29,27 @@ const DEFAULT_TIMEOUT_SECS: u64 = 60;
 /// 拒绝含空白/;/" 的任意串（会向 batch 注入额外参数/指令）。
 const VALID_PROFILES: &[&str] = &["rdfs", "owl-rl", "owl-dl", "owl-full"];
 
+/// 单调递增序号，用于临时文件名的唯一性（#R3-8）。
+/// pid + 单调序列（而非依赖 SystemTime 纳秒的粗粒度时钟），并发调用绝不碰撞。
+static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// 临时文件 RAII 守卫（#R3-6）：持有 batch 脚本路径，drop 时删除，
+/// 确保 spawn 失败 / 超时 / 解析失败等**所有**退出路径都清理临时文件，防磁盘耗尽。
+struct BatchFileGuard(std::path::PathBuf);
+impl BatchFileGuard {
+    fn new(p: std::path::PathBuf) -> Self {
+        BatchFileGuard(p)
+    }
+    fn path(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+impl Drop for BatchFileGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
 /// 物化结果：导出文件路径 + 从 TTL 解析出的推断边。
 #[derive(Debug, Default)]
 pub struct MaterializeResult {
@@ -88,11 +109,14 @@ pub fn materialize(
 ) -> Result<MaterializeResult, String> {
     let start = Instant::now();
     let _ = std::fs::create_dir_all(&cfg.data_dir);
-    // 每次调用用唯一文件名（pid + 纳秒时间戳），避免并发调用（CLI + 定时任务 / 未来
-    // MCP/web 触发）互相覆盖 script/output，导致读到他方半写文件（#7）。
-    let uniq = format!("{}_{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0));
+    // 每次调用用唯一文件名（pid + 单调序列），避免并发调用（CLI + 定时任务 / 未来
+    // MCP/web 触发）互相覆盖 script/output，导致读到他方半写文件（#7/#R3-8）。
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let uniq = format!("{}_{}", std::process::id(), seq);
     let batch_file = cfg.data_dir.join(format!("materialize_{}.batch", uniq));
     let out_ttl = cfg.data_dir.join(format!("materialized_{}.ttl", uniq));
+    // RAII：batch 脚本在任意退出路径（spawn 失败/超时/解析失败…）都被删除，#R3-6。
+    let batch_guard = BatchFileGuard::new(batch_file.clone());
 
     // 安全校验（#115/#117 命令注入）：profile 白名单 + source 拒绝危险字符。
     // 换行会注入额外的 load/reason/save 指令；profile 含空白/;/" 会向 batch 注入额外参数。
@@ -105,8 +129,8 @@ pub fn materialize(
         ));
     }
     if source_ttl.contains(['\n', '\r', '"', ';']) {
-    return Err("invalid source_ttl: control chars / quote / semicolon not allowed".to_string());
-}
+        return Err("invalid source_ttl: control chars / quote / semicolon not allowed".to_string());
+    }
     // 物化前解析源 TTL 的显式目标关系边集，供物化后 diff 出真正的新增推断边（#113）。
     let source_edges: std::collections::HashSet<(String, String, String)> = {
         let src = std::fs::read_to_string(source_ttl)
@@ -120,8 +144,11 @@ pub fn materialize(
     let mut script = String::new();
     if cfg.schema_path.exists() {
         let sp = cfg.schema_path.to_string_lossy();
-        if sp.contains('"') {
-            return Err("invalid schema_path: double quote not allowed".to_string());
+        // #R3-7：schema_path 也做与 source_ttl 相同的危险字符校验（换行/引号/分号），
+        // 否则 crafted env 可注入额外 batch 指令。其它 env 派生路径（data_dir）由唯一名
+        // 自生成不含危险字符；bin 仅用于 spawn 不走 batch 脚本注入面。
+        if sp.contains(['\n', '\r', '"', ';']) {
+            return Err("invalid schema_path: control chars / quote / semicolon not allowed".to_string());
         }
         script.push_str(&format!("load {}\n", win_path_quoted(&cfg.schema_path)));
     } else {
@@ -137,12 +164,12 @@ pub fn materialize(
         profile,
         win_path_quoted(&out_ttl)
     ));
-    std::fs::write(&batch_file, script)
+    std::fs::write(batch_guard.path(), script)
         .map_err(|e| format!("write batch script: {}", e))?;
 
     let mut child = Command::new(&cfg.bin)
         .arg("batch")
-        .arg(win_path(&batch_file))
+        .arg(win_path(batch_guard.path()))
         .arg("--data-dir")
         .arg(win_path(&cfg.data_dir))
         .stdout(std::process::Stdio::piped())
@@ -175,8 +202,18 @@ pub fn materialize(
     let timeout = Duration::from_secs(cfg.timeout_secs);
     let wait_start = Instant::now();
     let status = loop {
-        if let Some(st) = child.try_wait().map_err(|e| format!("wait: {}", e))? {
-            break st;
+        match child.try_wait() {
+            Ok(Some(st)) => break st,
+            Ok(None) => {}
+            Err(e) => {
+                // try_wait 出错（EINTR / Windows handle）：必须 kill + wait + join reader，
+                // 否则子进程继续跑、reader 线程阻塞在 read_to_string，泄漏失控进程（#R3-3）。
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = stdout_reader.join();
+                let _ = stderr_reader.join();
+                return Err(format!("wait: {}", e));
+            }
         }
         if wait_start.elapsed() > timeout {
             let _ = child.kill();
@@ -237,9 +274,8 @@ pub fn materialize(
         .cloned()
         .collect();
 
-    // 清理临时 batch 脚本（#119）：避免反复物化累积临时文件致磁盘耗尽。
+    // batch 脚本由 BatchFileGuard 在函数返回时自动删除（含成功路径，#R3-6）。
     // out_ttl 视为产物保留，供调用方消费后自行清理。
-    let _ = std::fs::remove_file(&batch_file);
 
     Ok(MaterializeResult {
         output_path: out_ttl.to_string_lossy().to_string(),
@@ -342,7 +378,7 @@ fn parse_ttl_edges(ttl: &str) -> Vec<(String, String, String)> {
         let new_block = line.starts_with('<') && prev_sep.is_none();
         if new_block {
             // 主语
-            if let Some(t) = tokens.get(0) {
+            if let Some(t) = tokens.first() {
                 if t.starts_with('<') {
                     subj = Some(t[1..t.len() - 1].to_string());
                     pred = None;
@@ -351,12 +387,18 @@ fn parse_ttl_edges(ttl: &str) -> Vec<(String, String, String)> {
             }
         } else if line.starts_with('<') && prev_sep == Some(';') {
             // 续行且上一行以 `;` 结尾：行首 IRI 是新谓词（沿用 subj）。
-            if let Some(t) = tokens.get(0) {
+            if let Some(t) = tokens.first() {
                 if t.starts_with('<') {
                     pred = Some(t[1..t.len() - 1].to_string());
                     i = 1;
                 }
             }
+        } else if !line.starts_with('<') && prev_sep.is_none() {
+            // 行首不是 `<` 且非续行：blank node 主语（`_:b0 ...` / `[...] ...`）
+            // 或其它非 IRI 主语。若沿用上一块的 stale subj/pred 会产出错误边，
+            // 因此重置 subj/pred，避免 `(prevSubj, supersedes, docA)` 这类伪边（#R3-2）。
+            subj = None;
+            pred = None;
         }
         while i < tokens.len() {
             let tok = &tokens[i];
@@ -404,6 +446,9 @@ fn parse_ttl_edges(ttl: &str) -> Vec<(String, String, String)> {
 }
 
 /// 把一行 TTL 切成 token：`<iri>` 整体 + `;``,` 分隔符。
+///
+/// 跳过引号字面量跨度（`"foo,bar"` / `"x;y"`）：字面量内的 `,`/`;` 不是 Turtle
+/// 分隔符，不得触发状态机（否则会误清 pred / 错连 stale subj，#R3-5）。
 fn tokenize_ttl(line: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut rest = line;
@@ -416,13 +461,21 @@ fn tokenize_ttl(line: &str) -> Vec<String> {
             } else {
                 break;
             }
+        } else if b == b'"' || b == b'\'' {
+            // 引号字面量：跳到配对的闭合引号（简单处理，不处理转义 —— 字面量内分隔符直接略过）
+            let quote = b;
+            if let Some(end) = rest[1..].find(quote as char) {
+                rest = &rest[end + 2..];
+            } else {
+                break;
+            }
         } else if b == b';' || b == b',' {
             out.push(rest[..1].to_string());
             rest = &rest[1..];
         } else {
             // 跳过空白及 `a` 等裸 token（逐字符推进到下一个 < 或分隔符）
             let next = rest
-                .find(['<', ';', ','])
+                .find(['<', ';', ',', '"', '\''])
                 .unwrap_or(rest.len());
             if next == 0 {
                 rest = &rest[1..];
@@ -524,6 +577,10 @@ fn iri_local_name(iri: &str) -> String {
 
 /// 把 TTL 关系的完整 IRI/短名映射到 RELATION_TYPES 短名。
 /// 返回 None = 该校验规则不属于受控枚举（跳过写回）。
+///
+/// 只认显式白名单的 OWL 通用语义边（#R3-4）：不再对任意命名空间的局部名做
+/// fallback 匹配——`http://foreign-vendor/onto#references` 这类无关词汇的局部名
+/// 即使撞上 RELATION_TYPES 也不得写成语义边，否则违背"防垃圾边"意图。
 fn map_relation_iri(pred: &str) -> Option<String> {
     let short = pred
         .rsplit(|c| c == '/' || c == '#')
@@ -537,7 +594,6 @@ fn map_relation_iri(pred: &str) -> Option<String> {
         "dependsOn" | "depends_on" => Some("depends_on".to_string()),
         "partOf" | "part_of" => Some("part_of".to_string()),
         "belongsTo" | "belongs_to" => Some("belongs_to".to_string()),
-        _ if crate::tools::graph::is_valid_relation_type(short) => Some(short.to_string()),
         _ => None,
     }
 }
@@ -546,30 +602,65 @@ fn map_relation_iri(pred: &str) -> Option<String> {
 /// 返回 (进程是否可 spawn, 健康描述)。
 pub fn status(cfg: &OntologyConfig) -> Result<String, String> {
     let start = Instant::now();
-    let out = Command::new(&cfg.bin)
+    // #R3-9：--help 探测也带超时（沿本模块"子进程必须超时"规矩），
+    // 避免挂死的二进制无限阻塞探活。
+    let mut child = Command::new(&cfg.bin)
         .arg("--help")
-        .output()
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
         .map_err(|e| format!("spawn open-ontologies: {} (未安装？)", e))?;
-    let stderr_txt = String::from_utf8_lossy(&out.stderr);
-    let stdout_txt = String::from_utf8_lossy(&out.stdout);
+    use std::io::Read;
+    let so = child.stdout.take();
+    let se = child.stderr.take();
+    let stdout_reader = std::thread::spawn(move || {
+        let mut b = String::new();
+        if let Some(mut o) = so { let _ = o.read_to_string(&mut b); }
+        b
+    });
+    let stderr_reader = std::thread::spawn(move || {
+        let mut b = String::new();
+        if let Some(mut e) = se { let _ = e.read_to_string(&mut b); }
+        b
+    });
+    let timeout = Duration::from_secs(cfg.timeout_secs);
+    let wait_start = Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(st)) => break Some(st),
+            Ok(None) => {}
+            Err(_) => {
+                // kill + wait 让子进程退出；reader 线程因 EOF 自然结束，下方统一 join。
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+        }
+        if wait_start.elapsed() > timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let stdout_txt = stdout_reader.join().unwrap_or_default();
+    let stderr_txt = stderr_reader.join().unwrap_or_default();
     let detected = if stdout_txt.contains("serve-http") || stderr_txt.contains("serve-http") {
         "serve-http 可用"
     } else {
         "serve-http 未检测到"
     };
-    Ok(format!(
+    let ok = matches!(status, Some(st) if st.success());
+    let msg = format!(
         "open-ontologies 可执行: {} ({})\nbin: {}\ndata: {}\nschema: {}\ndetected: {}",
         cfg.bin.display(),
-        if out.status.success() { "OK" } else { "FAIL" },
+        if ok { "OK" } else { "FAIL/超时" },
         cfg.bin.display(),
         cfg.data_dir.display(),
         cfg.schema_path.display(),
         detected,
-    ))
-    .map(|s| {
-        // 保留耗时信息
-        format!("{}\ncheck_ms: {}", s, start.elapsed().as_millis())
-    })
+    );
+    Ok(format!("{}\ncheck_ms: {}", msg, start.elapsed().as_millis()))
 }
 
 #[cfg(test)]
