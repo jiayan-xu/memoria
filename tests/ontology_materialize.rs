@@ -60,10 +60,12 @@ fn find_bin() -> Option<String> {
     // pinned 路径会让套件静默绿色通过而不跑真实物化，正是 R4-7 要防的假绿。显式设置本身
     // 即表达"必须用这个二进制"的意图，校验失败即 panic（权威配置>隐式回退）。
     // #R16（第16轮 maintainability/low）：OPEN_ONTOLOGIES_BIN 只读一次，避免两次 var_os 造成
-    // check-then-act 不一致与可读性差；与 locate_bin 的单次读取风格一致。非空即视为显式设置。
-    let explicit_bin = std::env::var_os("OPEN_ONTOLOGIES_BIN")
-        .map(|v| !v.is_empty())
-        .unwrap_or(false);
+    // check-then-act 不一致与可读性差。
+    // #R17（第17轮 bug/medium）：空值语义须与 locate_bin 统一——一旦 set（含空串）即表达
+    // "必须用这个二进制"，`.is_some()` 而非 `!is_empty()`。否则 `OPEN_ONTOLOGIES_BIN=''`（CI
+    // 模板未填、export 后未赋值等常见情形）会让 explicit_bin=false，套件静默 skip 而不跑真实
+    // 物化——正是 R4-7 要封死的假绿路径。空串校验必失败（is_file false），安全走下方硬失败。
+    let explicit_bin = std::env::var_os("OPEN_ONTOLOGIES_BIN").is_some();
     if found.is_none() && explicit_bin {
         panic!(
             "OPEN_ONTOLOGIES_BIN is set but invalid (not a file or --help probe failed); \
@@ -86,14 +88,19 @@ fn locate_bin() -> Option<String> {
     //    路径被 PATH 上另一个二进制掩盖造成假绿）。
     // 2. 用 var_os 检测"是否设置"而非 var().ok()——后者对非 UTF-8 值与"未设置"无法区分，
     //    会静默回退重新打开假绿。非 UTF-8 值经 to_string_lossy 参与校验，仍权威失败。
+    // #R17（第17轮 maintainability/low）：probe_timeout 在入口解析一次，沿调用链传给
+    // probe_help，避免每次探测重复 var_os 读 PROBE_TIMEOUT_SECS（check-then-act 窗口）。
+    let pt = probe_timeout();
     if let Some(b_os) = std::env::var_os("OPEN_ONTOLOGIES_BIN") {
         let b = b_os.to_string_lossy();
+        // #R17：空串与其它无效值同语义——一旦 set 即"必须用它"，空串 is_file 必 false，
+        // 校验失败返回 None，由 find_bin 硬失败（拒绝静默跳过），绝不回退 PATH 掩盖假绿。
         if b.is_empty() {
-            return None; // 显式空值 = 明确禁用，不回退
+            return None;
         }
         // env 值先做 is_file() 校验 + 可执行探测（--help 能 spawn），失败即权威地返回 None，
         // 避免后续 materialize(...).expect(...) 因 spawn 失败而 panic 或跑错二进制（#R3-1）。
-        if std::path::Path::new(&*b).is_file() && probe_help(&b, probe_timeout()) {
+        if std::path::Path::new(&*b).is_file() && probe_help(&b, pt) {
             return Some(b.into_owned());
         }
         return None; // 显式设置但校验失败 → 权威失败，不回退 PATH
@@ -139,7 +146,8 @@ fn locate_bin() -> Option<String> {
                 return None; // 剩余预算不足，放弃扫描
             }
             if let Some(s) = exe.to_str() {
-                if probe_help(s, remaining) {
+                // #R17：budget = min(单次探测超时, 剩余整体预算)，与 probe_help 的 deadline 语义一致
+                if probe_help(s, pt.min(remaining)) {
                     return Some(s.to_string());
                 }
             }
@@ -196,9 +204,10 @@ fn probe_timeout() -> std::time::Duration {
 /// 用 `std::process::Child::wait_timeout` 无法直接获得（std 无此 API），故用
 /// `spawn` + 轮询 `try_wait` + 超时 kill 的既有模式。
 /// #2（第12轮 bug/low）：`budget` 为调用方传入的**剩余整体探测预算**；本次探测的 deadline =
-/// `min(probe_timeout, budget)`。这样 PATH 扫描中在 scan_deadline 前一刻发现的候选，其探测
-/// 不会超过剩余预算，把 30s 整体预算做成真实硬上界（此前探测只要在 deadline 前启动就跑满
-/// 整个 PROBE_TIMEOUT，最坏 ~40s，注释宣称的"硬预算"名不副实）。
+/// `budget`（调用方已按 `probe_timeout().min(剩余预算)` 语义给出，见 find_bin/locate_bin）。
+/// #R17（第17轮 maintainability/low）：`probe_help` 不再内部重复 `probe_timeout()`——否则同一
+/// env 每次探测被解析两次，且与 find_bin/locate_bin 的"单次读取"约定相悖（check-then-act 窗口）。
+/// 调用方在入口解析一次 probe_timeout 后沿调用链传入，探测一致的超时语义。
 fn probe_help(bin: &str, budget: std::time::Duration) -> bool {
     let mut child = match std::process::Command::new(bin)
         .arg("--help")
@@ -209,7 +218,7 @@ fn probe_help(bin: &str, budget: std::time::Duration) -> bool {
         Ok(c) => c,
         Err(_) => return false,
     };
-    let cap = probe_timeout().min(budget);
+    let cap = budget;
     let deadline = std::time::Instant::now() + cap;
     loop {
         match child.try_wait() {
