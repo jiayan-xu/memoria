@@ -36,8 +36,38 @@ const DATA_TTL: &str = r#"@prefix : <http://memoria.ai/onto/> .
 /// #R4-7：设置 `REQUIRE_ONTOLOGIES_BIN=1` 时，找不到二进制直接 panic（CI 硬要求），
 /// 而不是静默 skip——防止 CI 上"测试绿了但实际没跑真实物化"的假绿通过门禁。
 fn find_bin() -> Option<String> {
-    let require = std::env::var("REQUIRE_ONTOLOGIES_BIN").map(|v| v == "1").unwrap_or(false);
+    // #R15（第15轮 test/low）：REQUIRE_ONTOLOGIES_BIN 接受常见真值（1/true/yes/on），
+    // 而非只认字面量 "1"——"true"/"yes" 等 CI 常见写法此前被静默当作未设置，硬失败门禁
+    // 悄悄失效、套件静默 skip（防假绿工具自身成了假绿源）。空/"0"/"false"/"no"/"off" 视为
+    // 未要求；其它未知值发出警示（既不强真也不静默忽略）。
+    let require = match std::env::var("REQUIRE_ONTOLOGIES_BIN") {
+        Ok(v) => match v.to_ascii_lowercase().as_str() {
+            "" | "0" | "false" | "no" | "off" => false,
+            "1" | "true" | "yes" | "on" => true,
+            other => {
+                eprintln!(
+                    "WARN: REQUIRE_ONTOLOGIES_BIN={:?} unrecognized, treating as unset",
+                    other
+                );
+                false
+            }
+        },
+        Err(_) => false,
+    };
     let found = locate_bin();
+    // #R15（第15轮 test/low）：任何显式设置 OPEN_ONTOLOGIES_BIN 的 CI，若路径无效（非文件/
+    // --help 探测失败/超时），套件必须在 REQUIRE=1 之外也硬失败——否则一个 stale/误配的
+    // pinned 路径会让套件静默绿色通过而不跑真实物化，正是 R4-7 要防的假绿。显式设置本身
+    // 即表达"必须用这个二进制"的意图，校验失败即 panic（权威配置>隐式回退）。
+    if found.is_none()
+        && std::env::var_os("OPEN_ONTOLOGIES_BIN").is_some()
+        && !std::env::var_os("OPEN_ONTOLOGIES_BIN").map(|v| v.is_empty()).unwrap_or(false)
+    {
+        panic!(
+            "OPEN_ONTOLOGIES_BIN is set but invalid (not a file or --help probe failed); \
+             refusing to silently skip materialization tests"
+        );
+    }
     if found.is_none() && require {
         panic!(
             "REQUIRE_ONTOLOGIES_BIN=1 but open-ontologies binary not found \
@@ -48,15 +78,12 @@ fn find_bin() -> Option<String> {
 }
 
 fn locate_bin() -> Option<String> {
-    // #1（第9轮 maintainability/low）：`OPEN_ONTOLOGIES_BIN` 是显式 override，一旦设置就必须
-    // 权威——若校验失败（非文件 / --help 探测失败或超时），直接返回 None（REQUIRE=1 下
-    // find_bin 会 panic），**绝不静默回退到 PATH 扫描**。否则 CI 里一个 stale/损坏的 pinned
-    // 路径会被 PATH 上恰好存在的另一个 open-ontologies 二进制掩盖，产出"跑错了可执行文件"
-    // 的假绿（或对错误版本报错，令人困惑）。
-    // #1（第10轮 bug/low）：必须用 `var_os`（OsString）检测"是否设置"，而非 `var().ok()`——
-    // 后者对非 UTF-8 值返回 `Err(NotUnicode)` → `.ok()` 映射为 None，与"未设置"无法区分，
-    // 会静默回退到 PATH 扫描，恰好重新打开上面要防的假绿场景。用 var_os 后，非 UTF-8 值用
-    // to_string_lossy 也能参与校验，且依旧权威失败不回退。
+    // 设计不变式（#R15 汇总，替代逐轮审查注释）：
+    // 1. 权威 override：显式设置 OPEN_ONTOLOGIES_BIN 即表达"必须用它"，校验失败（非文件/
+    //    --help 探测失败/超时）绝**不**回退 PATH 扫描，由 find_bin 硬失败（防 stale pinned
+    //    路径被 PATH 上另一个二进制掩盖造成假绿）。
+    // 2. 用 var_os 检测"是否设置"而非 var().ok()——后者对非 UTF-8 值与"未设置"无法区分，
+    //    会静默回退重新打开假绿。非 UTF-8 值经 to_string_lossy 参与校验，仍权威失败。
     if let Some(b_os) = std::env::var_os("OPEN_ONTOLOGIES_BIN") {
         let b = b_os.to_string_lossy();
         if b.is_empty() {
@@ -70,15 +97,11 @@ fn locate_bin() -> Option<String> {
         return None; // 显式设置但校验失败 → 权威失败，不回退 PATH
     }
     // 未显式设置：才走 PATH 遍历。不在 PATH 上则 None（测试跳过）。
-    // #2（第7轮 bug/low）：不再 shell 到 `where`/`which`——(a) Windows 的 `where` 用控制台
-    // 代码页（如 GBK）输出，非 ASCII 安装路径会被 from_utf8_lossy 乱码，误判"未找到"；
-    // (b) `where` 会顺带搜 CWD，可能选中过时/无关的同名文件。改为直接遍历 `split_paths(PATH)`
-    // 并对每个候选 dir 里的 `open-ontologies(.exe)` 用 probe_help 探测（无编码问题、不搜 CWD）。
+    // 不用 `where`/`which`：Windows 控制台代码页（GBK）会让非 ASCII 安装路径乱码误判"未找到"，
+    // 且 `where` 会顺带搜 CWD 可能选中过时文件。直接遍历 split_paths(PATH) 并对候选探测。
     let path_var = std::env::var_os("PATH")?;
-    // #3（第10轮 performance/low）：PATH 探测需要**整体预算**，否则单个挂死候选阻塞 N×10s
-    // （N = PATH 条目数），与文件自身"#R4-6 所有探测必须带超时"的规则只约束了单次探测、
-    // 未约束整体相矛盾。用共享 deadline 在循环内检查，到点即放弃扫描返回 None（REQUIRE=1 下
-    // find_bin panic，CI 不会无限等）。
+    // PATH 探测需**整体预算**：单个挂死候选阻塞 N×10s（N=PATH 条目数），与"所有探测必须带
+    // 超时"只约束单次、不约束整体相矛盾。用共享 deadline 循环内检查，到点放弃返回 None。
     let scan_deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     for dir in std::env::split_paths(&path_var) {
         // #2（第10轮 bug/low）：split_paths 对空 PATH 条目（前导/尾随/连续冒号）产出空分量，
@@ -394,7 +417,18 @@ fn end_to_end_materialize_and_writeback() {
     let conn = engine.pool.get().unwrap();
     let ns = "agent/onto";
     let (written, _) = write_back_edges(&conn, ns, &res.inferred_edges).expect("write_back");
-    assert!(written >= 1, "at least 1 inferred edge written");
+    // #R15（第15轮 test/low）：必须断言**精确计数**而非 `>=1`。DATA_TTL 的传递闭包只应推断
+    // 恰好 1 条新 supersedes 边（docC supersedes docA）；重复插入或部分写入回归（如同一推断边
+    // 写两次）会通过 `>=1` 却违反精确语义。查库数 supersedes 边数须 ==1，与单测级严格度一致。
+    assert_eq!(written, 1, "exactly 1 inferred supersedes edge written (DAT_TTL closure)");
+    let supersedes_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM entity_edges WHERE namespace=?1 AND relation_type='supersedes'",
+            params![ns],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(supersedes_count, 1, "exactly 1 supersedes edge persisted in entity_edges");
 
     // 验证**具体推断边** docC supersedes docA 在库里（#123/#R3-10）：
     // 因 DATA_TTL 用完整 IRI，inferred_edges 只含真正新增的推断边。
