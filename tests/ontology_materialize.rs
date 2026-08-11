@@ -105,7 +105,14 @@ fn locate_bin() -> Option<String> {
             // 挂死候选在 deadline 前一刻被发现仍可耗尽整个 PROBE_TIMEOUT（默认 10s），使注释
             // 宣称的"整体探测超时，放弃扫描"硬预算形同虚设。第12轮把**剩余预算**传给 probe_help
             // （deadline=min(PROBE_TIMEOUT, 剩余)），探测不会超过剩余预算，30s 整体预算成为真实上界。
+            // #2（第13轮 bug/low）：deadline 刚过时 remaining≈0，cap=min(PROBE_TIMEOUT, 0)≈0，
+            // probe_help 仍会 spawn 子进程然后在首次 deadline 检查立即 kill——纯因边界竞态误拒
+            // 健康二进制（spurious skip 或 REQUIRE=1 下假 panic）。剩余预算过小时跳过探测，不
+            // spawn 一个必然被杀的进程。
             let remaining = scan_deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.as_millis() < 100 {
+                return None; // 剩余预算不足，放弃扫描
+            }
             if let Some(s) = exe.to_str() {
                 if probe_help(s, remaining) {
                     return Some(s.to_string());
@@ -248,7 +255,10 @@ fn materialize_infers_transitive_supersedes() {
     let (_guard, cfg, data) = match setup_bin_and_fixtures("materialize") {
         Some(x) => x,
         None => {
-            eprintln!("SKIP: OPEN_ONTOLOGIES_BIN not found");
+            eprintln!(
+                "SKIP: open-ontologies binary unavailable (set OPEN_ONTOLOGIES_BIN, \
+                 or REQUIRE_ONTOLOGIES_BIN=1 to fail instead of skip)"
+            );
             return;
         }
     };
@@ -343,7 +353,10 @@ fn end_to_end_materialize_and_writeback() {
     let (guard, cfg, data) = match setup_bin_and_fixtures("e2e") {
         Some(x) => x,
         None => {
-            eprintln!("SKIP: OPEN_ONTOLOGIES_BIN not found");
+            eprintln!(
+                "SKIP: open-ontologies binary unavailable (set OPEN_ONTOLOGIES_BIN, \
+                 or REQUIRE_ONTOLOGIES_BIN=1 to fail instead of skip)"
+            );
             return;
         }
     };
