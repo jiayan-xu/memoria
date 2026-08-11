@@ -283,8 +283,7 @@ pub fn materialize(
     // 随机名只防"覆盖已知文件"，挡不住"写进攻击者目录"。创建后校验最终 data_dir 非链接。
     #[cfg(unix)]
     {
-        use std::os::unix::fs::symlink_metadata;
-        if symlink_metadata(&cfg.data_dir)
+        if std::fs::symlink_metadata(&cfg.data_dir)
             .map(|m| m.file_type().is_symlink())
             .unwrap_or(false)
         {
