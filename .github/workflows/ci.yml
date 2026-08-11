@@ -40,5 +40,19 @@ jobs:
       - name: Build
         run: cargo build --release --verbose
 
-      - name: Run tests
-        run: cargo test --verbose
+      # #1（第6轮 test/medium）：此前 CI 不装 open-ontologies 也不设 REQUIRE_ONTOLOGIES_BIN，
+      # 三个二进制相关的集成测试每次都静默 return（假绿），materialize→写回闭环从未真正在 CI 跑过，
+      # src/ontology.rs 回归可无感漏过。现构建 open-ontologies 并硬要求，让 CI 真实执行闭环。
+      - name: Build open-ontologies (for ontology integration tests)
+        run: |
+          git clone --depth 1 --branch v1.1.1 https://github.com/fabio-rovai/open-ontologies.git /tmp/open-ontologies
+          cargo build --release --manifest-path /tmp/open-ontologies/Cargo.toml
+          # 放到 PATH 上，find_bin 的 which/where 分支能找到
+          mkdir -p ~/.local/bin
+          cp /tmp/open-ontologies/target/release/open-ontologies ~/.local/bin/
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Run tests (ontology tests hard-required)
+        run: |
+          export REQUIRE_ONTOLOGIES_BIN=1
+          cargo test --verbose

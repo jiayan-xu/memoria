@@ -76,7 +76,24 @@ fn locate_bin() -> Option<String> {
         .map(str::to_string)
 }
 
+/// 探活子进程超时（秒）。
+/// #3（第6轮 test/low）：比实际 materialize 的 timeout_secs(60) 小的固定 3s，在慢机器/冷缓存/
+/// Defender 扫描下会把"反应慢但正常"的二进制误判为缺失（假绿跳过 或 REQUIRE=1 假红）。放大到
+/// 10s 并可用 PROBE_TIMEOUT_SECS env 覆盖，兼顾 CI 慢 runner 与本地快速失败。
+const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+fn probe_timeout() -> std::time::Duration {
+    std::env::var("PROBE_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(std::time::Duration::from_secs)
+        .unwrap_or(PROBE_TIMEOUT)
+}
+
 /// 带超时的 `which`/`where` 探测（#1）。spawn 失败 / 非零退出 / 超时都返回 None。
+/// #2（第6轮 bug/low）：stdout 用 reader 线程在子进程运行期间并发 drain，避免 which/where
+/// 输出超过 OS 管道缓冲（~64KB）时子进程阻塞在 write 上、被超时误杀成"假未找到"。
+/// （与 src/ontology.rs 生产代码的并发 reader 模式一致。）
 fn probe_locate(locator: &str) -> Option<Vec<u8>> {
     let mut child = std::process::Command::new(locator)
         .arg("open-ontologies")
@@ -84,21 +101,20 @@ fn probe_locate(locator: &str) -> Option<Vec<u8>> {
         .stderr(std::process::Stdio::null())
         .spawn()
         .ok()?;
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-    loop {
+    use std::io::Read;
+    let so = child.stdout.take();
+    // reader 线程并发 drain stdout；子进程退出后拿到完整输出。
+    let reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(mut o) = so {
+            let _ = o.read_to_end(&mut buf);
+        }
+        buf
+    });
+    let deadline = std::time::Instant::now() + probe_timeout();
+    let status = loop {
         match child.try_wait() {
-            Ok(Some(st)) => {
-                if !st.success() {
-                    let _ = child.wait();
-                    return None;
-                }
-                use std::io::Read;
-                let mut buf = Vec::new();
-                if let Some(mut so) = child.stdout.take() {
-                    let _ = so.read_to_end(&mut buf);
-                }
-                return Some(buf);
-            }
+            Ok(Some(st)) => break Some(st),
             Ok(None) => {}
             Err(_) => {
                 let _ = child.kill();
@@ -112,6 +128,11 @@ fn probe_locate(locator: &str) -> Option<Vec<u8>> {
             return None;
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    let buf = reader.join().unwrap_or_default();
+    match status {
+        Some(st) if st.success() => Some(buf),
+        _ => None,
     }
 }
 
@@ -128,7 +149,7 @@ fn probe_help(bin: &str) -> bool {
         Ok(c) => c,
         Err(_) => return false,
     };
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    let deadline = std::time::Instant::now() + probe_timeout();
     loop {
         match child.try_wait() {
             // #3（第5轮 test/low）：--help 非零退出也视为不可用（此前任何退出码都返回 true，
