@@ -333,14 +333,18 @@ fn materialize_infers_transitive_supersedes() {
     assert!(res.triples_after > res.triples_before, "expected inference");
     assert_inferred_doc_c_supersedes_doc_a(&res.inferred_edges);
     // #5（第11轮 test/medium）：必须**负断言**显式源边不在 inferred_edges。DATA_TTL 显式声明
-    // docB supersedes docA、docC supersedes docB、docA createdBy alice 等；若 parse_ttl_edges 提取
-    // source_edges 失败（前缀/完整 IRI 不匹配回归），集合差 `materialized - source_edges` 会把
-    // 这些显式边误算进 inferred_edges——正是 #123 完整 IRI fixture 要防的场景，但此测试此前只
-    // 断言"有 docC supersedes docA"仍会通过。显式断言显式边不在推断集中，才能拦住该回归。
+    // 的显式边是 5 条：docB/docC supersedes、docA/docB/docC createdBy（map_relation_iri 会把
+    // createdBy 也提取，且 docB/docC 的 createdBy 位于 `;` 前的多谓词行上）。若 parse_ttl_edges
+    // 提取 source_edges 失败（前缀/完整 IRI 不匹配、`;` 续行回归等），集合差 `materialized -
+    // source_edges` 会把**任一条**显式边误算进 inferred_edges——正是 #123 完整 IRI fixture 要防
+    // 的场景，但此测试此前只断言"有 docC supersedes docA"仍会通过。负列表须穷尽全部 5 条显式边，
+    // 才能拦住"`;` 续行回归把部分显式边当推断"的完整回归面。
     for (s, p, o) in &[
         ("http://memoria.ai/onto/docB", "http://memoria.ai/onto/supersedes", "http://memoria.ai/onto/docA"),
         ("http://memoria.ai/onto/docC", "http://memoria.ai/onto/supersedes", "http://memoria.ai/onto/docB"),
         ("http://memoria.ai/onto/docA", "http://memoria.ai/onto/createdBy", "http://memoria.ai/onto/alice"),
+        ("http://memoria.ai/onto/docB", "http://memoria.ai/onto/createdBy", "http://memoria.ai/onto/alice"),
+        ("http://memoria.ai/onto/docC", "http://memoria.ai/onto/createdBy", "http://memoria.ai/onto/alice"),
     ] {
         assert!(
             !res.inferred_edges.iter().any(|(s2, p2, o2)| s2 == s && p2 == p && o2 == o),
@@ -357,7 +361,7 @@ fn write_back_edges_upserts_into_entity_edges() {
     let _guard = temp_dir("writeback");
     let dir = _guard.path();
     let db = dir.join("mem.db");
-    let engine = memoria_core::MemoriaEngine::new(&db.to_string_lossy()).expect("engine");
+    let engine = memoria_core::MemoriaEngine::new(db.to_str().expect("temp path must be UTF-8")).expect("engine");
     let conn = engine.pool.get().unwrap();
     let ns = "agent/onto";
 
@@ -433,7 +437,7 @@ fn end_to_end_materialize_and_writeback() {
             .expect("materialize");
 
     let db = dir.join("mem.db");
-    let engine = memoria_core::MemoriaEngine::new(&db.to_string_lossy()).expect("engine");
+    let engine = memoria_core::MemoriaEngine::new(db.to_str().expect("temp path must be UTF-8")).expect("engine");
     let conn = engine.pool.get().unwrap();
     let ns = "agent/onto";
     let (written, _) = write_back_edges(&conn, ns, &res.inferred_edges).expect("write_back");
