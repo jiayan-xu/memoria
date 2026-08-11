@@ -51,14 +51,19 @@ jobs:
         shell: bash
         run: |
           git clone --depth 1 --branch v1.1.1 https://github.com/fabio-rovai/open-ontologies.git "$RUNNER_TEMP"/open-ontologies
-          cargo build --release --manifest-path "$RUNNER_TEMP"/open-ontologies/Cargo.toml
+          # --target-dir 固定产物位置：cargo build --manifest-path 的 target 默认落当前工作目录，
+          # 冷编译/缓存差异下产物可能不再源码目录，导致下述 cp 静默失败、测试阶段找不到二进制。
+          cargo build --release --manifest-path "$RUNNER_TEMP"/open-ontologies/Cargo.toml \
+            --target-dir "$RUNNER_TEMP"/oo-target
           # 放到 PATH 上，find_bin 的 which/where 分支能找到
           mkdir -p "$HOME"/.local/bin
           if [ "$RUNNER_OS" = "Windows" ]; then
-            cp "$RUNNER_TEMP"/open-ontologies/target/release/open-ontologies.exe "$HOME"/.local/bin/
+            cp "$RUNNER_TEMP"/oo-target/release/open-ontologies.exe "$HOME"/.local/bin/
           else
-            cp "$RUNNER_TEMP"/open-ontologies/target/release/open-ontologies "$HOME"/.local/bin/
+            cp "$RUNNER_TEMP"/oo-target/release/open-ontologies "$HOME"/.local/bin/
           fi
+          # 显式校验产物存在：cp 失败时 set -e 会中断，而非静默带入测试阶段假失败
+          ls -la "$HOME"/.local/bin/
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       - name: Run tests (ontology tests hard-required)
