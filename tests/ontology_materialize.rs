@@ -5,6 +5,11 @@
 //! 运行：`cargo test --test ontology_materialize`
 //! 前置：OPEN_ONTOLOGIES_BIN 指向 open-ontologies 可执行文件；缺失时测试自动跳过。
 //!
+//! 防假绿门禁：**缺失二进制静默 SKIP 的默认只用于本地开发**。CI 的 `ci.yml` 测试步骤固定
+//! `export REQUIRE_ONTOLOGIES_BIN=1`——在该标志下找不到二进制会 panic 而非 skip，故 CI 的
+//! materialize→写回闭环**必然真实执行**（不会"tests passed 但没跑物化"）。本地如需同样硬门禁，
+//! 手动设 `REQUIRE_ONTOLOGIES_BIN=1` 即可。
+//!
 //! 硬约束（报告 §8）：离线物化，写回 entity_edges（受控枚举门禁），不动热路径。
 
 use memoria_core::ontology::{materialize, write_back_edges, OntologyConfig};
@@ -83,7 +88,7 @@ fn find_bin() -> Option<String> {
     found
 }
 
-fn locate_bin(_env_bin: &Option<std::ffi::OsString>) -> Option<String> {
+fn locate_bin(env_bin: &Option<std::ffi::OsString>) -> Option<String> {
     // 设计不变式：
     // 1. 权威 override：显式设置 OPEN_ONTOLOGIES_BIN 即表达"必须用它"，校验失败（非文件/
     //    --help 探测失败/超时）绝**不**回退 PATH 扫描，由 find_bin 硬失败（防 stale pinned
@@ -93,7 +98,7 @@ fn locate_bin(_env_bin: &Option<std::ffi::OsString>) -> Option<String> {
     // 3. 环境只读一次：probe_timeout 与 OPEN_ONTOLOGIES_BIN 均在入口读一次，沿调用链传参，
     //    消除 find_bin/locate_bin 双读与循环内重复 var_os 造成的 check-then-act 窗口。
     let pt = probe_timeout();
-    if let Some(b_os) = _env_bin {
+    if let Some(b_os) = env_bin {
         let b = b_os.to_string_lossy();
         // 空串与其它无效值同语义——一旦 set 即"必须用它"，is_file 必 false，校验失败返回 None，
         // 由 find_bin 硬失败（拒绝静默跳过），绝不回退 PATH 掩盖假绿。
