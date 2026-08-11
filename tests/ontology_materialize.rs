@@ -101,6 +101,12 @@ fn locate_bin() -> Option<String> {
         // 意图直接矛盾（首个非 UTF-8 PATH 目录即触发假绿 skip 或 REQUIRE=1 假红）。
         // 改用 `if let` 只跳过该候选，继续扫描后续目录。
         if exe.is_file() {
+            // #7（第11轮 other/low）：deadline 只在 PATH 循环顶检查，但单个挂死候选在 deadline
+            // 前一刻被发现仍可耗尽整个 PROBE_TIMEOUT（默认 10s），使注释宣称的"整体探测超时，
+            // 放弃扫描"硬预算形同虚设。在每次 probe_help 前再查一次，把预算做成真实上界。
+            if std::time::Instant::now() > scan_deadline {
+                return None;
+            }
             if let Some(s) = exe.to_str() {
                 if probe_help(s) {
                     return Some(s.to_string());
@@ -118,9 +124,12 @@ fn locate_bin() -> Option<String> {
 const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 fn probe_timeout() -> std::time::Duration {
+    // #8（第11轮 test/low）：拒绝 0——`PROBE_TIMEOUT_SECS=0` 会让每次探测立即 kill 子进程，
+    // 所有测试静默跳（或 REQUIRE=1 下 panic），与 OntologyConfig::from_env 显式 clamp 0→1s 的
+    // 生产约定不一致。filter 掉 0 后回退到 PROBE_TIMEOUT，行为统一。
     std::env::var("PROBE_TIMEOUT_SECS")
         .ok()
-        .and_then(|v| v.parse::<u64>().ok())
+        .and_then(|v| v.parse::<u64>().ok().filter(|n| *n > 0))
         .map(std::time::Duration::from_secs)
         .unwrap_or(PROBE_TIMEOUT)
 }
@@ -250,6 +259,22 @@ fn materialize_infers_transitive_supersedes() {
     // OWL TransitiveProperty：docC supersedes docA 应被推断
     assert!(res.triples_after > res.triples_before, "expected inference");
     assert_inferred_doc_c_supersedes_doc_a(&res.inferred_edges);
+    // #5（第11轮 test/medium）：必须**负断言**显式源边不在 inferred_edges。DATA_TTL 显式声明
+    // docB supersedes docA、docC supersedes docB、docA createdBy alice 等；若 parse_ttl_edges 提取
+    // source_edges 失败（前缀/完整 IRI 不匹配回归），集合差 `materialized - source_edges` 会把
+    // 这些显式边误算进 inferred_edges——正是 #123 完整 IRI fixture 要防的场景，但此测试此前只
+    // 断言"有 docC supersedes docA"仍会通过。显式断言显式边不在推断集中，才能拦住该回归。
+    for (s, p, o) in &[
+        ("http://memoria.ai/onto/docB", "http://memoria.ai/onto/supersedes", "http://memoria.ai/onto/docA"),
+        ("http://memoria.ai/onto/docC", "http://memoria.ai/onto/supersedes", "http://memoria.ai/onto/docB"),
+        ("http://memoria.ai/onto/docA", "http://memoria.ai/onto/createdBy", "http://memoria.ai/onto/alice"),
+    ] {
+        assert!(
+            !res.inferred_edges.iter().any(|(s2, p2, o2)| s2 == s && p2 == p && o2 == o),
+            "explicit source edge ({}, {}, {}) must NOT be in inferred_edges — parse_ttl_edges regression?",
+            s, p, o
+        );
+    }
     println!("inferred_edges: {:?}", res.inferred_edges);
 }
 
@@ -286,6 +311,21 @@ fn write_back_edges_upserts_into_entity_edges() {
     let (written, skipped) = write_back_edges(&conn, ns, &edges).expect("write_back");
     assert_eq!(written, 2, "exactly 2 supersedes edges written");
     assert_eq!(skipped, 1, "1 unknown banana edge skipped");
+
+    // #6（第11轮 test/low）：`skipped==1` 不足以证明 allowlist 门禁生效——一个同时插入行又
+    // 递增 skipped（或误报 affected=0）的门禁回归仍会通过。必须查库确认未知 banana 边**确实
+    // 未持久化**，否则允许列表不变式被破坏却测试仍绿。
+    let banana_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM entity_edges WHERE namespace=?1 AND relation_type='banana'",
+            params![ns],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        banana_count, 0,
+        "unknown banana edge must NOT be persisted by write_back_edges"
+    );
 
     // 幂等：重复写回不重复
     let (w2, _) = write_back_edges(&conn, ns, &edges[..2]).expect("write_back again");
