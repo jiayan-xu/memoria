@@ -56,10 +56,9 @@ impl Drop for TempFileGuard {
     }
 }
 
-/// 物化结果：导出文件路径 + 从 TTL 解析出的推断边。
+/// 物化结果：从 TTL 解析出的推断边（全部显式边 + 推断边统计）。
 #[derive(Debug, Default)]
 pub struct MaterializeResult {
-    pub output_path: String,
     /// (source, relation, target) 三元组（仅推断边）
     pub inferred_edges: Vec<(String, String, String)>,
     /// (source, relation, target) 三元组（全部显式边，含原数据）
@@ -119,6 +118,15 @@ pub fn materialize(
     // 文件失败，且那发生在校验之后、spawn 之前，正是最该早期暴露的位置。
     std::fs::create_dir_all(&cfg.data_dir)
         .map_err(|e| format!("create data dir {}: {}", cfg.data_dir.display(), e))?;
+    // #5（第5轮 security/medium）：data_dir 来自 OPEN_ONTOLOGIES_DATA env（用户可控），
+    // 且被拼进 out_ttl 后经 win_path_quoted 插进 batch 脚本的 `save` 行。与 schema_path/
+    // source_ttl 相同，data_dir 若含换行/引号/分号会逃逸双引号注入额外 batch 指令——
+    // 必须用同一套规则校验，否则 #115/#117 的注入防线被 data_dir 这道口子绕过。
+    // 此前注释"data_dir 由唯一名自生成不含危险字符"是错的：唯一名只是后缀，前缀是用户可控。
+    let data_dir_str = cfg.data_dir.to_string_lossy();
+    if data_dir_str.contains(['\n', '\r', '"', ';']) {
+        return Err("invalid data_dir: control chars / quote / semicolon not allowed".to_string());
+    }
     // 每次调用用唯一文件名（pid + 单调序列），避免并发调用（CLI + 定时任务 / 未来
     // MCP/web 触发）互相覆盖 script/output，导致读到他方半写文件（#7/#R3-8）。
     let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -155,8 +163,8 @@ pub fn materialize(
     if cfg.schema_path.exists() {
         let sp = cfg.schema_path.to_string_lossy();
         // #R3-7：schema_path 也做与 source_ttl 相同的危险字符校验（换行/引号/分号），
-        // 否则 crafted env 可注入额外 batch 指令。其它 env 派生路径（data_dir）由唯一名
-        // 自生成不含危险字符；bin 仅用于 spawn 不走 batch 脚本注入面。
+        // 否则 crafted env 可注入额外 batch 指令。data_dir 的同类校验见上方（#5），
+        // 它同样被拼进 batch 脚本的 save 行；bin 仅用于 spawn 不走 batch 脚本注入面。
         if sp.contains(['\n', '\r', '"', ';']) {
             return Err("invalid schema_path: control chars / quote / semicolon not allowed".to_string());
         }
@@ -284,11 +292,10 @@ pub fn materialize(
         .cloned()
         .collect();
 
-    // batch 脚本由 BatchFileGuard 在函数返回时自动删除（含成功路径，#R3-6）。
-    // out_ttl 视为产物保留，供调用方消费后自行清理。
+    // batch 脚本与 out_ttl 均由 TempFileGuard 在函数返回时自动删除（含成功路径，#R3-6/#R4-2）。
+    // 边已全部解析进内存（all_edges/inferred_edges），out_ttl 无需保留，防磁盘耗尽（#5-high）。
 
     Ok(MaterializeResult {
-        output_path: out_ttl.to_string_lossy().to_string(),
         inferred_edges,
         all_edges,
         triples_before,
@@ -353,7 +360,13 @@ fn parse_ttl_edges(ttl: &str) -> Vec<(String, String, String)> {
     let mut prev_sep: Option<char> = None;
 
     for raw in ttl.lines() {
-        let line_trimmed = raw.trim();
+        // #7（第5轮 bug/medium）：先剥离行内注释（`#` 到行尾）。Turtle 允许行内注释，
+        // 若不剥离，`... <docA> . # see <http://.../supersedes>` 里的 `<http://.../supersedes>` 会被
+        // tokenize_ttl 当作真实对象，pred 仍为 supersedes 时产生伪边 (docC, supersedes, supersedes)，
+        // 且能逃过"物化−源"集合差成为推断边并写库。
+        // 剥离须避开 `<...>` IRI 内与引号字面量内的 `#`（#7 明示）。
+        let stripped = strip_inline_comment(raw);
+        let line_trimmed = stripped.trim();
         if line_trimmed.is_empty() || line_trimmed.starts_with('#') {
             continue;
         }
@@ -468,6 +481,39 @@ fn parse_ttl_edges(ttl: &str) -> Vec<(String, String, String)> {
     all
 }
 
+/// 剥离 Turtle 行内注释：从行内第一个"裸 `#`"到行尾。
+/// 必须避开 `<...>` IRI 内与 `"..."`/`'...'` 引号字面量内的 `#`（#7）——
+/// 例如 `http://foo#bar` 的 `#` 是 IRI 的一部分，不是注释起点。
+fn strip_inline_comment(line: &str) -> &str {
+    let bytes = line.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'<' {
+            // 跳过 `<...>` IRI 跨度
+            if let Some(end) = line[i + 1..].find('>') {
+                i += end + 2;
+                continue;
+            } else {
+                return &line[..i]; // 未闭合 `<`，其后到行尾视为注释
+            }
+        } else if b == b'"' || b == b'\'' {
+            // 跳过引号字面量（简单配对，不处理转义——字面量内 `#` 不是注释）
+            let quote = b;
+            if let Some(end) = line[i + 1..].find(quote as char) {
+                i += end + 2;
+                continue;
+            } else {
+                return &line[..i];
+            }
+        } else if b == b'#' {
+            return &line[..i];
+        }
+        i += 1;
+    }
+    line
+}
+
 /// 解析 `@prefix p: <base>` 声明，返回 `(前缀名, 基IRI)`。
 /// 前缀名可为空（`@prefix : <base>` 表示默认前缀）。
 /// 只接受这种定型形式；`p:` 与 `<base>` 之间可有空白。返回 None 表示不是前缀声明。
@@ -531,6 +577,16 @@ fn tokenize_ttl(line: &str) -> Vec<String> {
         } else if b == b';' || b == b',' {
             out.push(rest[..1].to_string());
             rest = &rest[1..];
+        } else if b == b'[' {
+            // #8（第5轮 bug/medium）：blank node 对象 `[ a <Document> ]`。必须把整个 `[...]`
+            // 跨度当作不透明 token 跳过（不产出任何 out token），否则内层 `<Document>` 会被
+            // 当作外层谓词的对象，产生伪边 (docA, partOf, Document)。OWL 推理 TTL 常见这种结构。
+            if let Some(end) = rest.find(']') {
+                rest = &rest[end + 1..];
+            } else {
+                // 未闭合 `[`：丢弃整行剩余部分（视为不完整 blank node）
+                break;
+            }
         } else if rest.starts_with("_:")
             || is_qname_start(b)
             || b == b':'                    // 默认前缀 `:local`
@@ -861,6 +917,49 @@ mod tests {
         assert_eq!(iri_local_name("http://example.org/"), "http://example.org/");
         assert_eq!(iri_local_name("http://example.org#"), "http://example.org#");
     }
+
+    #[test]
+    fn ttl_parse_strips_inline_comments() {
+        // #7（第5轮）：行内注释 `# ...` 到行尾会被剥离，注释里的 `<IRI>` 不产出伪边；
+        // 但 `<...>#...`（IRI 内 #）与引号字面量内的 # 不被当作注释起点。
+        // 依赖：谓词是受控命名空间内、对象是 `<...>`，注释在行尾。
+        let ttl = r#"@prefix : <http://example.org/> .
+:docC <http://example.org/supersedes> :docA . # see <http://example.org/supersedes>
+"#;
+        let all = parse_ttl_edges(ttl);
+        // 只应有 1 条真实边（docC supersedes docA），注释里的 <http://example.org/supersedes>
+        // 不得被当作对象产生伪边 (docC, supersedes, supersedes)。
+        assert_eq!(all.len(), 1, "got {:?}", all);
+        assert!(all.contains(&(
+            "http://example.org/docC".to_string(),
+            "http://example.org/supersedes".to_string(),
+            "http://example.org/docA".to_string()
+        )));
+    }
+
+    #[test]
+    fn strip_inline_comment_ignores_iri_and_quotes() {
+        // IRI 内 `#` 是 IRI 一部分，不是注释起点
+        assert_eq!(strip_inline_comment("<http://foo#bar> <p> <o> ."), "<http://foo#bar> <p> <o> .");
+        // 引号字面量内 `#` 不是注释起点
+        assert_eq!(strip_inline_comment("\"a#b\" <p> <o> ."), "\"a#b\" <p> <o> .");
+        // 行内裸 `#` 起注释
+        assert_eq!(strip_inline_comment("<a> <b> . # comment"), "<a> <b> . ");
+        // 行首 `#` 整行注释
+        assert_eq!(strip_inline_comment("# full comment"), "");
+    }
+
+    #[test]
+    fn ttl_parse_skips_blank_node_objects() {
+        // #8（第5轮）：blank node 对象 `[ a <Document> ]` 整体跳过，内层 <Document> 不得
+        // 成为外层谓词的对象，否则产生伪边 (docA, partOf, Document)。
+        let ttl = r#"@prefix : <http://example.org/> .
+<http://example.org/docA> <http://example.org/partOf> [ a <http://example.org/Document> ] .
+"#;
+        let all = parse_ttl_edges(ttl);
+        // partOf 是受控关系，但对象是 blank node（无实 IRI），不应产出任何边。
+        assert_eq!(all.len(), 0, "got {:?}", all);
+    }
 }
 
 // 供外部（web_api / mcp_server）复用的通用入口
@@ -893,13 +992,12 @@ pub fn run_ontology_cli(args: &[String]) -> Result<String, String> {
                 Err(e) => return Err(e),
             };
             Ok(format!(
-                "materialize OK\nduration_ms: {}\nprofile: {}\ntriples: {} -> {} (inferred {})\noutput: {}\ninferred_edges: {}",
+                "materialize OK\nduration_ms: {}\nprofile: {}\ntriples: {} -> {} (inferred {})\ninferred_edges: {}",
                 res.duration_ms,
                 res.profile,
                 res.triples_before,
                 res.triples_after,
                 res.triples_after.saturating_sub(res.triples_before),
-                res.output_path,
                 res.inferred_edges.len(),
             ))
         }
@@ -936,15 +1034,38 @@ fn serve_http_placeholder(cfg: &OntologyConfig, args: &[String]) -> Result<Strin
         .stderr(std::process::Stdio::piped())
         .spawn()
         .map_err(|e| format!("spawn open-ontologies serve-http: {}", e))?;
-    // 短暂等待，确认进程未立即崩溃（端口已绑定即成功）
+    // 短暂等待，确认进程未立即崩溃（端口已绑定即成功）。
+    // #9（第5轮 bug/low）：stdout/stderr 若在等待期间持续被写且不 drain，超过 OS 管道缓冲
+    // （~64KB）后子进程会阻塞在 write 上、永远无法退出，使"存活>800ms"成为不可靠的信号。
+    // 故用 reader 线程并发 drain，与 materialize 的既有模式一致。
+    use std::io::Read;
+    let so = child.stdout.take();
+    let se = child.stderr.take();
+    let stdout_reader = std::thread::spawn(move || {
+        let mut b = String::new();
+        if let Some(mut o) = so { let _ = o.read_to_string(&mut b); }
+        b
+    });
+    let stderr_reader = std::thread::spawn(move || {
+        let mut b = String::new();
+        if let Some(mut e) = se { let _ = e.read_to_string(&mut b); }
+        b
+    });
     std::thread::sleep(Duration::from_millis(800));
-    let status = child.try_wait().map_err(|e| format!("wait: {}", e))?;
-    if let Some(st) = status {
-        let mut err = String::new();
-        use std::io::Read;
-        if let Some(mut e) = child.stderr.take() {
-            let _ = e.read_to_string(&mut err);
+    // #9：try_wait 出错时必须 kill + wait + join reader，避免遗留失控进程与阻塞线程
+    // （与 materialize/status 的 kill+wait 模式一致）。
+    let status = match child.try_wait() {
+        Ok(st) => st,
+        Err(e) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = stdout_reader.join();
+            let _ = stderr_reader.join();
+            return Err(format!("wait: {}", e));
         }
+    };
+    if let Some(st) = status {
+        let err = stderr_reader.join().unwrap_or_default();
         return Err(format!(
             "serve-http exited immediately (code {}): {}",
             st, err
@@ -954,6 +1075,8 @@ fn serve_http_placeholder(cfg: &OntologyConfig, args: &[String]) -> Result<Strin
     // 避免 Unix 下遗留僵尸进程（#121，与 materialize 超时路径的 kill+wait 一致）。
     let _ = child.kill();
     let _ = child.wait();
+    let _ = stdout_reader.join();
+    let _ = stderr_reader.join();
     Ok(format!(
         "serve-http 在线通道占位 OK\nport: {} (进程存活>800ms, 未实测端口监听)\nstorage: persistent\nverification_ms: {}\n(注: serve-http 为 MCP Streamable HTTP, 健康探测需 MCP 握手, 本期未接客户端; '端口已绑定'未实测, 仅验证进程可启动)",
         port,
