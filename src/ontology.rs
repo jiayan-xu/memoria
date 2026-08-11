@@ -24,6 +24,11 @@ use std::time::{Duration, Instant};
 /// 物化子进程默认超时（秒）。OWL tableaux 推理最坏指数复杂度，必须设上限。
 const DEFAULT_TIMEOUT_SECS: u64 = 60;
 
+/// 允许的 OWL 推理 profile 白名单（#117 命令注入防护）。
+/// 未来经 MCP/web 触发时 profile 是租户可控输入，必须严格白名单，
+/// 拒绝含空白/;/" 的任意串（会向 batch 注入额外参数/指令）。
+const VALID_PROFILES: &[&str] = &["rdfs", "owl-rl", "owl-dl", "owl-full"];
+
 /// 物化结果：导出文件路径 + 从 TTL 解析出的推断边。
 #[derive(Debug, Default)]
 pub struct MaterializeResult {
@@ -89,11 +94,19 @@ pub fn materialize(
     let batch_file = cfg.data_dir.join(format!("materialize_{}.batch", uniq));
     let out_ttl = cfg.data_dir.join(format!("materialized_{}.ttl", uniq));
 
-    // 安全校验（#115 命令注入）：profile/source 不允许换行，路径含空格用引号包裹。
-    // 换行会注入额外的 load/reason/save 指令；未引号路径会破坏 batch 解析。
-    if profile.contains(['\n', '\r']) || source_ttl.contains(['\n', '\r']) {
-        return Err("invalid profile/source_ttl: newline not allowed".to_string());
+    // 安全校验（#115/#117 命令注入）：profile 白名单 + source 拒绝危险字符。
+    // 换行会注入额外的 load/reason/save 指令；profile 含空白/;/" 会向 batch 注入额外参数。
+    // 未来经 MCP/web 触发时 profile/source 是租户可控输入，必须严格白名单。
+    if !VALID_PROFILES.contains(&profile) {
+        return Err(format!(
+            "invalid profile: {:?} (allowed: {})",
+            profile,
+            VALID_PROFILES.join(", ")
+        ));
     }
+    if source_ttl.contains(['\n', '\r', '"', ';']) {
+    return Err("invalid source_ttl: control chars / quote / semicolon not allowed".to_string());
+}
     // 物化前解析源 TTL 的显式目标关系边集，供物化后 diff 出真正的新增推断边（#113）。
     let source_edges: std::collections::HashSet<(String, String, String)> = {
         let src = std::fs::read_to_string(source_ttl)
@@ -106,6 +119,10 @@ pub fn materialize(
     // 不会产生传递闭包推断（P0 验证实锤：schema 未 load 时 inferred=0）。
     let mut script = String::new();
     if cfg.schema_path.exists() {
+        let sp = cfg.schema_path.to_string_lossy();
+        if sp.contains('"') {
+            return Err("invalid schema_path: double quote not allowed".to_string());
+        }
         script.push_str(&format!("load {}\n", win_path_quoted(&cfg.schema_path)));
     } else {
         // 低危：#8 schema 缺失静默——显式告警，避免误以为推理已正确运行。
@@ -220,6 +237,10 @@ pub fn materialize(
         .cloned()
         .collect();
 
+    // 清理临时 batch 脚本（#119）：避免反复物化累积临时文件致磁盘耗尽。
+    // out_ttl 视为产物保留，供调用方消费后自行清理。
+    let _ = std::fs::remove_file(&batch_file);
+
     Ok(MaterializeResult {
         output_path: out_ttl.to_string_lossy().to_string(),
         inferred_edges,
@@ -236,19 +257,24 @@ fn parse_json_line(line: &str) -> Result<serde_json::Value, serde_json::Error> {
     serde_json::from_str(line)
 }
 
-/// 把路径规范为 Windows 正斜杠（`C:/...`），供 open-ontologies 识别。
+/// 把路径规范为 open-ontologies 可识别的形式。
+///
+/// 仅 Windows（或含盘符前缀的 Windows 风格路径）时把 `\` 替换为 `/`；
+/// Unix 上合法文件名自带的反斜杠不改写（#122，避免跨平台路径损坏）。
 fn win_path(p: &std::path::Path) -> String {
-    p.to_string_lossy().replace('\\', "/")
+    let s = p.to_string_lossy();
+    if cfg!(windows) || s.starts_with(|c: char| c.is_ascii_alphabetic()) && s.as_bytes().get(1) == Some(&b':') {
+        s.replace('\\', "/")
+    } else {
+        s.into_owned()
+    }
 }
 
-/// 同 `win_path`，但路径含空格时用双引号包裹（batch 脚本解析需要，#115）。
+/// 同 `win_path`，但始终用双引号包裹（batch 脚本解析需要，#117）。
+/// 路径含 `"` 时无法安全转义，直接拒绝（由调用方拦截）。
 fn win_path_quoted(p: &std::path::Path) -> String {
     let s = win_path(p);
-    if s.contains(' ') {
-        format!("\"{}\"", s)
-    } else {
-        s
-    }
+    format!("\"{}\"", s)
 }
 
 /// 轻量 TTL 三元组解析器（目标谓词扫描版）。
@@ -290,9 +316,17 @@ fn parse_ttl_edges(ttl: &str) -> Vec<(String, String, String)> {
             .starts_with("a ")
             || line_trimmed.trim_start().starts_with("a <");
         if type_only {
-            // 类型声明行以 `.` 结尾，会被跳过；但必须重置 prev_sep，
-            // 否则上一行的 `;` 续行状态会污染下一主语块（把新主语误判为续行谓词）。
-            prev_sep = None;
+            // 类型声明行（`a <Type>`）无目标关系边，跳过内容。
+            // 但必须保留行尾续行标记：块中间的 `a <Type> ;` 后可能还有 `<pred> <obj>` 续行，
+            // 直接置 None 会把后续续行误判为新主语块，导致真实语义边被静默丢弃（#118）。
+            // 若本行以 `.` 结尾则重置为 None（下行为新主语块）。
+            prev_sep = if line_trimmed.ends_with(';') {
+                Some(';')
+            } else if line_trimmed.ends_with(',') {
+                Some(',')
+            } else {
+                None
+            };
             continue;
         }
 
@@ -417,48 +451,65 @@ pub fn write_back_edges(
 ) -> Result<(usize, usize), String> {
     let mut written = 0usize;
     let mut skipped = 0usize;
-    for (s, p, o) in edges {
-        let rtype = match map_relation_iri(p) {
-            Some(r) => r,
-            None => {
+    // #120：整个写回用事务包裹——循环中途任一条出错时整体 ROLLBACK，
+    // 避免部分写回造成数据不一致；上千条边也只开一次事务，性能更好。
+    // `unchecked_transaction` 允许在 &Connection 上使用（调用方保证池连接可用）。
+    let tx = pool
+        .unchecked_transaction()
+        .map_err(|e| format!("begin transaction: {}", e))?;
+    let r = (|| -> Result<(), String> {
+        for (s, p, o) in edges {
+            let rtype = match map_relation_iri(p) {
+                Some(r) => r,
+                None => {
+                    skipped += 1;
+                    continue;
+                }
+            };
+            if !crate::tools::graph::is_valid_relation_type(&rtype) {
                 skipped += 1;
                 continue;
             }
-        };
-        if !crate::tools::graph::is_valid_relation_type(&rtype) {
-            skipped += 1;
-            continue;
-        }
-        if s.is_empty() || o.is_empty() {
-            skipped += 1;
-            continue;
-        }
-        // 实体 id = 完整 IRI（区分命名空间）；name = 局部名（可读）。
-        let sname = iri_local_name(s);
-        let oname = iri_local_name(o);
-        // 幂等 upsert 两端实体（满足外键约束）——错误必须传播，不静默吞掉（#9），
-        // 否则 INSERT 失败会被掩盖，直到边插入时才暴露为令人困惑的 FK 冲突。
-        for (eid, ename) in [(s.as_str(), sname.as_str()), (o.as_str(), oname.as_str())] {
-            pool.execute(
-                "INSERT INTO entities(id, namespace, entity_type, name, aliases, summary)
-                 VALUES(?1, ?2, 'concept', ?3, '[]', NULL)
-                 ON CONFLICT(id) DO NOTHING",
-                rusqlite::params![eid, namespace, ename],
+            if s.is_empty() || o.is_empty() {
+                skipped += 1;
+                continue;
+            }
+            // 实体 id = 完整 IRI（区分命名空间）；name = 局部名（可读）。
+            let sname = iri_local_name(s);
+            let oname = iri_local_name(o);
+            // 幂等 upsert 两端实体（满足外键约束）——错误必须传播，不静默吞掉（#9），
+            // 否则 INSERT 失败会被掩盖，直到边插入时才暴露为令人困惑的 FK 冲突。
+            for (eid, ename) in [(s.as_str(), sname.as_str()), (o.as_str(), oname.as_str())] {
+                tx.execute(
+                    "INSERT INTO entities(id, namespace, entity_type, name, aliases, summary)
+                     VALUES(?1, ?2, 'concept', ?3, '[]', NULL)
+                     ON CONFLICT(id) DO NOTHING",
+                    rusqlite::params![eid, namespace, ename],
+                )
+                .map_err(|e| format!(
+                    "upsert entity {}: {}",
+                    eid, e
+                ))?;
+            }
+            tx.execute(
+                "INSERT INTO entity_edges(namespace, source_entity_id, target_entity_id, relation_type, weight, evidence)
+                 VALUES(?1, ?2, ?3, ?4, 1.0, 'ontology:materialized')
+                 ON CONFLICT(namespace, source_entity_id, target_entity_id, relation_type)
+                 DO UPDATE SET evidence=excluded.evidence",
+                rusqlite::params![namespace, s, o, rtype],
             )
-            .map_err(|e| format!(
-                "upsert entity {}: {}",
-                eid, e
-            ))?;
+            .map_err(|e| format!("insert edge {} {} {}: {}", s, rtype, o, e))?;
+            written += 1;
         }
-        pool.execute(
-            "INSERT INTO entity_edges(namespace, source_entity_id, target_entity_id, relation_type, weight, evidence)
-             VALUES(?1, ?2, ?3, ?4, 1.0, 'ontology:materialized')
-             ON CONFLICT(namespace, source_entity_id, target_entity_id, relation_type)
-             DO UPDATE SET evidence=excluded.evidence",
-            rusqlite::params![namespace, s, o, rtype],
-        )
-        .map_err(|e| format!("insert edge {} {} {}: {}", s, rtype, o, e))?;
-        written += 1;
+        Ok(())
+    })();
+    // 提交或回滚；即使业务循环出错也保证事务关闭。
+    match r {
+        Ok(()) => tx.commit().map_err(|e| format!("commit transaction: {}", e))?,
+        Err(e) => {
+            let _ = tx.rollback();
+            return Err(e);
+        }
     }
     Ok((written, skipped))
 }
@@ -571,10 +622,20 @@ mod tests {
 
     #[test]
     fn win_path_normalizes() {
+        // Windows 风格路径：`\` → `/`
         assert_eq!(win_path(std::path::Path::new("D:\\data\\a.ttl")), "D:/data/a.ttl");
-        // #115：含空格路径用引号包裹
+        // 盘符前缀路径也被识别为 Windows 风格
+        assert_eq!(win_path(std::path::Path::new("C:/data/a.ttl")), "C:/data/a.ttl");
+        // #117：路径始终双引号包裹（供 batch 脚本解析）
         assert_eq!(win_path_quoted(std::path::Path::new("D:\\my data\\a.ttl")), "\"D:/my data/a.ttl\"");
-        assert_eq!(win_path_quoted(std::path::Path::new("D:\\data\\a.ttl")), "D:/data/a.ttl");
+        assert_eq!(win_path_quoted(std::path::Path::new("D:\\data\\a.ttl")), "\"D:/data/a.ttl\"");
+    }
+
+    #[test]
+    fn profile_whitelist_rejects_unknown() {
+        // #117：profile 白名单
+        assert!(VALID_PROFILES.contains(&"owl-rl"));
+        assert!(!VALID_PROFILES.contains(&"owl-rl --some-flag"));
     }
 }
 
@@ -665,10 +726,12 @@ fn serve_http_placeholder(cfg: &OntologyConfig, args: &[String]) -> Result<Strin
             st, err
         ));
     }
-    // 进程活着且端口绑定成功 → 关掉（占位验证）
+    // 进程在 800ms 内未退出 → 视为能正常启动（占位验证）。随后 kill 并 wait 收割，
+    // 避免 Unix 下遗留僵尸进程（#121，与 materialize 超时路径的 kill+wait 一致）。
     let _ = child.kill();
+    let _ = child.wait();
     Ok(format!(
-        "serve-http 在线通道占位 OK\nport: {} (已绑定)\nstorage: persistent\nverification_ms: {}\n(注: serve-http 为 MCP Streamable HTTP, 健康探测需 MCP 握手, 本期未接客户端)",
+        "serve-http 在线通道占位 OK\nport: {} (进程存活>800ms, 未实测端口监听)\nstorage: persistent\nverification_ms: {}\n(注: serve-http 为 MCP Streamable HTTP, 健康探测需 MCP 握手, 本期未接客户端; '端口已绑定'未实测, 仅验证进程可启动)",
         port,
         start.elapsed().as_millis()
     ))
