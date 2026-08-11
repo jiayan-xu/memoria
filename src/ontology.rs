@@ -24,6 +24,12 @@ use std::time::{Duration, Instant};
 
 /// 物化子进程默认超时（秒）。OWL tableaux 推理最坏指数复杂度，必须设上限。
 const DEFAULT_TIMEOUT_SECS: u64 = 60;
+/// 超时硬上界（秒）。#R17（第17轮 bug/medium）：`join_bounded` 里 `Instant::now() + bound` 走
+/// std `Add<Duration>`，内部对溢出会 `expect` panic（Windows 100ns tick 表示在 ~2.9e11s 即溢出，
+/// Unix i64 秒约 9.2e18s）。一个语法合法但过大的 env 值（如 u64::MAX）会让 materialize/status
+/// 直接 panic 而非走"超时降级"路径，违背"必须超时"纪律。from_env 收敛到 1 天（86400s）上界，
+/// 超过则告警拉回，杜绝溢出 panic。
+const MAX_TIMEOUT_SECS: u64 = 86400;
 
 /// 允许的 OWL 推理 profile 白名单（#117 命令注入防护）。
 /// 未来经 MCP/web 触发时 profile 是租户可控输入，必须严格白名单，
@@ -131,7 +137,15 @@ impl OntologyConfig {
                     // 实际却让挂死的物化跑满一分钟。打印告警。0 会被接受但无文档且语义怪（首轮
                     // ~50ms 即杀），统一拒绝为 1s 下限。
                     match v.parse::<u64>() {
-                        Ok(n) if n > 0 => Some(n),
+                        Ok(n) if n > 0 && n <= MAX_TIMEOUT_SECS => Some(n),
+                        Ok(n) if n > MAX_TIMEOUT_SECS => {
+                            // #R17：超过硬上界拉回，避免 join_bounded 的 Instant 加法溢出 panic。
+                            eprintln!(
+                                "WARN: OPEN_ONTOLOGIES_TIMEOUT_SECS={:?} exceeds hard max {}s, clamped to {}s",
+                                v, MAX_TIMEOUT_SECS, MAX_TIMEOUT_SECS
+                            );
+                            Some(MAX_TIMEOUT_SECS)
+                        }
                         Ok(_) => {
                             eprintln!("WARN: OPEN_ONTOLOGIES_TIMEOUT_SECS={:?} is 0/invalid, clamped to 1s", v);
                             Some(1)
@@ -264,10 +278,21 @@ pub fn materialize(
     };
     std::fs::create_dir_all(&cfg.data_dir)
         .map_err(|e| format!("create data dir {}: {}", cfg.data_dir.display(), e))?;
-    // 每次调用用唯一文件名（pid + 单调序列），避免并发调用（CLI + 定时任务 / 未来
-    // MCP/web 触发）互相覆盖 script/output，导致读到他方半写文件（#7/#R3-8）。
+    // 每次调用用唯一文件名（pid + 单调序列 + 一次性随机数），避免并发调用（CLI + 定时任务 /
+    // 未来 MCP/web 触发）互相覆盖 script/output，导致读到他方半写文件（#7/#R3-8）。
     let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let uniq = format!("{}_{}", std::process::id(), seq);
+    // #R17（第17轮 security/medium）：仅 `pid + 单调序列` 可预测（CWE-377）。O_EXCL 预占只防
+    // spawn 时刻路径已被符号链接占据；load+reason 窗口可能很长，能写 data_dir 的本地攻击者可在
+    // 预占后 unlink 常规文件并预置符号链接，子进程 save 按路径覆盖写会沿链接写到任意可写文件。
+    // 追加 8 字节不可预测随机数（getrandom），使攻击者无法预知路径，配合 O_NOFOLLOW 读兜底。
+    let mut rand_buf = [0u8; 8];
+    let _ = getrandom::getrandom(&mut rand_buf);
+    let uniq = format!(
+        "{}_{}_{:016x}",
+        std::process::id(),
+        seq,
+        u64::from_le_bytes(rand_buf)
+    );
     let batch_file = cfg.data_dir.join(format!("materialize_{}.batch", uniq));
     let out_ttl = cfg.data_dir.join(format!("materialized_{}.ttl", uniq));
     // RAII：batch 脚本 + 物化 TTL 在任意退出路径（spawn 失败/超时/解析失败…）都被删除。#R3-6/#R4-2
@@ -279,12 +304,15 @@ pub fn materialize(
     // 与 out_ttl 的 O_EXCL/O_NOFOLLOW 防御不对称。把已读入内存的内容写进唯一名 + O_EXCL 的
     // 副本，batch 引用副本，彻底关闭该 TOCTOU。
     let source_copy = cfg.data_dir.join(format!("source_{}.ttl", uniq));
-    write_ttl_copy(&source_copy, &source_content)?;
+    // #R17（第17轮 other/low）：先注册进 guard 再写入——若 create_new 成功但 write_all 中途失败
+    // （磁盘满等）返回 Err，半成品临时文件已在 guard 内、随 drop 清理，不违背"所有退出路径都清理"
+    // 不变式（此前 write 成功后才 add，失败路径会泄漏半成品临时文件，反复失败累积）。
     temp_guard.add(source_copy.clone());
+    write_ttl_copy(&source_copy, &source_content)?;
     let schema_copy: Option<std::path::PathBuf> = if let Some(sc) = &schema_content {
         let p = cfg.data_dir.join(format!("schema_{}.ttl", uniq));
-        write_ttl_copy(&p, sc)?;
         temp_guard.add(p.clone());
+        write_ttl_copy(&p, sc)?;
         Some(p)
     } else {
         None
@@ -510,12 +538,33 @@ pub fn materialize(
     let all_edges = parse_ttl_edges(&ttl);
     // 推断边 = 物化后边集 ∖ 物化前显式边集（集合差，顺序无关）。
     // 不用 reason 报告的 inferred_count，也不假设"推断边排最前"——那些跨版本都不可靠（#113）。
+    // #R17（第17轮 bug/medium）：比较前对集合两边做**轻量 IRI 归一**（尾部 #/ 归一），对齐
+    // `http://x/onto/docA#` vs `http://x/onto/docA` 这类派生不一致，避免显式边被误判为推断。
+    // 相对 vs 绝对（无 @base）的差异归下方 inferred_ratio 高占比告警兜底。
     let materialized_set: std::collections::HashSet<(String, String, String)> =
-        all_edges.iter().cloned().collect();
+        all_edges.iter().map(normalize_edge).collect();
+    let source_norm: std::collections::HashSet<(String, String, String)> =
+        source_edges.iter().map(normalize_edge).collect();
     let inferred_edges: Vec<(String, String, String)> = materialized_set
-        .difference(&source_edges)
+        .difference(&source_norm)
         .cloned()
         .collect();
+    // #R17：推断占比异常高（≥80% 物化边被判为推断）时告警。通常正常物化只新增少量推断边；
+    // 若几乎全部边都是"推断"，强烈提示源/物化 IRI 形式不一致（如相对 vs 绝对）导致集合差误判，
+    // 而非真实推理。运维据此排查，避免静默污染语义记账。
+    if !materialized_set.is_empty() {
+        let inferred_ratio = inferred_edges.len() as f64 / materialized_set.len() as f64;
+        if inferred_ratio >= 0.8 {
+            eprintln!(
+                "WARN: inferred ratio {:.0}% ({}/{}) is abnormally high — possible IRI form \
+                 mismatch between source and materialized TTL (e.g. relative vs absolute); \
+                 explicit edges may be misclassified as inferred",
+                inferred_ratio * 100.0,
+                inferred_edges.len(),
+                materialized_set.len()
+            );
+        }
+    }
 
     // batch 脚本与 out_ttl 均由 TempFileGuard 在函数返回时自动删除（含成功路径，#R3-6/#R4-2）。
     // 边已全部解析进内存（all_edges/inferred_edges），out_ttl 无需保留，防磁盘耗尽（#5-high）。
@@ -539,19 +588,25 @@ fn parse_json_line(line: &str) -> Result<serde_json::Value, serde_json::Error> {
 /// （#3 第11轮引入，第12轮扩展复用于 source_ttl/schema_path）。
 ///
 /// 用于所有"读取前需确认是常规文件"的 TTL 输入（out_ttl / source_ttl / schema_path）：
-/// Unix：open 时 `O_NOFOLLOW` 直接拒绝符号链接，随后在已打开的句柄上 fstat 校验常规文件
-/// （拒绝 FIFO/设备，防阻塞读），再通过句柄读取——路径替换不影响已打开的真实文件。
+/// Unix：open 时 `O_NOFOLLOW` 直接拒绝符号链接 + `O_NONBLOCK` 拒绝 FIFO 阻塞，随后在已打开的
+/// 句柄上 fstat 校验常规文件（拒绝 FIFO/设备，防阻塞读），再通过句柄读取——路径替换不影响
+/// 已打开的真实文件。
+/// #R17（第17轮 security/high）：Unix 分支必须同时加 `O_NONBLOCK`。仅 `O_NOFOLLOW` 时，open
+/// 一个无 writer 的 FIFO 会无限阻塞到有 writer 出现（fstat 常规文件校验在 open 返回后才执行，
+/// 永远轮不到）；若 out_ttl 在子进程运行期间被换成 FIFO，父进程 open 还会与子进程 save 的写端
+/// 互相等待形成死锁。`O_NONBLOCK` 使 open FIFO 立即返回，fstat 确认常规文件后再读取（常规文件
+/// 读写不受 O_NONBLOCK 影响），真正关闭 FIFO DoS 面。
 /// Windows 无 `O_NOFOLLOW`：符号链接创建需管理员权限（风险已收窄），此处用 `symlink_metadata`
 /// 校验兜底。
 #[cfg(unix)]
 fn read_ttl_no_follow(path: &std::path::Path) -> Result<String, String> {
     use std::io::Read;
-    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    use std::os::unix::fs::OpenOptionsExt;
     let mut f = std::fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)
-        .map_err(|e| format!("open ttl (O_NOFOLLOW): {}", e))?;
+        .map_err(|e| format!("open ttl (O_NOFOLLOW|O_NONBLOCK): {}", e))?;
     let md = f
         .metadata()
         .map_err(|e| format!("fstat ttl: {}", e))?;
@@ -1237,6 +1292,30 @@ fn iri_local_name(iri: &str) -> String {
     }
 }
 
+/// 规范化 IRI 用于**集合差比较**（#R17 第17轮 bug/medium）。
+///
+/// 推断边 = `materialized_set.difference(&source_edges)` 依赖源 TTL 与推理器输出的 IRI **逐字符串
+/// 相等**。`expand_term` 对无 `@base` 的相对 `<rel>` IRI 会保留相对形式，而 open-ontologies 按自己
+/// 的 base 解析成绝对 IRI——此时全部显式边落进差集、被误标为推断边写回（静默污染）。`@base` 支持
+/// 只覆盖"源 TTL 声明了 @base"这一类场景。
+///
+/// 这里做**轻量归一**，对齐最常见的推导不一致来源：
+/// - 去除多余尾部 `#`/`/`（同一 IRI 的 `http://x/onto/docA#` 与 `http://x/onto/docA` 视为相同）
+/// - 但对"相对 vs 绝对"（无 @base 时）无力对齐——那需要子进程统一的 base 语义，归到下方
+///   `inferred_ratio` 告警兜底捕捉。
+fn normalize_iri(iri: &str) -> String {
+    let mut s = iri.to_string();
+    while s.len() > 1 && (s.ends_with('#') || s.ends_with('/')) {
+        s.pop();
+    }
+    s
+}
+
+/// 对三元组做轻量 IRI 归一（用于集合差比较，#R17）。顺序不变。
+fn normalize_edge(e: &(String, String, String)) -> (String, String, String) {
+    (normalize_iri(&e.0), normalize_iri(&e.1), normalize_iri(&e.2))
+}
+
 /// 受控本体命名空间前缀（#R4-1 命名空间感知）。
 /// 只有来自这些命名空间的谓词 IRI 才被识别为受控语义边；其它命名空间的
 /// 局部名即使撞上白名单（如 `http://foreign-vendor/onto#references`）也拒绝，
@@ -1832,15 +1911,19 @@ pub fn run_ontology_cli(args: &[String]) -> Result<String, String> {
                 Ok(r) => r,
                 Err(e) => return Err(e),
             };
-            Ok(format!(
-                "materialize OK\nduration_ms: {}\nprofile: {}\ntriples: {} -> {} (inferred {})\ninferred_edges: {}",
-                res.duration_ms,
-                res.profile,
-                res.triples_before,
-                res.triples_after,
-                res.triples_after.saturating_sub(res.triples_before),
-                res.inferred_edges.len(),
-            ))
+            // #R17（第17轮 other/low）：`(inferred {})` 原用 `triples_after - triples_before`——那是三元组
+        // 计数差（含 schema 本体声明、rdf:type 等非语义边），与下一行 `inferred_edges: {}`（语义
+        // 推断边数）不一致，可能误导运维（"inferred 500" 而实际仅 3 条语义边）。改标签为
+        // `triples_delta` 明确其语义，避免与 inferred_edges 混淆。
+        Ok(format!(
+            "materialize OK\nduration_ms: {}\nprofile: {}\ntriples: {} -> {} (triples_delta {})\ninferred_edges: {}",
+            res.duration_ms,
+            res.profile,
+            res.triples_before,
+            res.triples_after,
+            res.triples_after.saturating_sub(res.triples_before),
+            res.inferred_edges.len(),
+        ))
         }
         "status" => status(&cfg),
         "serve" => serve_http_placeholder(&cfg, args),
