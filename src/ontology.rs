@@ -40,19 +40,28 @@ static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 struct TempFileGuard {
     batch: std::path::PathBuf,
     out: std::path::PathBuf,
+    // #R15（第15轮 security/medium）：source/schema 的 O_EXCL 副本也由 guard 清理，
+    // 与 batch/out 同生命周期，避免泄漏临时文件。
+    extras: Vec<std::path::PathBuf>,
 }
 impl TempFileGuard {
     fn new(batch: std::path::PathBuf, out: std::path::PathBuf) -> Self {
-        TempFileGuard { batch, out }
+        TempFileGuard { batch, out, extras: Vec::new() }
     }
     fn batch_path(&self) -> &std::path::Path {
         &self.batch
+    }
+    fn add(&mut self, p: std::path::PathBuf) {
+        self.extras.push(p);
     }
 }
 impl Drop for TempFileGuard {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.batch);
         let _ = std::fs::remove_file(&self.out);
+        for p in &self.extras {
+            let _ = std::fs::remove_file(p);
+        }
     }
 }
 
@@ -167,8 +176,15 @@ pub fn materialize(
     // create_dir_all 之前完成——否则恶意输入会先创建目录（副作用）再被拒绝，
     // 违背"任何注入/危险输入在产生任何文件系统足迹前就被拒绝"的不变式（#5 第8轮 security/low）。
     let data_dir_str = cfg.data_dir.to_string_lossy();
-    if data_dir_str.contains(['\n', '\r', '"', ';']) {
-        return Err("invalid data_dir: control chars / quote / semicolon not allowed".to_string());
+    // #R15（第15轮 security/low）：data_dir 拒绝字符集须与 source_ttl/schema_path 用"同一套规则"
+    // ——非 Windows 上额外拒绝 `\`（尾随 `\` 逃逸 batch 双引号注入）。此前 out_ttl/batch 文件名的
+    // `.ttl`/`.batch` 后缀恰好掩盖了该逃逸，属脆弱纵深防御；补上 `\` 避免未来改动引入注入面。
+    let mut data_dir_forbid: Vec<char> = vec!['\n', '\r', '"', ';'];
+    if !cfg!(windows) {
+        data_dir_forbid.push('\\');
+    }
+    if data_dir_str.contains(data_dir_forbid.as_slice()) {
+        return Err("invalid data_dir: control chars / quote / semicolon (and backslash on Unix) not allowed".to_string());
     }
     // 安全校验（#115/#117 命令注入）：profile 白名单 + source 拒绝危险字符。
     // 换行会注入额外的 load/reason/save 指令；profile 含空白/;/" 会向 batch 注入额外参数。
@@ -199,18 +215,20 @@ pub fn materialize(
     // 之后），违背 #R4-4 不变式——crafted OPEN_ONTOLOGIES_SCHEMA 会先触发 data-dir 创建 + schema
     // 文件读取才被拒绝；且若 schema_path 指向 FIFO/命名管道，上方的 read_to_string 会无限阻塞
     // 在才有机会校验（可用性漏洞）。这里统一前置，任何危险输入在产生文件系统足迹前被拒绝。
-    if cfg.schema_path.exists() {
-        let sp = cfg.schema_path.to_string_lossy();
-        // #6（第11轮 security/medium）：与 source_ttl 同，schema_path **在 Unix 上**拒绝 `\`
-        // （可能尾随 `\` 逃逸 batch 引号注入）。Windows 上 `win_path` 会把 `\` 转成 `/`，正常
-        // `C:\...` 必含反斜杠，不能拒绝（#11 实测）。schema_path 租户可控（OPEN_ONTOLOGIES_SCHEMA env）。
-        let mut forbidden: Vec<char> = vec!['\n', '\r', '"', ';'];
-        if !cfg!(windows) {
-            forbidden.push('\\');
-        }
-        if sp.contains(forbidden.as_slice()) {
-            return Err("invalid schema_path: control chars / quote / semicolon (and backslash on Unix) not allowed".to_string());
-        }
+    // #R15（第15轮 security/medium）：校验必须**无条件**执行，不能挂在 `if schema_path.exists()`
+    // 上——否则攻击者在校验时文件尚不存在、随后（batch 脚本构建前）创建为名称含 `"`/`;`/换行的
+    // 文件，win_path_quoted 只做双引号包裹不做自转义，路径被原样拼进 load 行，绕过注入防线。
+    // 与 source_ttl/data_dir 的无条件校验一致。
+    let sp = cfg.schema_path.to_string_lossy();
+    // #6（第11轮 security/medium）：与 source_ttl 同，schema_path **在 Unix 上**拒绝 `\`
+    // （可能尾随 `\` 逃逸 batch 引号注入）。Windows 上 `win_path` 会把 `\` 转成 `/`，正常
+    // `C:\...` 必含反斜杠，不能拒绝（#11 实测）。schema_path 租户可控（OPEN_ONTOLOGIES_SCHEMA env）。
+    let mut forbidden: Vec<char> = vec!['\n', '\r', '"', ';'];
+    if !cfg!(windows) {
+        forbidden.push('\\');
+    }
+    if sp.contains(forbidden.as_slice()) {
+        return Err("invalid schema_path: control chars / quote / semicolon (and backslash on Unix) not allowed".to_string());
     }
     // #R4-4：create_dir_all 失败必须传播（此前 `let _ =` 吞错，data_dir 不可写时
     // 后续 write batch/out 会以更令人困惑的路径错误暴露）。未显式创建会造成写临时
@@ -222,12 +240,13 @@ pub fn materialize(
     // （O_NOFOLLOW 打开 + fstat 校验常规文件 + 持句柄读），关闭 metadata 检查与 read_to_string
     // 按名重开之间的 TOCTOU——与 out_ttl 的防御一致（此前用 `metadata().is_file()` + 按名重开，
     // 检查与读之间路径可被换成 FIFO 永久阻塞，可用性 DoS）。
-    let mut source_edges: std::collections::HashSet<(String, String, String)> = {
-        let src = read_ttl_no_follow(std::path::Path::new(source_ttl))
-            .map_err(|e| format!("read source ttl: {}", e))?;
-        parse_ttl_edges(&src).into_iter().collect()
-    };
-    if cfg.schema_path.exists() {
+    // 读取 source/schema 内容为字符串（既用于解析 source_edges，也用于后续写 O_EXCL 副本，
+    // 关闭 #261 的 TOCTOU）。
+    let source_content = read_ttl_no_follow(std::path::Path::new(source_ttl))
+        .map_err(|e| format!("read source ttl: {}", e))?;
+    let mut source_edges: std::collections::HashSet<(String, String, String)> =
+        parse_ttl_edges(&source_content).into_iter().collect();
+    let schema_content: Option<String> = if cfg.schema_path.exists() {
         // #6：schema 的受控边并入 source_edges 一起减。schema_path 的危险字符校验
         // 在下方的 batch 脚本构建处统一做（此处只读不写，早于任何注入面）。
         // #3（第9轮 bug/medium）：schema 读取失败不能再被 `if let Ok` 静默吞掉——若 schema_path
@@ -239,7 +258,10 @@ pub fn materialize(
         let schema_src = read_ttl_no_follow(&cfg.schema_path)
             .map_err(|e| format!("read schema ttl {}: {}", cfg.schema_path.display(), e))?;
         source_edges.extend(parse_ttl_edges(&schema_src));
-    }
+        Some(schema_src)
+    } else {
+        None
+    };
     std::fs::create_dir_all(&cfg.data_dir)
         .map_err(|e| format!("create data dir {}: {}", cfg.data_dir.display(), e))?;
     // 每次调用用唯一文件名（pid + 单调序列），避免并发调用（CLI + 定时任务 / 未来
@@ -249,16 +271,32 @@ pub fn materialize(
     let batch_file = cfg.data_dir.join(format!("materialize_{}.batch", uniq));
     let out_ttl = cfg.data_dir.join(format!("materialized_{}.ttl", uniq));
     // RAII：batch 脚本 + 物化 TTL 在任意退出路径（spawn 失败/超时/解析失败…）都被删除。#R3-6/#R4-2
-    let temp_guard = TempFileGuard::new(batch_file.clone(), out_ttl.clone());
+    let mut temp_guard = TempFileGuard::new(batch_file.clone(), out_ttl.clone());
+
+    // #R15（第15轮 security/medium）：batch 脚本若按原始路径 load source/schema，本模块读出后、
+    // 子进程 load 前攻击者可把文件换成不同内容/FIFO——推理数据与 source_edges 基线不一致，
+    // 集合差把显式边误标为推断写回（静默污染）；换成 FIFO 则子进程阻塞至超时（反复 DoS）。
+    // 与 out_ttl 的 O_EXCL/O_NOFOLLOW 防御不对称。把已读入内存的内容写进唯一名 + O_EXCL 的
+    // 副本，batch 引用副本，彻底关闭该 TOCTOU。
+    let source_copy = cfg.data_dir.join(format!("source_{}.ttl", uniq));
+    write_ttl_copy(&source_copy, &source_content)?;
+    temp_guard.add(source_copy.clone());
+    let schema_copy: Option<std::path::PathBuf> = if let Some(sc) = &schema_content {
+        let p = cfg.data_dir.join(format!("schema_{}.ttl", uniq));
+        write_ttl_copy(&p, sc)?;
+        temp_guard.add(p.clone());
+        Some(p)
+    } else {
+        None
+    };
 
     // 剧本：load schema（含 OWL 传递/对称属性声明）→ load 数据 → reason → save。
     // OWL 推理需要本体声明（TransitiveProperty 等）在场，否则 supersedes 等只是普通属性，
     // 不会产生传递闭包推断（P0 验证实锤：schema 未 load 时 inferred=0）。
     let mut script = String::new();
-    if cfg.schema_path.exists() {
-        // schema_path 危险字符校验已在 materialize() 顶部统一前置（#6 第10轮 security/medium，
-        // 见 create_dir_all 之前），此处不再重复。
-        script.push_str(&format!("load {}\n", win_path_quoted(&cfg.schema_path)));
+    if let Some(sc) = &schema_copy {
+        // #R15：batch 引用 O_EXCL 副本，不再按原始路径重开（关闭 TOCTOU）。
+        script.push_str(&format!("load {}\n", win_path_quoted(sc)));
     } else {
         // 低危：#8 schema 缺失静默——显式告警，避免误以为推理已正确运行。
         eprintln!(
@@ -268,7 +306,7 @@ pub fn materialize(
     }
     script.push_str(&format!(
         "load {}\nreason --profile {}\nsave {}\n",
-        win_path_quoted(std::path::Path::new(source_ttl)),
+        win_path_quoted(&source_copy),
         profile,
         win_path_quoted(&out_ttl)
     ));
@@ -576,6 +614,20 @@ fn win_path_quoted(p: &std::path::Path) -> String {
     format!("\"{}\"", s)
 }
 
+/// 以 `create_new`（O_EXCL）写一份 TTL 副本，供 batch 脚本按副本路径 load（#R15/#261）。
+/// 副本用唯一名（pid+seq），攻击者无法预置符号链接劫持；batch 引用副本而非原始路径，
+/// 关闭"模块读出后、子进程 load 前文件被换"的 TOCTOU。
+fn write_ttl_copy(path: &std::path::Path, content: &str) -> Result<(), String> {
+    use std::io::Write;
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|e| format!("create ttl copy (exclusive): {}", e))?;
+    f.write_all(content.as_bytes())
+        .map_err(|e| format!("write ttl copy {}: {}", path.display(), e))
+}
+
 /// 轻量 TTL 三元组解析器（目标谓词扫描版）。
 ///
 /// 只解析本骨架需要的子集：提取「主语 → 目标关系谓词 → 对象」三元组。
@@ -603,6 +655,10 @@ fn parse_ttl_edges(ttl: &str) -> Vec<(String, String, String)> {
     let ttl = ttl.strip_prefix('\u{FEFF}').unwrap_or(ttl);
     // 前缀表：`p:local` → 完整 IRI。#R4-3 前缀展开。默认前缀 `:` 也在此表。
     let mut prefixes: HashMap<String, String> = HashMap::new();
+    // #R15（第15轮 bug/high）：`@base <iri>` 声明。Turtle 导出常见 `@base <...>` + 相对 `<rel>`
+    // IRI 形式；若不支持，主语/谓词/对象都不会解析为绝对 IRI，受控关系谓词无法命中命名空间，
+    // 显式边从 source_edges 整体丢失，集合差把全部显式边误判为推断边写回（静默污染）。
+    let mut base: Option<String> = None;
     let mut subj: Option<String> = None;
     let mut pred: Option<String> = None;
     // 上一行结尾的分隔符：Some(';') = 下行首个 IRI 是新谓词；Some(',') = 下行首个 IRI 是新对象。
@@ -628,8 +684,14 @@ fn parse_ttl_edges(ttl: &str) -> Vec<(String, String, String)> {
             prev_sep = None;
             continue;
         }
+        if let Some(b) = parse_base_decl(line_trimmed) {
+            // #R15：`@base <iri>` 声明，供相对 `<rel>` IRI 展开。不参与三元组状态机。
+            base = Some(b);
+            prev_sep = None;
+            continue;
+        }
         if line_trimmed.starts_with('@') {
-            // 其它 @ 指令（@base 等）本骨架不处理，跳过。
+            // 其它 @ 指令本骨架不处理，跳过。
             continue;
         }
         // 剥掉行尾续行标记。
@@ -666,63 +728,83 @@ fn parse_ttl_edges(ttl: &str) -> Vec<(String, String, String)> {
         // 会把既有链接误报为推断或漏写回。故：非纯类型行只跳过前导 `a <Type>` 两个 token。
         // 谓词 `a` 在 tokenize 中作为 token 捕获（`a ` 分支）。
         let type_pred_at_0 = tokens.first().map(|t| t.as_str()) == Some("a");
-        let has_type_target = tokens.get(1).is_some();
-        let is_pure_type = type_pred_at_0 && has_type_target && tokens.len() == 2;
-        if is_pure_type {
-            // 纯类型声明行（`a <Type>`）：无目标关系边，跳过内容。
-            // 但必须保留行尾续行标记：块中间的 `a <Type> ;` 后可能还有 `<pred> <obj>` 续行，
-            // 直接置 None 会把后续续行误判为新主语块，导致真实语义边被静默丢弃（#118）。
-            // 本行以 `.` 结尾则重置为 None（下行为新主语块）。
-            prev_sep = if line_trimmed.ends_with(';') {
-                Some(';')
-            } else if line_trimmed.ends_with(',') {
-                Some(',')
+        // #R15（第15轮 bug/low）：`a <T>` 的类型对象必须被显式跳过（含 `,`/`;` 续行），
+        // 不能依赖 `tokens.len()==2` 判定纯类型——`a <T> ; <pred> <obj>` 或 `a <T> , <U> ;`
+        // 时 token 数 >2，旧逻辑把 `<T>` 当谓词、`,` 后的 `<U>` 当对象，若 `<T>` 恰为受控
+        // 命名空间内白名单局部名（如 `.../partOf` 用作类）会产出伪边 (s, T, U)。显式跳过
+        // `a` 及其全部类型对象与分隔符，只保留真正的目标关系边。#6 原先的"纯类型跳过"由
+        // 这个更通用的类型对象跳过取代。
+        // 计算本行起始 token 索引 `i`（类型行跳过 `a <T>` 及对象列表；普通行做主语/谓词判定）。
+        // 之后统一用 while 处理关系边（类型行 `;` 续行与普通行共用同一状态机）。
+        let mut i;
+        if type_pred_at_0 {
+            // tokens: [a, <T0>, {, <T1>...} | {; pred obj...}]
+            // 跳过 `a`（index 0）。
+            i = 1;
+            // 跳过第一个类型对象 `<T0>`。
+            if i < tokens.len() {
+                i += 1;
+            }
+            // 跳过逗号分隔的其它类型对象 `, <Tn>`。
+            while i < tokens.len() && tokens[i] == "," {
+                i += 2; // 跳过 `,` 和其后的类型对象
+            }
+            // 若后面紧跟 `;`，这是续行（后续可能有关系边），置 i 于 `;` 处交给状态机；
+            // 否则本行无目标关系边，按纯类型行处理。
+            if i < tokens.len() && tokens[i] == ";" {
+                i += 1; // 从 `;` 后继续（状态机见 `;` 会清 pred）
             } else {
-                None
-            };
-            continue;
+                // 纯类型行（或仅对象列表）：无目标关系边。
+                prev_sep = if line_trimmed.ends_with(';') {
+                    Some(';')
+                } else if line_trimmed.ends_with(',') {
+                    Some(',')
+                } else {
+                    None
+                };
+                continue;
+            }
+        } else {
+            i = 0;
+            // 行首首个 token 若能展开为 IRI，且上一行不是续行 → 新主语块。
+            // 同时兼容 `<iri>` 与 `p:local`/`:local`（#R4-3 前缀展开）。
+            let first_term = tokens.get(i).and_then(|t| expand_term(t, &prefixes, &base));
+            // 仅当上一行不是续行（`;`/`,`）且本行首 token 是 IRI 时，才视为新主语块。
+            let new_block = prev_sep.is_none() && first_term.is_some();
+            if new_block {
+                if let Some(s) = first_term {
+                    subj = Some(s);
+                    pred = None;
+                    i += 1;
+                }
+            } else if prev_sep == Some(';') && first_term.is_some() {
+                // 续行且上一行以 `;` 结尾：行首 IRI 是新谓词（沿用 subj）。
+                if let Some(p) = first_term {
+                    pred = Some(p);
+                    i += 1;
+                }
+            } else if first_term.is_none() && prev_sep.is_none() {
+                // 行首不是可展开 IRI 且非续行。可能是 blank node 主语（`_:b0 <p> <o>` /
+                // `[ ... ] <p> <o>`）或其它非 IRI 主语。
+                // #5（第6轮 bug/medium）：blank node 主语不能直接把表示边丢弃——否则
+                // `source_edges` 少算这些边，物化后若推理器对 blank node skolemize 成 IRIs，
+                // "物化−源"集合差会把显式边误标为推断边并写库（evidence=ontology:materialized），
+                // 污染推断记账。故对 `_:label` / `[...]` 主语：保留 subj 为 blank node 占位，
+                // 让后续 `<pred> <obj>` 正常产出边。仅对确实无法识别的主语才重置，避免 stale 伪边。
+                let first_tok = tokens.first().map(|t| t.as_str()).unwrap_or("");
+                let is_bnode = first_tok.starts_with("_:") || first_tok.starts_with('[');
+                if is_bnode {
+                    subj = Some(first_tok.to_string());
+                    pred = None;
+                    i = 1;
+                } else {
+                    subj = None;
+                    pred = None;
+                }
+            }
         }
-        // 非纯类型：跳过前导 `a <Type>` 两个 token（若有），继续处理其余关系边（#6）。
-        let mut i = if type_pred_at_0 && has_type_target { 2 } else { 0 };
 
-        // 行首首个 token 若能展开为 IRI，且上一行不是续行 → 新主语块。
-        // 同时兼容 `<iri>` 与 `p:local`/`:local`（#R4-3 前缀展开）。
-        let first_term = tokens.get(i).and_then(|t| expand_term(t, &prefixes));
-        // 仅当上一行不是续行（`;`/`,`）且本行首 token 是 IRI 时，才视为新主语块。
-        let new_block = prev_sep.is_none() && first_term.is_some();
-        if new_block {
-            // 主语（i 可能已跳过前导 `a <Type>`，故用 i+1 而非硬编码 1）
-            if let Some(s) = first_term {
-                subj = Some(s);
-                pred = None;
-                i += 1;
-            }
-        } else if prev_sep == Some(';') && first_term.is_some() {
-            // 续行且上一行以 `;` 结尾：行首 IRI 是新谓词（沿用 subj）。
-            if let Some(p) = first_term {
-                pred = Some(p);
-                i += 1;
-            }
-        } else if first_term.is_none() && prev_sep.is_none() {
-            // 行首不是可展开 IRI 且非续行。可能是 blank node 主语（`_:b0 <p> <o>` /
-            // `[ ... ] <p> <o>`）或其它非 IRI 主语。
-            // #5（第6轮 bug/medium）：blank node 主语不能直接把表示边丢弃——否则
-            // `source_edges` 少算这些边，物化后若推理器对 blank node skolemize 成 IRIs，
-            // "物化−源"集合差会把显式边误标为推断边并写库（evidence=ontology:materialized），
-            // 污染推断记账。故对 `_:label` / `[...]` 主语：保留 subj 为 blank node 占位，
-            // 让后续 `<pred> <obj>` 正常产出边（blank node 主语本身不展开，仅作占位）。
-            // 仅对确实无法识别的主语（既非 IRI 也非 blank node）才重置，避免 stale 伪边（#R3-2）。
-            let first_tok = tokens.first().map(|t| t.as_str()).unwrap_or("");
-            let is_bnode = first_tok.starts_with("_:") || first_tok.starts_with('[');
-            if is_bnode {
-                subj = Some(first_tok.to_string());
-                pred = None;
-                i = 1;
-            } else {
-                subj = None;
-                pred = None;
-            }
-        }
+        // 统一处理关系边（类型行 `;` 续行与普通行共用状态机，#R15）。
         while i < tokens.len() {
             let tok = &tokens[i];
             match tok.as_str() {
@@ -735,9 +817,29 @@ fn parse_ttl_edges(ttl: &str) -> Vec<(String, String, String)> {
                     i += 1;
                 }
                 _ => {
+                    // #R15（第15轮 bug/low）：`a` 是 rdf:type 简写谓词，可能出现于**主语之后**：
+                    // `<subj> a <T0> , <T1> ; <pred> <obj>`。当 `a` 落在谓词位时，其后到 `;`（或行尾）
+                    // 的对象都是类型对象，不能按"谓词+对象"产边——否则 `<T0>` 被当谓词、`,` 后的
+                    // `<T1>` 被当对象，若 `<T0>` 恰为受控命名空间内白名单局部名（如 `.../partOf`
+                    // 用作类）会产出伪边 (s, T0, T1)。这里显式跳过 `a` 及其全部类型对象列表。
+                    if pred.is_none() && tok == "a" {
+                        // 跳过 `a` 本身。
+                        i += 1;
+                        // 跳过首个类型对象 `<T0>`（若存在）。
+                        if i < tokens.len() {
+                            i += 1;
+                        }
+                        // 跳过逗号分隔的其它类型对象 `, <Tn>`。
+                        while i < tokens.len() && tokens[i] == "," {
+                            i += 2;
+                        }
+                        // 若 `<T0>` 后紧跟 `;`，由主循环 `;` 分支清 pred 继续关系边；
+                        // 否则本行无目标关系边，循环条件自然结束。
+                        continue;
+                    }
                     // 尝试把 token 展开为完整 IRI：#R4-3 前缀展开。
                     // 支持 `<iri>` 与 `p:local`（含默认 `:local`）两种形式。
-                    if let Some(iri) = expand_term(tok, &prefixes) {
+                    if let Some(iri) = expand_term(tok, &prefixes, &base) {
                         if pred.is_none() {
                             // 谓词
                             pred = Some(iri);
@@ -753,12 +855,10 @@ fn parse_ttl_edges(ttl: &str) -> Vec<(String, String, String)> {
                         && (tok.starts_with("_:") || tok.starts_with('['))
                     {
                         // #7（第10轮 bug/medium）：blank node **对象** 不能静默丢弃，须与
-                        // 主语处理对称（见上方 #5 主语分支）。若 `_:b0`/`[...]` 在对象位被丢，
-                        // source_edges 漏算这些边；物化后若 OWL 推理器把 blank node skolemize 成
-                        // 新 IRI，这些边出现在 all_edges 但不在 source_edges，集合差会误标为推断
-                        // 边写回（evidence=ontology:materialized），污染推断记账。故对象位也保留
-                        // blank node 占位进 source_edges。写回时 write_back_edges 已过滤 `_:`/`[`
-                        // 端点（#6 第8轮），不会污染全局实体。
+                        // 主语处理对称。若 `_:b0`/`[...]` 在对象位被丢，source_edges 漏算这些边；
+                        // 物化后若 OWL 推理器把 blank node skolemize 成新 IRI，集合差会误标为
+                        // 推断边写回（evidence=ontology:materialized）。故对象位保留 blank node
+                        // 占位进 source_edges。写回时 write_back_edges 已过滤 `_:`/`[` 端点。
                         if let (Some(s), Some(p)) = (&subj, &pred) {
                             if map_relation_iri(p).is_some() {
                                 all.push((s.clone(), p.clone(), (*tok).to_string()));
@@ -843,13 +943,32 @@ fn parse_prefix_decl(line: &str) -> Option<(String, String)> {
     Some((name, base.to_string()))
 }
 
+/// 解析 `@base <iri> .` 声明，返回基 IRI（#R15/#631 bug/high）。
+/// Turtle 导出常见形式：`@base <http://.../onto/>` + 相对 `<rel>` IRI。
+/// 返回 None 表示不是 `@base` 声明。
+fn parse_base_decl(line: &str) -> Option<String> {
+    let rest = line.strip_prefix("@base")?.trim_start();
+    // `@base <iri> .` —— 末尾通常有 `.`，先剥掉再取 `<>` 内 IRI。
+    let rest = rest.strip_suffix('.').unwrap_or(rest).trim_end();
+    rest.strip_prefix('<')?.strip_suffix('>').map(|s| s.to_string())
+}
+
 /// 把 TTL 术语 token 展开为完整 IRI。
-/// - `<iri>` → 直接返回内层 IRI。
+/// - `<iri>` → `<rel>` 是相对 IRI 且有 `@base` 时按 RFC3986 相对解析；否则直接返回内层 IRI。
 /// - `p:local`（含默认 `:local`）→ 用前缀表展开；前缀未声明则返回 None（跳过）。
 /// - 其它（如 `a`）→ None。
-fn expand_term(tok: &str, prefixes: &HashMap<String, String>) -> Option<String> {
+/// #R15（第15轮 bug/high）：`base` 参数来自 `@base` 声明，供相对 `<rel>` 展开。
+fn expand_term(tok: &str, prefixes: &HashMap<String, String>, base: &Option<String>) -> Option<String> {
     if tok.starts_with('<') && tok.ends_with('>') && tok.len() >= 2 {
-        return Some(tok[1..tok.len() - 1].to_string());
+        let inner = &tok[1..tok.len() - 1];
+        // 相对 IRI（无 scheme 且非 `//`、非绝对路径空根）：需 base 解析，否则受控谓词无法命中。
+        let is_absolute = inner.contains("://") || inner.starts_with("//");
+        if !is_absolute {
+            if let Some(b) = base {
+                return Some(resolve_iri(b, inner));
+            }
+        }
+        return Some(inner.to_string());
     }
     // 前缀名形式：`p:local` 或 `:local`。`a` 谓词（无冒号）不展开。
     if let Some(colon) = tok.find(':') {
@@ -860,6 +979,32 @@ fn expand_term(tok: &str, prefixes: &HashMap<String, String>) -> Option<String> 
         }
     }
     None
+}
+
+/// 简化的 RFC3986 相对 IRI 解析：把 `rel` 按 `base` 解析为绝对 IRI。
+/// 覆盖本骨架需要的 Turtle 相对形式：`<rel>`、`<dir/rel>`、`<rel.ttl>` 等。
+/// 不做完整的 RFC3986 段合并（非 goal），但正确处理常见导出形式。
+fn resolve_iri(base: &str, rel: &str) -> String {
+    // 分割 base 的 scheme + authority + path：`scheme://authority/path...`
+    let (scheme, scheme_rest) = match base.find("://") {
+        Some(i) => (&base[..i], &base[i + 3..]),
+        None => ("", base),
+    };
+    // scheme_rest = `authority/path`
+    let (authority, base_path) = match scheme_rest.find('/') {
+        Some(i) => (&scheme_rest[..i], &scheme_rest[i..]),
+        None => (scheme_rest, ""),
+    };
+    // 相对引用以 `/` 开头 → 替换整个路径
+    if rel.starts_with('/') {
+        return format!("{}://{}{}", scheme, authority, rel);
+    }
+    // 相对引用是纯路径 → 基于 base 的目录部分拼接
+    let base_dir = match base_path.rfind('/') {
+        Some(i) => &base_path[..=i],
+        None => "/",
+    };
+    format!("{}://{}{}{}", scheme, authority, base_dir, rel)
 }
 
 /// 把一行 TTL 切成 token：`<iri>` 整体 + `p:local`/`:local` 前缀名 + `;``,` 分隔符。
@@ -1334,6 +1479,47 @@ mod tests {
             "http://memoria.ai/onto/supersedes".to_string(),
             "http://example.org/docA".to_string()
         )));
+    }
+
+    #[test]
+    fn ttl_parse_expands_base_relative_iris() {
+        // #R15（第15轮 bug/high）：`@base <...>` + 相对 `<rel>` IRI（Turtle 导出常见形式）。
+        // 若不展开，主语/谓词/对象都不会解析为绝对 IRI，受控谓词无法命中命名空间，显式边
+        // 从 source_edges 整体丢失，集合差把全部显式边误判为推断边写回（静默污染）。
+        let ttl = r#"@base <http://memoria.ai/onto/> .
+@prefix owl: <http://www.w3.org/2002/07/owl#> .
+<supersedes> a owl:ObjectProperty, owl:TransitiveProperty .
+<docB> <supersedes> <docA> ;
+    a owl:ObjectProperty .
+"#;
+        let all = parse_ttl_edges(ttl);
+        // `a` 类型行不产边；只应产出 (docB, supersedes, docA)，且经 @base 展开为绝对 IRI。
+        assert_eq!(all.len(), 1, "got {:?}", all);
+        assert!(all.contains(&(
+            "http://memoria.ai/onto/docB".to_string(),
+            "http://memoria.ai/onto/supersedes".to_string(),
+            "http://memoria.ai/onto/docA".to_string()
+        )), "got {:?}", all);
+    }
+
+    #[test]
+    fn ttl_parse_skips_type_objects_with_continuation() {
+        // #R15（第15轮 bug/low）：`a <T> ; <pred> <obj>` 或 `a <T> , <U> ;` 带续行分隔符时，
+        // `<T>` 绝不能被当谓词、`,` 后的 `<U>` 当对象——若 `<T>`/`<U>` 恰为受控命名空间内
+        // 白名单局部名会产出伪边。类型对象须显式跳过，只保留真正的目标关系边。
+        let ttl = r#"@base <http://memoria.ai/onto/> .
+@prefix owl: <http://www.w3.org/2002/07/owl#> .
+<docC> a <http://memoria.ai/onto/partOf>, <http://memoria.ai/onto/Agent> ;
+    <supersedes> <docA> .
+"#;
+        let all = parse_ttl_edges(ttl);
+        // 只产 1 条 (docC, supersedes, docA)；不得因类型对象 partOf/Agent 产伪边。
+        assert_eq!(all.len(), 1, "got {:?}", all);
+        assert!(all.contains(&(
+            "http://memoria.ai/onto/docC".to_string(),
+            "http://memoria.ai/onto/supersedes".to_string(),
+            "http://memoria.ai/onto/docA".to_string()
+        )), "got {:?}", all);
     }
 
     #[test]
