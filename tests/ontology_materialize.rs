@@ -30,16 +30,30 @@ const DATA_TTL: &str = r#"@prefix : <http://memoria.ai/onto/> .
 /// 定位 open-ontologies 二进制；缺失则 None（测试跳过）。
 /// 仅当显式设置了 OPEN_ONTOLOGIES_BIN 且路径存在、或二进制确定在 PATH 上时才返回 Some，
 /// 避免在无二进制的环境（如 CI runner）误判后 spawn 失败。
+///
+/// #R4-6：所有探测（env 路径 --help、`which`/`where`）都带超时，避免挂死的二进制
+/// / 无响应的 PATH 探测卡住测试进程（与主模块"子进程必须超时"规矩一致）。
+/// #R4-7：设置 `REQUIRE_ONTOLOGIES_BIN=1` 时，找不到二进制直接 panic（CI 硬要求），
+/// 而不是静默 skip——防止 CI 上"测试绿了但实际没跑真实物化"的假绿通过门禁。
 fn find_bin() -> Option<String> {
+    let require = std::env::var("REQUIRE_ONTOLOGIES_BIN").map(|v| v == "1").unwrap_or(false);
+    let found = locate_bin();
+    if found.is_none() && require {
+        panic!(
+            "REQUIRE_ONTOLOGIES_BIN=1 but open-ontologies binary not found \
+             (set OPEN_ONTOLOGIES_BIN or ensure it's on PATH)"
+        );
+    }
+    found
+}
+
+fn locate_bin() -> Option<String> {
     // env 值先做 is_file() 校验 + 可执行探测（--help 能 spawn），缺失/不可执行则跳过，
     // 避免后续 materialize(...).expect(...) 因 spawn 失败而 panic（#R3-1）。
     if let Ok(b) = std::env::var("OPEN_ONTOLOGIES_BIN") {
         if !b.is_empty()
             && std::path::Path::new(&b).is_file()
-            && std::process::Command::new(&b)
-                .arg("--help")
-                .output()
-                .is_ok()
+            && probe_help(&b)
         {
             return Some(b);
         }
@@ -58,6 +72,39 @@ fn find_bin() -> Option<String> {
         .map(str::trim)
         .find(|s| !s.is_empty() && std::path::Path::new(s).is_file())
         .map(str::to_string)
+}
+
+/// 带超时的 `--help` 可执行探测（#R4-6）。spawn 失败、超时、非零退出都视为不可用。
+/// 用 `std::process::Child::wait_timeout` 无法直接获得（std 无此 API），故用
+/// `spawn` + 轮询 `try_wait` + 超时 kill 的既有模式。
+fn probe_help(bin: &str) -> bool {
+    let mut child = match std::process::Command::new(bin)
+        .arg("--help")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_st)) => return true,
+            Ok(None) => {}
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+        }
+        if std::time::Instant::now() > deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
 }
 
 /// RAII 临时目录守卫（#123）：drop 时自动清理，panic 也不泄漏临时文件。

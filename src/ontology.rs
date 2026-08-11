@@ -17,6 +17,7 @@
 //!
 //! 2026-08-11 P0 骨架。关系类型映射与 RELATION_TYPES（tools/graph.rs）保持一致。
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -33,20 +34,25 @@ const VALID_PROFILES: &[&str] = &["rdfs", "owl-rl", "owl-dl", "owl-full"];
 /// pid + 单调序列（而非依赖 SystemTime 纳秒的粗粒度时钟），并发调用绝不碰撞。
 static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// 临时文件 RAII 守卫（#R3-6）：持有 batch 脚本路径，drop 时删除，
-/// 确保 spawn 失败 / 超时 / 解析失败等**所有**退出路径都清理临时文件，防磁盘耗尽。
-struct BatchFileGuard(std::path::PathBuf);
-impl BatchFileGuard {
-    fn new(p: std::path::PathBuf) -> Self {
-        BatchFileGuard(p)
+/// 临时文件 RAII 守卫（#R3-6/#R4-2）：持有 batch 脚本 + 物化 TTL 路径，drop 时删除，
+/// 确保 spawn 失败 / 超时 / 解析失败等**所有**退出路径都清理临时文件。
+/// 边已全部解析进内存（all_edges/inferred_edges），out_ttl 无需保留，防磁盘耗尽。
+struct TempFileGuard {
+    batch: std::path::PathBuf,
+    out: std::path::PathBuf,
+}
+impl TempFileGuard {
+    fn new(batch: std::path::PathBuf, out: std::path::PathBuf) -> Self {
+        TempFileGuard { batch, out }
     }
-    fn path(&self) -> &std::path::Path {
-        &self.0
+    fn batch_path(&self) -> &std::path::Path {
+        &self.batch
     }
 }
-impl Drop for BatchFileGuard {
+impl Drop for TempFileGuard {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
+        let _ = std::fs::remove_file(&self.batch);
+        let _ = std::fs::remove_file(&self.out);
     }
 }
 
@@ -108,15 +114,19 @@ pub fn materialize(
     profile: &str,
 ) -> Result<MaterializeResult, String> {
     let start = Instant::now();
-    let _ = std::fs::create_dir_all(&cfg.data_dir);
+    // #R4-4：create_dir_all 失败必须传播（此前 `let _ =` 吞错，data_dir 不可写时
+    // 后续 write batch/out 会以更令人困惑的路径错误暴露）。未显式创建会造成写临时
+    // 文件失败，且那发生在校验之后、spawn 之前，正是最该早期暴露的位置。
+    std::fs::create_dir_all(&cfg.data_dir)
+        .map_err(|e| format!("create data dir {}: {}", cfg.data_dir.display(), e))?;
     // 每次调用用唯一文件名（pid + 单调序列），避免并发调用（CLI + 定时任务 / 未来
     // MCP/web 触发）互相覆盖 script/output，导致读到他方半写文件（#7/#R3-8）。
     let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let uniq = format!("{}_{}", std::process::id(), seq);
     let batch_file = cfg.data_dir.join(format!("materialize_{}.batch", uniq));
     let out_ttl = cfg.data_dir.join(format!("materialized_{}.ttl", uniq));
-    // RAII：batch 脚本在任意退出路径（spawn 失败/超时/解析失败…）都被删除，#R3-6。
-    let batch_guard = BatchFileGuard::new(batch_file.clone());
+    // RAII：batch 脚本 + 物化 TTL 在任意退出路径（spawn 失败/超时/解析失败…）都被删除。#R3-6/#R4-2
+    let temp_guard = TempFileGuard::new(batch_file.clone(), out_ttl.clone());
 
     // 安全校验（#115/#117 命令注入）：profile 白名单 + source 拒绝危险字符。
     // 换行会注入额外的 load/reason/save 指令；profile 含空白/;/" 会向 batch 注入额外参数。
@@ -164,12 +174,12 @@ pub fn materialize(
         profile,
         win_path_quoted(&out_ttl)
     ));
-    std::fs::write(batch_guard.path(), script)
+    std::fs::write(temp_guard.batch_path(), script)
         .map_err(|e| format!("write batch script: {}", e))?;
 
     let mut child = Command::new(&cfg.bin)
         .arg("batch")
-        .arg(win_path(batch_guard.path()))
+        .arg(win_path(temp_guard.batch_path()))
         .arg("--data-dir")
         .arg(win_path(&cfg.data_dir))
         .stdout(std::process::Stdio::piped())
@@ -320,16 +330,22 @@ fn win_path_quoted(p: &std::path::Path) -> String {
 /// 等声明谓词不产出语义边（由 map_relation_iri 返回 None 自然剔除）。
 ///
 /// 处理 open-ontologies 导出的 Turtle 子集：
+/// - **前缀展开**（#R4-3）：收集 `@prefix p: <base>` 声明，把 `p:local` 展开为完整 IRI；
+///   默认前缀 `@prefix : <base>` 用 `:local` 展开。这样 source_ttl 若用前缀名（而非完整
+///   `<...>` IRI），`parse_ttl_edges` 仍能解析出 source_edges，`inferred_edges` 的
+///   diff 才不会被"前缀名 vs 完整 IRI"的不一致误判（#R4-3/#123）。
 /// - 主语块行：`<s> <p> <o> , <o2> ; <p2> <o3> .`（对象用 `,` 分隔，谓词用 `;` 分隔）
 /// - **跨行续行**：前一行以 `;`/`,` 结尾时，当前行以 `<` 开头是谓词/对象续行而非新主语，
-///   subj/pred 状态跨行保留（用 `prev_cont` 跟踪）。
+///   subj/pred 状态跨行保留（用 `prev_sep` 跟踪）。
 /// - 类型续行 `a <Type> .`（无主语，跳过）
-/// - 忽略 `@prefix` / `#` 注释 / 空行
+/// - 忽略 `#` 注释 / 空行
 ///
 /// 返回全部目标关系边（显式 + 推断）。推断边由调用方对源 TTL 与物化 TTL 的
 /// 边集做集合差得出（见 `materialize`），避免依赖导出器"推断边排最前"这一不稳稿假设。
 fn parse_ttl_edges(ttl: &str) -> Vec<(String, String, String)> {
     let mut all: Vec<(String, String, String)> = Vec::new();
+    // 前缀表：`p:local` → 完整 IRI。#R4-3 前缀展开。默认前缀 `:` 也在此表。
+    let mut prefixes: HashMap<String, String> = HashMap::new();
     let mut subj: Option<String> = None;
     let mut pred: Option<String> = None;
     // 上一行结尾的分隔符：Some(';') = 下行首个 IRI 是新谓词；Some(',') = 下行首个 IRI 是新对象。
@@ -338,10 +354,19 @@ fn parse_ttl_edges(ttl: &str) -> Vec<(String, String, String)> {
 
     for raw in ttl.lines() {
         let line_trimmed = raw.trim();
-        if line_trimmed.is_empty()
-            || line_trimmed.starts_with('#')
-            || line_trimmed.starts_with('@')
-        {
+        if line_trimmed.is_empty() || line_trimmed.starts_with('#') {
+            continue;
+        }
+        // #R4-3：`@prefix p: <base>` 声明（含 `@prefix : <base>` 默认前缀）。
+        // 在跳过所有 `@` 行之前先收集，供后续 `p:local` 展开。
+        if let Some(p) = parse_prefix_decl(line_trimmed) {
+            prefixes.insert(p.0, p.1);
+            // 前缀声明行不参与三元组状态机，且不改变 prev_sep（前缀行必以 `.` 结尾）。
+            prev_sep = None;
+            continue;
+        }
+        if line_trimmed.starts_with('@') {
+            // 其它 @ 指令（@base 等）本骨架不处理，跳过。
             continue;
         }
         // 类型续行 `<subject> a <Type>` 或 `a <Type>`：无目标关系边，跳过类型声明。
@@ -374,27 +399,26 @@ fn parse_ttl_edges(ttl: &str) -> Vec<(String, String, String)> {
         let tokens = tokenize_ttl(line);
 
         let mut i = 0;
-        // 仅当行首是 `<` 且上一行不是续行 → 新主语块。
-        let new_block = line.starts_with('<') && prev_sep.is_none();
+        // 行首首个 token 若能展开为 IRI，且上一行不是续行 → 新主语块。
+        // 同时兼容 `<iri>` 与 `p:local`/`:local`（#R4-3 前缀展开）。
+        let first_term = tokens.first().and_then(|t| expand_term(t, &prefixes));
+        // 仅当上一行不是续行（`;`/`,`）且本行首 token 是 IRI 时，才视为新主语块。
+        let new_block = prev_sep.is_none() && first_term.is_some();
         if new_block {
             // 主语
-            if let Some(t) = tokens.first() {
-                if t.starts_with('<') {
-                    subj = Some(t[1..t.len() - 1].to_string());
-                    pred = None;
-                    i = 1;
-                }
+            if let Some(s) = first_term {
+                subj = Some(s);
+                pred = None;
+                i = 1;
             }
-        } else if line.starts_with('<') && prev_sep == Some(';') {
+        } else if prev_sep == Some(';') && first_term.is_some() {
             // 续行且上一行以 `;` 结尾：行首 IRI 是新谓词（沿用 subj）。
-            if let Some(t) = tokens.first() {
-                if t.starts_with('<') {
-                    pred = Some(t[1..t.len() - 1].to_string());
-                    i = 1;
-                }
+            if let Some(p) = first_term {
+                pred = Some(p);
+                i = 1;
             }
-        } else if !line.starts_with('<') && prev_sep.is_none() {
-            // 行首不是 `<` 且非续行：blank node 主语（`_:b0 ...` / `[...] ...`）
+        } else if first_term.is_none() && prev_sep.is_none() {
+            // 行首不是 IRI 且非续行：blank node 主语（`_:b0 ...` / `[...] ...`）
             // 或其它非 IRI 主语。若沿用上一块的 stale subj/pred 会产出错误边，
             // 因此重置 subj/pred，避免 `(prevSubj, supersedes, docA)` 这类伪边（#R3-2）。
             subj = None;
@@ -411,23 +435,22 @@ fn parse_ttl_edges(ttl: &str) -> Vec<(String, String, String)> {
                 "," => {
                     i += 1;
                 }
-                _ if tok.starts_with('<') => {
-                    let iri = tok[1..tok.len() - 1].to_string();
-                    if pred.is_none() {
-                        // 谓词
-                        pred = Some(iri);
-                    } else {
-                        // 对象
-                        if let (Some(s), Some(p)) = (&subj, &pred) {
-                            if map_relation_iri(&p).is_some() {
-                                all.push((s.clone(), p.clone(), iri));
+                _ => {
+                    // 尝试把 token 展开为完整 IRI：#R4-3 前缀展开。
+                    // 支持 `<iri>` 与 `p:local`（含默认 `:local`）两种形式。
+                    if let Some(iri) = expand_term(tok, &prefixes) {
+                        if pred.is_none() {
+                            // 谓词
+                            pred = Some(iri);
+                        } else {
+                            // 对象
+                            if let (Some(s), Some(p)) = (&subj, &pred) {
+                                if map_relation_iri(&p).is_some() {
+                                    all.push((s.clone(), p.clone(), iri));
+                                }
                             }
                         }
                     }
-                    i += 1;
-                }
-                _ => {
-                    // 非 IRI（如 `a` 谓词）跳过
                     i += 1;
                 }
             }
@@ -445,10 +468,46 @@ fn parse_ttl_edges(ttl: &str) -> Vec<(String, String, String)> {
     all
 }
 
-/// 把一行 TTL 切成 token：`<iri>` 整体 + `;``,` 分隔符。
+/// 解析 `@prefix p: <base>` 声明，返回 `(前缀名, 基IRI)`。
+/// 前缀名可为空（`@prefix : <base>` 表示默认前缀）。
+/// 只接受这种定型形式；`p:` 与 `<base>` 之间可有空白。返回 None 表示不是前缀声明。
+fn parse_prefix_decl(line: &str) -> Option<(String, String)> {
+    let rest = line.strip_prefix("@prefix")?.trim_start();
+    // 前缀名：`p:` 或 `:`（默认前缀），`:` 前可有字母/数字/下划线/连字符/点。
+    let colon = rest.find(':')?;
+    let name = rest[..colon].trim().to_string();
+    let after = rest[colon + 1..].trim_start();
+    // `@prefix p: <base> .` —— 末尾通常有 `.`，先剥掉再取 `<>` 内 IRI（#R4-3）。
+    let after = after.strip_suffix('.').unwrap_or(after).trim_end();
+    let base = after.strip_prefix('<')?.strip_suffix('>')?;
+    Some((name, base.to_string()))
+}
+
+/// 把 TTL 术语 token 展开为完整 IRI。
+/// - `<iri>` → 直接返回内层 IRI。
+/// - `p:local`（含默认 `:local`）→ 用前缀表展开；前缀未声明则返回 None（跳过）。
+/// - 其它（如 `a`）→ None。
+fn expand_term(tok: &str, prefixes: &HashMap<String, String>) -> Option<String> {
+    if tok.starts_with('<') && tok.ends_with('>') && tok.len() >= 2 {
+        return Some(tok[1..tok.len() - 1].to_string());
+    }
+    // 前缀名形式：`p:local` 或 `:local`。`a` 谓词（无冒号）不展开。
+    if let Some(colon) = tok.find(':') {
+        let name = &tok[..colon];
+        let local = &tok[colon + 1..];
+        if let Some(base) = prefixes.get(name) {
+            return Some(format!("{}{}", base, local));
+        }
+    }
+    None
+}
+
+/// 把一行 TTL 切成 token：`<iri>` 整体 + `p:local`/`:local` 前缀名 + `;``,` 分隔符。
 ///
 /// 跳过引号字面量跨度（`"foo,bar"` / `"x;y"`）：字面量内的 `,`/`;` 不是 Turtle
 /// 分隔符，不得触发状态机（否则会误清 pred / 错连 stale subj，#R3-5）。
+/// #R4-3：前缀名 `p:local`（含默认 `:local`）与 `a` 谓词是合法术语，需捕获为 token，
+/// 由调用方用 `expand_term` 展开为完整 IRI。
 fn tokenize_ttl(line: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut rest = line;
@@ -472,10 +531,25 @@ fn tokenize_ttl(line: &str) -> Vec<String> {
         } else if b == b';' || b == b',' {
             out.push(rest[..1].to_string());
             rest = &rest[1..];
-        } else {
-            // 跳过空白及 `a` 等裸 token（逐字符推进到下一个 < 或分隔符）
+        } else if rest.starts_with("_:")
+            || is_qname_start(b)
+            || b == b':'                    // 默认前缀 `:local`
+            || rest.starts_with("a ")        // `a` 谓词（rdf:type 简写）
+            || rest.starts_with("a\t")
+            || rest.starts_with("a;")
+            || rest.starts_with("a,")
+            || (b == b'a' && rest.len() == 1)
+        {
+            // 前缀名 / blank node 标签 / `a` 谓词：捕获到下一个空白或分隔符。
             let next = rest
-                .find(['<', ';', ',', '"', '\''])
+                .find([' ', '\t', ';', ',', '<', '"', '\'', '>'])
+                .unwrap_or(rest.len());
+            out.push(rest[..next].to_string());
+            rest = &rest[next..];
+        } else {
+            // 其它（空白、`.` 等）跳过
+            let next = rest
+                .find(['<', ';', ',', '"', '\'', ' ', '\t'])
                 .unwrap_or(rest.len());
             if next == 0 {
                 rest = &rest[1..];
@@ -485,6 +559,11 @@ fn tokenize_ttl(line: &str) -> Vec<String> {
         }
     }
     out
+}
+
+/// 判断字节是否可作为 QName 前缀名 / 局部名的起始（字母、数字、`_`、`-`）。
+fn is_qname_start(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_' || b == b'-'
 }
 
 /// 物化完成后，把推断边 / 全部边写回 entity_edges（幂等 upsert）。
@@ -568,22 +647,42 @@ pub fn write_back_edges(
 }
 
 /// 从完整 IRI 提取末段局部名（`http://x/y/docA` → `docA`）。
+/// #R4-5：末段为空（如 `http://example.org/` 以 `/` 结尾）时回退完整 IRI，
+/// 避免把空字符串当实体名写入（`iri.rsplit().next()` 对尾斜杠返回 `""`）。
 fn iri_local_name(iri: &str) -> String {
-    iri.rsplit(['/', '#'])
-        .next()
-        .unwrap_or(iri)
-        .to_string()
+    let last = iri.rsplit(['/', '#']).next().unwrap_or(iri);
+    if last.is_empty() {
+        iri.to_string()
+    } else {
+        last.to_string()
+    }
 }
 
-/// 把 TTL 关系的完整 IRI/短名映射到 RELATION_TYPES 短名。
+/// 受控本体命名空间前缀（#R4-1 命名空间感知）。
+/// 只有来自这些命名空间的谓词 IRI 才被识别为受控语义边；其它命名空间的
+/// 局部名即使撞上白名单（如 `http://foreign-vendor/onto#references`）也拒绝，
+/// 防止无关词汇注入 entity_edges。
+/// - `http://memoria.ai/onto/`：本模块 schema_core 的默认本体命名空间
+/// - `http://www.w3.org/2002/07/owl#`：OWL 内置（不作为语义边，仅站位）
+/// - `http://example.org/`：测试 / 示例命名空间
+const CONTROLLED_NS: &[&str] = &[
+    "http://memoria.ai/onto/",
+    "http://example.org/",
+];
+
+/// 把 TTL 关系的完整 IRI 映射到 RELATION_TYPES 短名。
 /// 返回 None = 该校验规则不属于受控枚举（跳过写回）。
 ///
-/// 只认显式白名单的 OWL 通用语义边（#R3-4）：不再对任意命名空间的局部名做
-/// fallback 匹配——`http://foreign-vendor/onto#references` 这类无关词汇的局部名
-/// 即使撞上 RELATION_TYPES 也不得写成语义边，否则违背"防垃圾边"意图。
+/// 命名空间感知（#R4-1）：谓词 IRI 必须位于 `CONTROLLED_NS` 命名空间内，
+/// 且局部名命中显式白名单，才映射成语义边。其它命名空间的局部名撞名亦拒绝，
+/// 严格符合"防垃圾边"意图（与文档一致）。
 fn map_relation_iri(pred: &str) -> Option<String> {
+    // 先校验命名空间，再取局部名匹配白名单。
+    if !CONTROLLED_NS.iter().any(|ns| pred.starts_with(ns)) {
+        return None;
+    }
     let short = pred
-        .rsplit(|c| c == '/' || c == '#')
+        .rsplit(['/', '#'])
         .next()
         .unwrap_or(pred);
     match short {
@@ -727,6 +826,40 @@ mod tests {
         // #117：profile 白名单
         assert!(VALID_PROFILES.contains(&"owl-rl"));
         assert!(!VALID_PROFILES.contains(&"owl-rl --some-flag"));
+    }
+
+    #[test]
+    fn ttl_parse_expands_prefixes() {
+        // #R4-3：source_ttl 用前缀名（非完整 IRI）时，parse_ttl_edges 必须展开为完整 IRI，
+        // 否则 source_edges 为空、物化后 diff 会误把所有显式边都当推断边。
+        let ttl = r#"@prefix : <http://example.org/> .
+@prefix ex: <http://memoria.ai/onto/> .
+:docC ex:supersedes :docA , :docB ;
+    a ex:Document .
+:docB ex:supersedes :docA ;
+    a ex:Document .
+"#;
+        let all = parse_ttl_edges(ttl);
+        // 3 条显式边（docC supersedes docA, docC supersedes docB, docB supersedes docA）
+        assert_eq!(all.len(), 3, "got {:?}", all);
+        assert!(all.contains(&(
+            "http://example.org/docC".to_string(),
+            "http://memoria.ai/onto/supersedes".to_string(),
+            "http://example.org/docA".to_string()
+        )));
+        assert!(all.contains(&(
+            "http://example.org/docB".to_string(),
+            "http://memoria.ai/onto/supersedes".to_string(),
+            "http://example.org/docA".to_string()
+        )));
+    }
+
+    #[test]
+    fn iri_local_name_falls_back_on_empty() {
+        // #R4-5：末段为空（尾斜杠 IRI）时回退完整 IRI，不写入空名称。
+        assert_eq!(iri_local_name("http://example.org/docA"), "docA");
+        assert_eq!(iri_local_name("http://example.org/"), "http://example.org/");
+        assert_eq!(iri_local_name("http://example.org#"), "http://example.org#");
     }
 }
 
