@@ -31,6 +31,11 @@ const DEFAULT_TIMEOUT_SECS: u64 = 60;
 /// 超过则告警拉回，杜绝溢出 panic。
 const MAX_TIMEOUT_SECS: u64 = 86400;
 
+/// TTL 文件读取大小上限（#R27 第27轮 security/low）：read_ttl_no_follow / parse_ttl_edges
+/// 全量读入内存。物化 TTL（source/schema/out）通常 < 几 MB，64MB 上限足够容纳极端本体，
+/// 又阻断"未来 MCP/web 触发时租户可控大文件导致父进程 OOM"的面。
+const MAX_TTL_BYTES: u64 = 64 * 1024 * 1024;
+
 /// 允许的 OWL 推理 profile 白名单（#117 命令注入防护）。
 /// 未来经 MCP/web 触发时 profile 是租户可控输入，必须严格白名单，
 /// 拒绝含空白/;/" 的任意串（会向 batch 注入额外参数/指令）。
@@ -93,6 +98,75 @@ fn join_bounded<T: Send + 'static>(
         }
         std::thread::sleep(Duration::from_millis(10));
     }
+}
+
+/// 杀掉整个子进程树（#R27 第27轮 bug/medium）。
+///
+/// `open-ontologies` 可能 spawn 继承 stdout/stderr 管道写端的孙进程（`join_bounded` 的存在
+/// 即为此设计）。超时/错误路径只 `kill` 直接子进程时，孙进程继续运行：既泄漏 CPU/内存（多次
+/// 调用累积），其持有的管道写端也使 reader 线程无法 EOF——破坏"子进程必须超时"不变式。
+/// 故 kill 必须覆盖整棵进程树：
+/// - Unix：spawn 时用 `process_group(0)`（下方 spawn 处）把子进程置入新进程组（pgid = 子进程
+///   pid），kill 时 `killpg` 杀全组，孙进程因继承组 id 一并终止。
+/// - Windows：std 无 kill-tree API，用 `taskkill /T`（树式终止）。`/F` 强杀避免优雅退出挂起。
+fn kill_process_tree(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // spawn 处已 process_group(0)；此处仅当确实在组内才 killpg（防误杀调用方进程组）。
+        // process_group(0) 的 pgid == child pid，直接以 pid 为 pgid 杀组。
+        let _ = unsafe { libc::killpg(child.id() as libc::pid_t, libc::SIGKILL) };
+        // killpg 后 wait 收割直接子进程，避免僵尸（Unix）。
+        let _ = child.wait();
+    }
+    #[cfg(windows)]
+    {
+        let _ = std::process::Command::new("taskkill")
+            .args(["/PID", &child.id().to_string(), "/T", "/F"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        let _ = child.wait();
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+}
+
+/// 校验路径的**所有**组件非符号链接（#R27 第27轮 security/low）。
+///
+/// `create_dir_all` 沿路径跟随每个组件的 symlink/junction——若 data_dir 的某个**祖先**组件是
+/// 攻击者预置的链接（如 `OPEN_ONTOLOGIES_DATA=/tmp/a/ontology` 而 `/tmp/a` 是链接），本模块的
+/// 临时工件会落入攻击者选定目录，只查最终组件的 symlink_metadata 挡不住。此处从根到最终组件
+/// 逐级 `symlink_metadata`（不跟随链接）检查；任一级是 symlink 即拒绝。
+/// Windows 上目录 junction/reparse point 创建不需管理员，检查同样适用。
+fn ensure_no_symlink_components(path: &std::path::Path) -> Result<(), String> {
+    // 从最短祖先（根）开始逐级下探到完整路径，确保每一级都被检查。
+    // `path` 已由 create_dir_all 创建（存在），直接遍历 ancestors。
+    let mut checked = 0usize;
+    for anc in path.ancestors() {
+        // 跳过根与当前目录的琐碎情况；ancestors 从完整路径到根。
+        let is_link = std::fs::symlink_metadata(anc)
+            .map(|m| m.file_type().is_symlink())
+            .unwrap_or(false);
+        if is_link {
+            return Err(format!(
+                "path component {} of data dir {} is a symlink (possible attack); \
+                 refusing to write temp artifacts",
+                anc.display(),
+                path.display()
+            ));
+        }
+        checked += 1;
+        // 到达文件系统根（anc == parent）即终止；`ancestors()` 最末是 `..` 的根。
+        if anc.parent().is_none() {
+            break;
+        }
+    }
+    let _ = checked;
+    Ok(())
 }
 
 /// 物化结果：从 TTL 解析出的推断边（全部显式边 + 推断边统计）。
@@ -280,19 +354,11 @@ pub fn materialize(
         .map_err(|e| format!("create data dir {}: {}", cfg.data_dir.display(), e))?;
     // data_dir 可能是攻击者预置的符号链接：create_dir_all 会沿链接创建/写入，把本模块的临时
     // 文件（batch 脚本、源/schema 副本、预占 out_ttl）重定向进攻击者选定的目录。O_EXCL 预占 +
-    // 随机名只防"覆盖已知文件"，挡不住"写进攻击者目录"。创建后校验最终 data_dir 非链接。
-    #[cfg(unix)]
-    {
-        if std::fs::symlink_metadata(&cfg.data_dir)
-            .map(|m| m.file_type().is_symlink())
-            .unwrap_or(false)
-        {
-            return Err(format!(
-                "data dir {} is a symlink (possible attack); refusing to write temp artifacts",
-                cfg.data_dir.display()
-            ));
-        }
-    }
+    // 随机名只防"覆盖已知文件"，挡不住"写进攻击者目录"。创建后校验 data_dir 的**所有组件**
+    // （#R27 第27轮 security/low：此前只查最终组件，祖先组件若是 symlink——如
+    // OPEN_ONTOLOGIES_DATA=/tmp/a/ontology 而 /tmp/a 是攻击者链接——create_dir_all 沿链接写入，
+    // 最终组件的 symlink_metadata 检查形同虚设）。
+    ensure_no_symlink_components(&cfg.data_dir)?;
     // 每次调用用唯一文件名（pid + 单调序列 + 一次性随机数），避免并发调用（CLI + 定时任务 /
     // 未来 MCP/web 触发）互相覆盖 script/output，导致读到他方半写文件（#7/#R3-8）。
     let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -384,13 +450,23 @@ pub fn materialize(
         let _ = f.write_all(b"");
     }
 
-    let mut child = Command::new(&cfg.bin)
+    // #R27（第27轮 bug/medium）：Unix 上把子进程放入新进程组（pgid = child pid），配合
+    // kill_process_tree 的 killpg 杀整棵进程树——open-ontologies 可能 spawn 继承管道写端的
+    // 孙进程，只 kill 直接子进程会泄漏孙进程并阻塞 reader 线程 EOF。
+    let mut binding = Command::new(&cfg.bin);
+    binding
         .arg("batch")
         .arg(win_path(temp_guard.batch_path()))
         .arg("--data-dir")
         .arg(win_path(&cfg.data_dir))
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        binding.process_group(0);
+    }
+    let mut child = binding
         .spawn()
         .map_err(|e| format!("spawn open-ontologies: {}", e))?;
 
@@ -426,24 +502,25 @@ pub fn materialize(
             Ok(Some(st)) => break st,
             Ok(None) => {}
             Err(e) => {
-                // try_wait 出错（EINTR / Windows handle）：必须 kill + wait + join reader，
-                // 否则子进程继续跑、reader 线程阻塞在 read_to_string，泄漏失控进程（#R3-3）。
+                // try_wait 出错（EINTR / Windows handle）：必须 kill 进程树 + join reader，
+                // 否则子进程（及孙进程）继续跑、reader 线程阻塞在 read_to_string，泄漏失控进程（#R3-3）。
                 // join 用有界版本（#4），防止孙进程持管道导致永久阻塞。
-                let _ = child.kill();
-                let _ = child.wait();
+                kill_process_tree(&mut child);
                 let _ = join_bounded(stdout_reader, Duration::from_secs(2), String::new());
                 let _ = join_bounded(stderr_reader, Duration::from_secs(2), String::new());
                 return Err(format!("wait: {}", e));
             }
         }
         if wait_start.elapsed() > timeout {
-            let _ = child.kill();
-            let _ = child.wait(); // 收割子进程，避免僵尸（Unix）
+            kill_process_tree(&mut child);
             let _ = join_bounded(stdout_reader, Duration::from_secs(2), String::new());
             let _ = join_bounded(stderr_reader, Duration::from_secs(2), String::new());
+            // #R27（第27轮 bug/low）：消息必须报**实际生效的**超时（clamp 后 `timeout`），
+            // 而非原始 `cfg.timeout_secs`——env 值被 clamp（如 100000 → 86400）时，报原始值
+            // 会声称"100000s 后超时"而进程实际 86400s 即被杀，误导运维排查。
             return Err(format!(
                 "ontology materialize timed out after {}s (killed)",
-                cfg.timeout_secs
+                timeout.as_secs()
             ));
         }
         std::thread::sleep(Duration::from_millis(50));
@@ -568,12 +645,25 @@ pub fn materialize(
     // #R17（第17轮 bug/medium）：比较前对集合两边做**轻量 IRI 归一**（尾部 #/ 归一），对齐
     // `http://x/onto/docA#` vs `http://x/onto/docA` 这类派生不一致，避免显式边被误判为推断。
     // 相对 vs 绝对（无 @base）的差异归下方 inferred_ratio 高占比告警兜底。
+    // #R27（第27轮 bug/medium）：归一**只用于集合差计算**，绝不用归一化 IRI 作返回/写回。
+    // 此前把归一化后的 all_edges 直接返回，写回 entity_edges 时 `http://x/docA` 与
+    // `http://x/docA/` 这两个**不同 RDF 资源**被归一成同一实体行、边被合并——静默语义损坏 +
+    // 推断边记账偏差。返回的边列表保留原始 IRI；inferred_edges 用"原始边中归一化后落在差集"
+    // 的方式取，既保持差集语义又保留资源原貌。
     let materialized_set: std::collections::HashSet<(String, String, String)> =
         all_edges.iter().map(normalize_edge).collect();
     let source_norm: std::collections::HashSet<(String, String, String)> =
         source_edges.iter().map(normalize_edge).collect();
-    let inferred_edges: Vec<(String, String, String)> = materialized_set
+    let inferred_norm: std::collections::HashSet<(String, String, String)> = materialized_set
         .difference(&source_norm)
+        .cloned()
+        .collect();
+    // 推断边 = all_edges（原始 IRI）中归一化后落在 inferred_norm 的边。逐条 filter 保留
+    // 原始 IRI；同一归一化三元组对应多条原始边（如 docA 与 docA/ 都 supersedes docC）时
+    // 全部保留——它们本是不同资源的边，写回各自建实体行，不合并。
+    let inferred_edges: Vec<(String, String, String)> = all_edges
+        .iter()
+        .filter(|e| inferred_norm.contains(&normalize_edge(e)))
         .cloned()
         .collect();
     // #R17：推断占比异常高（≥80% 物化边被判为推断）时告警。通常正常物化只新增少量推断边；
@@ -595,12 +685,9 @@ pub fn materialize(
 
     // batch 脚本与 out_ttl 均由 TempFileGuard 在函数返回时自动删除（含成功路径，#R3-6/#R4-2）。
     // 边已全部解析进内存（all_edges/inferred_edges），out_ttl 无需保留，防磁盘耗尽（#5-high）。
-    // all_edges 与 inferred_edges 同出一源（parse_ttl_edges / 集合差），返回前对 all_edges 也归一，
-    // 保证两者 IRI 形式一致（尾部 #/ 归一）——否则未来调用方按 struct 文档写回 raw all_edges，
-    // 会用 `http://x/docA#` 建实体行，与归一后的 `http://x/docA` 重复，破坏集合差 provenance。
-    let all_edges: Vec<(String, String, String)> =
-        all_edges.iter().map(normalize_edge).collect();
-
+    // all_edges 返回**原始 IRI**（#R27 第27轮 bug/medium）：写回 entity_edges 时实体 id 用完整
+    // IRI，若在此归一化，`http://x/docA` 与 `http://x/docA/` 会被合并成同一实体行、边被合并——
+    // 静默语义损坏。归一仅用于上方差集计算，返回列表保持资源原貌。
     Ok(MaterializeResult {
         inferred_edges,
         all_edges,
@@ -648,43 +735,60 @@ fn read_ttl_no_follow(path: &std::path::Path) -> Result<String, String> {
             path.display()
         ));
     }
+    // #R27（第27轮 security/low）：TTL 读取加大小上限——全量读入内存无限制时，未来 MCP/web
+    // 触发的租户可控/异常大 TTL 可致父进程 OOM。与 Windows 分支同一 cap。
+    if md.len() > MAX_TTL_BYTES {
+        return Err(format!(
+            "{} is {} bytes, exceeds TTL size cap {} bytes",
+            path.display(),
+            md.len(),
+            MAX_TTL_BYTES
+        ));
+    }
     let mut s = String::new();
     f.read_to_string(&mut s)
         .map_err(|e| format!("read ttl {}: {}", path.display(), e))?;
     Ok(s)
 }
 
-/// Windows 版本：无 `O_NOFOLLOW`，用 `symlink_metadata`（不跟随链接）确认非符号链接，
-/// 再确认常规文件，最后**通过已打开的句柄**读取。create_new 预占已收窄竞态。
-/// #R18（第18轮 security/medium）：此前 `symlink_metadata` 检查后 `std::fs::read_to_string(path)`
-/// 按名重开——check-read 之间路径可被换成 symlink/junction（目录 junction/reparse point 创建不
-/// 需管理员；dev/CI 常提权运行），使 FIFO 阻塞 DoS 与内容替换在 Windows 上仍部分敞开。改为
-/// `File::open` 打开一次句柄，在句柄上 fstat 校验 + 通过句柄读：路径在 open 后被替换不影响
-/// 已打开的真实文件，与 Unix 的持句柄读一致。
+/// Windows 版本：用 `FILE_FLAG_OPEN_REPARSE_POINT` 打开——不跟随 reparse point（symlink/junction）
+/// 的句柄，fstat 校验与 open **原子绑定到同一句柄**，关闭 check-open TOCTOU（#R27 第27轮
+/// security/medium：此前 `symlink_metadata` 检查与 `File::open` 分离，两者之间路径可被换成
+/// symlink/junction，open 跟随链接后 handle fstat 返回目标元数据，常规文件检查形同虚设）。
+/// 带该 flag 打开的句柄若路径是 reparse point，fstat 属性含 FILE_ATTRIBUTE_REPARSE_POINT，
+/// `file_type().is_symlink()` 返回 true，即可在句柄上检测并拒绝。
+/// 另加读取大小上限（#R27 第27轮 security/low）：TTL 全量读入内存无限制，未来 MCP/web 触发
+/// 时恶意/异常大文件可致父进程 OOM——超上限直接拒绝。
+/// 与 Unix 分支的持句柄读语义一致。
 #[cfg(windows)]
 fn read_ttl_no_follow(path: &std::path::Path) -> Result<String, String> {
     use std::io::Read;
-    let sm = std::fs::symlink_metadata(path)
-        .map_err(|e| format!("lstat ttl {}: {}", path.display(), e))?;
-    if sm.file_type().is_symlink() {
+    use std::os::windows::fs::OpenOptionsExt;
+    // FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000：open 不跟随 reparse point 的句柄。
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    let mut f = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+        .map_err(|e| format!("open ttl {}: {}", path.display(), e))?;
+    let md = f
+        .metadata()
+        .map_err(|e| format!("fstat ttl {}: {}", path.display(), e))?;
+    if md.file_type().is_symlink() {
         return Err(format!("{} is a symlink (possible attack)", path.display()));
     }
-    if !sm.is_file() {
+    if !md.is_file() {
         return Err(format!(
             "{} is not a regular file (possible fifo/device)",
             path.display()
         ));
     }
-    // 打开一次句柄，之后全部经句柄操作（fstat + 读），不按名重开——关闭 check-read TOCTOU。
-    let mut f = std::fs::File::open(path)
-        .map_err(|e| format!("open ttl {}: {}", path.display(), e))?;
-    let md = f
-        .metadata()
-        .map_err(|e| format!("fstat ttl {}: {}", path.display(), e))?;
-    if !md.is_file() {
+    if md.len() > MAX_TTL_BYTES {
         return Err(format!(
-            "{} is not a regular file (possible fifo/device)",
-            path.display()
+            "{} is {} bytes, exceeds TTL size cap {} bytes",
+            path.display(),
+            md.len(),
+            MAX_TTL_BYTES
         ));
     }
     let mut s = String::new();
@@ -1329,9 +1433,12 @@ pub fn write_back_edges(
             // 该行的 name/aliases/summary 经共享行对第二个租户可见，且第二个租户按 namespace 统计
             // 实体时该行不计入（graph build_graph 分歧）。完整修复需把 namespace 并入 entities
             // 复合主键（跨 schema 迁移 + entity_mentions/entity_edges 复合 FK），属独立数据模型
-            // 任务，不在本骨架热循环内强改（避免大范围迁移引入回归）。此处做**防御性检测**：
-            // 当实体 id 已存在但 namespace 不同（跨租户撞名）时显式告警，暴露此前被 ON CONFLICT
-            // DO NOTHING 静默掩盖的串扰，供运维/后续迁移决策；实体行保持首个 owner 语义。
+            // 任务，不在本骨架热循环内强改（避免大范围迁移引入回归）。
+            // #R27（第27轮 bug/medium）：此前 `continue` 只跳过冲突端点的 **entity upsert**，
+            // 但下方 entity_edges INSERT 仍执行——跨租户边经共享实体行泄漏 name/summary，且
+            // `skipped` 未递增，(written, skipped) 记账虚低。任一端点已被其它 namespace 拥有时，
+            // **整条边**跳过（不写实体也不写边），`skipped += 1`。
+            let mut ns_conflict = false;
             for (eid, ename) in [(s.as_str(), sname.as_str()), (o.as_str(), oname.as_str())] {
                 let existing_ns: Option<String> = tx
                     .query_row(
@@ -1344,12 +1451,20 @@ pub fn write_back_edges(
                     if existing != namespace {
                         eprintln!(
                             "WARN: entity {} already owned by namespace {:?}, cannot re-owner as {:?}; \
-                             share row but per-namespace graph isolation may be lossy (see R18)",
-                            eid, existing, namespace
+                             skipping entire edge (s={}, o={}) to preserve per-namespace graph isolation (see R18)",
+                            eid, existing, namespace, s, o
                         );
-                        continue; // 跳过 upsert，保持首个 owner；不静默覆盖
+                        ns_conflict = true;
+                        break;
                     }
                 }
+            }
+            if ns_conflict {
+                skipped += 1;
+                continue;
+            }
+            // 两端实体均无跨 namespace 冲突，正常 upsert。
+            for (eid, ename) in [(s.as_str(), sname.as_str()), (o.as_str(), oname.as_str())] {
                 tx.execute(
                     "INSERT INTO entities(id, namespace, entity_type, name, aliases, summary)
                      VALUES(?1, ?2, 'concept', ?3, '[]', NULL)

@@ -45,13 +45,11 @@ const DATA_TTL: &str = r#"@prefix : <http://memoria.ai/onto/> .
 /// - FAIL OPEN 关闭：`REQUIRE_ONTOLOGIES_BIN=1` 时找不到二进制直接 panic（CI 硬要求），而非
 ///   静默 skip——防止 CI 上"测试绿了但实际没跑真实物化"的假绿通过门禁。
 fn find_bin() -> Option<String> {
-    // REQUIRE_ONTOLOGIES_BIN 接受常见真值（1/true/yes/on），非只认字面量 "1"——"true"/"yes" 等
-    // CI 常见写法此前被静默当作未设置，硬失败门禁悄悄失效、套件静默 skip（防假绿工具自身成了
-    // 假绿源）。空/"0"/"false"/"no"/"off" 视为未要求；**任何已设置的其它值都视为要求**——
-    // 本文件唯一目的是 fail-closed（找不到二进制就 panic），unrecognized 值（CI typo "ture"、
-    // 尾随空格 "true "）若静默当 unset 会让门禁 fail-open，正是要防的假绿。用 var_os + lossy 转换
-    // 区分"未设置"(None) 与"设为非 UTF-8 值"(Some)——后者也按 fail-closed 处理（非 UTF-8 值经
-    // lossy 后无法识别 → require），与下方 OPEN_ONTOLOGIES_BIN 的 var_os 检测语义一致。
+    // REQUIRE_ONTOLOGIES_BIN 接受常见真值（1/true/yes/on）；空/"0"/"false"/"no"/"off" 视为未要求；
+    // **任何已设置的其它值都视为要求**（fail-closed）——CI typo（"ture"）或尾随空格若静默当 unset
+    // 会让"找不到二进制就 panic"的门禁悄悄失效、套件静默 skip（防假绿工具自身成了假绿源）。
+    // 用 var_os + lossy 区分"未设置"(None) 与"设为非 UTF-8 值"(Some)——后者按 fail-closed 处理，
+    // 与下方 OPEN_ONTOLOGIES_BIN 的 var_os 检测语义一致。
     let require = match std::env::var_os("REQUIRE_ONTOLOGIES_BIN") {
         None => false,
         Some(v) => {
@@ -113,11 +111,10 @@ fn locate_bin(env_bin: &Option<std::ffi::OsString>) -> Option<String> {
         if b.is_empty() {
             return None;
         }
-        // env 值先做 is_file() 校验 + 可执行探测（--help 能 spawn + --version 身份校验），失败即
-        // 权威地返回 None，避免后续 materialize(...).expect(...) 因 spawn 失败而 panic 或跑错
-        // 二进制（#R3-1）。#R26（第25轮 other/low）：explicit 路径本就 fail-closed，此处补上
-        // `probe_identity` 身份校验——确认它真是 open-ontologies 而非同名其它工具，保持 fail-closed。
-        if std::path::Path::new(&*b).is_file() && probe_help(&b, pt) && probe_identity(&b, pt) {
+                // env 值先做 is_file() 校验 + 可执行/身份探测（--help 能 spawn 且输出确认是 open-ontologies），
+        // 失败即权威地返回 None，避免后续 materialize(...).expect(...) 因 spawn 失败而 panic 或跑错
+        // 二进制（#R3-1）。explicit 路径本就 fail-closed，`probe_bin` 的身份校验保证它不是同名其它工具。
+        if std::path::Path::new(&*b).is_file() && probe_bin(&b, pt) {
             return Some(b.into_owned());
         }
         return None; // 显式设置但校验失败 → 权威失败，不回退 PATH
@@ -163,12 +160,11 @@ fn locate_bin(env_bin: &Option<std::ffi::OsString>) -> Option<String> {
                 return None; // 剩余预算不足，放弃扫描
             }
             if let Some(s) = exe.to_str() {
-                // #R17：budget = min(单次探测超时, 剩余整体预算)，与 probe_help 的 deadline 语义一致
-                // #R26（第25轮 other/low）：PATH 候选仅凭 `--help` 探测出"可执行"不足以确认它就是
-                // open-ontologies——一个更早 PATH 上的 stale/同名二进制会静默被选中，违背本文件中心的
-                // 防假绿意图。追加 `probe_identity`（`--version` 输出含 open-ontologies 标识）才接受。
-                // 注意：命名按 `--version` 就近读一次剩余预算，避免与扫描预算解耦引入新边界竞态。
-                if probe_help(s, pt.min(remaining)) && probe_identity(s, pt.min(remaining)) {
+                // #R17：budget = min(单次探测超时, 剩余整体预算)，与 probe_bin 的 deadline 语义一致
+                // PATH 候选仅凭"可执行"不足以确认它就是 open-ontologies——一个更早 PATH 上的
+                // stale/同名二进制会静默被选中，违背本文件中心的防假绿意图。`probe_bin` 在 --help
+                // 探测的同时校验输出含 open-ontologies 标识，身份不符即拒绝该候选。
+                if probe_bin(s, pt.min(remaining)) {
                     return Some(s.to_string());
                 }
             }
@@ -229,62 +225,35 @@ fn probe_timeout() -> std::time::Duration {
     }
 }
 
-/// 带超时的 `--help` 可执行探测（#R4-6）。spawn 失败、超时、非零退出都视为不可用。
-/// 用 `std::process::Child::wait_timeout` 无法直接获得（std 无此 API），故用
-/// `spawn` + 轮询 `try_wait` + 超时 kill 的既有模式。
-/// #2（第12轮 bug/low）：`budget` 为调用方传入的**剩余整体探测预算**；本次探测的 deadline =
-/// `budget`（调用方已按 `probe_timeout().min(剩余预算)` 语义给出，见 find_bin/locate_bin）。
-/// #R17（第17轮 maintainability/low）：`probe_help` 不再内部重复 `probe_timeout()`——否则同一
-/// env 每次探测被解析两次，且与 find_bin/locate_bin 的"单次读取"约定相悖（check-then-act 窗口）。
-/// 调用方在入口解析一次 probe_timeout 后沿调用链传入，探测一致的超时语义。
-fn probe_help(bin: &str, budget: std::time::Duration) -> bool {
-    let mut child = match std::process::Command::new(bin)
-        .arg("--help")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
+/// 带超时的可执行 + 身份探测（--help）。spawn 失败、超时、非零退出、stdout 不含 open-ontologies
+/// 标识，都视为不可用。`budget` 为调用方传入的**剩余整体探测预算**，本次探测的 deadline = budget
+/// （调用方已按 `probe_timeout().min(剩余预算)` 语义给出，见 find_bin/locate_bin）。
+/// 设计要点（#R26 第25轮 bug/medium + other/low 合并修复）：
+/// 1. stdout 重定向到**临时文件**而非管道——候选二进制若 spawn 了继承 stdout 写端的孙进程，
+///    管道 EOF 永远不来、`read_to_end` 无界阻塞会挂死整个测试；文件读总是有界（读到子进程已写的
+///    内容即可），孙进程持写端也不阻塞。
+/// 2. 身份校验与可执行探测合并：`--help` 输出必含 clap 的 `name = "open-ontologies"`，子串匹配
+///    `open-ontologies`（大小写不敏感）即确认"真的是 open-ontologies"，无需额外 `--version`
+///    探测（v1.1.1 的 CLI 未注册 version 子命令，`--version` 会非零退出误拒真实二进制）。
+/// 3. 先 wait 再读：轮询 try_wait 拿退出状态，退出后读文件；超时 kill。
+fn probe_bin(bin: &str, budget: std::time::Duration) -> bool {
+    // stdout 写临时文件：进程退出后读文件内容做身份校验。NamedTempFile 随机名 + 独占创建，
+    // 与测试其它临时资源一致；drop 自动清理。
+    let mut out_file = match tempfile::Builder::new()
+        .prefix("memoria_onto_probe_")
+        .tempfile()
     {
-        Ok(c) => c,
+        Ok(f) => f,
         Err(_) => return false,
     };
-    let cap = budget;
-    let deadline = std::time::Instant::now() + cap;
-    loop {
-        match child.try_wait() {
-            // #3（第5轮 test/low）：--help 非零退出也视为不可用（此前任何退出码都返回 true，
-            // 与 doc 注释"非零退出视为不可用"矛盾）。
-            Ok(Some(st)) => return st.success(),
-            Ok(None) => {}
-            Err(_) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return false;
-            }
-        }
-        if std::time::Instant::now() > deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            return false;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
-}
-
-/// `--version` 身份校验（#R26 第25轮 other/low）：确认候选二进制**确实是 open-ontologies**，而非
-/// 任何碰巧通过 `--help` probe 的同名/无关工具。PATH 兜底路径此前只做可执行探测（fail-open 于
-/// "跑哪个二进制"），a stale/更早 PATH 上的同名二进制会被静默选中，违背文件中心的防假绿意图。
-/// 语义：spawn 失败、超时、非零退出、stdout 不包含 `open-ontologies` 标识 → 视为身份不符，返回
-/// false。与 `probe_help` 共用相同的超时语义（budget 已含剩余预算 clamp），保持"所有探测必超时"纪律。
-/// 注意：真实 `open-ontologies --version` 若输出带版本号（如 `open-ontologies 0.1.0`），子串匹配
-/// `open-ontologies` 既兼容纯名也兼容带版本号；大小写不敏感以兼容 `Open-Ontologies` 等变体字形。
-/// 实现纪律：**先 wait 再读 stdout**——`--version` 输出极小（远小于管道缓冲 64KB），子进程不会
-/// 因管道未消费而阻塞写，轮询 try_wait 能正常拿到退出状态；进程退出后管道 EOF，read_to_end 立即
-/// 返回。若在轮询中先阻塞 read_to_end，子进程挂死（不退出不关 stdout）时超时检查将永远执行不到
-/// ——必须避免。预算为调用方传入的剩余整体探测预算（与 probe_help 的 deadline 语义一致）。
-fn probe_identity(bin: &str, budget: std::time::Duration) -> bool {
+    // 子进程写 stdout 到 out_file 的文件句柄；父进程保留 out_file 待进程退出后读。
+    let out_handle = match out_file.reopen() {
+        Ok(h) => h,
+        Err(_) => return false,
+    };
     let mut child = match std::process::Command::new(bin)
-        .arg("--version")
-        .stdout(std::process::Stdio::piped())
+        .arg("--help")
+        .stdout(std::process::Stdio::from(out_handle))
         .stderr(std::process::Stdio::null())
         .spawn()
     {
@@ -292,9 +261,9 @@ fn probe_identity(bin: &str, budget: std::time::Duration) -> bool {
         Err(_) => return false,
     };
     let deadline = std::time::Instant::now() + budget;
-    // 阶段一：先轮询等退出（不读管道，靠"输出小不填缓冲"保证不阻塞写）。
     loop {
         match child.try_wait() {
+            // --help 非零退出也视为不可用（此前任何退出码都返回 true，与 doc 注释矛盾）。
             Ok(Some(st)) => {
                 if !st.success() {
                     return false;
@@ -315,16 +284,16 @@ fn probe_identity(bin: &str, budget: std::time::Duration) -> bool {
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
-    // 阶段二：进程已退出，管道 EOF，此时读 stdout 不会阻塞。
+    // 进程已退出：读临时文件内容校验身份（文件读有界，不依赖管道 EOF）。
     use std::io::Read;
     let mut out = Vec::new();
-    if let Some(mut stdout) = child.stdout.take() {
-        let _ = stdout.read_to_end(&mut out);
-    }
+    let _ = out_file.as_file().read_to_end(&mut out);
     let text = String::from_utf8_lossy(&out);
     let lower = text.to_ascii_lowercase();
     if !lower.contains("open-ontologies") {
-        eprintln!("WARN: candidate binary {bin:?} --version output lacks 'open-ontologies' identity: {text:?}");
+        eprintln!(
+            "WARN: candidate binary {bin:?} --help output lacks 'open-ontologies' identity: {text:?}"
+        );
         return false;
     }
     true
@@ -491,9 +460,11 @@ fn write_back_edges_upserts_into_entity_edges() {
         "unknown banana edge must NOT be persisted by write_back_edges"
     );
 
-    // 幂等：重复写回不重复
-    let (w2, _) = write_back_edges(&conn, ns, &edges[..2]).expect("write_back again");
-    assert_eq!(w2, 2);
+    // 幂等：重复写回不重复。#R27（第27轮 test/low）：不再断言 `w2 == 2`——那是 `write_back_edges`
+    // **内部受影响行计数**的实现细节（如未来重构为 dedupe-before-write / INSERT OR IGNORE，不再
+    // 计数 no-op 更新时该断言会假失败，尽管幂等语义仍成立）。幂等的真正契约是 DB 终态行数，
+    // 只断言库状态（下方 count==2）即可。
+    let (_w2, _) = write_back_edges(&conn, ns, &edges[..2]).expect("write_back again");
     let count: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM entity_edges WHERE namespace=?1 AND relation_type='supersedes'",
