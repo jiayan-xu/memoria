@@ -50,6 +50,11 @@ console-subscriber = { version = "0.4", optional = true }
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+[dev-dependencies]
+# #1（第12轮 security/low）：集成测试用 tempfile::TempDir（随机名 + 独占创建）替代可预测路径
+# 的自定义临时目录，消除符号链接 TOCTOU 与 PID 复用误删风险。
+tempfile = "3"
+
 [features]
 # P2-7：生产默认不链 PyO3。需要 Python 绑定时显式：
 #   cargo build --release --features python
