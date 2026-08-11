@@ -183,6 +183,17 @@ pub fn materialize(
     if source_ttl.contains(['\n', '\r', '"', ';']) {
         return Err("invalid source_ttl: control chars / quote / semicolon not allowed".to_string());
     }
+    // #6（第10轮 security/medium）：schema_path 的危险字符校验必须**前移到 create_dir_all
+    // 之前**（与 data_dir/source_ttl 同处）。此前它在下方 batch 脚本构建处才做（create_dir_all
+    // 之后），违背 #R4-4 不变式——crafted OPEN_ONTOLOGIES_SCHEMA 会先触发 data-dir 创建 + schema
+    // 文件读取才被拒绝；且若 schema_path 指向 FIFO/命名管道，上方的 read_to_string 会无限阻塞
+    // 在才有机会校验（可用性漏洞）。这里统一前置，任何危险输入在产生文件系统足迹前被拒绝。
+    if cfg.schema_path.exists() {
+        let sp = cfg.schema_path.to_string_lossy();
+        if sp.contains(['\n', '\r', '"', ';']) {
+            return Err("invalid schema_path: control chars / quote / semicolon not allowed".to_string());
+        }
+    }
     // #R4-4：create_dir_all 失败必须传播（此前 `let _ =` 吞错，data_dir 不可写时
     // 后续 write batch/out 会以更令人困惑的路径错误暴露）。未显式创建会造成写临时
     // 文件失败，且那发生在校验之后、spawn 之前，正是最该早期暴露的位置。
@@ -223,13 +234,8 @@ pub fn materialize(
     // 不会产生传递闭包推断（P0 验证实锤：schema 未 load 时 inferred=0）。
     let mut script = String::new();
     if cfg.schema_path.exists() {
-        let sp = cfg.schema_path.to_string_lossy();
-        // #R3-7：schema_path 也做与 source_ttl 相同的危险字符校验（换行/引号/分号），
-        // 否则 crafted env 可注入额外 batch 指令。data_dir 的同类校验见上方（#5），
-        // 它同样被拼进 batch 脚本的 save 行；bin 仅用于 spawn 不走 batch 脚本注入面。
-        if sp.contains(['\n', '\r', '"', ';']) {
-            return Err("invalid schema_path: control chars / quote / semicolon not allowed".to_string());
-        }
+        // schema_path 危险字符校验已在 materialize() 顶部统一前置（#6 第10轮 security/medium，
+        // 见 create_dir_all 之前），此处不再重复。
         script.push_str(&format!("load {}\n", win_path_quoted(&cfg.schema_path)));
     } else {
         // 低危：#8 schema 缺失静默——显式告警，避免误以为推理已正确运行。
@@ -338,13 +344,22 @@ pub fn materialize(
         std::thread::sleep(Duration::from_millis(50));
     };
     // 子进程已退出：join reader 线程，拿到完整输出。
-    // #5（第9轮 bug/low）：**成功路径用无界 join**——子进程已退出，pipes 必达 EOF，reader 线程
-    // 会自然结束；有界 join（2s）在输出量大（慢盘/慢管道 drain）时可能静默返回空串，丢失
-    // 解析 triples_before/triples_after 所需的 JSON 行，调用方误报 0→0。孙进程持管道卡死的
-    // 场景只发生在 kill/timeout/error 路径（子进程被强杀后 read_to_string 才可能阻塞），
-    // 那里保留 join_bounded（见上方错误/超时分支）。
-    let stdout = stdout_reader.join().unwrap_or_default();
-    let stderr = stderr_reader.join().unwrap_or_default();
+    // #5（第9轮 bug/low + 第10轮 bug/medium）：成功路径既不能无界 join，也不能用太小的有界值。
+    // 第9轮曾改无界 join（担心 2s 有界值在慢管道 drain 时静默丢 JSON 行），但第10轮指出：
+    // 孙进程如果继承了 stdout/stderr 写端，即使直接子进程正常退出，read_to_string 仍不会撞 EOF，
+    // 无界 join 会永久阻塞，违背模块"子进程必须超时"的不变式（未来 MCP/web 触发时永久占用
+    // worker 线程）。正确折中：用 `cfg.timeout_secs` 作为 bound——足够大以覆盖慢盘/慢管道 drain
+    // （不会误丢正常输出），又保留超时护栏（孙进程持管道时不会永久挂起）。
+    let stdout = join_bounded(
+        stdout_reader,
+        Duration::from_secs(cfg.timeout_secs.max(1)),
+        String::new(),
+    );
+    let stderr = join_bounded(
+        stderr_reader,
+        Duration::from_secs(cfg.timeout_secs.max(1)),
+        String::new(),
+    );
     if !status.success() {
         return Err(format!(
             "open-ontologies batch failed: {} (stderr: {})",
@@ -595,6 +610,21 @@ fn parse_ttl_edges(ttl: &str) -> Vec<(String, String, String)> {
                                 if map_relation_iri(&p).is_some() {
                                     all.push((s.clone(), p.clone(), iri));
                                 }
+                            }
+                        }
+                    } else if pred.is_some()
+                        && (tok.starts_with("_:") || tok.starts_with('['))
+                    {
+                        // #7（第10轮 bug/medium）：blank node **对象** 不能静默丢弃，须与
+                        // 主语处理对称（见上方 #5 主语分支）。若 `_:b0`/`[...]` 在对象位被丢，
+                        // source_edges 漏算这些边；物化后若 OWL 推理器把 blank node skolemize 成
+                        // 新 IRI，这些边出现在 all_edges 但不在 source_edges，集合差会误标为推断
+                        // 边写回（evidence=ontology:materialized），污染推断记账。故对象位也保留
+                        // blank node 占位进 source_edges。写回时 write_back_edges 已过滤 `_:`/`[`
+                        // 端点（#6 第8轮），不会污染全局实体。
+                        if let (Some(s), Some(p)) = (&subj, &pred) {
+                            if map_relation_iri(p).is_some() {
+                                all.push((s.clone(), p.clone(), (*tok).to_string()));
                             }
                         }
                     }
@@ -929,13 +959,28 @@ fn iri_local_name(iri: &str) -> String {
 /// 只有来自这些命名空间的谓词 IRI 才被识别为受控语义边；其它命名空间的
 /// 局部名即使撞上白名单（如 `http://foreign-vendor/onto#references`）也拒绝，
 /// 防止无关词汇注入 entity_edges。
-/// - `http://memoria.ai/onto/`：本模块 schema_core 的默认本体命名空间
+/// - `http://memoria.ai/onto/`：本模块 schema_core 的默认本体命名空间（生产受控）
 /// - `http://www.w3.org/2002/07/owl#`：OWL 内置（不作为语义边，仅站位）
-/// - `http://example.org/`：测试 / 示例命名空间
-const CONTROLLED_NS: &[&str] = &[
-    "http://memoria.ai/onto/",
-    "http://example.org/",
-];
+/// - `http://example.org/`：**仅测试 / 示例**——见 `controlled_ns()` 的 cfg 门禁
+///
+/// #8（第10轮 security/low）：`http://example.org/` 是测试专用命名空间，但此前在**生产匹配
+/// 路径**里活跃。一旦模块被租户可控 TTL 触发（未来 MCP/web），租户可用 `example.org` 下的
+/// 白名单局部名（supersedes/createdBy…）绕过受控词汇门禁。故生产构建的受控命名空间只含
+/// memoria 本体；example.org 通过 `#[cfg(test)]` 仅在测试构建加入（单测/集测 fixture 依赖它）。
+const PROD_CONTROLLED_NS: &[&str] = &["http://memoria.ai/onto/"];
+
+/// 返回当前编译目标的受控命名空间集合（生产 vs 测试）。
+fn controlled_ns() -> &'static [&'static str] {
+    #[cfg(test)]
+    {
+        // 测试构建：生产命名空间 + 测试专用 example.org（静态数组，避免临时值引用）
+        &["http://memoria.ai/onto/", "http://example.org/"]
+    }
+    #[cfg(not(test))]
+    {
+        PROD_CONTROLLED_NS
+    }
+}
 
 /// 把 TTL 关系的完整 IRI 映射到 RELATION_TYPES 短名。
 /// 返回 None = 该校验规则不属于受控枚举（跳过写回）。
@@ -949,7 +994,7 @@ fn map_relation_iri(pred: &str) -> Option<String> {
     // 深层 IRI 会被误认为受控关系（只要末段撞白名单），使攻击者/租户可在受控前缀下注入任意
     // 深度的白名单局部名进 entity_edges，违背 #R4-1 防垃圾边意图。
     // 修正：匹配前缀后，剩余部分必须是单个局部名（不含 '/' 或 '#'），否则拒绝。
-    let ns = CONTROLLED_NS.iter().find(|ns| pred.starts_with(**ns));
+    let ns = controlled_ns().iter().find(|ns| pred.starts_with(**ns));
     let short = match ns {
         Some(ns) => {
             let rest = &pred[ns.len()..];
@@ -1169,15 +1214,22 @@ mod tests {
     }
 
     #[test]
-    fn ttl_parse_skips_blank_node_objects() {
-        // #8（第5轮）：blank node 对象 `[ a <Document> ]` 整体跳过，内层 <Document> 不得
-        // 成为外层谓词的对象，否则产生伪边 (docA, partOf, Document)。
+    fn ttl_parse_skips_inner_type_of_blank_node_object() {
+        // #8（第5轮）+ #7（第10轮 bug/medium）：blank node 对象 `[ a <Document> ]`——内层
+        // `<Document>` 不得成为外层谓词的对象（否则产生伪边 (docA, partOf, Document)），
+        // 且整个 `[ ... ]` 跨度须作为**对象占位**保留进 source_edges（#7，与主语对称，防
+        // skolemize 后误标推断）。此前断言 `all.len()==0`（静默丢对象边）已被 #7 修正。
         let ttl = r#"@prefix : <http://example.org/> .
 <http://example.org/docA> <http://example.org/partOf> [ a <http://example.org/Document> ] .
 "#;
         let all = parse_ttl_edges(ttl);
-        // partOf 是受控关系，但对象是 blank node（无实 IRI），不应产出任何边。
-        assert_eq!(all.len(), 0, "got {:?}", all);
+        // 对象是本 bracket 跨度占位（非内层 <Document>），partOf 受控关系应保留这条边
+        assert_eq!(all.len(), 1, "got {:?}", all);
+        assert!(all.contains(&(
+            "http://example.org/docA".to_string(),
+            "http://example.org/partOf".to_string(),
+            "[ a <http://example.org/Document> ]".to_string()
+        )), "got {:?}", all);
     }
 
     #[test]
@@ -1209,6 +1261,38 @@ _:b0 <http://example.org/supersedes> :docA .
             "http://example.org/supersedes".to_string(),
             "http://example.org/docA".to_string()
         )));
+    }
+
+    #[test]
+    fn ttl_parse_keeps_blank_node_object_edges() {
+        // #7（第10轮 bug/medium）：blank node **对象**（`_:b0` / `[ ... ]`）须与主语对称保留
+        // 进 source_edges，否则 source_edges 漏算，物化后推理器 skolemize 成新 IRI 时这些边
+        // 被集合差误标为推断边写回（evidence=ontology:materialized）。写回时 write_back_edges
+        // 已过滤 `_:`/`[` 端点，不会污染全局实体。
+        let ttl = r#"@prefix : <http://example.org/> .
+:docA <http://example.org/supersedes> _:b0 .
+:docB <http://example.org/partOf> [ a <http://example.org/Document> ] .
+"#;
+        let all = parse_ttl_edges(ttl);
+        // 两条边都应保留（对象为 blank node 占位）
+        assert!(
+            all.contains(&(
+                "http://example.org/docA".to_string(),
+                "http://example.org/supersedes".to_string(),
+                "_:b0".to_string()
+            )),
+            "blank-node object edge should be retained, got {:?}",
+            all
+        );
+        assert!(
+            all.contains(&(
+                "http://example.org/docB".to_string(),
+                "http://example.org/partOf".to_string(),
+                "[ a <http://example.org/Document> ]".to_string()
+            )),
+            "bracket blank-node object edge should be retained, got {:?}",
+            all
+        );
     }
 
     #[test]
