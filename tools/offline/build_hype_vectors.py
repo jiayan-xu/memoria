@@ -105,7 +105,18 @@ def generate_question(content: str) -> str:
             # 无条件 .strip() 会 AttributeError/KeyError，3 次重试后被误判为"瞬时失败"
             # 进 fail_ids（永不收敛且每轮白付 3 次付费调用）。null/缺失是**确定性**结果，
             # 直接返回 ""（走确定性 skip 分支）。
-            content_val = resp.get("choices", [{}])[0].get("message", {}).get("content")
+            # #R42 bug/low：choices 空数组（content-filter refusal）或非 dict 元素也是
+            # 确定性响应——重试 3 次纯白付。校验响应形态，空/畸形按确定性 skip 返回 ""。
+            choices = resp.get("choices")
+            if not isinstance(choices, list) or not choices:
+                return ""
+            msg = choices[0]
+            if not isinstance(msg, dict):
+                return ""
+            content_val = msg.get("message")
+            if not isinstance(content_val, dict):
+                return ""
+            content_val = content_val.get("content")
             if content_val is None:
                 return ""
             return str(content_val).strip().strip('"').strip("'")
@@ -179,12 +190,23 @@ def main():
     # connect（创建不存在的 DB 文件）并 SELECT（无 memories 表时裸抛
     # OperationalError，dry-run 带副作用崩溃）。dry-run 一律用 golden 目标
     # （只需展示问句生成，不需要全库枚举）。
+    # #R42 bug/low：--all 非 dry-run 的 connect 前先做**存在性检查**——DB 缺失/路径
+    # 错误时 connect 会静默创建空文件，随后 SELECT memories 裸抛 traceback 且留下
+    # 副作用空库。明确诊断先行。
     if args.all and not args.dry_run:
+        if not os.path.exists(args.db):
+            print(f"错误: 数据库不存在 {args.db}（请检查 MEMORIA_DB_PATH / --db）")
+            sys.exit(1)
         con = sqlite3.connect(args.db)
-        rows = con.execute(
-            "SELECT id, content FROM memories WHERE namespace='agent/xujiayan' "
-            "AND superseded_by IS NULL AND length(content) BETWEEN 10 AND 500"
-        ).fetchall()
+        try:
+            rows = con.execute(
+                "SELECT id, content FROM memories WHERE namespace='agent/xujiayan' "
+                "AND superseded_by IS NULL AND length(content) BETWEEN 10 AND 500"
+            ).fetchall()
+        except sqlite3.OperationalError as e:
+            con.close()
+            print(f"错误: 读取 {args.db} 的 memories 表失败（库未初始化/路径错误）: {e}")
+            sys.exit(1)
         con.close()
         targets = [(mid, c) for mid, c in rows]
         print(f"全库目标: {len(targets)} 条")
@@ -223,8 +245,24 @@ def main():
     # 失败归因（批内单条失败 → 单独重嵌该条），留待后续优化，本轮保持正确性优先。
     # #R39 bug/medium：清理仅非 dry-run 分支执行——dry-run 不重写该文件却先删除它，
     # 会清空上次失败批次已落盘的 id 清单（运维先 dry-run 验证修复会丢失"定点重跑"清单）。
+    # #R42 bug/medium：清理必须**在 preflight 之后**——preflight 失败（服务不可达/
+    # 维度不匹配）时 sys.exit 发生在清理前，上次运行的失败清单得以保留（否则 preflight
+    # 失败 = 丢失定点重跑清单 = 被迫全量 --all 再付几千次付费调用）。
     failed_ids_path = os.path.join(HERE, "hype_failed_ids.txt")
+    # #R39 performance/medium：嵌入服务预检——系统性配置错误（local 模型 768d 触发
+    # dim≠RUST_DIM、服务不可达）若不先探测，--all 会先为每条付一次付费 LLM chat 再
+    # 全部失败。循环前单次探测嵌入校验 dim==RUST_DIM，配置错误立即 fail-fast。
     if not args.dry_run:
+        try:
+            _vecs, pre_dim = embed(["preflight"])
+        except Exception as e:
+            print(f"错误: embed_server 不可达（{e}）——请先启动 embed_server 再补嵌")
+            sys.exit(1)
+        if pre_dim != RUST_DIM:
+            print(f"错误: embed_server 维度 {pre_dim}≠Rust DIM {RUST_DIM}（模型不匹配，无法补嵌）")
+            sys.exit(1)
+        print(f"预检通过: embed_server dim={pre_dim} == RUST_DIM")
+        # preflight 通过后才清理旧清单（见上方 #R42 说明）。
         try:
             if os.path.exists(failed_ids_path):
                 os.remove(failed_ids_path)
@@ -242,19 +280,6 @@ def main():
                     f.write(mid + "\n")
             except OSError as e:
                 print(f"  [warn] 追加 {failed_ids_path} 失败: {e}")
-    # #R39 performance/medium：嵌入服务预检——系统性配置错误（local 模型 768d 触发
-    # dim≠RUST_DIM、服务不可达）若不先探测，--all 会先为每条付一次付费 LLM chat 再
-    # 全部失败。循环前单次探测嵌入校验 dim==RUST_DIM，配置错误立即 fail-fast。
-    if not args.dry_run:
-        try:
-            _vecs, pre_dim = embed(["preflight"])
-        except Exception as e:
-            print(f"错误: embed_server 不可达（{e}）——请先启动 embed_server 再补嵌")
-            sys.exit(1)
-        if pre_dim != RUST_DIM:
-            print(f"错误: embed_server 维度 {pre_dim}≠Rust DIM {RUST_DIM}（模型不匹配，无法补嵌）")
-            sys.exit(1)
-        print(f"预检通过: embed_server dim={pre_dim} == RUST_DIM")
     for i, (mid, content) in enumerate(targets, 1):
         try:
             q = generate_question(content)

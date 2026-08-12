@@ -135,7 +135,6 @@ pub fn semantic_search(
         // 对每批都会失败，循环内 log-and-continue 会让所有批失败却仍返回 Ok + 空正文
         // 结果——P3-0 内容丢失 bug 的全量复发（#R36 bug/medium）。
         let conn = p.get().map_err(|e| format!("semantic content backfill pool: {}", e))?;
-        let mut batches_ok = 0usize;
         let mut batches_total = 0usize;
         let mut hard_failed_batches = 0usize;
         for chunk in ids.chunks(BATCH) {
@@ -156,7 +155,16 @@ pub fn semantic_search(
             match conn.prepare(&sql) {
                 Ok(mut stmt) => match stmt.query_map(
                     rusqlite::params_from_iter(chunk.iter().map(|s| *s)),
-                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                    // #R42 bug/high：content 可空（schema `content TEXT` 无 NOT NULL）——
+                    // 用 Option<String> 读取，NULL 单独计数（合法数据态），不当作行映射
+                    // 错误；否则全 NULL 批会被误判为"系统性列问题"硬失败，所有批都如此
+                    // 时触发全批升级、整个语义通道被 hybrid.rs 丢弃。
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, Option<String>>(1)?,
+                        ))
+                    },
                 ) {
                     Ok(rows) => {
                         // #R38 bug/low：行级反序列化错误（列类型漂移等）不能 flatten 静默
@@ -164,11 +172,20 @@ pub fn semantic_search(
                         // P3-0 空正文在列漂移下无告警复发。累计行级错误并在全部为空时升级。
                         let mut row_errors = 0usize;
                         let mut inserted = 0usize;
+                        let mut null_content = 0usize;
                         for r in rows {
                             match r {
-                                Ok(v) => {
-                                    contents.insert(v.0, v.1);
-                                    inserted += 1;
+                                Ok((id, content_opt)) => {
+                                    match content_opt {
+                                        Some(c) => {
+                                            contents.insert(id.clone(), c);
+                                            inserted += 1;
+                                        }
+                                        None => {
+                                            // NULL content = 合法数据态，召回损失（剔 id）
+                                            null_content += 1;
+                                        }
+                                    }
                                 }
                                 Err(e) => {
                                     row_errors += 1;
@@ -180,25 +197,24 @@ pub fn semantic_search(
                                 }
                             }
                         }
-                        if inserted == 0 && row_errors > 0 {
-                            // 该批全部行映射失败 = 系统性列问题，硬失败。
+                        if inserted == 0 && row_errors > 0 && null_content == 0 {
+                            // 仅当全部映射失败且不含 NULL content（真正的列类型漂移）
+                            // 才算硬失败；全 NULL content 是合法数据态，按召回损失处理。
                             eprintln!(
                                 "[semantic] content backfill: batch of {} ids all failed row mapping",
                                 chunk.len()
                             );
                             hard_failed = true;
-                        } else if row_errors > 0 {
-                            // #R40 bug/medium：**部分**行映射失败（如 content 为 NULL——
-                            // memories.content 可空）：失败行经 unwrap_or_default 产出空
-                            // 正文、复现 P3-0 内容损坏。剔除范围见下方——只剔未成功插入
-                            // 的 id，成功行保留；本批仍算部分成功（不触发全批升级）。
+                        } else if row_errors > 0 || null_content > 0 {
+                            // #R40/#R41 bug/medium：部分行失败（映射错误或 NULL content）
+                            // 的 id 经 unwrap_or_default 会产出空正文、复现 P3-0 内容损坏。
+                            // 剔除范围见下方——只剔未成功插入的 id，成功行保留；本批仍
+                            // 算部分成功（不触发全批升级）。
                             eprintln!(
-                                "[semantic] content backfill: {row_errors} of {} rows failed mapping (dropping those ids)",
+                                "[semantic] content backfill: {row_errors} row errors + {null_content} NULL content of {} ids (dropping those ids)",
                                 chunk.len()
                             );
                             partial_failed = true;
-                        } else {
-                            batches_ok += 1;
                         }
                     }
                     Err(e) => {
