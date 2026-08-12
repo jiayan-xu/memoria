@@ -235,13 +235,13 @@ pub fn semantic_search(
                     hard_failed = true;
                 }
             }
-            // 剔除失败行 id：硬失败整批未插入（contents 无这些 id），部分失败只剔
-            // 未插入的（成功行正文完好保留）。
-            if hard_failed || partial_failed {
-                for id in chunk.iter() {
-                    if !contents.contains_key(*id) {
-                        failed_batch_ids.insert((*id).clone());
-                    }
+            // #R43 bug/medium：**无条件**剔除未成功插入的 id——返回行数 < 请求数
+            // （并发删除/悬空 id 的 TOCTOU）既非硬失败也非部分失败，原守卫会放过它们，
+            // 最终 unwrap_or_default 产出空正文、复现 P3-0 内容损坏（rrf_merge 首次插入
+            // 即锁定空正文）。成功插入的 id 在 contents 中，天然保留。
+            for id in chunk.iter() {
+                if !contents.contains_key(*id) {
+                    failed_batch_ids.insert((*id).clone());
                 }
             }
             if hard_failed {
@@ -388,6 +388,18 @@ fn lookup_namespaces(
                     if inserted == 0 && row_errors > 0 {
                         mid_failure.get_or_insert(format!(
                             "row mapping: {row_errors} rows failed in batch of {}",
+                            chunk.len()
+                        ));
+                    } else if inserted == 0 && row_errors == 0 {
+                        // #R43 bug/low：0 行且无错误 = 请求的 id 在 memories 中全不存在
+                        // （悬空 HNSW id / 表被清空）——静默消失会让"系统性数据流损坏"
+                        // 与"该 ns 无结果"不可区分（全批升级被绕过）。记录使降级可见。
+                        eprintln!(
+                            "[semantic] ns lookup: batch of {} ids matched 0 memories rows (stale ids?)",
+                            chunk.len()
+                        );
+                        mid_failure.get_or_insert(format!(
+                            "0 rows matched for batch of {} (stale ids)",
                             chunk.len()
                         ));
                     }

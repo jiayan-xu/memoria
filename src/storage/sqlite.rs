@@ -589,7 +589,14 @@ pub fn migrate_evolution(pool: &SqlitePool) -> Result<(), String> {
 /// 的行——否则孤儿向量行在每次启动 rebuild 时被重新加入 HNSW，永久浪费索引内存/存储
 /// （web_api/mcp_server 的 DELETE 只删 memories，不碰向量表）。
 pub fn migrate_hype_vectors(pool: &SqlitePool) -> Result<(), String> {
-    let conn = pool.get().map_err(|e| format!("pool get: {}", e))?;
+    let mut conn = pool.get().map_err(|e| format!("pool get: {}", e))?;
+    // #R43 bug/medium：busy_timeout 必须在**本函数所有 DDL/写操作之前**设置——连接来自
+    // 池（create_pool 无 per-connection init），迁移可能拿到默认 busy_timeout=0 的连接，
+    // 上面的 CREATE TABLE/INDEX/TRIGGER 与 migration_flags DDL 在并发首启场景下会立即
+    // SQLITE_BUSY（本迁移正是为三进程并发首启设计的）。统一函数入口设置（幂等，覆盖
+    // 池连接状态）。
+    conn.execute_batch("PRAGMA busy_timeout = 5000;")
+        .map_err(|e| format!("set busy_timeout: {}", e))?;
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS memory_hype_vectors (
             id TEXT PRIMARY KEY,
@@ -652,33 +659,32 @@ pub fn migrate_hype_vectors(pool: &SqlitePool) -> Result<(), String> {
         )
         .map_err(|e| format!("check cleanup flag: {}", e))?;
     if already == 0 {
-        // #R42 performance/medium：并发首启依赖 busy_timeout——若迁移拿到的是池中
-        // 其它连接（create_pool 未注册 per-connection init），默认 0 会让第二进程在
-        // BEGIN IMMEDIATE 立即 SQLITE_BUSY 失败而非等待。此处显式设置（幂等无害）。
-        conn.execute_batch("PRAGMA busy_timeout = 5000;")
-            .map_err(|e| format!("set busy_timeout: {}", e))?;
-        conn.execute_batch("BEGIN IMMEDIATE")
+        // #R43 bug/medium：改用 rusqlite 的 transaction_with_behavior(TransactionBehavior::
+        // Immediate) 替代手动 BEGIN/COMMIT/ROLLBACK——Transaction 在 Drop 时自动回滚，
+        // 任何 `?` 提前返回或 panic 都不会把"仍持有写锁的连接"还给池（r2d2 无
+        // test_on_check_out，归还后后续查询会静默跑在未提交事务内、写锁不释放，其他写者
+        // SQLITE_BUSY）。错误路径免疫未来编辑/panic，与模块其余代码风格一致。
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(|e| format!("begin cleanup tx: {}", e))?;
-        let r: Result<(), String> = (|| {
-            // 事务内重读标记（首个提交后此处看到已置位 → 跳过清理）。
-            let already2: i64 = conn
-                .query_row(
-                    "SELECT COUNT(*) FROM migration_flags WHERE flag = ?1",
-                    rusqlite::params![CLEANUP_FLAG],
-                    |r| r.get(0),
-                )
-                .map_err(|e| format!("check cleanup flag (tx): {}", e))?;
-            if already2 != 0 {
-                return Ok(());
-            }
+        // 事务内重读标记（首个提交后此处看到已置位 → 跳过清理）。
+        let already2: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM migration_flags WHERE flag = ?1",
+                rusqlite::params![CLEANUP_FLAG],
+                |r| r.get(0),
+            )
+            .map_err(|e| format!("check cleanup flag (tx): {}", e))?;
+        if already2 == 0 {
             // 空表短路：向量表无行时无需扫描（避免持写锁的全表相关扫描）。
-            let v_count: i64 = conn
+            let v_count: i64 = tx
                 .query_row("SELECT COUNT(*) FROM memory_vectors", [], |r| r.get(0))
                 .map_err(|e| format!("count memory_vectors rows: {}", e))?;
             if v_count > 0 {
-                let orphans_vec: i64 = conn
+                let orphans_vec: i64 = tx
                     .query_row(
-                        "SELECT COUNT(*) FROM memory_vectors WHERE NOT EXISTS (SELECT 1 FROM memories m WHERE m.id = memory_vectors.id)",
+                        "SELECT COUNT(*) FROM memory_vectors \
+                         WHERE NOT EXISTS (SELECT 1 FROM memories m WHERE m.id = memory_vectors.id)",
                         [],
                         |r| r.get(0),
                     )
@@ -686,14 +692,17 @@ pub fn migrate_hype_vectors(pool: &SqlitePool) -> Result<(), String> {
                 if orphans_vec > 0 {
                     // #R42 performance/medium：分批删除（每批 1000）限定单次持锁时间——
                     // 大向量表全量 DELETE 的相关扫描可能超 busy_timeout。
+                    // #R43 maintainability/low：SQL 规范化（去掉填充空白）+ 错误消息
+                    // 内嵌 SQL 片段，便于真实库上失败时审计定位。
+                    const DEL_VEC: &str = "DELETE FROM memory_vectors WHERE rowid IN ( \
+                        SELECT rowid FROM memory_vectors \
+                        WHERE NOT EXISTS (SELECT 1 FROM memories m WHERE m.id = memory_vectors.id) \
+                        LIMIT 1000)";
                     let mut remaining = orphans_vec;
                     while remaining > 0 {
-                        let n = conn
-                            .execute(
-                                "DELETE FROM memory_vectors WHERE rowid IN (                                  SELECT rowid FROM memory_vectors WHERE NOT EXISTS                                  (SELECT 1 FROM memories m WHERE m.id = memory_vectors.id) LIMIT 1000)",
-                                [],
-                            )
-                            .map_err(|e| format!("clean memory_vectors orphans (batch): {}", e))?;
+                        let n = tx.execute(DEL_VEC, []).map_err(|e| {
+                            format!("clean memory_vectors orphans (batch): {e} [SQL: {DEL_VEC}]")
+                        })?;
                         if n == 0 {
                             break;
                         }
@@ -702,26 +711,28 @@ pub fn migrate_hype_vectors(pool: &SqlitePool) -> Result<(), String> {
                     eprintln!("[Memoria] Migration: removed {orphans_vec} orphan memory_vectors rows");
                 }
             }
-            let h_count: i64 = conn
+            let h_count: i64 = tx
                 .query_row("SELECT COUNT(*) FROM memory_hype_vectors", [], |r| r.get(0))
                 .map_err(|e| format!("count memory_hype_vectors rows: {}", e))?;
             if h_count > 0 {
-                let orphans_hype: i64 = conn
+                let orphans_hype: i64 = tx
                     .query_row(
-                        "SELECT COUNT(*) FROM memory_hype_vectors WHERE NOT EXISTS (SELECT 1 FROM memories m WHERE m.id = memory_hype_vectors.id)",
+                        "SELECT COUNT(*) FROM memory_hype_vectors \
+                         WHERE NOT EXISTS (SELECT 1 FROM memories m WHERE m.id = memory_hype_vectors.id)",
                         [],
                         |r| r.get(0),
                     )
                     .map_err(|e| format!("count memory_hype_vectors orphans: {}", e))?;
                 if orphans_hype > 0 {
+                    const DEL_HYPE: &str = "DELETE FROM memory_hype_vectors WHERE rowid IN ( \
+                        SELECT rowid FROM memory_hype_vectors \
+                        WHERE NOT EXISTS (SELECT 1 FROM memories m WHERE m.id = memory_hype_vectors.id) \
+                        LIMIT 1000)";
                     let mut remaining = orphans_hype;
                     while remaining > 0 {
-                        let n = conn
-                            .execute(
-                                "DELETE FROM memory_hype_vectors WHERE rowid IN (                                  SELECT rowid FROM memory_hype_vectors WHERE NOT EXISTS                                  (SELECT 1 FROM memories m WHERE m.id = memory_hype_vectors.id) LIMIT 1000)",
-                                [],
-                            )
-                            .map_err(|e| format!("clean memory_hype_vectors orphans (batch): {}", e))?;
+                        let n = tx.execute(DEL_HYPE, []).map_err(|e| {
+                            format!("clean memory_hype_vectors orphans (batch): {e} [SQL: {DEL_HYPE}]")
+                        })?;
                         if n == 0 {
                             break;
                         }
@@ -731,45 +742,16 @@ pub fn migrate_hype_vectors(pool: &SqlitePool) -> Result<(), String> {
                 }
             }
             // 置位标记：插入 migration_flags 行（事务内，提交后对并发进程可见）。
-            conn.execute(
+            tx.execute(
                 "INSERT OR IGNORE INTO migration_flags (flag) VALUES (?1)",
                 rusqlite::params![CLEANUP_FLAG],
             )
             .map_err(|e| format!("set cleanup flag: {}", e))?;
-            Ok(())
-        })();
-        match r {
-            Ok(()) => {
-                // #R40 bug/medium：COMMIT 失败同样必须 ROLLBACK——连接仍持有打开的写
-                // 事务，若直接 `?` 传播，连接还池后后续查询静默跑在事务内、写锁不释放
-                // （其他写者 SQLITE_BUSY）。与事务体 Err 分支同款处理。
-                if let Err(e) = conn.execute_batch("COMMIT") {
-                    // #R41 bug/low：ROLLBACK 失败也要呈现（连接可能带着未关闭事务还池，
-                    // r2d2 的 test_on_check_out 检测不到）——吞掉会完全掩盖。
-                    match conn.execute_batch("ROLLBACK") {
-                        Ok(()) => return Err(format!("commit cleanup tx: {}", e)),
-                        Err(re) => {
-                            return Err(format!(
-                                "commit cleanup tx failed ({e}) AND rollback failed ({re}); \
-                                 connection may hold an open write transaction"
-                            ))
-                        }
-                    }
-                }
-            }
-            Err(e) => {
-                // #R41 bug/low：事务体失败后的 ROLLBACK 失败同样呈现。
-                match conn.execute_batch("ROLLBACK") {
-                    Ok(()) => return Err(e),
-                    Err(re) => {
-                        return Err(format!(
-                            "cleanup tx body failed ({e}) AND rollback failed ({re}); \
-                             connection may hold an open write transaction"
-                        ))
-                    }
-                }
-            }
         }
+        // #R43 bug/medium：commit 失败时 Transaction 的 Drop 自动回滚——连接不会带着
+        // 未提交事务还池（手动 COMMIT 失败还需手动 ROLLBACK 的双失败路径已消除）。
+        tx.commit()
+            .map_err(|e| format!("commit cleanup tx: {}", e))?;
     }
     Ok(())
 }
