@@ -31,12 +31,18 @@ import argparse
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.normpath(os.path.join(HERE, "..", ".."))
+# 默认 DB 相对仓库内 data/（与代码库其余脚本一致），而非依赖外层目录恰好叫
+# "memoria"——否则换目录名会静默写到错误的兄弟路径（#R35 maintainability/low）。
 DB = os.environ.get(
     "MEMORIA_DB_PATH",
-    os.path.join(os.path.dirname(REPO), "memoria", "data", "memoria.db"),
+    os.path.join(REPO, "data", "memoria.db"),
 )
 GOLDEN = os.path.join(REPO, "eval", "hyde_queries.json")
-ENV = os.path.join(os.path.dirname(REPO), "memoria", ".env")
+# .env 优先环境变量，其次仓库同级 memoria/ 的运行时镜像（与 recall_guard 的 resolve 一致）
+ENV = os.environ.get(
+    "MEMORIA_ENV_PATH",
+    os.path.join(os.path.dirname(REPO), "memoria", ".env"),
+)
 
 EMBED_URL = os.environ.get("MEMORIA_EMBEDDING_URL", "http://127.0.0.1:8777/embed")
 # Rust 侧 HNSW 维度硬约束（src/vector/hnsw.rs DIM=1024）。仅校验 embed_server 返回的 dim
@@ -100,7 +106,6 @@ def generate_question(content: str) -> str:
                 print(f"  [warn] chat 失败: {e}")
                 return ""
             time.sleep(min(2 ** attempt, 10))
-    return ""
 
 
 def embed(texts):
@@ -199,17 +204,20 @@ def main():
             if len(v) != dim:
                 raise ValueError(f"维度异常 {len(v)}≠{dim}")
             blob = struct.pack(f"<{len(v)}f", *v)
+            # 写入也在此 try 内（#R35 bug/medium）：服务运行中 DB 可能被锁/磁盘满，
+            # 单行写失败若抛到外层会中断整批且 fail_ids 永不落盘——违背
+            # "不中断、可定点重跑"承诺。写失败按失败计数跳过并记录 id。
+            con.execute(
+                "INSERT OR REPLACE INTO memory_hype_vectors (id, namespace, question, vector, updated_at) "
+                "VALUES (?, 'agent/xujiayan', ?, ?, datetime('now'))",
+                (mid, q, blob),
+            )
+            con.commit()
         except Exception as e:
-            print(f"[{i}/{len(targets)}] {mid[:8]} 嵌入数据异常: {e}")
+            print(f"[{i}/{len(targets)}] {mid[:8]} 嵌入/写入异常: {e}")
             fail += 1
             fail_ids.append(mid)
             continue
-        con.execute(
-            "INSERT OR REPLACE INTO memory_hype_vectors (id, namespace, question, vector, updated_at) "
-            "VALUES (?, 'agent/xujiayan', ?, ?, datetime('now'))",
-            (mid, q, blob),
-        )
-        con.commit()
         ok += 1
         if i % 10 == 0:
             print(f"  ...{i}/{len(targets)}")

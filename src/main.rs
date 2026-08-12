@@ -237,11 +237,8 @@ fn main() {
     };
     // ef_search：默认 128（相比原 50 召回候选更多、精度↑；42k 向量下检索仍快）。
     // 可用环境变量 MEMORIA_EF_SEARCH 临时覆盖，免重编译。
-    let ef_search = std::env::var("MEMORIA_EF_SEARCH")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .filter(|&ef| ef >= 16)
-        .unwrap_or(128);
+    // 解析走 persist::resolve_ef_search 收口（与 lib.rs 的 MemoriaEngine 共用，防入口分叉）。
+    let ef_search = memoria_core::vector::persist::resolve_ef_search();
     hnsw.set_ef_search(ef_search);
     println!("[Memoria] HNSW ef_search = {}", ef_search);
     // P1-3：以 memory_vectors 持久表为权威源重建 HNSW（.bin 仅作可选快取）

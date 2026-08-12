@@ -67,7 +67,7 @@ pub fn hybrid_search(
     // None 而整体跳过，会连已有的 hype 通道也一起丢掉。
     if let Some(qc) = query_cache {
         if hnsw.is_some() || hype_hnsw.is_some() {
-            if let Ok(sem) = search::semantic::semantic_search(
+            match search::semantic::semantic_search(
                 query,
                 namespace,
                 primary_limit,
@@ -76,10 +76,21 @@ pub fn hybrid_search(
                 Some(qc),
                 Some(pool),
             ) {
-                if !sem.is_empty() {
-                    sem_res = Some(sem.clone());
-                    signals.push(sem);
-                    weights.push(w_semantic);
+                Ok(sem) => {
+                    if !sem.is_empty() {
+                        sem_res = Some(sem.clone());
+                        signals.push(sem);
+                        weights.push(w_semantic);
+                    }
+                }
+                // #R35 maintainability/low：semantic_search 在"全部 HNSW 路失败"
+                // （poisoned/corrupted）时显式返回 Err——此处不能静默丢弃整个语义信号
+                // （退化为 keyword-only 无痕），至少记录，让降级可观测。
+                Err(e) => {
+                    eprintln!(
+                        "[hybrid] semantic signal dropped (index degraded): {}",
+                        e
+                    );
                 }
             }
         }
