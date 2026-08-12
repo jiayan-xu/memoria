@@ -39,6 +39,10 @@ GOLDEN = os.path.join(REPO, "eval", "hyde_queries.json")
 ENV = os.path.join(os.path.dirname(REPO), "memoria", ".env")
 
 EMBED_URL = os.environ.get("MEMORIA_EMBEDDING_URL", "http://127.0.0.1:8777/embed")
+# Rust 侧 HNSW 维度硬约束（src/vector/hnsw.rs DIM=1024）。仅校验 embed_server 返回的 dim
+# 不够——服务器可能跑 local 模型（text2vec 768d），len(v)==dim 通过但 rebuild 侧
+# v.len()!=DIM 会静默跳过每一行，整批"看起来成功"而索引恒空（#R34 bug/medium）。
+RUST_DIM = int(os.environ.get("MEMORIA_EMBED_DIM", "1024"))
 CHAT_URL = os.environ.get(
     "SILICONFLOW_CHAT_URL", "https://api.siliconflow.cn/v1/chat/completions"
 )
@@ -172,6 +176,10 @@ def main():
         if not q or len(q) < 6:
             print(f"[{i}/{len(targets)}] {mid[:8]} 问句生成失败/过短，跳过")
             skip += 1
+            # 跳过也记入 fail_ids：hype_failed_ids.txt 承诺"可定点重跑"——LLM 瞬时失败
+            # 的记忆若不记录，基于该文件的定点重跑永远无法补上这些缺口（#R34
+            # maintainability/low）。
+            fail_ids.append(mid)
             continue
         # dry-run 前置：只生成问句、不嵌入不写库——文档承诺"只生成问句"就必须
         # 不依赖 embed_server 在线（否则服务抖动时 dry-run 报"嵌入失败"而非显示问句）。
@@ -184,6 +192,10 @@ def main():
             v = vecs[0]
             # 维度校验与 pack 也在 try 内：畸形响应（非序列/非数值）抛异常 →
             # 按失败计数跳过而非中断整个 --all 批（否则 5339 条白跑且无 fail_ids）。
+            # 同时校验 embed_server 的 dim 与 Rust 侧 DIM 一致：服务器若跑 local 模型
+            # （768d），len(v)==dim 会通过但 rebuild 侧全部静默跳过——必须显式拒绝。
+            if dim != RUST_DIM:
+                raise ValueError(f"服务维度 {dim}≠Rust DIM {RUST_DIM}（模型不匹配）")
             if len(v) != dim:
                 raise ValueError(f"维度异常 {len(v)}≠{dim}")
             blob = struct.pack(f"<{len(v)}f", *v)
@@ -203,6 +215,10 @@ def main():
             print(f"  ...{i}/{len(targets)}")
 
     con.close()
+    if args.dry_run:
+        # dry-run 不落库——文案须如实反映，否则运维误以为已写入（#R34 other/low）
+        print(f"\n完成(dry-run，未写库): 生成 {ok} / 跳过 {skip} / 失败 {fail}")
+        return
     print(f"\n完成: 写入 {ok} / 跳过 {skip} / 失败 {fail}")
     if fail_ids:
         # 失败 id 落盘（ops 可据此定点重跑，不必全量 --all 再来一遍）

@@ -52,11 +52,22 @@ pub fn semantic_search(
     // 系统性高分的一路——当前内容/问句向量同出自 Qwen3-VL-8B（同模型同空间），A/B 实测
     // （+9.4pp recall@10）未现偏差；若未来换模型/分路，须先校准两路分数尺度再依赖 raw max。
     let mut best: HashMap<String, f64> = HashMap::new(); // memory_id -> max cosine
+    // 两路分别搜索；`roads_ok` 统计成功路数——若**所有存在的路**都失败（如 RwLock
+    // poisoned），返回 Err 而非空集，使调用方能区分"索引空"与"索引坏了"（#R34 other/low：
+    // 此前全失败静默映射为空结果，健康检查无法发现语义通道悄悄降级）。
+    let mut roads_ok = 0usize;
     if let Some(h) = hnsw {
-        search_and_merge(h, "content", &vector, limit, &mut best);
+        if search_and_merge(h, "content", &vector, limit, &mut best) {
+            roads_ok += 1;
+        }
     }
     if let Some(h) = hype_hnsw {
-        search_and_merge(h, "HYPE", &vector, limit, &mut best);
+        if search_and_merge(h, "HYPE", &vector, limit, &mut best) {
+            roads_ok += 1;
+        }
+    }
+    if roads_ok == 0 && (hnsw.is_some() || hype_hnsw.is_some()) {
+        return Err("semantic_search: all HNSW roads failed (poisoned/corrupted index)".into());
     }
     if best.is_empty() {
         return Ok(vec![]);
@@ -89,22 +100,28 @@ pub fn semantic_search(
     // P3-0 修复：语义结果此前 content 恒为空（只带 memory_id），
     // 经 rrf_merge 首次插入即锁定空正文，导致「仅被语义命中」的记忆在 fusion 后丢失正文，
     // benchmark 拼上下文时得不到内容、答案必错。此处按 allowed id 批量回取 content 补齐。
+    // #R34 performance/medium：与 lookup_namespaces 同款分批（BATCH=500）——allowed 规模
+    // 与 best 同量级（可达 ~12000），单条 IN(...) 在旧 SQLite（999 变量上限）会 prepare
+    // 失败且被 if let Ok 静默吞掉，导致全部语义结果正文为空却无任何告警。
     let mut contents: HashMap<String, String> = HashMap::new();
     if let Some(p) = pool {
+        const BATCH: usize = 500;
         let ids: Vec<&String> = allowed.iter().collect();
-        let placeholders = vec!["?"; ids.len()].join(",");
-        let sql = format!(
-            "SELECT id, content FROM memories WHERE id IN ({})",
-            placeholders
-        );
-        if let Ok(conn) = p.get() {
-            if let Ok(mut stmt) = conn.prepare(&sql) {
-                if let Ok(rows) = stmt.query_map(
-                    rusqlite::params_from_iter(ids.iter().map(|s| *s)),
-                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-                ) {
-                    for r in rows.flatten() {
-                        contents.insert(r.0, r.1);
+        for chunk in ids.chunks(BATCH) {
+            let placeholders = vec!["?"; chunk.len()].join(",");
+            let sql = format!(
+                "SELECT id, content FROM memories WHERE id IN ({})",
+                placeholders
+            );
+            if let Ok(conn) = p.get() {
+                if let Ok(mut stmt) = conn.prepare(&sql) {
+                    if let Ok(rows) = stmt.query_map(
+                        rusqlite::params_from_iter(chunk.iter().map(|s| *s)),
+                        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                    ) {
+                        for r in rows.flatten() {
+                            contents.insert(r.0, r.1);
+                        }
                     }
                 }
             }
@@ -142,20 +159,22 @@ pub fn semantic_search(
 /// 单路 HNSW 搜索并合并进 `best`（按 memory_id 取 max cosine）。内容路与 HyPE 路共用，
 /// 保证双路契约一致（#R33 maintainability/low：两路若各写一份，未来改 overfetch/分数
 /// 过滤/错误处理极易漏改一路，静默分裂）。`label` 仅用于错误日志前缀。
+/// 返回 true = 该路搜索成功（即使 0 结果）；false = 索引故障（RwLock poisoned）。
 fn search_and_merge(
     h: &HnswIndex,
     label: &str,
     vector: &[f32],
     limit: u32,
     best: &mut HashMap<String, f64>,
-) {
+) -> bool {
     let cap = h.len();
     let overfetch = (limit as usize)
         .saturating_mul(20)
         .max(2048)
         .min(cap.max(1));
     // search_with_ef 仅可能在索引被并发 panic 污染（RwLock poisoned）时返回 Err——
-    // 此时不能静默吞掉（会永久静默降级语义通道且无法诊断），必须记录。
+    // 不静默吞掉（会永久静默降级语义通道且无法诊断），记录并返回 false 供调用方
+    // 聚合判定"全部路失败 → 显式 Err"（#R34 other/low）。
     match h.search_with_ef(vector, overfetch, overfetch) {
         Ok(results) => {
             for (memory_id, distance) in results {
@@ -167,8 +186,12 @@ fn search_and_merge(
                     }
                 }
             }
+            true
         }
-        Err(e) => eprintln!("[semantic] {label} HNSW search failed: {e}"),
+        Err(e) => {
+            eprintln!("[semantic] {label} HNSW search failed: {e}");
+            false
+        }
     }
 }
 
