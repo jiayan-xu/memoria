@@ -652,6 +652,11 @@ pub fn migrate_hype_vectors(pool: &SqlitePool) -> Result<(), String> {
         )
         .map_err(|e| format!("check cleanup flag: {}", e))?;
     if already == 0 {
+        // #R42 performance/medium：并发首启依赖 busy_timeout——若迁移拿到的是池中
+        // 其它连接（create_pool 未注册 per-connection init），默认 0 会让第二进程在
+        // BEGIN IMMEDIATE 立即 SQLITE_BUSY 失败而非等待。此处显式设置（幂等无害）。
+        conn.execute_batch("PRAGMA busy_timeout = 5000;")
+            .map_err(|e| format!("set busy_timeout: {}", e))?;
         conn.execute_batch("BEGIN IMMEDIATE")
             .map_err(|e| format!("begin cleanup tx: {}", e))?;
         let r: Result<(), String> = (|| {
@@ -679,11 +684,21 @@ pub fn migrate_hype_vectors(pool: &SqlitePool) -> Result<(), String> {
                     )
                     .map_err(|e| format!("count memory_vectors orphans: {}", e))?;
                 if orphans_vec > 0 {
-                    conn.execute(
-                        "DELETE FROM memory_vectors WHERE NOT EXISTS (SELECT 1 FROM memories m WHERE m.id = memory_vectors.id)",
-                        [],
-                    )
-                    .map_err(|e| format!("clean memory_vectors orphans: {}", e))?;
+                    // #R42 performance/medium：分批删除（每批 1000）限定单次持锁时间——
+                    // 大向量表全量 DELETE 的相关扫描可能超 busy_timeout。
+                    let mut remaining = orphans_vec;
+                    while remaining > 0 {
+                        let n = conn
+                            .execute(
+                                "DELETE FROM memory_vectors WHERE rowid IN (                                  SELECT rowid FROM memory_vectors WHERE NOT EXISTS                                  (SELECT 1 FROM memories m WHERE m.id = memory_vectors.id) LIMIT 1000)",
+                                [],
+                            )
+                            .map_err(|e| format!("clean memory_vectors orphans (batch): {}", e))?;
+                        if n == 0 {
+                            break;
+                        }
+                        remaining -= n as i64;
+                    }
                     eprintln!("[Memoria] Migration: removed {orphans_vec} orphan memory_vectors rows");
                 }
             }
@@ -699,11 +714,19 @@ pub fn migrate_hype_vectors(pool: &SqlitePool) -> Result<(), String> {
                     )
                     .map_err(|e| format!("count memory_hype_vectors orphans: {}", e))?;
                 if orphans_hype > 0 {
-                    conn.execute(
-                        "DELETE FROM memory_hype_vectors WHERE NOT EXISTS (SELECT 1 FROM memories m WHERE m.id = memory_hype_vectors.id)",
-                        [],
-                    )
-                    .map_err(|e| format!("clean memory_hype_vectors orphans: {}", e))?;
+                    let mut remaining = orphans_hype;
+                    while remaining > 0 {
+                        let n = conn
+                            .execute(
+                                "DELETE FROM memory_hype_vectors WHERE rowid IN (                                  SELECT rowid FROM memory_hype_vectors WHERE NOT EXISTS                                  (SELECT 1 FROM memories m WHERE m.id = memory_hype_vectors.id) LIMIT 1000)",
+                                [],
+                            )
+                            .map_err(|e| format!("clean memory_hype_vectors orphans (batch): {}", e))?;
+                        if n == 0 {
+                            break;
+                        }
+                        remaining -= n as i64;
+                    }
                     eprintln!("[Memoria] Migration: removed {orphans_hype} orphan memory_hype_vectors rows");
                 }
             }

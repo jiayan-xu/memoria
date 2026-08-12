@@ -134,49 +134,71 @@ async fn memory_eval_semantic() {
             use memoria_core::vector::{VectorEntry, persist};
             // 唯一处理集：每个 rid 只计数一次（近义去重会让同一 rid 出现多次——重复
             // 计数会虚增分母、拉低覆盖率造成假红，#R39 bug/medium）。
-            if hype_processed.insert(rid.clone()) {
+            // #R42 bug/medium：`insert` 在操作**之后**才提交最终结果——若首次遭遇
+            // 失败（瞬时 embed 错误/退化向量/add 返回 0），该 rid 从 processed 移除
+            // 允许后续近义重复条目重试，避免"一次失败永久无 HyPE 向量"且覆盖断言
+            // 在小的唯一集上因几次瞬时失败假红。
+            if !hype_processed.contains(&rid) {
+                hype_processed.insert(rid.clone());
                 // 问句化改写：与内容向量不同（否则双路合并无意义）。嵌入失败则**跳过**
                 // 该条（不 put/add）——fallback 到内容向量会让两路恒等、退化为内容通道，
                 // 正是本块要防的 no-op 假覆盖（且把内容向量写进 question 列与离线脚本
                 // 的问句向量不一致，rebuild 后会混入两种形态）。
-                if let Ok(hv) = embed(&client, &format!("用户提问：{content}")).await {
-                    // #R38 test/low：put 可能因退化向量（零/NaN）返回 Err——内容路容忍
-                    // 静默跳过，此处同样按 skip 计数而非 panic（局部 embed 服务异常不应
-                    // 打挂整个评测；最终覆盖率断言会反映真实填充情况）。
-                    match persist::put_hype_stored_vector(&pool, &rid, ns, &hv) {
-                        Ok(()) => {
-                            // #R40 bug/medium：add 失败/0 条按 skip 计数而非 panic——
-                            // put 用 f64 校验、HnswIndex::add 用 f32 复检（且重复 id 返回 0
-                            // 属正常），put 通过仍可能 n==0；expect/assert 会打挂整个评测
-                            // 丢失全部召回诊断。覆盖率断言（≥80%）已兜住"索引恒空"假绿。
-                            let n = engine
-                                .hype_hnsw
-                                .add(&[VectorEntry {
+                // #R42 maintainability/low：绑定并记录 embed 实际错误（HTTP/解析/字段
+                // 缺失）——否则系统性拒绝带前缀 prompt 时只有 rid 无根因。
+                match embed(&client, &format!("用户提问：{content}")).await {
+                    Ok(hv) => {
+                        // #R38 test/low：put 可能因退化向量（零/NaN）返回 Err——内容路
+                        // 容忍静默跳过，此处同样按 skip 计数而非 panic（局部 embed 服务
+                        // 异常不应打挂整个评测；最终覆盖率断言会反映真实填充情况）。
+                        match persist::put_hype_stored_vector(&pool, &rid, ns, &hv) {
+                            Ok(()) => {
+                                // #R40 bug/medium：add 失败/0 条按 skip 计数而非 panic——
+                                // put 用 f64 校验、HnswIndex::add 用 f32 复检（且重复 id
+                                // 返回 0 属正常），put 通过仍可能 n==0；expect/assert 会
+                                // 打挂整个评测丢失全部召回诊断。覆盖率断言（≥80%）已兜住
+                                // "索引恒空"假绿。
+                                // #R42 maintainability/low：add 的 Err（维度不符/锁污染）
+                                // 与重复 id 的 Ok(0) 是不同失败，日志须区分。
+                                match engine.hype_hnsw.add(&[VectorEntry {
                                     id: rid.clone(),
                                     vector: hv,
-                                }])
-                                .unwrap_or(0);
-                            if n > 0 {
-                                hype_seen.insert(rid.clone());
-                                hype_covered += 1;
-                            } else {
-                                eprintln!("[eval_semantic] hype add skipped (0 entries added)");
+                                }]) {
+                                    Ok(n) if n > 0 => {
+                                        hype_seen.insert(rid.clone());
+                                        hype_covered += 1;
+                                    }
+                                    Ok(_) => {
+                                        eprintln!(
+                                            "[eval_semantic] hype add skipped (0 entries added, dup id?)"
+                                        );
+                                        hype_skipped += 1;
+                                        hype_processed.remove(&rid);
+                                    }
+                                    Err(e) => {
+                                        eprintln!(
+                                            "[eval_semantic] hype add failed (skip): {e}"
+                                        );
+                                        hype_skipped += 1;
+                                        hype_processed.remove(&rid);
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("[eval_semantic] hype put skipped (degenerate): {e}");
                                 hype_skipped += 1;
+                                hype_processed.remove(&rid);
                             }
                         }
-                        Err(e) => {
-                            eprintln!("[eval_semantic] hype put skipped (degenerate): {e}");
-                            hype_skipped += 1;
-                        }
                     }
-                } else {
-                    // #R41 maintainability/low：embed 失败要记录实际错误——若服务系统性地
-                    // 拒绝带前缀的 prompt，此分支对每条语料静默执行、只有最终覆盖率断言
-                    // 的猜测提示根因。记录后可直接诊断。
-                    eprintln!(
-                        "[eval_semantic] question embed failed for {rid:?} (skipping hype put/add)"
-                    );
-                    hype_skipped += 1;
+                    Err(e) => {
+                        // #R42 maintainability/low：记录实际 embed 错误。
+                        eprintln!(
+                            "[eval_semantic] question embed failed for {rid:?}: {e} (skipping hype put/add)"
+                        );
+                        hype_skipped += 1;
+                        hype_processed.remove(&rid);
+                    }
                 }
             }
         }

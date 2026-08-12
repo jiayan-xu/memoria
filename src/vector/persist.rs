@@ -234,6 +234,9 @@ pub fn build_hype_hnsw(pool: &SqlitePool, ef_search: usize) -> Result<(HnswIndex
 /// rebuild 失败不 panic（软降级空索引，语义检索退单路），失败以 eprintln 显式告警。
 /// 调用方只负责各自的日志流（stdout vs stderr）——若 build/降级/WARN 行为在两入口
 /// 各写一份，后续改一处另一处静默分裂（#R38 maintainability/low）。
+/// #R42 other/low：注意 count=0 折叠了"空表（功能未启用）"与"rebuild 失败（数据损坏）"
+/// 两种状态——区分只存在于本函数发出的 WARN 行；调用方若需要编程式区分，请改用
+/// `build_hype_hnsw`（返回 Result）。
 pub fn build_hype_hnsw_or_default(pool: &SqlitePool, ef_search: usize) -> (HnswIndex, usize) {
     match build_hype_hnsw(pool, ef_search) {
         Ok(x) => x,
@@ -306,7 +309,7 @@ fn rebuild_from_table(
     }
     if skipped > 0 {
         eprintln!(
-            "[persist] {label}: {skipped} row(s) skipped (decode failure or dim != {DIM})"
+            "[persist] {label}: {skipped} row(s) skipped (degenerate zero/NaN, decode failure, or dim != {DIM})"
         );
     }
 
