@@ -126,9 +126,12 @@ async fn memory_eval_semantic() {
         // 故仅当是**首次**遇到该 rid 时才断言 n>0；重复 id 跳过 add 但继续处理 created_at。
         {
             use memoria_core::vector::{VectorEntry, persist};
-            persist::put_hype_stored_vector(&pool, &rid, ns, &v)
-                .expect("put_hype_stored_vector should succeed");
+            // 首次遇到该 rid 才持久化 + 入索引：近义去重命中的旧 id 若只 put 不 add，
+            // 权威表会被新向量覆盖而运行中索引仍持旧向量——表/索引分歧，后续 rebuild
+            // 会得到与当前索引不同的向量。put 与 add 必须同受 hype_seen 守卫（#R33 bug/low）。
             if hype_seen.insert(rid.clone()) {
+                persist::put_hype_stored_vector(&pool, &rid, ns, &v)
+                    .expect("put_hype_stored_vector should succeed");
                 let n = engine
                     .hype_hnsw
                     .add(&[VectorEntry {

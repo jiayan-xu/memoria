@@ -45,57 +45,72 @@ pub fn put_stored_vector(
     namespace: &str,
     vector: &[f32],
 ) -> Result<(), String> {
-    let conn = pool.get().map_err(|e| format!("pool: {}", e))?;
-    // P0 防御：拒绝退化（零 / 非有限）向量落库。历史嵌入失败的写入会在 memory_vectors
-    // 留下全 0 向量，污染 HNSW 语义召回（零向量被 DistCosine 误判为完美匹配）。
-    // 调用方均 `let _ =` 忽略返回值，故记忆仍照常写入、仅缺语义向量（退化为 keyword-only）。
-    let norm_sq: f64 = vector.iter().map(|x| (*x as f64) * (*x as f64)).sum();
-    if !norm_sq.is_finite() || norm_sq == 0.0 {
-        return Err("put_stored_vector: degenerate (zero/NaN) vector rejected".into());
-    }
-    // 写入时校验维度：错误长度的向量落库后会被 rebuild 静默跳过（仅 stderr 告警），
-    // 造成"API 接受但索引永远不含"的死行——fail fast 使写入/读取路径一致。
-    if vector.len() != DIM {
-        return Err(format!(
-            "put_stored_vector: dimension mismatch: expected {}, got {}",
-            DIM,
-            vector.len()
-        ));
-    }
-    conn.execute(
-        "INSERT OR REPLACE INTO memory_vectors (id, namespace, vector) VALUES (?, ?, ?)",
-        rusqlite::params![id, namespace, encode_vector(vector)],
-    )
-    .map_err(|e| format!("put_stored_vector: {}", e))?;
-    Ok(())
+    put_vector_into(pool, id, namespace, vector, "memory_vectors")
 }
 
-/// V1（2026-08-12）：写入/覆盖某记忆的 HyPE 问句向量（INSERT OR REPLACE，与
-/// `put_stored_vector` 对称，落 `memory_hype_vectors` 表）。同款退化向量防御。
+/// V1（2026-08-12）：写入/覆盖某记忆的 HyPE 问句向量（与 `put_stored_vector` 对称，
+/// 落 `memory_hype_vectors` 表）。同款退化/维度防御；共享 `put_vector_into` 实现。
 pub fn put_hype_stored_vector(
     pool: &SqlitePool,
     id: &str,
     namespace: &str,
     vector: &[f32],
 ) -> Result<(), String> {
+    put_vector_into(pool, id, namespace, vector, "memory_hype_vectors")
+}
+
+/// 共享实现：校验后写入 `table`（须含 id/namespace/vector/updated_at 列）。
+///
+/// `table` 仅接受两个内部常量（白名单 dispatch，杜绝字符串插值注入面）；
+/// 用 `ON CONFLICT(id) DO UPDATE` 而非 INSERT OR REPLACE——REPLACE 会整行删除重建，
+/// 把 `memory_hype_vectors.question`（离线脚本写入的假设问句）静默抹成 NULL。
+fn put_vector_into(
+    pool: &SqlitePool,
+    id: &str,
+    namespace: &str,
+    vector: &[f32],
+    table: &str,
+) -> Result<(), String> {
     let conn = pool.get().map_err(|e| format!("pool: {}", e))?;
+    // P0 防御：拒绝退化（零 / 非有限）向量落库。历史嵌入失败的写入会在 memory_vectors
+    // 留下全 0 向量，污染 HNSW 语义召回（零向量被 DistCosine 误判为完美匹配）。
+    // 调用方均 `let _ =` 忽略返回值，故记忆仍照常写入、仅缺语义向量（退化为 keyword-only）。
     let norm_sq: f64 = vector.iter().map(|x| (*x as f64) * (*x as f64)).sum();
     if !norm_sq.is_finite() || norm_sq == 0.0 {
-        return Err("put_hype_stored_vector: degenerate (zero/NaN) vector rejected".into());
+        return Err(format!("{table}: degenerate (zero/NaN) vector rejected"));
     }
+    // 写入时校验维度：错误长度的向量落库后会被 rebuild 静默跳过（仅 stderr 告警），
+    // 造成"API 接受但索引永远不含"的死行——fail fast 使写入/读取路径一致。
+    // 注意：退化检查在前、维度检查在后——零值且错长度的向量报"degenerate"而非
+    // "dimension mismatch"，是刻意为之（退化更根本，先拒绝）。
     if vector.len() != DIM {
         return Err(format!(
-            "put_hype_stored_vector: dimension mismatch: expected {}, got {}",
+            "{table}: dimension mismatch: expected {}, got {}",
             DIM,
             vector.len()
         ));
     }
-    conn.execute(
-        "INSERT OR REPLACE INTO memory_hype_vectors (id, namespace, vector, updated_at) \
-         VALUES (?, ?, ?, datetime('now'))",
-        rusqlite::params![id, namespace, encode_vector(vector)],
-    )
-    .map_err(|e| format!("put_hype_stored_vector: {}", e))?;
+    match table {
+        "memory_vectors" => conn
+            .execute(
+                "INSERT INTO memory_vectors (id, namespace, vector) VALUES (?, ?, ?) \
+                 ON CONFLICT(id) DO UPDATE SET vector=excluded.vector",
+                rusqlite::params![id, namespace, encode_vector(vector)],
+            )
+            .map(|_| ())
+            .map_err(|e| format!("put_stored_vector: {}", e))?,
+        "memory_hype_vectors" => conn
+            .execute(
+                "INSERT INTO memory_hype_vectors (id, namespace, vector, updated_at) \
+                 VALUES (?, ?, ?, datetime('now')) \
+                 ON CONFLICT(id) DO UPDATE SET vector=excluded.vector, \
+                                                updated_at=excluded.updated_at",
+                rusqlite::params![id, namespace, encode_vector(vector)],
+            )
+            .map(|_| ())
+            .map_err(|e| format!("put_hype_stored_vector: {}", e))?,
+        _ => return Err(format!("put_vector_into: unknown table {table}")),
+    }
     Ok(())
 }
 
@@ -133,6 +148,8 @@ pub fn rebuild_hype_hnsw_from_store(pool: &SqlitePool, hnsw: &HnswIndex) -> Resu
 /// `label` 用于错误/告警前缀（区分 content/hype，便于日志定位）。
 /// 统计并告警被跳过的行（解码失败 / 维度 ≠ DIM），使索引健康度可观测——
 /// 数据损坏不再被静默吞掉（#R32 other/low：flatten 丢弃的行错误 + 维度不符行无计数）。
+/// 表名**白名单 dispatch**（非字符串插值）：两个调用方只传内部常量，杜绝未来
+/// 非受控输入进入 SQL 的注入面（#R33 security/low）。
 fn rebuild_from_table(
     pool: &SqlitePool,
     hnsw: &HnswIndex,
@@ -140,8 +157,13 @@ fn rebuild_from_table(
     label: &str,
 ) -> Result<usize, String> {
     let conn = pool.get().map_err(|e| format!("pool: {}", e))?;
+    let table_sql = match table {
+        "memory_vectors" => "SELECT id, vector FROM memory_vectors",
+        "memory_hype_vectors" => "SELECT id, vector FROM memory_hype_vectors",
+        _ => return Err(format!("{label}: unknown rebuild table {table}")),
+    };
     let mut stmt = conn
-        .prepare(&format!("SELECT id, vector FROM {}", table))
+        .prepare(table_sql)
         .map_err(|e| format!("prepare {}: {}", label, e))?;
     let rows = stmt
         .query_map([], |row| {

@@ -53,74 +53,20 @@ pub fn semantic_search(
     // （+9.4pp recall@10）未现偏差；若未来换模型/分路，须先校准两路分数尺度再依赖 raw max。
     let mut best: HashMap<String, f64> = HashMap::new(); // memory_id -> max cosine
     if let Some(h) = hnsw {
-        let cap = h.len();
-        let overfetch = (limit as usize)
-            .saturating_mul(20)
-            .max(2048)
-            .min(cap.max(1));
-        // search_with_ef 仅可能在索引被并发 panic 污染（RwLock poisoned）时返回 Err——
-        // 此时不能静默吞掉（会永久静默降级语义通道且无法诊断），必须记录。
-        match h.search_with_ef(&vector, overfetch, overfetch) {
-            Ok(results) => {
-                for (memory_id, distance) in results {
-                    let score = 1.0 - distance as f64;
-                    if score.is_finite() && score > 0.0 {
-                        let e = best.entry(memory_id).or_insert(0.0);
-                        if score > *e {
-                            *e = score;
-                        }
-                    }
-                }
-            }
-            Err(e) => eprintln!("[semantic] content HNSW search failed: {}", e),
-        }
+        search_and_merge(h, "content", &vector, limit, &mut best);
     }
     if let Some(h) = hype_hnsw {
-        let cap = h.len();
-        let overfetch = (limit as usize)
-            .saturating_mul(20)
-            .max(2048)
-            .min(cap.max(1));
-        match h.search_with_ef(&vector, overfetch, overfetch) {
-            Ok(results) => {
-                for (memory_id, distance) in results {
-                    let score = 1.0 - distance as f64;
-                    if score.is_finite() && score > 0.0 {
-                        let e = best.entry(memory_id).or_insert(0.0);
-                        if score > *e {
-                            *e = score;
-                        }
-                    }
-                }
-            }
-            Err(e) => eprintln!("[semantic] HYPE HNSW search failed: {}", e),
-        }
+        search_and_merge(h, "HYPE", &vector, limit, &mut best);
     }
     if best.is_empty() {
         return Ok(vec![]);
     }
 
-    // 双路 overfetch 合并后 union 最坏可达 2×max(limit*20, 2048)（rerank pool=100 时
-    // primary_limit=300，每路 6000、union 可达 ~12000）。ns 回查前先截断：
-    // **cap 须按实际 overfetch 动态取值（2×overfetch）而非固定 4096**——固定值在
-    // limit>102 时会砍掉全局排名 4096-12000 的目标 ns gold，重蹈 2026-07-26 修复的
-    // 跨 ns 拥挤漏召问题。2×overfetch 保证"每路 top-overfetch 的并集"完整保留。
-    let max_union = {
-        let ovf = (limit as usize)
-            .saturating_mul(20)
-            .max(2048);
-        ovf.saturating_mul(2).max(2048)
-    };
-    if best.len() > max_union {
-        let mut ranked: Vec<(String, f64)> = best.into_iter().collect();
-        ranked.sort_by(|a, b| {
-            b.1.partial_cmp(&a.1)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.0.cmp(&b.0))
-        });
-        ranked.truncate(max_union);
-        best = ranked.into_iter().collect();
-    }
+    // 合并上限说明（#R33 maintainability/low）：`search_with_ef(overfetch, overfetch)` 每路
+    // 至多返回 overfetch 条，best 按 memory_id 去重后 len ≤ ovf_content + ovf_hype ≤ 2×ovf——
+    // 因此无需（也无法）在此截断；曾有的 sort/truncate 分支是 dead code，已移除。
+    // ns 回查的 IN(...) 规模即 ≤ 2×ovf（默认 ~6000，远低于 SQLite 32766 变量上限；
+    // 若未来索引规模使 2×ovf 逼近上限，需在 lookup_namespaces 内分批，见该函数注释）。
 
     // HNSW 是全局索引，无 namespace 维度。按调用者 ns 回查 memories 表，
     // 仅保留归属当前 ns 的记忆，杜绝跨租户泄露。无 pool 时无法过滤，保守返回空。
@@ -193,26 +139,66 @@ pub fn semantic_search(
     Ok(out)
 }
 
-/// 批量回查 memory_id 的 namespace（单条 IN 查询，避免 N+1）。
+/// 单路 HNSW 搜索并合并进 `best`（按 memory_id 取 max cosine）。内容路与 HyPE 路共用，
+/// 保证双路契约一致（#R33 maintainability/low：两路若各写一份，未来改 overfetch/分数
+/// 过滤/错误处理极易漏改一路，静默分裂）。`label` 仅用于错误日志前缀。
+fn search_and_merge(
+    h: &HnswIndex,
+    label: &str,
+    vector: &[f32],
+    limit: u32,
+    best: &mut HashMap<String, f64>,
+) {
+    let cap = h.len();
+    let overfetch = (limit as usize)
+        .saturating_mul(20)
+        .max(2048)
+        .min(cap.max(1));
+    // search_with_ef 仅可能在索引被并发 panic 污染（RwLock poisoned）时返回 Err——
+    // 此时不能静默吞掉（会永久静默降级语义通道且无法诊断），必须记录。
+    match h.search_with_ef(vector, overfetch, overfetch) {
+        Ok(results) => {
+            for (memory_id, distance) in results {
+                let score = 1.0 - distance as f64;
+                if score.is_finite() && score > 0.0 {
+                    let e = best.entry(memory_id).or_insert(0.0);
+                    if score > *e {
+                        *e = score;
+                    }
+                }
+            }
+        }
+        Err(e) => eprintln!("[semantic] {label} HNSW search failed: {e}"),
+    }
+}
+
+/// 批量回查 memory_id 的 namespace（分批 IN 查询，避免 N+1 且不超 SQLite 变量上限）。
+///
+/// 双路合并后 id 数可达 ~12000（limit=300 时 2×overfetch），单条 IN(...) 逼近/超过
+/// SQLITE_MAX_VARIABLE_NUMBER（bundled 32766；旧库可能 999）会 prepare 失败并静默降级。
+/// 每批最多 500 个占位符，分批查询后合并（#R33 performance/medium）。
 fn lookup_namespaces(
     pool: &SqlitePool,
     results: &[&str],
 ) -> Result<HashMap<String, String>, String> {
+    const BATCH: usize = 500;
     let conn = pool.get().map_err(|e| format!("pool: {}", e))?;
-    let placeholders = vec!["?"; results.len()].join(",");
-    let sql = format!(
-        "SELECT id, namespace FROM memories WHERE id IN ({})",
-        placeholders
-    );
-    let mut stmt = conn.prepare(&sql).map_err(|e| format!("prepare: {}", e))?;
-    let rows = stmt
-        .query_map(rusqlite::params_from_iter(results.iter().map(|s| *s)), |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })
-        .map_err(|e| format!("query: {}", e))?;
     let mut map = HashMap::new();
-    for row in rows.flatten() {
-        map.insert(row.0, row.1);
+    for chunk in results.chunks(BATCH) {
+        let placeholders = vec!["?"; chunk.len()].join(",");
+        let sql = format!(
+            "SELECT id, namespace FROM memories WHERE id IN ({})",
+            placeholders
+        );
+        let mut stmt = conn.prepare(&sql).map_err(|e| format!("prepare: {}", e))?;
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(chunk.iter().map(|s| *s)), |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|e| format!("query: {}", e))?;
+        for row in rows.flatten() {
+            map.insert(row.0, row.1);
+        }
     }
     Ok(map)
 }
