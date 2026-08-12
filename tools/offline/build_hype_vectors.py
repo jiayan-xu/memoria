@@ -140,6 +140,16 @@ def main():
         targets = targets[: args.limit]
 
     con = sqlite3.connect(args.db)
+    # 自包含：表可能尚未经 Rust 迁移创建（离线补嵌先于服务启动时）——镜像
+    # src/storage/sqlite.rs 的 schema，确保首次运行不因缺表崩溃、幂等成立。
+    con.execute(
+        "CREATE TABLE IF NOT EXISTS memory_hype_vectors ("
+        "id TEXT PRIMARY KEY, namespace TEXT NOT NULL DEFAULT 'default', "
+        "question TEXT, vector BLOB NOT NULL, updated_at TEXT DEFAULT (datetime('now')))"
+    )
+    con.execute(
+        "CREATE INDEX IF NOT EXISTS idx_hype_ns ON memory_hype_vectors(namespace)"
+    )
     ok = skip = fail = 0
     for i, (mid, content) in enumerate(targets, 1):
         q = generate_question(content)
@@ -154,8 +164,8 @@ def main():
             print(f"[{i}/{len(targets)}] {mid[:8]} 嵌入失败: {e}")
             fail += 1
             continue
-        if len(v) != 1024:
-            print(f"[{i}/{len(targets)}] {mid[:8]} 维度异常 {len(v)}≠1024，跳过")
+        if len(v) != dim:
+            print(f"[{i}/{len(targets)}] {mid[:8]} 维度异常 {len(v)}≠{dim}，跳过")
             fail += 1
             continue
         if args.dry_run:
