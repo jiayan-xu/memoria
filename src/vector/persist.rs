@@ -132,11 +132,16 @@ fn put_vector_into(
     // 注意：退化检查在前、维度检查在后——零值且错长度的向量报"degenerate"而非
     // "dimension mismatch"，是刻意为之（退化更根本，先拒绝）。
     if vector.len() != DIM {
-        return Err(format!(
+        // #R40 other/low：调用方均 `let _ =` 忽略返回值——维度拒绝若静默，嵌入模型
+        // 维度漂移（1024→768）时记忆照常写入但语义覆盖悄然下降、无任何日志。记录
+        // 使失败可观测（与 rebuild 侧 skipped 行的 eprintln 诊断对齐）。
+        let msg = format!(
             "{fn_name}: dimension mismatch: expected {}, got {}",
             DIM,
             vector.len()
-        ));
+        );
+        eprintln!("[persist] WARN: {msg}");
+        return Err(msg);
     }
     conn.execute(td.insert_sql, rusqlite::params![id, namespace, encode_vector(vector)])
         .map(|_| ())
@@ -176,11 +181,14 @@ pub fn rebuild_hype_hnsw_from_store(pool: &SqlitePool, hnsw: &HnswIndex) -> Resu
 /// V1（2026-08-12）：解析 `MEMORIA_EF_SEARCH` 的**唯一入口**（main.rs 与 lib.rs 共用）。
 /// 此前两入口各自复制「env 读取 + clamp + 默认 128」——若一处改 clamp/默认而另一处漏改，
 /// 内容/HyPE 索引 ef 行为静默分裂。收口后两入口天然同步。
+/// #R40 maintainability/low：**clamp** 而非过滤——`.filter(ef>=16)` 会把运维刻意配置的
+/// 低值（如 8，trade recall for latency）静默替换成默认 128 且无提示；`.map(ef.max(16))`
+/// 保留低值意图并夹到文档下限。
 pub fn resolve_ef_search() -> usize {
     std::env::var("MEMORIA_EF_SEARCH")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
-        .filter(|&ef| ef >= 16)
+        .map(|ef| ef.max(16))
         .unwrap_or(128)
 }
 

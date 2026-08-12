@@ -145,16 +145,24 @@ async fn memory_eval_semantic() {
                     // 打挂整个评测；最终覆盖率断言会反映真实填充情况）。
                     match persist::put_hype_stored_vector(&pool, &rid, ns, &hv) {
                         Ok(()) => {
+                            // #R40 bug/medium：add 失败/0 条按 skip 计数而非 panic——
+                            // put 用 f64 校验、HnswIndex::add 用 f32 复检（且重复 id 返回 0
+                            // 属正常），put 通过仍可能 n==0；expect/assert 会打挂整个评测
+                            // 丢失全部召回诊断。覆盖率断言（≥80%）已兜住"索引恒空"假绿。
                             let n = engine
                                 .hype_hnsw
                                 .add(&[VectorEntry {
                                     id: rid.clone(),
                                     vector: hv,
                                 }])
-                                .expect("hype_hnsw.add should succeed");
-                            assert!(n > 0, "hype_hnsw.add added 0 entries (degenerate vector or duplicate id)");
-                            hype_seen.insert(rid.clone());
-                            hype_covered += 1;
+                                .unwrap_or(0);
+                            if n > 0 {
+                                hype_seen.insert(rid.clone());
+                                hype_covered += 1;
+                            } else {
+                                eprintln!("[eval_semantic] hype add skipped (0 entries added)");
+                                hype_skipped += 1;
+                            }
                         }
                         Err(e) => {
                             eprintln!("[eval_semantic] hype put skipped (degenerate): {e}");
@@ -186,6 +194,15 @@ async fn memory_eval_semantic() {
     assert!(
         engine.hype_hnsw.len() > 0,
         "hype index empty after corpus setup: question-embed likely failing"
+    );
+    // #R40 maintainability/low：hype_seen（成功 add 的唯一 rid 集）与 covered 计数必须
+    // 一致——两者不同说明计数/去重逻辑漂移（各 rid 恰计一次）。
+    assert_eq!(
+        hype_seen.len(),
+        hype_covered,
+        "hype_seen ({}) != hype_covered ({}) — dedup/count drift",
+        hype_seen.len(),
+        hype_covered
     );
     assert!(
         hype_covered as f64 >= hype_processed.len() as f64 * 0.8,

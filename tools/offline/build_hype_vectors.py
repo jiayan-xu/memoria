@@ -100,7 +100,14 @@ def generate_question(content: str) -> str:
             )
             with urllib.request.urlopen(req, timeout=30) as r:
                 resp = json.loads(r.read().decode())
-            return resp["choices"][0]["message"]["content"].strip().strip('"').strip("'")
+            # #R40 bug/medium：OpenAI 兼容端点的 content 可为 null/missing（refusal/空回复）——
+            # 无条件 .strip() 会 AttributeError/KeyError，3 次重试后被误判为"瞬时失败"
+            # 进 fail_ids（永不收敛且每轮白付 3 次付费调用）。null/缺失是**确定性**结果，
+            # 直接返回 ""（走确定性 skip 分支）。
+            content_val = resp.get("choices", [{}])[0].get("message", {}).get("content")
+            if content_val is None:
+                return ""
+            return str(content_val).strip().strip('"').strip("'")
         except Exception as e:
             if attempt == 2:
                 # #R38 bug/medium：重试耗尽 = 瞬时故障（网络/API 抖动），可重跑修复——
@@ -191,6 +198,9 @@ def main():
     ok = skip = fail = 0
     fail_ids = []
     skip_ids = []
+    # 已知限制（#R40 performance/low）：每轮一次 chat + 一次 embed 串行（--all 约 1 万次
+    # 顺序请求）；embed 已支持 list 可批 16（仿 rebuild_vectors.py），但批量化需重构
+    # 失败归因（批内单条失败 → 单独重嵌该条），留待后续优化，本轮保持正确性优先。
     # #R39 bug/medium：清理仅非 dry-run 分支执行——dry-run 不重写该文件却先删除它，
     # 会清空上次失败批次已落盘的 id 清单（运维先 dry-run 验证修复会丢失"定点重跑"清单）。
     failed_ids_path = os.path.join(HERE, "hype_failed_ids.txt")
@@ -200,6 +210,18 @@ def main():
                 os.remove(failed_ids_path)
         except OSError as e:
             print(f"  [warn] 清理旧 hype_failed_ids.txt 失败: {e}")
+
+    def record_fail(mid):
+        """失败 id **立即追加**落盘（#R40 bug/medium）：脚本中断（Ctrl+C/崩溃）时
+        已累计的失败清单不丢——"可定点重跑"承诺依赖该文件，删除旧清单后若只在循环
+        结束时写一次，中断即全丢。"""
+        fail_ids.append(mid)
+        if not args.dry_run:
+            try:
+                with open(failed_ids_path, "a", encoding="utf-8") as f:
+                    f.write(mid + "\n")
+            except OSError as e:
+                print(f"  [warn] 追加 {failed_ids_path} 失败: {e}")
     # #R39 performance/medium：嵌入服务预检——系统性配置错误（local 模型 768d 触发
     # dim≠RUST_DIM、服务不可达）若不先探测，--all 会先为每条付一次付费 LLM chat 再
     # 全部失败。循环前单次探测嵌入校验 dim==RUST_DIM，配置错误立即 fail-fast。
@@ -220,7 +242,7 @@ def main():
             # 重试耗尽的瞬时故障：记入 fail_ids（可定点重跑），非确定性 skip。
             print(f"[{i}/{len(targets)}] {mid[:8]} 问句生成瞬时失败: {e}")
             fail += 1
-            fail_ids.append(mid)
+            record_fail(mid)
             continue
         if not q or len(q) < 6:
             print(f"[{i}/{len(targets)}] {mid[:8]} 问句生成失败/过短，跳过")
@@ -261,7 +283,7 @@ def main():
         except Exception as e:
             print(f"[{i}/{len(targets)}] {mid[:8]} 嵌入/写入异常: {e}")
             fail += 1
-            fail_ids.append(mid)
+            record_fail(mid)
             continue
         ok += 1
         if i % 10 == 0:
@@ -277,10 +299,14 @@ def main():
     if skip_ids:
         print(f"提示: {len(skip_ids)} 条确定性跳过（LLM 判为不可检索，重跑不会成功），未写入失败列表")
     if fail_ids:
-        # 瞬时失败 id 落盘（ops 可据此定点重跑，不必全量 --all 再来一遍）
-        with open(failed_ids_path, "w", encoding="utf-8") as f:
-            f.write("\n".join(fail_ids))
-        print(f"失败 id 已写入 {failed_ids_path}（{len(fail_ids)} 条）")
+        # 追加式已实时落盘；此处去重重写（追加过程中同 id 可能多次失败产生重复行，
+        # 定点重跑清单须无重复）。#R40 bug/medium：中断时追加的清单仍完整保留。
+        try:
+            with open(failed_ids_path, "w", encoding="utf-8") as f:
+                f.write("\n".join(dict.fromkeys(fail_ids)))
+        except OSError as e:
+            print(f"  [warn] 重写 {failed_ids_path} 失败（追加清单仍保留）: {e}")
+        print(f"失败 id 已写入 {failed_ids_path}（{len(set(fail_ids))} 条）")
 
 
 if __name__ == "__main__":

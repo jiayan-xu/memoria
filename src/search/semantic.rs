@@ -181,6 +181,16 @@ pub fn semantic_search(
                                 chunk.len()
                             );
                             batch_failed = true;
+                        } else if row_errors > 0 {
+                            // #R40 bug/medium：**部分**行映射失败（如 content 为 NULL——
+                            // memories.content 可空）也须标失败批：失败行经 unwrap_or_default
+                            // 产出空正文、复现 P3-0 内容损坏（rrf_merge 首次插入锁定空正文）。
+                            // 剔除范围见下方——只剔未成功插入的 id，成功行保留。
+                            eprintln!(
+                                "[semantic] content backfill: {row_errors} of {} rows failed mapping (dropping those ids)",
+                                chunk.len()
+                            );
+                            batch_failed = true;
                         } else {
                             batches_ok += 1;
                         }
@@ -204,8 +214,12 @@ pub fn semantic_search(
                 }
             }
             if batch_failed {
+                // #R40 bug/medium：只剔除**未成功插入**的 id——部分行失败时成功行
+                // 正文完好，不应连同整批一起丢弃（只损失失败行召回，保留成功行）。
                 for id in chunk.iter() {
-                    failed_batch_ids.insert((*id).clone());
+                    if !contents.contains_key(*id) {
+                        failed_batch_ids.insert((*id).clone());
+                    }
                 }
             }
         }
