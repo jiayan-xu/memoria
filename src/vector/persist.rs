@@ -53,6 +53,15 @@ pub fn put_stored_vector(
     if !norm_sq.is_finite() || norm_sq == 0.0 {
         return Err("put_stored_vector: degenerate (zero/NaN) vector rejected".into());
     }
+    // 写入时校验维度：错误长度的向量落库后会被 rebuild 静默跳过（仅 stderr 告警），
+    // 造成"API 接受但索引永远不含"的死行——fail fast 使写入/读取路径一致。
+    if vector.len() != DIM {
+        return Err(format!(
+            "put_stored_vector: dimension mismatch: expected {}, got {}",
+            DIM,
+            vector.len()
+        ));
+    }
     conn.execute(
         "INSERT OR REPLACE INTO memory_vectors (id, namespace, vector) VALUES (?, ?, ?)",
         rusqlite::params![id, namespace, encode_vector(vector)],
@@ -73,6 +82,13 @@ pub fn put_hype_stored_vector(
     let norm_sq: f64 = vector.iter().map(|x| (*x as f64) * (*x as f64)).sum();
     if !norm_sq.is_finite() || norm_sq == 0.0 {
         return Err("put_hype_stored_vector: degenerate (zero/NaN) vector rejected".into());
+    }
+    if vector.len() != DIM {
+        return Err(format!(
+            "put_hype_stored_vector: dimension mismatch: expected {}, got {}",
+            DIM,
+            vector.len()
+        ));
     }
     conn.execute(
         "INSERT OR REPLACE INTO memory_hype_vectors (id, namespace, vector, updated_at) \
@@ -147,7 +163,9 @@ fn rebuild_from_table(
             }
             Err(e) => {
                 skipped += 1;
-                eprintln!("[persist] {label} row decode failed: {e}");
+                // 注意：decode_vector 本身不可失败（长度不符走 Ok 分支的跳过路径），
+                // 此 Err 分支捕获的是 query_map 的行读取/列转换/SQLite 迭代错误。
+                eprintln!("[persist] {label} row read/iteration failed: {e}");
             }
         }
     }

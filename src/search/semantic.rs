@@ -48,6 +48,9 @@ pub fn semantic_search(
     // 收集两路候选：content 路（hnsw）+ hype 路（hype_hnsw），按 memory_id 合并取 max。
     // HNSW 是全局索引、无 namespace 维度（语义检索 B2 修复说明）：
     // 先按远大于 limit 的窗口过取全局候选，再按 ns 过滤，保证目标 ns 拿到足够语义候选。
+    // 已知限制（#R32 other/low）：两路 cosine 分数分布不保证同尺度，per-id 取 max 会偏向
+    // 系统性高分的一路——当前内容/问句向量同出自 Qwen3-VL-8B（同模型同空间），A/B 实测
+    // （+9.4pp recall@10）未现偏差；若未来换模型/分路，须先校准两路分数尺度再依赖 raw max。
     let mut best: HashMap<String, f64> = HashMap::new(); // memory_id -> max cosine
     if let Some(h) = hnsw {
         let cap = h.len();
@@ -97,24 +100,31 @@ pub fn semantic_search(
         return Ok(vec![]);
     }
 
-    // 双路 overfetch 合并后 union 最坏可达 2×max(limit*20, 2048) ≈ 4096 个唯一 id——
-    // 远超单路（2048）。在 ns 回查前先截断到合理上界（取分数最高的前 4096），
-    // 避免 IN (...) 子句/绑定规模翻倍拖慢查询（SQLite 变量上限 32766 不会崩，
-    // 但每请求成本随 id 数线性涨，且旧库 999 上限会破）。
-    if best.len() > 4096 {
+    // 双路 overfetch 合并后 union 最坏可达 2×max(limit*20, 2048)（rerank pool=100 时
+    // primary_limit=300，每路 6000、union 可达 ~12000）。ns 回查前先截断：
+    // **cap 须按实际 overfetch 动态取值（2×overfetch）而非固定 4096**——固定值在
+    // limit>102 时会砍掉全局排名 4096-12000 的目标 ns gold，重蹈 2026-07-26 修复的
+    // 跨 ns 拥挤漏召问题。2×overfetch 保证"每路 top-overfetch 的并集"完整保留。
+    let max_union = {
+        let ovf = (limit as usize)
+            .saturating_mul(20)
+            .max(2048);
+        ovf.saturating_mul(2).max(2048)
+    };
+    if best.len() > max_union {
         let mut ranked: Vec<(String, f64)> = best.into_iter().collect();
         ranked.sort_by(|a, b| {
             b.1.partial_cmp(&a.1)
                 .unwrap_or(std::cmp::Ordering::Equal)
                 .then_with(|| a.0.cmp(&b.0))
         });
-        ranked.truncate(4096);
+        ranked.truncate(max_union);
         best = ranked.into_iter().collect();
     }
 
     // HNSW 是全局索引，无 namespace 维度。按调用者 ns 回查 memories 表，
     // 仅保留归属当前 ns 的记忆，杜绝跨租户泄露。无 pool 时无法过滤，保守返回空。
-    let ids: Vec<&String> = best.keys().collect();
+    let ids: Vec<&str> = best.keys().map(|s| s.as_str()).collect();
     let allowed: HashSet<String> = match pool {
         Some(p) => match lookup_namespaces(p, &ids) {
             Ok(map) => map
@@ -186,18 +196,17 @@ pub fn semantic_search(
 /// 批量回查 memory_id 的 namespace（单条 IN 查询，避免 N+1）。
 fn lookup_namespaces(
     pool: &SqlitePool,
-    results: &[&String],
+    results: &[&str],
 ) -> Result<HashMap<String, String>, String> {
     let conn = pool.get().map_err(|e| format!("pool: {}", e))?;
-    let ids: Vec<&String> = results.iter().map(|s| *s).collect();
-    let placeholders = vec!["?"; ids.len()].join(",");
+    let placeholders = vec!["?"; results.len()].join(",");
     let sql = format!(
         "SELECT id, namespace FROM memories WHERE id IN ({})",
         placeholders
     );
     let mut stmt = conn.prepare(&sql).map_err(|e| format!("prepare: {}", e))?;
     let rows = stmt
-        .query_map(rusqlite::params_from_iter(ids.iter().map(|s| *s)), |row| {
+        .query_map(rusqlite::params_from_iter(results.iter().map(|s| *s)), |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         })
         .map_err(|e| format!("query: {}", e))?;
