@@ -114,45 +114,47 @@ pub fn semantic_search(
     if let Some(p) = pool {
         const BATCH: usize = 500;
         let ids: Vec<&String> = allowed.iter().collect();
+        // pool.get 提到循环外并**传播**失败（与 lookup_namespaces 一致）：连接级错误
+        // 对每批都会失败，循环内 log-and-continue 会让所有批失败却仍返回 Ok + 空正文
+        // 结果——P3-0 内容丢失 bug 的全量复发（#R36 bug/medium）。
+        let conn = p.get().map_err(|e| format!("semantic content backfill pool: {}", e))?;
+        let mut batches_ok = 0usize;
+        let mut batches_total = 0usize;
         for chunk in ids.chunks(BATCH) {
+            batches_total += 1;
             let placeholders = vec!["?"; chunk.len()].join(",");
             let sql = format!(
                 "SELECT id, content FROM memories WHERE id IN ({})",
                 placeholders
             );
-            // #R35 bug/medium：分批消除了变量上限触发，但**每个失败点都不能静默吞**——
-            // 若某批 get/prepare/query_map 失败，该批 id 经 unwrap_or_default 变空正文，
-            // 部分成功部分丢失，正是 P3-0 内容丢失 bug 的局部复发且难以察觉。至少记录
-            // 每批失败（含批大小），与 lookup_namespaces 的传播式错误处理对齐。
-            match p.get() {
-                Ok(conn) => match conn.prepare(&sql) {
-                    Ok(mut stmt) => match stmt.query_map(
-                        rusqlite::params_from_iter(chunk.iter().map(|s| *s)),
-                        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-                    ) {
-                        Ok(rows) => {
-                            for r in rows.flatten() {
-                                contents.insert(r.0, r.1);
-                            }
+            // 单批瞬时失败（连接抖动等）log-and-continue；若**所有**批都失败（系统性
+            // schema/列变更等），escalate 返回 Err——不再把"全量空正文"伪装成正常结果。
+            match conn.prepare(&sql) {
+                Ok(mut stmt) => match stmt.query_map(
+                    rusqlite::params_from_iter(chunk.iter().map(|s| *s)),
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                ) {
+                    Ok(rows) => {
+                        for r in rows.flatten() {
+                            contents.insert(r.0, r.1);
                         }
-                        Err(e) => eprintln!(
-                            "[semantic] content backfill query failed (batch {} ids): {}",
-                            chunk.len(),
-                            e
-                        ),
-                    },
+                        batches_ok += 1;
+                    }
                     Err(e) => eprintln!(
-                        "[semantic] content backfill prepare failed (batch {} ids): {}",
+                        "[semantic] content backfill query failed (batch {} ids): {}",
                         chunk.len(),
                         e
                     ),
                 },
                 Err(e) => eprintln!(
-                    "[semantic] content backfill pool.get failed (batch {} ids): {}",
+                    "[semantic] content backfill prepare failed (batch {} ids): {}",
                     chunk.len(),
                     e
                 ),
             }
+        }
+        if batches_ok == 0 && batches_total > 0 {
+            return Err("semantic_search: content backfill failed for all batches".into());
         }
     }
 
@@ -243,21 +245,40 @@ fn lookup_namespaces(
     const BATCH: usize = 500;
     let conn = pool.get().map_err(|e| format!("pool: {}", e))?;
     let mut map = HashMap::new();
+    let mut mid_failure: Option<String> = None;
     for chunk in results.chunks(BATCH) {
         let placeholders = vec!["?"; chunk.len()].join(",");
         let sql = format!(
             "SELECT id, namespace FROM memories WHERE id IN ({})",
             placeholders
         );
-        let mut stmt = conn.prepare(&sql).map_err(|e| format!("prepare: {}", e))?;
-        let rows = stmt
-            .query_map(rusqlite::params_from_iter(chunk.iter().map(|s| *s)), |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })
-            .map_err(|e| format!("query: {}", e))?;
-        for row in rows.flatten() {
-            map.insert(row.0, row.1);
+        // 单批失败：**保留已收集的映射**（只降低召回，ns 过滤仍安全），记录并继续——
+        // 而不是 `?` 丢弃全部（#R36 bug/low：中途失败会把前面批次的成果一起扔掉，
+        // 变成"索引空"不可区分的全空结果）。
+        match conn.prepare(&sql) {
+            Ok(mut stmt) => match stmt.query_map(
+                rusqlite::params_from_iter(chunk.iter().map(|s| *s)),
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            ) {
+                Ok(rows) => {
+                    for row in rows.flatten() {
+                        map.insert(row.0, row.1);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("[semantic] ns lookup query failed (batch {} ids): {}", chunk.len(), e);
+                    mid_failure.get_or_insert(format!("query: {e}"));
+                }
+            },
+            Err(e) => {
+                eprintln!("[semantic] ns lookup prepare failed (batch {} ids): {}", chunk.len(), e);
+                mid_failure.get_or_insert(format!("prepare: {e}"));
+            }
         }
+    }
+    if let Some(e) = mid_failure {
+        // 部分失败：返回已收集映射 + 告警（调用方按部分映射过滤，比全空好）。
+        eprintln!("[semantic] ns lookup partial failure, continuing with {} namespaces: {}", map.len(), e);
     }
     Ok(map)
 }

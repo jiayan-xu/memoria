@@ -613,5 +613,38 @@ pub fn migrate_hype_vectors(pool: &SqlitePool) -> Result<(), String> {
         END",
     )
     .map_err(|e| format!("create mem_ad_vec trigger: {}", e))?;
+    // 一次性清理**存量**孤儿行（#R36 maintainability/low）：触发器只挡未来，
+    // 历史删除留下的 memory_vectors 孤儿（无对应 memories 行）仍会被启动 rebuild
+    // 重新加入 HNSW，浪费索引内存/存储。迁移内清理彻底闭环。
+    let orphans_vec: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM memory_vectors WHERE id NOT IN (SELECT id FROM memories)",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    if orphans_vec > 0 {
+        conn.execute(
+            "DELETE FROM memory_vectors WHERE id NOT IN (SELECT id FROM memories)",
+            [],
+        )
+        .map_err(|e| format!("clean memory_vectors orphans: {}", e))?;
+        println!("[Memoria] Migration: removed {orphans_vec} orphan memory_vectors rows");
+    }
+    let orphans_hype: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM memory_hype_vectors WHERE id NOT IN (SELECT id FROM memories)",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    if orphans_hype > 0 {
+        conn.execute(
+            "DELETE FROM memory_hype_vectors WHERE id NOT IN (SELECT id FROM memories)",
+            [],
+        )
+        .map_err(|e| format!("clean memory_hype_vectors orphans: {}", e))?;
+        println!("[Memoria] Migration: removed {orphans_hype} orphan memory_hype_vectors rows");
+    }
     Ok(())
 }

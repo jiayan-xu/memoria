@@ -93,7 +93,9 @@ async fn memory_eval_semantic() {
         let tags = item["tags"].as_str().unwrap_or("[]");
 
         let v = embed(&client, content).await.expect("corpus embed");
-        engine.cache_query_vector(content, v.clone());
+        // v 仅用于内容路（cache_query_vector/remember_with_dedup）；HyPE 块嵌入独立的
+        // 问句向量 hv，不再引用 v——无需 clone（#R36 performance/low）。
+        engine.cache_query_vector(content, v);
         let r = remember_with_dedup(
             &pool,
             content,
