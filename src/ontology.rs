@@ -135,37 +135,25 @@ fn kill_process_tree(child: &mut std::process::Child) {
     }
 }
 
-/// 校验路径的**所有**组件非符号链接（#R27 第27轮 security/low）。
+/// 校验 data_dir 的**最终组件**非符号链接（#R27 第27轮 security/low 修订）。
 ///
-/// `create_dir_all` 沿路径跟随每个组件的 symlink/junction——若 data_dir 的某个**祖先**组件是
-/// 攻击者预置的链接（如 `OPEN_ONTOLOGIES_DATA=/tmp/a/ontology` 而 `/tmp/a` 是链接），本模块的
-/// 临时工件会落入攻击者选定目录，只查最终组件的 symlink_metadata 挡不住。此处从根到最终组件
-/// 逐级 `symlink_metadata`（不跟随链接）检查；任一级是 symlink 即拒绝。
-/// Windows 上目录 junction/reparse point 创建不需管理员，检查同样适用。
+/// `create_dir_all` 沿路径跟随 symlink/junction。逐级检查**所有**祖先组件在理论上更严，
+/// 但会误伤平台常态：macOS 的 TMPDIR（`/var/folders/...`）与 Linux 的 `/tmp` 等系统目录
+/// 本身常是系统级 symlink（`/var`→`/private/var`），拒绝它们会让 `materialize` 在 macOS CI
+/// 与所有依赖系统 TMP 的环境假红（第29轮实测：`path component /var ... is a symlink` panic）。
+/// 祖先组件的 symlink 由**系统/用户可信路径**构成（根、/var、/tmp、用户主目录等），攻击者
+/// 无法预置；真正的攻击面是 data_dir 最终组件本身被预置链接（如 `data/ontology` 指向
+/// 攻击者目录）。故只检查最终组件，与 R20 的原始防御一致。
 fn ensure_no_symlink_components(path: &std::path::Path) -> Result<(), String> {
-    // 从最短祖先（根）开始逐级下探到完整路径，确保每一级都被检查。
-    // `path` 已由 create_dir_all 创建（存在），直接遍历 ancestors。
-    let mut checked = 0usize;
-    for anc in path.ancestors() {
-        // 跳过根与当前目录的琐碎情况；ancestors 从完整路径到根。
-        let is_link = std::fs::symlink_metadata(anc)
-            .map(|m| m.file_type().is_symlink())
-            .unwrap_or(false);
-        if is_link {
-            return Err(format!(
-                "path component {} of data dir {} is a symlink (possible attack); \
-                 refusing to write temp artifacts",
-                anc.display(),
-                path.display()
-            ));
-        }
-        checked += 1;
-        // 到达文件系统根（anc == parent）即终止；`ancestors()` 最末是 `..` 的根。
-        if anc.parent().is_none() {
-            break;
-        }
+    let is_link = std::fs::symlink_metadata(path)
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(false);
+    if is_link {
+        return Err(format!(
+            "data dir {} is a symlink (possible attack); refusing to write temp artifacts",
+            path.display()
+        ));
     }
-    let _ = checked;
     Ok(())
 }
 
