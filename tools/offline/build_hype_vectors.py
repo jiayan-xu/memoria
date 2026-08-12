@@ -163,17 +163,22 @@ def main():
     if args.limit is not None:
         targets = targets[: args.limit]
 
-    con = sqlite3.connect(args.db)
-    # 自包含：表可能尚未经 Rust 迁移创建（离线补嵌先于服务启动时）——镜像
-    # src/storage/sqlite.rs 的 schema，确保首次运行不因缺表崩溃、幂等成立。
-    con.execute(
-        "CREATE TABLE IF NOT EXISTS memory_hype_vectors ("
-        "id TEXT PRIMARY KEY, namespace TEXT NOT NULL DEFAULT 'default', "
-        "question TEXT, vector BLOB NOT NULL, updated_at TEXT DEFAULT (datetime('now')))"
-    )
-    con.execute(
-        "CREATE INDEX IF NOT EXISTS idx_hype_ns ON memory_hype_vectors(namespace)"
-    )
+    # connect + DDL 移到 dry-run 之后（#R36 bug/medium）：dry-run 承诺"只生成问句不写库"，
+    # 但 sqlite3.connect 会创建不存在的 DB 文件、CREATE TABLE/INDEX 会真实执行——
+    # 对生产库跑验证性 dry-run 也会产生副作用，与"完成(dry-run，未写库)"文案矛盾。
+    con = None
+    if not args.dry_run:
+        con = sqlite3.connect(args.db)
+        # 自包含：表可能尚未经 Rust 迁移创建（离线补嵌先于服务启动时）——镜像
+        # src/storage/sqlite.rs 的 schema，确保首次运行不因缺表崩溃、幂等成立。
+        con.execute(
+            "CREATE TABLE IF NOT EXISTS memory_hype_vectors ("
+            "id TEXT PRIMARY KEY, namespace TEXT NOT NULL DEFAULT 'default', "
+            "question TEXT, vector BLOB NOT NULL, updated_at TEXT DEFAULT (datetime('now')))"
+        )
+        con.execute(
+            "CREATE INDEX IF NOT EXISTS idx_hype_ns ON memory_hype_vectors(namespace)"
+        )
     ok = skip = fail = 0
     fail_ids = []
     for i, (mid, content) in enumerate(targets, 1):
@@ -222,7 +227,8 @@ def main():
         if i % 10 == 0:
             print(f"  ...{i}/{len(targets)}")
 
-    con.close()
+    if con is not None:
+        con.close()
     if args.dry_run:
         # dry-run 不落库——文案须如实反映，否则运维误以为已写入（#R34 other/low）
         print(f"\n完成(dry-run，未写库): 生成 {ok} / 跳过 {skip} / 失败 {fail}")

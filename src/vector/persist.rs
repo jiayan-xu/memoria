@@ -171,14 +171,14 @@ pub fn resolve_ef_search() -> usize {
 /// lib 路径与 standalone 路径此前各自写了一遍「解析 MEMORIA_EF_SEARCH + 双索引 ef 对齐 +
 /// HyPE rebuild」——正是代码库已收敛的入口分叉问题（见 migrate_superseded_by 注释
 /// "统一在此收口，避免入口分叉"）。若两处后续调参（clamp/默认值）会静默分裂，故收口。
-/// 返回 (hype_hnsw, count)；重建失败仅告警不 panic（软降级，语义检索退单路）。
-pub fn build_hype_hnsw(pool: &SqlitePool, ef_search: usize) -> HnswIndex {
+/// 返回 (hype_hnsw, count)：count 供调用方区分「功能未启用（空表，count=0）」与
+/// 「rebuild 失败（表有数据但加载失败）」——后者以 `Result` 错误呈现（#R36
+/// maintainability/low：此前静默丢弃 Result，失败只能从 WARN 行推断）。
+pub fn build_hype_hnsw(pool: &SqlitePool, ef_search: usize) -> Result<(HnswIndex, usize), String> {
     let hype_hnsw = HnswIndex::new();
     hype_hnsw.set_ef_search(ef_search);
-    if let Err(e) = rebuild_hype_hnsw_from_store(pool, &hype_hnsw) {
-        eprintln!("[Memoria] WARN: HYPE HNSW rebuild from memory_hype_vectors: {}", e);
-    }
-    hype_hnsw
+    let count = rebuild_hype_hnsw_from_store(pool, &hype_hnsw)?;
+    Ok((hype_hnsw, count))
 }
 
 /// 共享实现：从 `table`（须含 id/vector 列）读取全部向量并加入 HNSW。

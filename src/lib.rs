@@ -81,8 +81,19 @@ impl MemoriaEngine {
         // 避免两入口 ef 行为分裂（迁移收口的同一理由）。
         let ef_search = vector::persist::resolve_ef_search();
         hnsw.set_ef_search(ef_search);
-        let hype_hnsw = vector::persist::build_hype_hnsw(&pool, ef_search);
-        let hype_count = hype_hnsw.len();
+        // 库路径同样区分"rebuild 失败"与"空表"：失败软降级（空索引）并 eprintln，
+        // 不 panic（Python bindings 宿主不因 HyPE 故障崩溃）。
+        let (hype_hnsw, hype_count) =
+            match vector::persist::build_hype_hnsw(&pool, ef_search) {
+                Ok(x) => x,
+                Err(e) => {
+                    eprintln!(
+                        "[Memoria] WARN: HYPE HNSW rebuild failed (semantic degraded to single path): {}",
+                        e
+                    );
+                    (HnswIndex::new(), 0)
+                }
+            };
         // 库代码（Python bindings 等宿主）不污染 stdout——用 eprintln；且无条件打印
         // （0 也打），与 main.rs 一致：空表（未启用）与 rebuild 静默降级可区分。
         eprintln!("[Memoria] HYPE HNSW vectors: {}", hype_count);
