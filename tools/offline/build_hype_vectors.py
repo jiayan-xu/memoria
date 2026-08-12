@@ -146,7 +146,11 @@ def main():
         sys.exit(1)
 
     # ── 目标记忆列表 ──
-    if args.all:
+    # #R37 bug/low：--all 的 DB 访问也须在 dry-run 守卫后——否则 --all --dry-run 仍会
+    # connect（创建不存在的 DB 文件）并 SELECT（无 memories 表时裸抛
+    # OperationalError，dry-run 带副作用崩溃）。dry-run 一律用 golden 目标
+    # （只需展示问句生成，不需要全库枚举）。
+    if args.all and not args.dry_run:
         con = sqlite3.connect(args.db)
         rows = con.execute(
             "SELECT id, content FROM memories WHERE namespace='agent/xujiayan' "
@@ -158,7 +162,10 @@ def main():
     else:
         d = json.load(open(GOLDEN, encoding="utf-8"))
         targets = [(it["id"], it["content"]) for it in d["items"]]
-        print(f"golden 目标: {len(targets)} 条")
+        if args.all and args.dry_run:
+            print(f"--all --dry-run: 使用 golden 目标 {len(targets)} 条（不读库）")
+        else:
+            print(f"golden 目标: {len(targets)} 条")
 
     if args.limit is not None:
         targets = targets[: args.limit]
@@ -181,15 +188,17 @@ def main():
         )
     ok = skip = fail = 0
     fail_ids = []
+    skip_ids = []
     for i, (mid, content) in enumerate(targets, 1):
         q = generate_question(content)
         if not q or len(q) < 6:
             print(f"[{i}/{len(targets)}] {mid[:8]} 问句生成失败/过短，跳过")
             skip += 1
-            # 跳过也记入 fail_ids：hype_failed_ids.txt 承诺"可定点重跑"——LLM 瞬时失败
-            # 的记忆若不记录，基于该文件的定点重跑永远无法补上这些缺口（#R34
-            # maintainability/low）。
-            fail_ids.append(mid)
+            # #R37 maintainability/low：区分"瞬时失败"与"确定性跳过"——sys_prompt 明确
+            # 指示 LLM 对不可检索内容（纯代码/乱码）返回 ""，这类 id 重跑永远同样跳过，
+            # 记入 fail_ids 会让 hype_failed_ids.txt 永不收敛。跳过单独记 skip_ids
+            # （仅提示用），fail_ids 只含真正可修复的瞬时失败。
+            skip_ids.append(mid)
             continue
         # dry-run 前置：只生成问句、不嵌入不写库——文档承诺"只生成问句"就必须
         # 不依赖 embed_server 在线（否则服务抖动时 dry-run 报"嵌入失败"而非显示问句）。
@@ -234,8 +243,10 @@ def main():
         print(f"\n完成(dry-run，未写库): 生成 {ok} / 跳过 {skip} / 失败 {fail}")
         return
     print(f"\n完成: 写入 {ok} / 跳过 {skip} / 失败 {fail}")
+    if skip_ids:
+        print(f"提示: {len(skip_ids)} 条确定性跳过（LLM 判为不可检索，重跑不会成功），未写入失败列表")
     if fail_ids:
-        # 失败 id 落盘（ops 可据此定点重跑，不必全量 --all 再来一遍）
+        # 瞬时失败 id 落盘（ops 可据此定点重跑，不必全量 --all 再来一遍）
         with open(os.path.join(HERE, "hype_failed_ids.txt"), "w", encoding="utf-8") as f:
             f.write("\n".join(fail_ids))
         print(f"失败 id 已写入 hype_failed_ids.txt（{len(fail_ids)} 条）")

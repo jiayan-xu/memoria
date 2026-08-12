@@ -616,35 +616,50 @@ pub fn migrate_hype_vectors(pool: &SqlitePool) -> Result<(), String> {
     // 一次性清理**存量**孤儿行（#R36 maintainability/low）：触发器只挡未来，
     // 历史删除留下的 memory_vectors 孤儿（无对应 memories 行）仍会被启动 rebuild
     // 重新加入 HNSW，浪费索引内存/存储。迁移内清理彻底闭环。
-    let orphans_vec: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM memory_vectors WHERE id NOT IN (SELECT id FROM memories)",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap_or(0);
-    if orphans_vec > 0 {
-        conn.execute(
-            "DELETE FROM memory_vectors WHERE id NOT IN (SELECT id FROM memories)",
-            [],
-        )
-        .map_err(|e| format!("clean memory_vectors orphans: {}", e))?;
-        println!("[Memoria] Migration: removed {orphans_vec} orphan memory_vectors rows");
-    }
-    let orphans_hype: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM memory_hype_vectors WHERE id NOT IN (SELECT id FROM memories)",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap_or(0);
-    if orphans_hype > 0 {
-        conn.execute(
-            "DELETE FROM memory_hype_vectors WHERE id NOT IN (SELECT id FROM memories)",
-            [],
-        )
-        .map_err(|e| format!("clean memory_hype_vectors orphans: {}", e))?;
-        println!("[Memoria] Migration: removed {orphans_hype} orphan memory_hype_vectors rows");
+    // #R37 bug/medium：两表在此刻**必然存在**（刚 CREATE），query_row 失败即真实 DB
+    // 问题（BUSY/schema 异常）——unwrap_or(0) 会静默跳过清理、迁移假成功、孤儿
+    // 每启动重入 HNSW。必须传播。
+    // #R37 performance/medium：清理用 `PRAGMA user_version` 位标记门控——`COUNT(*) NOT IN`
+    // 是全表相关扫描 + 可能的大 DELETE，若每次启动都跑会拖慢启动并持写锁。
+    // user_version 已有值只增不减；用位 0x1000 标记"孤儿清理已执行"。
+    const CLEANUP_MARK: i64 = 0x1000;
+    let uv: i64 = conn
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .map_err(|e| format!("read user_version: {}", e))?;
+    if uv & CLEANUP_MARK == 0 {
+        let orphans_vec: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM memory_vectors WHERE id NOT IN (SELECT id FROM memories)",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(|e| format!("count memory_vectors orphans: {}", e))?;
+        if orphans_vec > 0 {
+            conn.execute(
+                "DELETE FROM memory_vectors WHERE id NOT IN (SELECT id FROM memories)",
+                [],
+            )
+            .map_err(|e| format!("clean memory_vectors orphans: {}", e))?;
+            println!("[Memoria] Migration: removed {orphans_vec} orphan memory_vectors rows");
+        }
+        let orphans_hype: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM memory_hype_vectors WHERE id NOT IN (SELECT id FROM memories)",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(|e| format!("count memory_hype_vectors orphans: {}", e))?;
+        if orphans_hype > 0 {
+            conn.execute(
+                "DELETE FROM memory_hype_vectors WHERE id NOT IN (SELECT id FROM memories)",
+                [],
+            )
+            .map_err(|e| format!("clean memory_hype_vectors orphans: {}", e))?;
+            println!("[Memoria] Migration: removed {orphans_hype} orphan memory_hype_vectors rows");
+        }
+        // 置位标记（保留既有位，只或入新位）。
+        conn.execute_batch(&format!("PRAGMA user_version = {};", uv | CLEANUP_MARK))
+            .map_err(|e| format!("set user_version cleanup mark: {}", e))?;
     }
     Ok(())
 }

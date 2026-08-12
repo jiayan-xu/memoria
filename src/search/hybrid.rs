@@ -86,11 +86,10 @@ pub fn hybrid_search(
                 // #R35 maintainability/low：semantic_search 在"全部 HNSW 路失败"
                 // （poisoned/corrupted）时显式返回 Err——此处不能静默丢弃整个语义信号
                 // （退化为 keyword-only 无痕），至少记录，让降级可观测。
+                // #R37 maintainability/low：Err 也可能来自 DB/pool 故障（content backfill
+                // pool/get 失败等），日志前缀保持中立，不预设根因是索引损坏。
                 Err(e) => {
-                    eprintln!(
-                        "[hybrid] semantic signal dropped (index degraded): {}",
-                        e
-                    );
+                    eprintln!("[hybrid] semantic signal dropped: {}", e);
                 }
             }
         }

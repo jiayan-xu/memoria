@@ -59,9 +59,53 @@ pub fn put_hype_stored_vector(
     put_vector_into(pool, id, namespace, vector, "memory_hype_vectors")
 }
 
+/// 向量表描述符（#R37 maintainability/low）：表名 → 建表/写入/读取 SQL + 公开函数名 +
+/// 日志 label 的**单一事实源**。此前三处 match 各自硬编码同一组字符串字面量——新增第三张
+/// 向量表需同步改三处，漏改会导致错误前缀错配或 SQL 不匹配。收口为 descriptor 后，
+/// 新增表只改这里。
+struct VectorTable {
+    table: &'static str,
+    select_sql: &'static str,
+    insert_sql: &'static str,
+    fn_name: &'static str,
+    label: &'static str,
+}
+
+fn vector_tables() -> &'static [VectorTable] {
+    static TABLES: [VectorTable; 2] = [
+        VectorTable {
+            table: "memory_vectors",
+            select_sql: "SELECT id, vector FROM memory_vectors",
+            insert_sql: "INSERT INTO memory_vectors (id, namespace, vector, updated_at) \
+                         VALUES (?, ?, ?, datetime('now')) \
+                         ON CONFLICT(id) DO UPDATE SET vector=excluded.vector, \
+                                                        namespace=excluded.namespace, \
+                                                        updated_at=excluded.updated_at",
+            fn_name: "put_stored_vector",
+            label: "content",
+        },
+        VectorTable {
+            table: "memory_hype_vectors",
+            select_sql: "SELECT id, vector FROM memory_hype_vectors",
+            insert_sql: "INSERT INTO memory_hype_vectors (id, namespace, vector, updated_at) \
+                         VALUES (?, ?, ?, datetime('now')) \
+                         ON CONFLICT(id) DO UPDATE SET vector=excluded.vector, \
+                                                        namespace=excluded.namespace, \
+                                                        updated_at=excluded.updated_at",
+            fn_name: "put_hype_stored_vector",
+            label: "hype",
+        },
+    ];
+    &TABLES
+}
+
+fn lookup_table(table: &str) -> Option<&'static VectorTable> {
+    vector_tables().iter().find(|t| t.table == table)
+}
+
 /// 共享实现：校验后写入 `table`（须含 id/namespace/vector/updated_at 列）。
 ///
-/// `table` 仅接受两个内部常量（白名单 dispatch，杜绝字符串插值注入面）；
+/// `table` 仅接受 descriptor 白名单（杜绝字符串插值注入面）；
 /// 用 `ON CONFLICT(id) DO UPDATE` 而非 INSERT OR REPLACE——REPLACE 会整行删除重建，
 /// 把 `memory_hype_vectors.question`（离线脚本写入的假设问句）静默抹成 NULL。
 fn put_vector_into(
@@ -72,14 +116,8 @@ fn put_vector_into(
     table: &str,
 ) -> Result<(), String> {
     let conn = pool.get().map_err(|e| format!("pool: {}", e))?;
-    // 错误前缀用**公开函数名**（put_stored_vector / put_hype_stored_vector）而非内部表名：
-    // 共享 helper 被两个入口调用，表名无法归因到具体 API（execute 分支的 map_err 已用
-    // 函数名，验证错误须一致，否则同 helper 内前缀分裂）。
-    let fn_name = match table {
-        "memory_vectors" => "put_stored_vector",
-        "memory_hype_vectors" => "put_hype_stored_vector",
-        _ => "put_vector_into",
-    };
+    let td = lookup_table(table).ok_or_else(|| format!("put_vector_into: unknown table {table}"))?;
+    let fn_name = td.fn_name;
     // P0 防御：拒绝退化（零 / 非有限）向量落库。历史嵌入失败的写入会在 memory_vectors
     // 留下全 0 向量，污染 HNSW 语义召回（零向量被 DistCosine 误判为完美匹配）。
     // 调用方均 `let _ =` 忽略返回值，故记忆仍照常写入、仅缺语义向量（退化为 keyword-only）。
@@ -98,31 +136,9 @@ fn put_vector_into(
             vector.len()
         ));
     }
-    match table {
-        "memory_vectors" => conn
-            .execute(
-                "INSERT INTO memory_vectors (id, namespace, vector, updated_at) \
-                 VALUES (?, ?, ?, datetime('now')) \
-                 ON CONFLICT(id) DO UPDATE SET vector=excluded.vector, \
-                                                namespace=excluded.namespace, \
-                                                updated_at=excluded.updated_at",
-                rusqlite::params![id, namespace, encode_vector(vector)],
-            )
-            .map(|_| ())
-            .map_err(|e| format!("{fn_name}: {}", e))?,
-        "memory_hype_vectors" => conn
-            .execute(
-                "INSERT INTO memory_hype_vectors (id, namespace, vector, updated_at) \
-                 VALUES (?, ?, ?, datetime('now')) \
-                 ON CONFLICT(id) DO UPDATE SET vector=excluded.vector, \
-                                                namespace=excluded.namespace, \
-                                                updated_at=excluded.updated_at",
-                rusqlite::params![id, namespace, encode_vector(vector)],
-            )
-            .map(|_| ())
-            .map_err(|e| format!("{fn_name}: {}", e))?,
-        _ => return Err(format!("{fn_name}: unknown table {table}")),
-    }
+    conn.execute(td.insert_sql, rusqlite::params![id, namespace, encode_vector(vector)])
+        .map(|_| ())
+        .map_err(|e| format!("{fn_name}: {}", e))?;
     Ok(())
 }
 
@@ -195,13 +211,10 @@ fn rebuild_from_table(
     label: &str,
 ) -> Result<usize, String> {
     let conn = pool.get().map_err(|e| format!("pool: {}", e))?;
-    let table_sql = match table {
-        "memory_vectors" => "SELECT id, vector FROM memory_vectors",
-        "memory_hype_vectors" => "SELECT id, vector FROM memory_hype_vectors",
-        _ => return Err(format!("{label}: unknown rebuild table {table}")),
-    };
+    let td = lookup_table(table)
+        .ok_or_else(|| format!("{label}: unknown rebuild table {table}"))?;
     let mut stmt = conn
-        .prepare(table_sql)
+        .prepare(td.select_sql)
         .map_err(|e| format!("prepare {}: {}", label, e))?;
     let rows = stmt
         .query_map([], |row| {
@@ -211,9 +224,11 @@ fn rebuild_from_table(
 
     let mut entries: Vec<VectorEntry> = Vec::new();
     let mut skipped = 0usize;
+    let mut rows_seen = 0usize;
     for row in rows {
         match row {
             Ok((id, blob)) => {
+                rows_seen += 1;
                 let v = decode_vector(&blob);
                 if v.len() == DIM {
                     entries.push(VectorEntry { id, vector: v });
@@ -222,6 +237,7 @@ fn rebuild_from_table(
                 }
             }
             Err(e) => {
+                rows_seen += 1;
                 skipped += 1;
                 // 注意：decode_vector 本身不可失败（长度不符走 Ok 分支的跳过路径），
                 // 此 Err 分支捕获的是 query_map 的行读取/列转换/SQLite 迭代错误。
@@ -235,6 +251,14 @@ fn rebuild_from_table(
         );
     }
 
+    // #R37 bug/medium：区分"空表"（无行，count=0 = 功能未启用）与"表有数据但全部损坏"
+    // （维度不符/解码失败，skipped=rows_seen>0）——后者若返回 Ok(0)，调用方会误判
+    // "HyPE 未配置"而静默单路降级，只有 stderr 告警可观测。全部损坏必须显式 Err。
+    if entries.is_empty() && rows_seen > 0 {
+        return Err(format!(
+            "{label}: table has {rows_seen} row(s) but ALL were skipped (dim mismatch or corrupt)"
+        ));
+    }
     if entries.is_empty() {
         return Ok(0);
     }
