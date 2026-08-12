@@ -103,8 +103,10 @@ def generate_question(content: str) -> str:
             return resp["choices"][0]["message"]["content"].strip().strip('"').strip("'")
         except Exception as e:
             if attempt == 2:
-                print(f"  [warn] chat 失败: {e}")
-                return ""
+                # #R38 bug/medium：重试耗尽 = 瞬时故障（网络/API 抖动），可重跑修复——
+                # 必须 raise 让调用方记入 fail_ids，不能与"LLM 合法返回空"（确定性不可
+                # 检索，重跑永远同样失败）混为同一 skip 分支。
+                raise RuntimeError(f"chat 重试耗尽: {e}") from e
             time.sleep(min(2 ** attempt, 10))
 
 
@@ -189,8 +191,23 @@ def main():
     ok = skip = fail = 0
     fail_ids = []
     skip_ids = []
+    # #R38 other/low：每次运行开始时截断失败清单——上次成功修复的 id 不应残留在
+    # 文件中误导 ops 重跑（幂等无害，但陈旧文件报告"新失败"削弱可信度）。
+    failed_ids_path = os.path.join(HERE, "hype_failed_ids.txt")
+    try:
+        if os.path.exists(failed_ids_path):
+            os.remove(failed_ids_path)
+    except OSError as e:
+        print(f"  [warn] 清理旧 hype_failed_ids.txt 失败: {e}")
     for i, (mid, content) in enumerate(targets, 1):
-        q = generate_question(content)
+        try:
+            q = generate_question(content)
+        except Exception as e:
+            # 重试耗尽的瞬时故障：记入 fail_ids（可定点重跑），非确定性 skip。
+            print(f"[{i}/{len(targets)}] {mid[:8]} 问句生成瞬时失败: {e}")
+            fail += 1
+            fail_ids.append(mid)
+            continue
         if not q or len(q) < 6:
             print(f"[{i}/{len(targets)}] {mid[:8]} 问句生成失败/过短，跳过")
             skip += 1
@@ -247,9 +264,9 @@ def main():
         print(f"提示: {len(skip_ids)} 条确定性跳过（LLM 判为不可检索，重跑不会成功），未写入失败列表")
     if fail_ids:
         # 瞬时失败 id 落盘（ops 可据此定点重跑，不必全量 --all 再来一遍）
-        with open(os.path.join(HERE, "hype_failed_ids.txt"), "w", encoding="utf-8") as f:
+        with open(failed_ids_path, "w", encoding="utf-8") as f:
             f.write("\n".join(fail_ids))
-        print(f"失败 id 已写入 hype_failed_ids.txt（{len(fail_ids)} 条）")
+        print(f"失败 id 已写入 {failed_ids_path}（{len(fail_ids)} 条）")
 
 
 if __name__ == "__main__":

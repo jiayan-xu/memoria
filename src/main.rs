@@ -248,21 +248,12 @@ fn main() {
     println!("[Memoria] HNSW vectors: {}", hnsw.len());
 
     // V1（2026-08-12）：HyPE 假设问句索引（独立实例，memory_hype_vectors 为权威源）。
-    // 与 lib.rs 的 MemoriaEngine 路径共用 build_hype_hnsw 收口（含 ef_search 对齐）。
+    // 与 lib.rs 的 MemoriaEngine 路径共用 build_hype_hnsw_or_default 收口
+    // （build + 软降级 + WARN 单一实现，两入口只差日志流）。
     // 计数**恒打印**（0 也打）：空表（未启用）与 rebuild 静默降级可区分——若只在 >0
     // 时打印，运维无法判断"功能未开"还是"重建失败被 WARN 淹没"。
-    // rebuild 失败（Result Err）不阻断启动：软降级单路语义，但显式告警（#R36）。
     let (hype_hnsw, hype_count) =
-        match memoria_core::vector::persist::build_hype_hnsw(&pool, ef_search) {
-            Ok(x) => x,
-            Err(e) => {
-                eprintln!(
-                    "[Memoria] WARN: HYPE HNSW rebuild failed (semantic degraded to single path): {}",
-                    e
-                );
-                (memoria_core::vector::HnswIndex::new(), 0)
-            }
-        };
+        memoria_core::vector::persist::build_hype_hnsw_or_default(&pool, ef_search);
     println!("[Memoria] HYPE HNSW vectors: {}", hype_count);
 
     // ── P0: 启动健康检查 ──

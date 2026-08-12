@@ -38,7 +38,9 @@ pub fn get_stored_vector(pool: &SqlitePool, id: &str) -> Option<Vec<f32>> {
     if v.len() == DIM { Some(v) } else { None }
 }
 
-/// 写入/覆盖某记忆的持久向量（INSERT OR REPLACE）。
+/// 写入/覆盖某记忆的持久向量（#R38 documentation/low：实现为 `ON CONFLICT(id) DO UPDATE`
+/// upsert，而非 INSERT OR REPLACE——REPLACE 会整行删除重建，把
+/// `memory_hype_vectors.question` 等非本函数列静默抹成 NULL）。
 pub fn put_stored_vector(
     pool: &SqlitePool,
     id: &str,
@@ -158,7 +160,7 @@ pub fn lookup_namespace(pool: &SqlitePool, id: &str) -> Option<String> {
 /// `HnswIndex::add` 内部按 id 去重，因此即使 .bin 已加载也能安全增量补齐；
 /// 返回实际加入的向量条数。
 pub fn rebuild_hnsw_from_store(pool: &SqlitePool, hnsw: &HnswIndex) -> Result<usize, String> {
-    rebuild_from_table(pool, hnsw, "memory_vectors", "content")
+    rebuild_from_table(pool, hnsw, "memory_vectors")
 }
 
 /// V1（2026-08-12）：从 `memory_hype_vectors` 表重建 HyPE 问句向量 HNSW 索引。
@@ -168,7 +170,7 @@ pub fn rebuild_hnsw_from_store(pool: &SqlitePool, hnsw: &HnswIndex) -> Result<us
 /// 一条向量）。调用方（main.rs/lib.rs）在启动时对两个索引分别 rebuild；`semantic_search`
 /// 双路搜索后按 memory_id 取 max 合并。
 pub fn rebuild_hype_hnsw_from_store(pool: &SqlitePool, hnsw: &HnswIndex) -> Result<usize, String> {
-    rebuild_from_table(pool, hnsw, "memory_hype_vectors", "hype")
+    rebuild_from_table(pool, hnsw, "memory_hype_vectors")
 }
 
 /// V1（2026-08-12）：解析 `MEMORIA_EF_SEARCH` 的**唯一入口**（main.rs 与 lib.rs 共用）。
@@ -197,22 +199,39 @@ pub fn build_hype_hnsw(pool: &SqlitePool, ef_search: usize) -> Result<(HnswIndex
     Ok((hype_hnsw, count))
 }
 
+/// V1（2026-08-12）：build + 软降级兜底的**唯一入口**（main.rs 与 lib.rs 共用）。
+///
+/// rebuild 失败不 panic（软降级空索引，语义检索退单路），失败以 eprintln 显式告警。
+/// 调用方只负责各自的日志流（stdout vs stderr）——若 build/降级/WARN 行为在两入口
+/// 各写一份，后续改一处另一处静默分裂（#R38 maintainability/low）。
+pub fn build_hype_hnsw_or_default(pool: &SqlitePool, ef_search: usize) -> (HnswIndex, usize) {
+    match build_hype_hnsw(pool, ef_search) {
+        Ok(x) => x,
+        Err(e) => {
+            eprintln!(
+                "[Memoria] WARN: HYPE HNSW rebuild failed (semantic degraded to single path): {}",
+                e
+            );
+            (HnswIndex::new(), 0)
+        }
+    }
+}
+
 /// 共享实现：从 `table`（须含 id/vector 列）读取全部向量并加入 HNSW。
 ///
-/// `label` 用于错误/告警前缀（区分 content/hype，便于日志定位）。
+/// 错误/告警前缀用 descriptor 的 `label`（区分 content/hype，便于日志定位）——不再由
+/// 调用方传第二份字符串，避免与 descriptor 漂移（#R38 maintainability/low）。
 /// 统计并告警被跳过的行（解码失败 / 维度 ≠ DIM），使索引健康度可观测——
-/// 数据损坏不再被静默吞掉（#R32 other/low：flatten 丢弃的行错误 + 维度不符行无计数）。
-/// 表名**白名单 dispatch**（非字符串插值）：两个调用方只传内部常量，杜绝未来
-/// 非受控输入进入 SQL 的注入面（#R33 security/low）。
+/// 数据损坏不再被静默吞掉。表名**白名单 dispatch**（descriptor 查找，非字符串插值）。
 fn rebuild_from_table(
     pool: &SqlitePool,
     hnsw: &HnswIndex,
     table: &str,
-    label: &str,
 ) -> Result<usize, String> {
     let conn = pool.get().map_err(|e| format!("pool: {}", e))?;
     let td = lookup_table(table)
-        .ok_or_else(|| format!("{label}: unknown rebuild table {table}"))?;
+        .ok_or_else(|| format!("rebuild_from_table: unknown rebuild table {table}"))?;
+    let label = td.label;
     let mut stmt = conn
         .prepare(td.select_sql)
         .map_err(|e| format!("prepare {}: {}", label, e))?;

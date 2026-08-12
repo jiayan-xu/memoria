@@ -145,10 +145,36 @@ pub fn semantic_search(
                     |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
                 ) {
                     Ok(rows) => {
-                        for r in rows.flatten() {
-                            contents.insert(r.0, r.1);
+                        // #R38 bug/low：行级反序列化错误（列类型漂移等）不能 flatten 静默
+                        // 丢弃——query_map 可能每批都 Ok 但 0 行插入，全批升级守卫被绕过，
+                        // P3-0 空正文在列漂移下无告警复发。累计行级错误并在全部为空时升级。
+                        let mut row_errors = 0usize;
+                        let mut inserted = 0usize;
+                        for r in rows {
+                            match r {
+                                Ok(v) => {
+                                    contents.insert(v.0, v.1);
+                                    inserted += 1;
+                                }
+                                Err(e) => {
+                                    row_errors += 1;
+                                    eprintln!(
+                                        "[semantic] content backfill row mapping failed (batch {} ids): {}",
+                                        chunk.len(),
+                                        e
+                                    );
+                                }
+                            }
                         }
-                        batches_ok += 1;
+                        if inserted == 0 && row_errors > 0 {
+                            // 该批全部行映射失败 = 系统性列问题，不算成功批。
+                            eprintln!(
+                                "[semantic] content backfill: batch of {} ids all failed row mapping",
+                                chunk.len()
+                            );
+                        } else {
+                            batches_ok += 1;
+                        }
                     }
                     Err(e) => eprintln!(
                         "[semantic] content backfill query failed (batch {} ids): {}",
@@ -289,6 +315,16 @@ fn lookup_namespaces(
     if let Some(e) = mid_failure {
         // 部分失败：返回已收集映射 + 告警（调用方按部分映射过滤，比全空好）。
         eprintln!("[semantic] ns lookup partial failure, continuing with {} namespaces: {}", map.len(), e);
+        // #R38 bug/medium：**所有批次都失败**（memories 表系统性故障：schema/列漂移、
+        // DB 不可用）时升级为 Err——否则调用方把 allowed 判空返回 Ok(vec![])，与
+        // "该 ns 确实无结果"不可区分，语义通道被静默关闭。与 content backfill
+        // 全批失败升级（#R36）保持一致。
+        if map.is_empty() {
+            return Err(format!(
+                "semantic ns lookup: all batches failed, no namespaces resolved ({})",
+                e
+            ));
+        }
     }
     Ok(map)
 }

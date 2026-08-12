@@ -85,6 +85,8 @@ async fn memory_eval_semantic() {
     // 1) 语料嵌入 + 写入（向量入 QueryCache → HNSW）
     let mut ids: Vec<String> = Vec::with_capacity(corpus.len());
     let mut hype_seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut hype_covered = 0usize;
+    let mut hype_skipped = 0usize;
     for item in &corpus {
         let content = item["content"].as_str().expect("corpus[].content");
         let category = item["category"].as_str().unwrap_or("fact");
@@ -141,17 +143,29 @@ async fn memory_eval_semantic() {
                 // 标记，首次 embed 失败会永久占用该 rid，后续 dedup 命中的同 id 也被跳过，
                 // 该记忆永远没有 HyPE 向量且无信号。
                 if let Ok(hv) = embed(&client, &format!("用户提问：{content}")).await {
-                    persist::put_hype_stored_vector(&pool, &rid, ns, &hv)
-                        .expect("put_hype_stored_vector should succeed");
-                    let n = engine
-                        .hype_hnsw
-                        .add(&[VectorEntry {
-                            id: rid.clone(),
-                            vector: hv,
-                        }])
-                        .expect("hype_hnsw.add should succeed");
-                    assert!(n > 0, "hype_hnsw.add added 0 entries (degenerate vector or duplicate id)");
-                    hype_seen.insert(rid.clone());
+                    // #R38 test/low：put 可能因退化向量（零/NaN）返回 Err——内容路容忍
+                    // 静默跳过，此处同样按 skip 计数而非 panic（局部 embed 服务异常不应
+                    // 打挂整个评测；最终覆盖率断言会反映真实填充情况）。
+                    match persist::put_hype_stored_vector(&pool, &rid, ns, &hv) {
+                        Ok(()) => {
+                            let n = engine
+                                .hype_hnsw
+                                .add(&[VectorEntry {
+                                    id: rid.clone(),
+                                    vector: hv,
+                                }])
+                                .expect("hype_hnsw.add should succeed");
+                            assert!(n > 0, "hype_hnsw.add added 0 entries (degenerate vector or duplicate id)");
+                            hype_seen.insert(rid.clone());
+                            hype_covered += 1;
+                        }
+                        Err(e) => {
+                            eprintln!("[eval_semantic] hype put skipped (degenerate): {e}");
+                            hype_skipped += 1;
+                        }
+                    }
+                } else {
+                    hype_skipped += 1;
                 }
             }
         }
@@ -168,12 +182,19 @@ async fn memory_eval_semantic() {
         }
     }
 
-    // #R37 test/medium：防假绿收口——若问句化 embed 持续失败（如服务拒绝带前缀的
-    // prompt），上述 put/add 全部静默跳过、hype_hnsw 恒空，测试会走 content-only 路径
-    // 仍通过——正是本块要防的 no-op 假覆盖。断言索引确实被填充，失败即暴露。
+    // #R37/#R38 test/medium：防假绿收口——若问句化 embed 持续失败（如服务拒绝带前缀的
+    // prompt），put/add 全部静默跳过、hype_hnsw 恒空或只覆盖 1 条，测试会走 content-only
+    // 路径仍通过——正是本块要防的 no-op 假覆盖。断言**高覆盖率**（非仅非空）：
+    // 大多数语料必须有 HyPE 向量，双路合并才被真实锻炼。
+    let unique_memories = hype_seen.len() + hype_skipped;
     assert!(
         engine.hype_hnsw.len() > 0,
         "hype index empty after corpus setup: question-embed likely failing"
+    );
+    assert!(
+        hype_covered as f64 >= unique_memories as f64 * 0.8,
+        "hype coverage too low: {hype_covered}/{unique_memories} memories have HyPE vectors \
+         (question-embed likely failing); skipped={hype_skipped}"
     );
 
     // 2) 官方 12 用例（query 嵌入 → 语义信号参与融合）
