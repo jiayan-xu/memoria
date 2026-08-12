@@ -92,7 +92,7 @@ async fn memory_eval_semantic() {
         let tags = item["tags"].as_str().unwrap_or("[]");
 
         let v = embed(&client, content).await.expect("corpus embed");
-        engine.cache_query_vector(content, v);
+        engine.cache_query_vector(content, v.clone());
         let r = remember_with_dedup(
             &pool,
             content,
@@ -115,6 +115,18 @@ async fn memory_eval_semantic() {
         .expect("remember");
         let rid = r.id.clone();
         ids.push(r.id);
+
+        // V1：HyPE 通道覆盖——把内容向量同时写入 memory_hype_vectors 并加入 hype 索引，
+        // 使语义测试真实走双路合并（否则 hype_hnsw 恒空、传参是 no-op，测不到 HyPE 路径）。
+        // 真实生产里问句向量由 LLM 生成；测试里以内容向量近似（仅验证通道贯通与合并逻辑）。
+        {
+            use memoria_core::vector::{VectorEntry, persist};
+            let _ = persist::put_hype_stored_vector(&pool, &rid, ns, &v);
+            let _ = engine.hype_hnsw.add(&[VectorEntry {
+                id: rid.clone(),
+                vector: v,
+            }]);
+        }
 
         // 应用时序偏移
         if let Some(off) = item["created_offset_days"].as_i64() {

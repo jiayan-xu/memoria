@@ -258,8 +258,9 @@ fn main() {
     {
         eprintln!("[Memoria] WARN: HYPE HNSW rebuild from memory_hype_vectors: {}", e);
     }
-    if hype_hnsw.len() > 0 {
-        println!("[Memoria] HYPE HNSW vectors: {}", hype_hnsw.len());
+    let hype_count = hype_hnsw.len();
+    if hype_count > 0 {
+        println!("[Memoria] HYPE HNSW vectors: {}", hype_count);
     }
 
     // ── P0: 启动健康检查 ──

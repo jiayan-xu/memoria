@@ -61,21 +61,26 @@ pub fn hybrid_search(
         }
     }
 
-    // S2: Semantic (HNSW vector) — 宽召回（V1：可选 HyPE 问句索引双路合并）
-    if let (Some(hnsw), Some(qc)) = (hnsw, query_cache) {
-        if let Ok(sem) = search::semantic::semantic_search(
-            query,
-            namespace,
-            primary_limit,
-            Some(hnsw),
-            hype_hnsw,
-            Some(qc),
-            Some(pool),
-        ) {
-            if !sem.is_empty() {
-                sem_res = Some(sem.clone());
-                signals.push(sem);
-                weights.push(w_semantic);
+    // S2: Semantic (HNSW vector) — 宽召回（V1：可选 HyPE 问句索引双路合并）。
+    // 门控：任一索引存在即启用——semantic_search 内部按索引各自独立搜索再合并，
+    // 单索引缺失时自然退化为单路（与 semantic_search 的契约一致）。若仅因 hnsw 为
+    // None 而整体跳过，会连已有的 hype 通道也一起丢掉。
+    if let Some(qc) = query_cache {
+        if hnsw.is_some() || hype_hnsw.is_some() {
+            if let Ok(sem) = search::semantic::semantic_search(
+                query,
+                namespace,
+                primary_limit,
+                hnsw,
+                hype_hnsw,
+                Some(qc),
+                Some(pool),
+            ) {
+                if !sem.is_empty() {
+                    sem_res = Some(sem.clone());
+                    signals.push(sem);
+                    weights.push(w_semantic);
+                }
             }
         }
     }

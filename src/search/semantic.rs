@@ -55,16 +55,21 @@ pub fn semantic_search(
             .saturating_mul(20)
             .max(2048)
             .min(cap.max(1));
-        if let Ok(results) = h.search_with_ef(&vector, overfetch, overfetch) {
-            for (memory_id, distance) in results {
-                let score = 1.0 - distance as f64;
-                if score.is_finite() && score > 0.0 {
-                    let e = best.entry(memory_id).or_insert(0.0);
-                    if score > *e {
-                        *e = score;
+        // search_with_ef 仅可能在索引被并发 panic 污染（RwLock poisoned）时返回 Err——
+        // 此时不能静默吞掉（会永久静默降级语义通道且无法诊断），必须记录。
+        match h.search_with_ef(&vector, overfetch, overfetch) {
+            Ok(results) => {
+                for (memory_id, distance) in results {
+                    let score = 1.0 - distance as f64;
+                    if score.is_finite() && score > 0.0 {
+                        let e = best.entry(memory_id).or_insert(0.0);
+                        if score > *e {
+                            *e = score;
+                        }
                     }
                 }
             }
+            Err(e) => eprintln!("[semantic] content HNSW search failed: {}", e),
         }
     }
     if let Some(h) = hype_hnsw {
@@ -73,20 +78,38 @@ pub fn semantic_search(
             .saturating_mul(20)
             .max(2048)
             .min(cap.max(1));
-        if let Ok(results) = h.search_with_ef(&vector, overfetch, overfetch) {
-            for (memory_id, distance) in results {
-                let score = 1.0 - distance as f64;
-                if score.is_finite() && score > 0.0 {
-                    let e = best.entry(memory_id).or_insert(0.0);
-                    if score > *e {
-                        *e = score;
+        match h.search_with_ef(&vector, overfetch, overfetch) {
+            Ok(results) => {
+                for (memory_id, distance) in results {
+                    let score = 1.0 - distance as f64;
+                    if score.is_finite() && score > 0.0 {
+                        let e = best.entry(memory_id).or_insert(0.0);
+                        if score > *e {
+                            *e = score;
+                        }
                     }
                 }
             }
+            Err(e) => eprintln!("[semantic] HYPE HNSW search failed: {}", e),
         }
     }
     if best.is_empty() {
         return Ok(vec![]);
+    }
+
+    // 双路 overfetch 合并后 union 最坏可达 2×max(limit*20, 2048) ≈ 4096 个唯一 id——
+    // 远超单路（2048）。在 ns 回查前先截断到合理上界（取分数最高的前 4096），
+    // 避免 IN (...) 子句/绑定规模翻倍拖慢查询（SQLite 变量上限 32766 不会崩，
+    // 但每请求成本随 id 数线性涨，且旧库 999 上限会破）。
+    if best.len() > 4096 {
+        let mut ranked: Vec<(String, f64)> = best.into_iter().collect();
+        ranked.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        ranked.truncate(4096);
+        best = ranked.into_iter().collect();
     }
 
     // HNSW 是全局索引，无 namespace 维度。按调用者 ns 回查 memories 表，
@@ -145,7 +168,15 @@ pub fn semantic_search(
         }
     }
     // 按合并后分数降序（保持原语义：语义通道按相似度排序进入融合）。
-    out.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    // 二级排序 key = memory_id：allowed 是 HashSet，迭代顺序每次运行随机——
+    // 平分（score 相同）时稳定排序会保留该随机序，使 tie 的相对序与
+    // `out.truncate(limit)` 边界取舍跨运行不确定。加 id 字典序打破平局，保证确定性。
+    out.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.memory_id.cmp(&b.memory_id))
+    });
     // 恢复「每通道贡献 limit 条」设计：过取后按 ns 过滤，再截断到本 ns 内 top-limit，
     // 避免把上千条跨 ns 候选灌进融合（既保平衡，又确保 gold 在正确的本 ns top 内）。
     out.truncate(limit as usize);
