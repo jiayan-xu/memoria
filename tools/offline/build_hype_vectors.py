@@ -24,6 +24,7 @@ import os
 import sys
 import json
 import time
+import struct
 import sqlite3
 import urllib.request
 import argparse
@@ -99,14 +100,28 @@ def generate_question(content: str) -> str:
 
 
 def embed(texts):
-    """调本地 embed_server（siliconflow Qwen3-VL-8B），返回 (vectors, dim)。"""
+    """调本地 embed_server（siliconflow Qwen3-VL-8B），返回 (vectors, dim)。
+
+    与 generate_question 同款重试纪律：全库 --all 一次跑 5339 行，单 POST 无重试时
+    任何瞬时网络/服务抖动都会永久漏掉那些记忆（--all 缺口无法定点修复）。
+    3 次尝试 + 指数退避；最终失败抛异常由调用方计数（并记录失败 id，见 fail_ids）。
+    """
     body = {"texts": texts, "normalize": False}
-    req = urllib.request.Request(
-        EMBED_URL, data=json.dumps(body).encode(), headers={"Content-Type": "application/json"}, method="POST"
-    )
-    with urllib.request.urlopen(req, timeout=60) as r:
-        resp = json.loads(r.read().decode())
-    return resp["embeddings"], resp.get("dim", 1024)
+    headers = {"Content-Type": "application/json"}
+    last_err = None
+    for attempt in range(3):
+        try:
+            req = urllib.request.Request(
+                EMBED_URL, data=json.dumps(body).encode(), headers=headers, method="POST"
+            )
+            with urllib.request.urlopen(req, timeout=60) as r:
+                resp = json.loads(r.read().decode())
+            return resp["embeddings"], resp.get("dim", 1024)
+        except Exception as e:
+            last_err = e
+            if attempt < 2:
+                time.sleep(min(2 ** attempt, 10))
+    raise last_err
 
 
 def main():
@@ -151,11 +166,18 @@ def main():
         "CREATE INDEX IF NOT EXISTS idx_hype_ns ON memory_hype_vectors(namespace)"
     )
     ok = skip = fail = 0
+    fail_ids = []
     for i, (mid, content) in enumerate(targets, 1):
         q = generate_question(content)
         if not q or len(q) < 6:
             print(f"[{i}/{len(targets)}] {mid[:8]} 问句生成失败/过短，跳过")
             skip += 1
+            continue
+        # dry-run 前置：只生成问句、不嵌入不写库——文档承诺"只生成问句"就必须
+        # 不依赖 embed_server 在线（否则服务抖动时 dry-run 报"嵌入失败"而非显示问句）。
+        if args.dry_run:
+            print(f"[{i}/{len(targets)}] {mid[:8]} [dry] 问句: {q[:60]}")
+            ok += 1
             continue
         try:
             vecs, dim = embed([q])
@@ -163,17 +185,13 @@ def main():
         except Exception as e:
             print(f"[{i}/{len(targets)}] {mid[:8]} 嵌入失败: {e}")
             fail += 1
+            fail_ids.append(mid)
             continue
         if len(v) != dim:
             print(f"[{i}/{len(targets)}] {mid[:8]} 维度异常 {len(v)}≠{dim}，跳过")
             fail += 1
+            fail_ids.append(mid)
             continue
-        if args.dry_run:
-            print(f"[{i}/{len(targets)}] {mid[:8]} [dry] 问句: {q[:60]}")
-            ok += 1
-            continue
-        import struct
-
         blob = struct.pack(f"<{len(v)}f", *v)
         con.execute(
             "INSERT OR REPLACE INTO memory_hype_vectors (id, namespace, question, vector, updated_at) "
@@ -187,6 +205,11 @@ def main():
 
     con.close()
     print(f"\n完成: 写入 {ok} / 跳过 {skip} / 失败 {fail}")
+    if fail_ids:
+        # 失败 id 落盘（ops 可据此定点重跑，不必全量 --all 再来一遍）
+        with open(os.path.join(HERE, "hype_failed_ids.txt"), "w", encoding="utf-8") as f:
+            f.write("\n".join(fail_ids))
+        print(f"失败 id 已写入 hype_failed_ids.txt（{len(fail_ids)} 条）")
 
 
 if __name__ == "__main__":

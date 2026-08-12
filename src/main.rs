@@ -253,6 +253,9 @@ fn main() {
     // V1（2026-08-12）：HyPE 假设问句索引（独立实例，memory_hype_vectors 为权威源）。
     // 空表 → 空索引 → semantic_search 双路退化单路，行为与未启用一致（向后兼容）。
     let hype_hnsw = memoria_core::vector::HnswIndex::new();
+    // 与内容索引保持一致的 ef_search：双路合并的两个索引若 ef 不一致，
+    // 运维调 recall 时只有内容路生效、HyPE 路静默留在默认值，行为分裂。
+    hype_hnsw.set_ef_search(ef_search);
     if let Err(e) =
         memoria_core::vector::persist::rebuild_hype_hnsw_from_store(&pool, &hype_hnsw)
     {

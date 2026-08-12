@@ -84,6 +84,7 @@ async fn memory_eval_semantic() {
 
     // 1) 语料嵌入 + 写入（向量入 QueryCache → HNSW）
     let mut ids: Vec<String> = Vec::with_capacity(corpus.len());
+    let mut hype_seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     for item in &corpus {
         let content = item["content"].as_str().expect("corpus[].content");
         let category = item["category"].as_str().unwrap_or("fact");
@@ -119,13 +120,24 @@ async fn memory_eval_semantic() {
         // V1：HyPE 通道覆盖——把内容向量同时写入 memory_hype_vectors 并加入 hype 索引，
         // 使语义测试真实走双路合并（否则 hype_hnsw 恒空、传参是 no-op，测不到 HyPE 路径）。
         // 真实生产里问句向量由 LLM 生成；测试里以内容向量近似（仅验证通道贯通与合并逻辑）。
+        // 结果必须断言：put/add 静默失败会让 hype_hnsw 恒空、测试假绿——正是本块要防的
+        // no-op 假覆盖。注意：remember_with_dedup 近义去重命中时返回的是**已有记忆 id**，
+        // 该 id 的 hype 向量可能已 add 过（HnswIndex 按 id 去重，重复 add 返回 0 属正常），
+        // 故仅当是**首次**遇到该 rid 时才断言 n>0；重复 id 跳过 add 但继续处理 created_at。
         {
             use memoria_core::vector::{VectorEntry, persist};
-            let _ = persist::put_hype_stored_vector(&pool, &rid, ns, &v);
-            let _ = engine.hype_hnsw.add(&[VectorEntry {
-                id: rid.clone(),
-                vector: v,
-            }]);
+            persist::put_hype_stored_vector(&pool, &rid, ns, &v)
+                .expect("put_hype_stored_vector should succeed");
+            if hype_seen.insert(rid.clone()) {
+                let n = engine
+                    .hype_hnsw
+                    .add(&[VectorEntry {
+                        id: rid.clone(),
+                        vector: v,
+                    }])
+                    .expect("hype_hnsw.add should succeed");
+                assert!(n > 0, "hype_hnsw.add added 0 entries (degenerate vector or duplicate id)");
+            }
         }
 
         // 应用时序偏移
