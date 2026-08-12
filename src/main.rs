@@ -79,6 +79,22 @@ fn main() {
         }
     }
 
+    // Open Ontologies 语义层骨架：`memoria-server ontology <materialize|status>`。
+    // 同样在单写者锁之前分发（materialize 只跑外部进程 + 解析，不写 memoria 库；
+    // 写回由 MCP/集成层显式调用，避免与运行实例竞态）。
+    if cli_args.len() >= 2 && cli_args[1] == "ontology" {
+        match memoria_core::ontology::run_ontology_cli(&cli_args[2..]) {
+            Ok(out) => {
+                println!("{}", out);
+                std::process::exit(0);
+            }
+            Err(e) => {
+                eprintln!("[Memoria][ontology] ERROR: {}", e);
+                std::process::exit(1);
+            }
+        }
+    }
+
     let runtime = build_runtime();
     // P0-4 单写者守卫：启动早期加锁，防止两个 memoria-server 实例并发写同一数据库（双写损坏）。
     let db_path_for_lock =

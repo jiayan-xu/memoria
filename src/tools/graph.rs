@@ -10,6 +10,10 @@ use std::collections::HashMap;
 
 /// 受控关系类型枚举（P2-3）。
 /// 边类型必须是其中之一，防止关系类型爆炸 / 垃圾关系污染图谱。
+///
+/// 2026-08-11 扩展（Open Ontologies 语义层骨架）：新增 OWL 通用语义边
+/// `references` / `supersedes` / `created_by` / `conflicts_with`，供本体物化
+/// 写回使用。与 `ontology` 模块的 TTL 关系名映射保持一致（见 ontology.rs）。
 pub const RELATION_TYPES: &[&str] = &[
     "related_to",
     "uses",
@@ -29,6 +33,11 @@ pub const RELATION_TYPES: &[&str] = &[
     "antagonist_of",
     "spawned_by",
     "triggers",
+    // Open Ontologies 通用语义边（P0 骨架）
+    "references",
+    "supersedes",
+    "created_by",
+    "conflicts_with",
 ];
 
 /// 校验关系类型是否在受控枚举内。
