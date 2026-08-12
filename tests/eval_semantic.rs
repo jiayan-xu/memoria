@@ -86,6 +86,13 @@ async fn memory_eval_semantic() {
     let mut ids: Vec<String> = Vec::with_capacity(corpus.len());
     let mut hype_seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut hype_processed: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // #R43 bug/low：记录已失败过的唯一 rid——持久失败（如系统性拒绝前缀 prompt）的
+    // rid 每次近义重复都会重试（付费 embed × N），且 hype_skipped 计尝试非唯一记忆。
+    // 失败一次即标记，后续重复直接跳过（不再重试），hype_skipped 只对唯一失败记忆 +1。
+    let mut hype_failed_once: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // #R43 bug/medium：total 独立计数（首次遇到即 +1，无论成败）——processed 失败时
+    // 会 remove（允许重试），断言时只剩成功的，用它作分母是重言式。
+    let mut hype_total = 0usize;
     let mut hype_covered = 0usize;
     let mut hype_skipped = 0usize;
     for item in &corpus {
@@ -138,8 +145,13 @@ async fn memory_eval_semantic() {
             // 失败（瞬时 embed 错误/退化向量/add 返回 0），该 rid 从 processed 移除
             // 允许后续近义重复条目重试，避免"一次失败永久无 HyPE 向量"且覆盖断言
             // 在小的唯一集上因几次瞬时失败假红。
-            if !hype_processed.contains(&rid) {
+            // #R43 bug/medium：`hype_total` 独立计数（首次遇到即 +1，无论成败）——
+            // processed 在失败时被 remove 以便重试，断言时只剩成功的，`hype_covered >=
+            // processed.len()*0.8` 恒真（重言式），无法防 no-op 假绿。用 total 作分母：
+            // 若问句化 embed 对多数记忆持续失败，覆盖断言真实失败。
+            if !hype_processed.contains(&rid) && !hype_failed_once.contains(&rid) {
                 hype_processed.insert(rid.clone());
+                hype_total += 1;
                 // 问句化改写：与内容向量不同（否则双路合并无意义）。嵌入失败则**跳过**
                 // 该条（不 put/add）——fallback 到内容向量会让两路恒等、退化为内容通道，
                 // 正是本块要防的 no-op 假覆盖（且把内容向量写进 question 列与离线脚本
@@ -151,6 +163,8 @@ async fn memory_eval_semantic() {
                         // #R38 test/low：put 可能因退化向量（零/NaN）返回 Err——内容路
                         // 容忍静默跳过，此处同样按 skip 计数而非 panic（局部 embed 服务
                         // 异常不应打挂整个评测；最终覆盖率断言会反映真实填充情况）。
+                        // #R43 maintainability/low：put 的 Err 不限于退化（维度不符/DB
+                        // 失败）——日志不预设原因。
                         match persist::put_hype_stored_vector(&pool, &rid, ns, &hv) {
                             Ok(()) => {
                                 // #R40 bug/medium：add 失败/0 条按 skip 计数而非 panic——
@@ -170,23 +184,31 @@ async fn memory_eval_semantic() {
                                     }
                                     Ok(_) => {
                                         eprintln!(
-                                            "[eval_semantic] hype add skipped (0 entries added, dup id?)"
+                                            "[eval_semantic] hype add skipped (0 entries: dup id or f32 re-validation)"
                                         );
-                                        hype_skipped += 1;
+                                        if hype_failed_once.insert(rid.clone()) {
+                                            hype_skipped += 1;
+                                        }
                                         hype_processed.remove(&rid);
                                     }
                                     Err(e) => {
                                         eprintln!(
                                             "[eval_semantic] hype add failed (skip): {e}"
                                         );
-                                        hype_skipped += 1;
+                                        if hype_failed_once.insert(rid.clone()) {
+                                            hype_skipped += 1;
+                                        }
                                         hype_processed.remove(&rid);
                                     }
                                 }
                             }
                             Err(e) => {
-                                eprintln!("[eval_semantic] hype put skipped (degenerate): {e}");
-                                hype_skipped += 1;
+                                eprintln!(
+                                    "[eval_semantic] hype put rejected (degenerate/dim/db): {e}"
+                                );
+                                if hype_failed_once.insert(rid.clone()) {
+                                    hype_skipped += 1;
+                                }
                                 hype_processed.remove(&rid);
                             }
                         }
@@ -196,7 +218,9 @@ async fn memory_eval_semantic() {
                         eprintln!(
                             "[eval_semantic] question embed failed for {rid:?}: {e} (skipping hype put/add)"
                         );
-                        hype_skipped += 1;
+                        if hype_failed_once.insert(rid.clone()) {
+                            hype_skipped += 1;
+                        }
                         hype_processed.remove(&rid);
                     }
                 }
@@ -215,10 +239,11 @@ async fn memory_eval_semantic() {
         }
     }
 
-    // #R37/#R38/#R39 test/medium：防假绿收口——若问句化 embed 持续失败（如服务拒绝带
+    // #R37/#R38/#R43 test/medium：防假绿收口——若问句化 embed 持续失败（如服务拒绝带
     // 前缀的 prompt），put/add 全部静默跳过、hype_hnsw 恒空或只覆盖 1 条，测试会走
-    // content-only 路径仍通过——正是本块要防的 no-op 假覆盖。断言**高覆盖率**（非仅
-    // 非空）：分母用唯一处理记忆数（hype_processed），重复 rid 只计一次。
+    // content-only 路径仍通过——正是本块要防的 no-op 假覆盖。断言**高覆盖率**：
+    // 分母用 hype_total（唯一记忆数，无论成败都计入）——processed 在失败时被 remove
+    // 无法作分母（重言式）。
     assert!(
         engine.hype_hnsw.len() > 0,
         "hype index empty after corpus setup: question-embed likely failing"
@@ -233,10 +258,9 @@ async fn memory_eval_semantic() {
         hype_covered
     );
     assert!(
-        hype_covered as f64 >= hype_processed.len() as f64 * 0.8,
-        "hype coverage too low: {hype_covered}/{} unique memories have HyPE vectors \
+        hype_covered as f64 >= hype_total as f64 * 0.8,
+        "hype coverage too low: {hype_covered}/{hype_total} unique memories have HyPE vectors \
          (question-embed likely failing); skipped={hype_skipped}",
-        hype_processed.len()
     );
 
     // 2) 官方 12 用例（query 嵌入 → 语义信号参与融合）

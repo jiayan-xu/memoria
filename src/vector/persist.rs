@@ -241,8 +241,10 @@ pub fn build_hype_hnsw_or_default(pool: &SqlitePool, ef_search: usize) -> (HnswI
     match build_hype_hnsw(pool, ef_search) {
         Ok(x) => x,
         Err(e) => {
+            // #R43 maintainability/low：统一 persist 层告警前缀（其余均为 [persist]）——
+            // 运维 grep persist 告警不会漏掉此行。
             eprintln!(
-                "[Memoria] WARN: HYPE HNSW rebuild failed (semantic degraded to single path): {}",
+                "[persist] WARN: HYPE HNSW rebuild failed (semantic degraded to single path): {}",
                 e
             );
             // #R39 maintainability/low：fallback 索引也须对齐 ef_search——成功路径设了
@@ -308,18 +310,26 @@ fn rebuild_from_table(
         }
     }
     if skipped > 0 {
+        // #R43 other/low：decode_vector 不可失败（chunks_exact 丢尾部字节 → 长度不符走
+        // dim 分支）——真实行级失败只有 Err 臂（已单独记录）。摘要只列真实原因。
         eprintln!(
-            "[persist] {label}: {skipped} row(s) skipped (degenerate zero/NaN, decode failure, or dim != {DIM})"
+            "[persist] {label}: {skipped} row(s) skipped (row read/iteration error, degenerate zero/NaN, or dim != {DIM})"
         );
     }
 
-    // #R37 bug/medium：区分"空表"（无行，count=0 = 功能未启用）与"表有数据但全部损坏"
-    // （维度不符/解码失败，skipped=rows_seen>0）——后者若返回 Ok(0)，调用方会误判
-    // "HyPE 未配置"而静默单路降级，只有 stderr 告警可观测。全部损坏必须显式 Err。
+    // #R37 bug/medium：区分"空表"（无行，count=0 = 功能未启用）与"表有数据但全部损坏"。
+    // #R43 bug/medium：仅 **hype** 路径全 skip 时 Err（区分"功能未启用"与"数据损坏"）；
+    // **content** 路径保持 Ok(0) + WARN——历史全退化行部署此前就是 Ok(0)，改 Err 是
+    // 对现有公共函数 rebuild_hnsw_from_store 的契约变更（startup 路径，下游可能 `?`）。
     if entries.is_empty() && rows_seen > 0 {
-        return Err(format!(
-            "{label}: table has {rows_seen} row(s) but ALL were skipped (dim mismatch or corrupt)"
-        ));
+        if label == "hype" {
+            return Err(format!(
+                "{label}: table has {rows_seen} row(s) but ALL were skipped (dim mismatch or corrupt)"
+            ));
+        }
+        eprintln!(
+            "[persist] {label}: {rows_seen} row(s) all skipped (legacy degenerate rows); returning 0 (historical behavior)"
+        );
     }
     if entries.is_empty() {
         return Ok(0);

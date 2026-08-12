@@ -199,9 +199,14 @@ def main():
             sys.exit(1)
         con = sqlite3.connect(args.db)
         try:
+            # #R43 bug/low：补充 valid_to 过期过滤——过期记忆（valid_to < now）经
+            # hybrid.rs 的 is_latest_now 在输出时被丢弃，为其生成问句+嵌入纯属
+            # 付费浪费（sibling rebuild_vectors.py 与 eval 脚本均应用同款过滤）。
             rows = con.execute(
                 "SELECT id, content FROM memories WHERE namespace='agent/xujiayan' "
-                "AND superseded_by IS NULL AND length(content) BETWEEN 10 AND 500"
+                "AND superseded_by IS NULL "
+                "AND (valid_to IS NULL OR valid_to='' OR valid_to > datetime('now')) "
+                "AND length(content) BETWEEN 10 AND 500"
             ).fetchall()
         except sqlite3.OperationalError as e:
             con.close()
@@ -211,7 +216,14 @@ def main():
         targets = [(mid, c) for mid, c in rows]
         print(f"全库目标: {len(targets)} 条")
     else:
-        d = json.load(open(GOLDEN, encoding="utf-8"))
+        # #R43 maintainability/low：golden 文件（gitignore，仅 eval/eval_hyde_recall.py
+        # --build 生成）缺失时给友好诊断而非裸 FileNotFoundError traceback；with 块
+        # 确保句柄关闭（镜像 --all 路径的错误处理）。
+        if not os.path.exists(GOLDEN):
+            print(f"错误: golden 文件不存在 {GOLDEN}（请先用 eval/eval_hyde_recall.py --build 生成）")
+            sys.exit(1)
+        with open(GOLDEN, encoding="utf-8") as f:
+            d = json.load(f)
         targets = [(it["id"], it["content"]) for it in d["items"]]
         if args.all and args.dry_run:
             print(f"--all --dry-run: 使用 golden 目标 {len(targets)} 条（不读库）")
@@ -226,6 +238,13 @@ def main():
     # 对生产库跑验证性 dry-run 也会产生副作用，与"完成(dry-run，未写库)"文案矛盾。
     con = None
     if not args.dry_run:
+        # #R43 bug/medium：**golden 路径**同样需要存在性检查——MEMORIA_DB_PATH/--db
+        # 缺失时 sqlite3.connect 静默创建空 DB，随后为 golden 记忆写入向量（memories
+        # 无对应行），报告"写入 N / 失败 0"假成功；孤儿行在下次启动被 Rust 清理，
+        # 整个运行是付费 no-op。镜像 --all 路径的诊断。
+        if not os.path.exists(args.db):
+            print(f"错误: 数据库不存在 {args.db}（请检查 MEMORIA_DB_PATH / --db）")
+            sys.exit(1)
         con = sqlite3.connect(args.db)
         # 自包含：表可能尚未经 Rust 迁移创建（离线补嵌先于服务启动时）——镜像
         # src/storage/sqlite.rs 的 schema，确保首次运行不因缺表崩溃、幂等成立。
