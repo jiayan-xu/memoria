@@ -151,7 +151,7 @@ def main():
         targets = [(it["id"], it["content"]) for it in d["items"]]
         print(f"golden 目标: {len(targets)} 条")
 
-    if args.limit:
+    if args.limit is not None:
         targets = targets[: args.limit]
 
     con = sqlite3.connect(args.db)
@@ -182,17 +182,16 @@ def main():
         try:
             vecs, dim = embed([q])
             v = vecs[0]
+            # 维度校验与 pack 也在 try 内：畸形响应（非序列/非数值）抛异常 →
+            # 按失败计数跳过而非中断整个 --all 批（否则 5339 条白跑且无 fail_ids）。
+            if len(v) != dim:
+                raise ValueError(f"维度异常 {len(v)}≠{dim}")
+            blob = struct.pack(f"<{len(v)}f", *v)
         except Exception as e:
-            print(f"[{i}/{len(targets)}] {mid[:8]} 嵌入失败: {e}")
+            print(f"[{i}/{len(targets)}] {mid[:8]} 嵌入数据异常: {e}")
             fail += 1
             fail_ids.append(mid)
             continue
-        if len(v) != dim:
-            print(f"[{i}/{len(targets)}] {mid[:8]} 维度异常 {len(v)}≠{dim}，跳过")
-            fail += 1
-            fail_ids.append(mid)
-            continue
-        blob = struct.pack(f"<{len(v)}f", *v)
         con.execute(
             "INSERT OR REPLACE INTO memory_hype_vectors (id, namespace, question, vector, updated_at) "
             "VALUES (?, 'agent/xujiayan', ?, ?, datetime('now'))",
