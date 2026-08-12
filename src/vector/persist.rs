@@ -109,7 +109,7 @@ fn put_vector_into(
                 rusqlite::params![id, namespace, encode_vector(vector)],
             )
             .map(|_| ())
-            .map_err(|e| format!("put_stored_vector: {}", e))?,
+            .map_err(|e| format!("{fn_name}: {}", e))?,
         "memory_hype_vectors" => conn
             .execute(
                 "INSERT INTO memory_hype_vectors (id, namespace, vector, updated_at) \
@@ -120,8 +120,8 @@ fn put_vector_into(
                 rusqlite::params![id, namespace, encode_vector(vector)],
             )
             .map(|_| ())
-            .map_err(|e| format!("put_hype_stored_vector: {}", e))?,
-        _ => return Err(format!("put_vector_into: unknown table {table}")),
+            .map_err(|e| format!("{fn_name}: {}", e))?,
+        _ => return Err(format!("{fn_name}: unknown table {table}")),
     }
     Ok(())
 }
@@ -153,6 +153,17 @@ pub fn rebuild_hnsw_from_store(pool: &SqlitePool, hnsw: &HnswIndex) -> Result<us
 /// 双路搜索后按 memory_id 取 max 合并。
 pub fn rebuild_hype_hnsw_from_store(pool: &SqlitePool, hnsw: &HnswIndex) -> Result<usize, String> {
     rebuild_from_table(pool, hnsw, "memory_hype_vectors", "hype")
+}
+
+/// V1（2026-08-12）：解析 `MEMORIA_EF_SEARCH` 的**唯一入口**（main.rs 与 lib.rs 共用）。
+/// 此前两入口各自复制「env 读取 + clamp + 默认 128」——若一处改 clamp/默认而另一处漏改，
+/// 内容/HyPE 索引 ef 行为静默分裂。收口后两入口天然同步。
+pub fn resolve_ef_search() -> usize {
+    std::env::var("MEMORIA_EF_SEARCH")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&ef| ef >= 16)
+        .unwrap_or(128)
 }
 
 /// V1（2026-08-12）：构造并重建 HyPE 索引的**唯一入口**（main.rs 与 lib.rs 共用）。

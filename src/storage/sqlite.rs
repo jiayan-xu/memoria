@@ -585,6 +585,9 @@ pub fn migrate_evolution(pool: &SqlitePool) -> Result<(), String> {
 /// 内容向量与问句向量（question-question 匹配），缩小「问句式 query vs 陈述式记忆」的
 /// 措辞 gap。本表存问句向量（id=记忆 id，与 memory_vectors 平行），由 semantic_search
 /// 双路合并（取 max）。幂等迁移；HNSW 由 persist::rebuild_hype_hnsw_from_store 重建。
+/// 清理（#R35 maintainability/low）：memories 删除时经触发器同步删本表与 memory_vectors
+/// 的行——否则孤儿向量行在每次启动 rebuild 时被重新加入 HNSW，永久浪费索引内存/存储
+/// （web_api/mcp_server 的 DELETE 只删 memories，不碰向量表）。
 pub fn migrate_hype_vectors(pool: &SqlitePool) -> Result<(), String> {
     let conn = pool.get().map_err(|e| format!("pool get: {}", e))?;
     conn.execute_batch(
@@ -601,5 +604,14 @@ pub fn migrate_hype_vectors(pool: &SqlitePool) -> Result<(), String> {
         "CREATE INDEX IF NOT EXISTS idx_hype_ns ON memory_hype_vectors(namespace)",
     )
     .map_err(|e| format!("create idx_hype_ns: {}", e))?;
+    // 删除联动：memories 行删除时清理两个向量表（幂等，触发器已存在则跳过）。
+    // 注意：memory_vectors 同样存在孤儿问题（历史行为），一并覆盖。
+    conn.execute_batch(
+        "CREATE TRIGGER IF NOT EXISTS mem_ad_vec AFTER DELETE ON memories BEGIN
+            DELETE FROM memory_vectors WHERE id = old.id;
+            DELETE FROM memory_hype_vectors WHERE id = old.id;
+        END",
+    )
+    .map_err(|e| format!("create mem_ad_vec trigger: {}", e))?;
     Ok(())
 }

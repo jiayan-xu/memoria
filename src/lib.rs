@@ -77,19 +77,15 @@ impl MemoriaEngine {
 
         // V1（2026-08-12）：HyPE 问句向量索引（独立实例，memory_hype_vectors 为权威源）。
         // 表为空 → 索引空 → semantic_search 双路退化单路，行为与未启用一致（向后兼容）。
-        // 与 main.rs 的 standalone 入口共用 build_hype_hnsw 收口（含 MEMORIA_EF_SEARCH 对齐），
+        // ef_search 解析与 hype 构造均走 persist 收口（与 main.rs 共用），
         // 避免两入口 ef 行为分裂（迁移收口的同一理由）。
-        let ef_search = std::env::var("MEMORIA_EF_SEARCH")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .filter(|&ef| ef >= 16)
-            .unwrap_or(128);
+        let ef_search = vector::persist::resolve_ef_search();
         hnsw.set_ef_search(ef_search);
         let hype_hnsw = vector::persist::build_hype_hnsw(&pool, ef_search);
         let hype_count = hype_hnsw.len();
-        if hype_count > 0 {
-            println!("[Memoria] HYPE HNSW vectors: {}", hype_count);
-        }
+        // 库代码（Python bindings 等宿主）不污染 stdout——用 eprintln；且无条件打印
+        // （0 也打），与 main.rs 一致：空表（未启用）与 rebuild 静默降级可区分。
+        eprintln!("[Memoria] HYPE HNSW vectors: {}", hype_count);
 
         Ok(Self {
             db_path: db_path.to_string(),

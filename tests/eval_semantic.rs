@@ -131,21 +131,22 @@ async fn memory_eval_semantic() {
             // 权威表会被新向量覆盖而运行中索引仍持旧向量——表/索引分歧，后续 rebuild
             // 会得到与当前索引不同的向量。put 与 add 必须同受 hype_seen 守卫（#R33 bug/low）。
             if hype_seen.insert(rid.clone()) {
-                // 问句化改写：与内容向量不同（否则双路合并无意义）；嵌入失败则跳过该条
-                // （不应让 embed 故障把整个语料 setup 打挂）。
-                let hv = embed(&client, &format!("用户提问：{content}"))
-                    .await
-                    .unwrap_or_else(|_| v.clone());
-                persist::put_hype_stored_vector(&pool, &rid, ns, &hv)
-                    .expect("put_hype_stored_vector should succeed");
-                let n = engine
-                    .hype_hnsw
-                    .add(&[VectorEntry {
-                        id: rid.clone(),
-                        vector: hv,
-                    }])
-                    .expect("hype_hnsw.add should succeed");
-                assert!(n > 0, "hype_hnsw.add added 0 entries (degenerate vector or duplicate id)");
+                // 问句化改写：与内容向量不同（否则双路合并无意义）。嵌入失败则**跳过**
+                // 该条（不 put/add）——fallback 到内容向量会让两路恒等、退化为内容通道，
+                // 正是本块要防的 no-op 假覆盖（且把内容向量写进 question 列与离线脚本
+                // 的问句向量不一致，rebuild 后会混入两种形态）。
+                if let Ok(hv) = embed(&client, &format!("用户提问：{content}")).await {
+                    persist::put_hype_stored_vector(&pool, &rid, ns, &hv)
+                        .expect("put_hype_stored_vector should succeed");
+                    let n = engine
+                        .hype_hnsw
+                        .add(&[VectorEntry {
+                            id: rid.clone(),
+                            vector: hv,
+                        }])
+                        .expect("hype_hnsw.add should succeed");
+                    assert!(n > 0, "hype_hnsw.add added 0 entries (degenerate vector or duplicate id)");
+                }
             }
         }
 
