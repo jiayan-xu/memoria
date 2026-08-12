@@ -31,6 +31,10 @@ pub struct AppState {
     pub auth_pool: storage::SqlitePool,
     pub hnsw: Arc<memoria_core::vector::HnswIndex>,
     /// V1（2026-08-12）：HyPE 假设问句索引（独立实例，memory_hype_vectors 重建）。
+    /// **限制（#R38 maintainability/low）**：仅进程启动时构建一次；运行时
+    /// memory_hype_vectors 被外部重灌（如重跑 build_hype_vectors.py）不会自动刷新——
+    /// 需重启进程，或手动调 `persist::rebuild_hype_hnsw_from_store(&state.pool, &state.hype_hnsw)`
+    /// 刷新（与 MemoriaEngine.hype_hnsw 的说明一致）。
     pub hype_hnsw: Arc<memoria_core::vector::HnswIndex>,
     pub hnsw_status: String,
     pub query_cache: Arc<memoria_core::vector::QueryCache>,
