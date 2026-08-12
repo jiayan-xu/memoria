@@ -44,6 +44,16 @@ pub fn semantic_search(
     if !norm_sq.is_finite() || norm_sq <= 0.0 {
         return Ok(vec![]);
     }
+    // #R37 bug/low：维度校验——query 向量长度 ≠ DIM 时 HNSW 距离计算跑在错配维度上，
+    // 静默产生垃圾分数（最坏 panic 污染索引锁）。离线脚本已防服务器模型漂移（768d），
+    // 运行时路径同样显式拒绝，使配置漂移快速可见而非悄悄劣化。
+    if vector.len() != crate::vector::DIM {
+        return Err(format!(
+            "semantic_search: query vector dim {} != HNSW DIM {}",
+            vector.len(),
+            crate::vector::DIM
+        ));
+    }
 
     // 收集两路候选：content 路（hnsw）+ hype 路（hype_hnsw），按 memory_id 合并取 max。
     // HNSW 是全局索引、无 namespace 维度（语义检索 B2 修复说明）：

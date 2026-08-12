@@ -27,6 +27,10 @@ pub struct MemoriaEngine {
     pub hnsw: HnswIndex,
     /// V1（2026-08-12）：HyPE 假设问句向量索引（可选）。由 memory_hype_vectors 表重建，
     /// semantic_search 双路合并（取 max）。空索引=功能未启用，检索退化为单路内容向量。
+    /// **限制（#R37 maintainability/low）**：仅在构造时从表一次性构建；引擎存活期间
+    /// memory_hype_vectors 被外部写入（如离线脚本重跑、未来工具运行时写 hype 向量）时，
+    /// 本索引不会自动刷新——需重建引擎/重启才能加载新向量。若要运行时刷新，调用
+    /// `persist::rebuild_hype_hnsw_from_store(&self.pool, &self.hype_hnsw)` 手动重建。
     pub hype_hnsw: HnswIndex,
     pub query_cache: QueryCache,
 }
@@ -170,6 +174,12 @@ impl MemoriaEngine {
         m.insert(
             "vector_index_size".to_string(),
             serde_json::Value::Number((self.hnsw.len() as i64).into()),
+        );
+        // V1（#R37 maintainability/low）：HyPE 索引规模也纳入公开统计——
+        // 否则 Python/standalone 宿主只能从启动 eprintln 行观察，API 无感知。
+        m.insert(
+            "hype_vector_index_size".to_string(),
+            serde_json::Value::Number((self.hype_hnsw.len() as i64).into()),
         );
         m.insert(
             "query_cache_size".to_string(),

@@ -132,11 +132,14 @@ async fn memory_eval_semantic() {
             // 首次遇到该 rid 才持久化 + 入索引：近义去重命中的旧 id 若只 put 不 add，
             // 权威表会被新向量覆盖而运行中索引仍持旧向量——表/索引分歧，后续 rebuild
             // 会得到与当前索引不同的向量。put 与 add 必须同受 hype_seen 守卫（#R33 bug/low）。
-            if hype_seen.insert(rid.clone()) {
+            if !hype_seen.contains(&rid) {
                 // 问句化改写：与内容向量不同（否则双路合并无意义）。嵌入失败则**跳过**
                 // 该条（不 put/add）——fallback 到内容向量会让两路恒等、退化为内容通道，
                 // 正是本块要防的 no-op 假覆盖（且把内容向量写进 question 列与离线脚本
                 // 的问句向量不一致，rebuild 后会混入两种形态）。
+                // hype_seen 在**成功 put+add 后**才标记（#R37 test/low）：若在 embed 前
+                // 标记，首次 embed 失败会永久占用该 rid，后续 dedup 命中的同 id 也被跳过，
+                // 该记忆永远没有 HyPE 向量且无信号。
                 if let Ok(hv) = embed(&client, &format!("用户提问：{content}")).await {
                     persist::put_hype_stored_vector(&pool, &rid, ns, &hv)
                         .expect("put_hype_stored_vector should succeed");
@@ -148,6 +151,7 @@ async fn memory_eval_semantic() {
                         }])
                         .expect("hype_hnsw.add should succeed");
                     assert!(n > 0, "hype_hnsw.add added 0 entries (degenerate vector or duplicate id)");
+                    hype_seen.insert(rid.clone());
                 }
             }
         }
@@ -163,6 +167,14 @@ async fn memory_eval_semantic() {
             }
         }
     }
+
+    // #R37 test/medium：防假绿收口——若问句化 embed 持续失败（如服务拒绝带前缀的
+    // prompt），上述 put/add 全部静默跳过、hype_hnsw 恒空，测试会走 content-only 路径
+    // 仍通过——正是本块要防的 no-op 假覆盖。断言索引确实被填充，失败即暴露。
+    assert!(
+        engine.hype_hnsw.len() > 0,
+        "hype index empty after corpus setup: question-embed likely failing"
+    );
 
     // 2) 官方 12 用例（query 嵌入 → 语义信号参与融合）
     let mut recall_hits = 0u32;
