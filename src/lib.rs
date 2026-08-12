@@ -7,6 +7,7 @@ pub mod auth;
 pub mod backup;
 pub mod document;
 pub mod health;
+pub mod ontology;
 pub mod quota;
 pub mod search;
 pub mod session_watcher;
