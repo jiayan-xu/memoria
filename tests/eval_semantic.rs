@@ -117,26 +117,32 @@ async fn memory_eval_semantic() {
         let rid = r.id.clone();
         ids.push(r.id);
 
-        // V1：HyPE 通道覆盖——把内容向量同时写入 memory_hype_vectors 并加入 hype 索引，
-        // 使语义测试真实走双路合并（否则 hype_hnsw 恒空、传参是 no-op，测不到 HyPE 路径）。
-        // 真实生产里问句向量由 LLM 生成；测试里以内容向量近似（仅验证通道贯通与合并逻辑）。
-        // 结果必须断言：put/add 静默失败会让 hype_hnsw 恒空、测试假绿——正是本块要防的
-        // no-op 假覆盖。注意：remember_with_dedup 近义去重命中时返回的是**已有记忆 id**，
-        // 该 id 的 hype 向量可能已 add 过（HnswIndex 按 id 去重，重复 add 返回 0 属正常），
-        // 故仅当是**首次**遇到该 rid 时才断言 n>0；重复 id 跳过 add 但继续处理 created_at。
+        // V1：HyPE 通道覆盖——写入**问句化改写**的向量并加入 hype 索引，使语义测试真实走
+        // 双路合并（若用与内容路相同的向量，两路 cosine 恒等、合并退化为内容通道，
+        // 测不到 HyPE 的 read/merge 路径——正是本块要防的 no-op 假覆盖）。真实生产里问句
+        // 向量由 LLM 生成；测试里以「用户提问：+ 内容」嵌入近似（问句-内容措辞不同，
+        // 双路分数各异，合并取 max 才有意义）。
+        // 结果必须断言：put/add 静默失败会让 hype_hnsw 恒空、测试假绿。注意：
+        // remember_with_dedup 近义去重命中时返回**已有记忆 id**，其 hype 向量可能已 add 过
+        // （HnswIndex 按 id 去重，重复 add 返回 0 属正常），故仅首次遇到该 rid 才断言 n>0。
         {
             use memoria_core::vector::{VectorEntry, persist};
             // 首次遇到该 rid 才持久化 + 入索引：近义去重命中的旧 id 若只 put 不 add，
             // 权威表会被新向量覆盖而运行中索引仍持旧向量——表/索引分歧，后续 rebuild
             // 会得到与当前索引不同的向量。put 与 add 必须同受 hype_seen 守卫（#R33 bug/low）。
             if hype_seen.insert(rid.clone()) {
-                persist::put_hype_stored_vector(&pool, &rid, ns, &v)
+                // 问句化改写：与内容向量不同（否则双路合并无意义）；嵌入失败则跳过该条
+                // （不应让 embed 故障把整个语料 setup 打挂）。
+                let hv = embed(&client, &format!("用户提问：{content}"))
+                    .await
+                    .unwrap_or_else(|_| v.clone());
+                persist::put_hype_stored_vector(&pool, &rid, ns, &hv)
                     .expect("put_hype_stored_vector should succeed");
                 let n = engine
                     .hype_hnsw
                     .add(&[VectorEntry {
                         id: rid.clone(),
-                        vector: v,
+                        vector: hv,
                     }])
                     .expect("hype_hnsw.add should succeed");
                 assert!(n > 0, "hype_hnsw.add added 0 entries (degenerate vector or duplicate id)");

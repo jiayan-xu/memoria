@@ -251,20 +251,12 @@ fn main() {
     println!("[Memoria] HNSW vectors: {}", hnsw.len());
 
     // V1（2026-08-12）：HyPE 假设问句索引（独立实例，memory_hype_vectors 为权威源）。
-    // 空表 → 空索引 → semantic_search 双路退化单路，行为与未启用一致（向后兼容）。
-    let hype_hnsw = memoria_core::vector::HnswIndex::new();
-    // 与内容索引保持一致的 ef_search：双路合并的两个索引若 ef 不一致，
-    // 运维调 recall 时只有内容路生效、HyPE 路静默留在默认值，行为分裂。
-    hype_hnsw.set_ef_search(ef_search);
-    if let Err(e) =
-        memoria_core::vector::persist::rebuild_hype_hnsw_from_store(&pool, &hype_hnsw)
-    {
-        eprintln!("[Memoria] WARN: HYPE HNSW rebuild from memory_hype_vectors: {}", e);
-    }
+    // 与 lib.rs 的 MemoriaEngine 路径共用 build_hype_hnsw 收口（含 ef_search 对齐）。
+    // 计数**恒打印**（0 也打）：空表（未启用）与 rebuild 静默降级可区分——若只在 >0
+    // 时打印，运维无法判断"功能未开"还是"重建失败被 WARN 淹没"。
+    let hype_hnsw = memoria_core::vector::persist::build_hype_hnsw(&pool, ef_search);
     let hype_count = hype_hnsw.len();
-    if hype_count > 0 {
-        println!("[Memoria] HYPE HNSW vectors: {}", hype_count);
-    }
+    println!("[Memoria] HYPE HNSW vectors: {}", hype_count);
 
     // ── P0: 启动健康检查 ──
     println!("[Memoria] Running startup health check...");

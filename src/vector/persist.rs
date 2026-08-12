@@ -72,12 +72,20 @@ fn put_vector_into(
     table: &str,
 ) -> Result<(), String> {
     let conn = pool.get().map_err(|e| format!("pool: {}", e))?;
+    // 错误前缀用**公开函数名**（put_stored_vector / put_hype_stored_vector）而非内部表名：
+    // 共享 helper 被两个入口调用，表名无法归因到具体 API（execute 分支的 map_err 已用
+    // 函数名，验证错误须一致，否则同 helper 内前缀分裂）。
+    let fn_name = match table {
+        "memory_vectors" => "put_stored_vector",
+        "memory_hype_vectors" => "put_hype_stored_vector",
+        _ => "put_vector_into",
+    };
     // P0 防御：拒绝退化（零 / 非有限）向量落库。历史嵌入失败的写入会在 memory_vectors
     // 留下全 0 向量，污染 HNSW 语义召回（零向量被 DistCosine 误判为完美匹配）。
     // 调用方均 `let _ =` 忽略返回值，故记忆仍照常写入、仅缺语义向量（退化为 keyword-only）。
     let norm_sq: f64 = vector.iter().map(|x| (*x as f64) * (*x as f64)).sum();
     if !norm_sq.is_finite() || norm_sq == 0.0 {
-        return Err(format!("{table}: degenerate (zero/NaN) vector rejected"));
+        return Err(format!("{fn_name}: degenerate (zero/NaN) vector rejected"));
     }
     // 写入时校验维度：错误长度的向量落库后会被 rebuild 静默跳过（仅 stderr 告警），
     // 造成"API 接受但索引永远不含"的死行——fail fast 使写入/读取路径一致。
@@ -85,7 +93,7 @@ fn put_vector_into(
     // "dimension mismatch"，是刻意为之（退化更根本，先拒绝）。
     if vector.len() != DIM {
         return Err(format!(
-            "{table}: dimension mismatch: expected {}, got {}",
+            "{fn_name}: dimension mismatch: expected {}, got {}",
             DIM,
             vector.len()
         ));
@@ -93,8 +101,11 @@ fn put_vector_into(
     match table {
         "memory_vectors" => conn
             .execute(
-                "INSERT INTO memory_vectors (id, namespace, vector) VALUES (?, ?, ?) \
-                 ON CONFLICT(id) DO UPDATE SET vector=excluded.vector",
+                "INSERT INTO memory_vectors (id, namespace, vector, updated_at) \
+                 VALUES (?, ?, ?, datetime('now')) \
+                 ON CONFLICT(id) DO UPDATE SET vector=excluded.vector, \
+                                                namespace=excluded.namespace, \
+                                                updated_at=excluded.updated_at",
                 rusqlite::params![id, namespace, encode_vector(vector)],
             )
             .map(|_| ())
@@ -104,6 +115,7 @@ fn put_vector_into(
                 "INSERT INTO memory_hype_vectors (id, namespace, vector, updated_at) \
                  VALUES (?, ?, ?, datetime('now')) \
                  ON CONFLICT(id) DO UPDATE SET vector=excluded.vector, \
+                                                namespace=excluded.namespace, \
                                                 updated_at=excluded.updated_at",
                 rusqlite::params![id, namespace, encode_vector(vector)],
             )
@@ -141,6 +153,21 @@ pub fn rebuild_hnsw_from_store(pool: &SqlitePool, hnsw: &HnswIndex) -> Result<us
 /// 双路搜索后按 memory_id 取 max 合并。
 pub fn rebuild_hype_hnsw_from_store(pool: &SqlitePool, hnsw: &HnswIndex) -> Result<usize, String> {
     rebuild_from_table(pool, hnsw, "memory_hype_vectors", "hype")
+}
+
+/// V1（2026-08-12）：构造并重建 HyPE 索引的**唯一入口**（main.rs 与 lib.rs 共用）。
+///
+/// lib 路径与 standalone 路径此前各自写了一遍「解析 MEMORIA_EF_SEARCH + 双索引 ef 对齐 +
+/// HyPE rebuild」——正是代码库已收敛的入口分叉问题（见 migrate_superseded_by 注释
+/// "统一在此收口，避免入口分叉"）。若两处后续调参（clamp/默认值）会静默分裂，故收口。
+/// 返回 (hype_hnsw, count)；重建失败仅告警不 panic（软降级，语义检索退单路）。
+pub fn build_hype_hnsw(pool: &SqlitePool, ef_search: usize) -> HnswIndex {
+    let hype_hnsw = HnswIndex::new();
+    hype_hnsw.set_ef_search(ef_search);
+    if let Err(e) = rebuild_hype_hnsw_from_store(pool, &hype_hnsw) {
+        eprintln!("[Memoria] WARN: HYPE HNSW rebuild from memory_hype_vectors: {}", e);
+    }
+    hype_hnsw
 }
 
 /// 共享实现：从 `table`（须含 id/vector 列）读取全部向量并加入 HNSW。
