@@ -627,6 +627,11 @@ pub fn migrate_hype_vectors(pool: &SqlitePool) -> Result<(), String> {
     // 会让多个进程同时跑全表扫描/DELETE（写锁争用），且 DELETE 后崩溃会留下未置位
     // 标记导致下次重复清理。BEGIN IMMEDIATE 使第二进程阻塞到首个提交后看到已置位。
     // #R38 maintainability/low：库代码（Python bindings 宿主可达）用 eprintln 不污染 stdout。
+    // #R39 bug/high：事务体内所有错误路径必须 ROLLBACK——raw execute_batch 开启的事务
+    // 池不知情，`?` 提前返回会把"仍持有写锁的事务"还给连接池：后续查询静默跑在事务内、
+    // 写锁不释放（其他写者 SQLITE_BUSY）。闭包返回 Result，错误统一 rollback 后传播。
+    // #R39 performance/medium：持写锁做全表 COUNT+DELETE 相关扫描可能超 busy_timeout——
+    // 空表直接短路（最常见的首次启动场景），减少持锁时间。
     const CLEANUP_MARK: i64 = 0x1000;
     let uv: i64 = conn
         .query_row("PRAGMA user_version", [], |r| r.get(0))
@@ -634,49 +639,68 @@ pub fn migrate_hype_vectors(pool: &SqlitePool) -> Result<(), String> {
     if uv & CLEANUP_MARK == 0 {
         conn.execute_batch("BEGIN IMMEDIATE")
             .map_err(|e| format!("begin cleanup tx: {}", e))?;
-        // 事务内重读 user_version（首个提交后此处看到已置位 → 跳过清理）。
-        let uv2: i64 = conn
-            .query_row("PRAGMA user_version", [], |r| r.get(0))
-            .map_err(|e| format!("read user_version (tx): {}", e))?;
-        if uv2 & CLEANUP_MARK != 0 {
-            conn.execute_batch("COMMIT")
-                .map_err(|e| format!("commit cleanup tx (noop): {}", e))?;
-        } else {
-            let orphans_vec: i64 = conn
-                .query_row(
-                    "SELECT COUNT(*) FROM memory_vectors WHERE NOT EXISTS (SELECT 1 FROM memories m WHERE m.id = memory_vectors.id)",
-                    [],
-                    |r| r.get(0),
-                )
-                .map_err(|e| format!("count memory_vectors orphans: {}", e))?;
-            if orphans_vec > 0 {
-                conn.execute(
-                    "DELETE FROM memory_vectors WHERE NOT EXISTS (SELECT 1 FROM memories m WHERE m.id = memory_vectors.id)",
-                    [],
-                )
-                .map_err(|e| format!("clean memory_vectors orphans: {}", e))?;
-                eprintln!("[Memoria] Migration: removed {orphans_vec} orphan memory_vectors rows");
+        let r: Result<(), String> = (|| {
+            // 事务内重读 user_version（首个提交后此处看到已置位 → 跳过清理）。
+            let uv2: i64 = conn
+                .query_row("PRAGMA user_version", [], |r| r.get(0))
+                .map_err(|e| format!("read user_version (tx): {}", e))?;
+            if uv2 & CLEANUP_MARK != 0 {
+                return Ok(());
             }
-            let orphans_hype: i64 = conn
-                .query_row(
-                    "SELECT COUNT(*) FROM memory_hype_vectors WHERE NOT EXISTS (SELECT 1 FROM memories m WHERE m.id = memory_hype_vectors.id)",
-                    [],
-                    |r| r.get(0),
-                )
-                .map_err(|e| format!("count memory_hype_vectors orphans: {}", e))?;
-            if orphans_hype > 0 {
-                conn.execute(
-                    "DELETE FROM memory_hype_vectors WHERE NOT EXISTS (SELECT 1 FROM memories m WHERE m.id = memory_hype_vectors.id)",
-                    [],
-                )
-                .map_err(|e| format!("clean memory_hype_vectors orphans: {}", e))?;
-                eprintln!("[Memoria] Migration: removed {orphans_hype} orphan memory_hype_vectors rows");
+            // 空表短路：向量表无行时无需扫描（避免持写锁的全表相关扫描）。
+            let v_count: i64 = conn
+                .query_row("SELECT COUNT(*) FROM memory_vectors", [], |r| r.get(0))
+                .map_err(|e| format!("count memory_vectors rows: {}", e))?;
+            if v_count > 0 {
+                let orphans_vec: i64 = conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM memory_vectors WHERE NOT EXISTS (SELECT 1 FROM memories m WHERE m.id = memory_vectors.id)",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .map_err(|e| format!("count memory_vectors orphans: {}", e))?;
+                if orphans_vec > 0 {
+                    conn.execute(
+                        "DELETE FROM memory_vectors WHERE NOT EXISTS (SELECT 1 FROM memories m WHERE m.id = memory_vectors.id)",
+                        [],
+                    )
+                    .map_err(|e| format!("clean memory_vectors orphans: {}", e))?;
+                    eprintln!("[Memoria] Migration: removed {orphans_vec} orphan memory_vectors rows");
+                }
+            }
+            let h_count: i64 = conn
+                .query_row("SELECT COUNT(*) FROM memory_hype_vectors", [], |r| r.get(0))
+                .map_err(|e| format!("count memory_hype_vectors rows: {}", e))?;
+            if h_count > 0 {
+                let orphans_hype: i64 = conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM memory_hype_vectors WHERE NOT EXISTS (SELECT 1 FROM memories m WHERE m.id = memory_hype_vectors.id)",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .map_err(|e| format!("count memory_hype_vectors orphans: {}", e))?;
+                if orphans_hype > 0 {
+                    conn.execute(
+                        "DELETE FROM memory_hype_vectors WHERE NOT EXISTS (SELECT 1 FROM memories m WHERE m.id = memory_hype_vectors.id)",
+                        [],
+                    )
+                    .map_err(|e| format!("clean memory_hype_vectors orphans: {}", e))?;
+                    eprintln!("[Memoria] Migration: removed {orphans_hype} orphan memory_hype_vectors rows");
+                }
             }
             // 置位标记（保留既有位，只或入新位）。
             conn.execute_batch(&format!("PRAGMA user_version = {};", uv2 | CLEANUP_MARK))
                 .map_err(|e| format!("set user_version cleanup mark: {}", e))?;
-            conn.execute_batch("COMMIT")
-                .map_err(|e| format!("commit cleanup tx: {}", e))?;
+            Ok(())
+        })();
+        match r {
+            Ok(()) => conn
+                .execute_batch("COMMIT")
+                .map_err(|e| format!("commit cleanup tx: {}", e))?,
+            Err(e) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                return Err(e);
+            }
         }
     }
     Ok(())

@@ -106,7 +106,11 @@ pub fn semantic_search(
                 .filter(|(_, ns)| ns == namespace)
                 .map(|(id, _)| id)
                 .collect(),
-            Err(_) => return Ok(vec![]),
+            // #R39 bug/medium：ns 回查全批失败（memories 表系统性故障）的 Err 必须
+            // **传播**而非转回 Ok(vec![])——否则与"该 ns 无结果"不可区分，语义通道
+            // 静默关闭（#R38 升级被自己的调用方架空成死代码）。hybrid.rs 会记录该
+            // 降级（与 content backfill 全批失败升级一致）。
+            Err(e) => return Err(e),
         },
         None => return Ok(vec![]),
     };
@@ -121,6 +125,9 @@ pub fn semantic_search(
     // 与 best 同量级（可达 ~12000），单条 IN(...) 在旧 SQLite（999 变量上限）会 prepare
     // 失败且被 if let Ok 静默吞掉，导致全部语义结果正文为空却无任何告警。
     let mut contents: HashMap<String, String> = HashMap::new();
+    // #R39 bug/low：部分批失败时，失败批的 id 从结果集**剔除**而非输出空正文——
+    // rrf_merge 在首次插入时锁定正文，空正文命中会复现 P3-0 内容损坏（见该处注释）。
+    let mut failed_batch_ids: HashSet<String> = HashSet::new();
     if let Some(p) = pool {
         const BATCH: usize = 500;
         let ids: Vec<&String> = allowed.iter().collect();
@@ -139,6 +146,7 @@ pub fn semantic_search(
             );
             // 单批瞬时失败（连接抖动等）log-and-continue；若**所有**批都失败（系统性
             // schema/列变更等），escalate 返回 Err——不再把"全量空正文"伪装成正常结果。
+            let mut batch_failed = false;
             match conn.prepare(&sql) {
                 Ok(mut stmt) => match stmt.query_map(
                     rusqlite::params_from_iter(chunk.iter().map(|s| *s)),
@@ -172,21 +180,33 @@ pub fn semantic_search(
                                 "[semantic] content backfill: batch of {} ids all failed row mapping",
                                 chunk.len()
                             );
+                            batch_failed = true;
                         } else {
                             batches_ok += 1;
                         }
                     }
-                    Err(e) => eprintln!(
-                        "[semantic] content backfill query failed (batch {} ids): {}",
+                    Err(e) => {
+                        eprintln!(
+                            "[semantic] content backfill query failed (batch {} ids): {}",
+                            chunk.len(),
+                            e
+                        );
+                        batch_failed = true;
+                    }
+                },
+                Err(e) => {
+                    eprintln!(
+                        "[semantic] content backfill prepare failed (batch {} ids): {}",
                         chunk.len(),
                         e
-                    ),
-                },
-                Err(e) => eprintln!(
-                    "[semantic] content backfill prepare failed (batch {} ids): {}",
-                    chunk.len(),
-                    e
-                ),
+                    );
+                    batch_failed = true;
+                }
+            }
+            if batch_failed {
+                for id in chunk.iter() {
+                    failed_batch_ids.insert((*id).clone());
+                }
             }
         }
         if batches_ok == 0 && batches_total > 0 {
@@ -196,6 +216,11 @@ pub fn semantic_search(
 
     let mut out: Vec<SignalResult> = Vec::with_capacity(allowed.len());
     for memory_id in &allowed {
+        // 失败批的 id 剔除（#R39 bug/low）：正文缺失的命中若进入融合会被 rrf_merge
+        // 以空正文锁定——不如直接不返回该候选（只损失该批召回，不污染正文）。
+        if failed_batch_ids.contains(memory_id) {
+            continue;
+        }
         if let Some((score, road)) = best.get(memory_id) {
             let content = contents.get(memory_id).cloned().unwrap_or_default();
             out.push(SignalResult {
@@ -297,8 +322,32 @@ fn lookup_namespaces(
                 |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
             ) {
                 Ok(rows) => {
-                    for row in rows.flatten() {
-                        map.insert(row.0, row.1);
+                    // #R39 bug/medium：行级映射错误（列类型/值漂移）不能 flatten 静默
+                    // 丢弃——query_map 可能 Ok 但每行 Err，map 空 + mid_failure None，
+                    // "全批失败"升级被绕过、通道静默返回空。逐行计数，全批行错记 mid_failure。
+                    let mut inserted = 0usize;
+                    let mut row_errors = 0usize;
+                    for row in rows {
+                        match row {
+                            Ok(v) => {
+                                map.insert(v.0, v.1);
+                                inserted += 1;
+                            }
+                            Err(e) => {
+                                row_errors += 1;
+                                eprintln!(
+                                    "[semantic] ns lookup row mapping failed (batch {} ids): {}",
+                                    chunk.len(),
+                                    e
+                                );
+                            }
+                        }
+                    }
+                    if inserted == 0 && row_errors > 0 {
+                        mid_failure.get_or_insert(format!(
+                            "row mapping: {row_errors} rows failed in batch of {}",
+                            chunk.len()
+                        ));
                     }
                 }
                 Err(e) => {

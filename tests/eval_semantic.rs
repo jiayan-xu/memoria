@@ -85,6 +85,7 @@ async fn memory_eval_semantic() {
     // 1) 语料嵌入 + 写入（向量入 QueryCache → HNSW）
     let mut ids: Vec<String> = Vec::with_capacity(corpus.len());
     let mut hype_seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut hype_processed: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut hype_covered = 0usize;
     let mut hype_skipped = 0usize;
     for item in &corpus {
@@ -131,17 +132,13 @@ async fn memory_eval_semantic() {
         // （HnswIndex 按 id 去重，重复 add 返回 0 属正常），故仅首次遇到该 rid 才断言 n>0。
         {
             use memoria_core::vector::{VectorEntry, persist};
-            // 首次遇到该 rid 才持久化 + 入索引：近义去重命中的旧 id 若只 put 不 add，
-            // 权威表会被新向量覆盖而运行中索引仍持旧向量——表/索引分歧，后续 rebuild
-            // 会得到与当前索引不同的向量。put 与 add 必须同受 hype_seen 守卫（#R33 bug/low）。
-            if !hype_seen.contains(&rid) {
+            // 唯一处理集：每个 rid 只计数一次（近义去重会让同一 rid 出现多次——重复
+            // 计数会虚增分母、拉低覆盖率造成假红，#R39 bug/medium）。
+            if hype_processed.insert(rid.clone()) {
                 // 问句化改写：与内容向量不同（否则双路合并无意义）。嵌入失败则**跳过**
                 // 该条（不 put/add）——fallback 到内容向量会让两路恒等、退化为内容通道，
                 // 正是本块要防的 no-op 假覆盖（且把内容向量写进 question 列与离线脚本
                 // 的问句向量不一致，rebuild 后会混入两种形态）。
-                // hype_seen 在**成功 put+add 后**才标记（#R37 test/low）：若在 embed 前
-                // 标记，首次 embed 失败会永久占用该 rid，后续 dedup 命中的同 id 也被跳过，
-                // 该记忆永远没有 HyPE 向量且无信号。
                 if let Ok(hv) = embed(&client, &format!("用户提问：{content}")).await {
                     // #R38 test/low：put 可能因退化向量（零/NaN）返回 Err——内容路容忍
                     // 静默跳过，此处同样按 skip 计数而非 panic（局部 embed 服务异常不应
@@ -182,19 +179,19 @@ async fn memory_eval_semantic() {
         }
     }
 
-    // #R37/#R38 test/medium：防假绿收口——若问句化 embed 持续失败（如服务拒绝带前缀的
-    // prompt），put/add 全部静默跳过、hype_hnsw 恒空或只覆盖 1 条，测试会走 content-only
-    // 路径仍通过——正是本块要防的 no-op 假覆盖。断言**高覆盖率**（非仅非空）：
-    // 大多数语料必须有 HyPE 向量，双路合并才被真实锻炼。
-    let unique_memories = hype_seen.len() + hype_skipped;
+    // #R37/#R38/#R39 test/medium：防假绿收口——若问句化 embed 持续失败（如服务拒绝带
+    // 前缀的 prompt），put/add 全部静默跳过、hype_hnsw 恒空或只覆盖 1 条，测试会走
+    // content-only 路径仍通过——正是本块要防的 no-op 假覆盖。断言**高覆盖率**（非仅
+    // 非空）：分母用唯一处理记忆数（hype_processed），重复 rid 只计一次。
     assert!(
         engine.hype_hnsw.len() > 0,
         "hype index empty after corpus setup: question-embed likely failing"
     );
     assert!(
-        hype_covered as f64 >= unique_memories as f64 * 0.8,
-        "hype coverage too low: {hype_covered}/{unique_memories} memories have HyPE vectors \
-         (question-embed likely failing); skipped={hype_skipped}"
+        hype_covered as f64 >= hype_processed.len() as f64 * 0.8,
+        "hype coverage too low: {hype_covered}/{} unique memories have HyPE vectors \
+         (question-embed likely failing); skipped={hype_skipped}",
+        hype_processed.len()
     );
 
     // 2) 官方 12 用例（query 嵌入 → 语义信号参与融合）
