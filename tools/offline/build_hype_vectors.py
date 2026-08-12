@@ -191,14 +191,28 @@ def main():
     ok = skip = fail = 0
     fail_ids = []
     skip_ids = []
-    # #R38 other/low：每次运行开始时截断失败清单——上次成功修复的 id 不应残留在
-    # 文件中误导 ops 重跑（幂等无害，但陈旧文件报告"新失败"削弱可信度）。
+    # #R39 bug/medium：清理仅非 dry-run 分支执行——dry-run 不重写该文件却先删除它，
+    # 会清空上次失败批次已落盘的 id 清单（运维先 dry-run 验证修复会丢失"定点重跑"清单）。
     failed_ids_path = os.path.join(HERE, "hype_failed_ids.txt")
-    try:
-        if os.path.exists(failed_ids_path):
-            os.remove(failed_ids_path)
-    except OSError as e:
-        print(f"  [warn] 清理旧 hype_failed_ids.txt 失败: {e}")
+    if not args.dry_run:
+        try:
+            if os.path.exists(failed_ids_path):
+                os.remove(failed_ids_path)
+        except OSError as e:
+            print(f"  [warn] 清理旧 hype_failed_ids.txt 失败: {e}")
+    # #R39 performance/medium：嵌入服务预检——系统性配置错误（local 模型 768d 触发
+    # dim≠RUST_DIM、服务不可达）若不先探测，--all 会先为每条付一次付费 LLM chat 再
+    # 全部失败。循环前单次探测嵌入校验 dim==RUST_DIM，配置错误立即 fail-fast。
+    if not args.dry_run:
+        try:
+            _vecs, pre_dim = embed(["preflight"])
+        except Exception as e:
+            print(f"错误: embed_server 不可达（{e}）——请先启动 embed_server 再补嵌")
+            sys.exit(1)
+        if pre_dim != RUST_DIM:
+            print(f"错误: embed_server 维度 {pre_dim}≠Rust DIM {RUST_DIM}（模型不匹配，无法补嵌）")
+            sys.exit(1)
+        print(f"预检通过: embed_server dim={pre_dim} == RUST_DIM")
     for i, (mid, content) in enumerate(targets, 1):
         try:
             q = generate_question(content)

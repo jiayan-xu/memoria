@@ -212,7 +212,12 @@ pub fn build_hype_hnsw_or_default(pool: &SqlitePool, ef_search: usize) -> (HnswI
                 "[Memoria] WARN: HYPE HNSW rebuild failed (semantic degraded to single path): {}",
                 e
             );
-            (HnswIndex::new(), 0)
+            // #R39 maintainability/low：fallback 索引也须对齐 ef_search——成功路径设了
+            // 配置值，fallback 若用默认 128 会在配置 ≠128 时与内容索引分裂（索引当前
+            // 为空，但 lib.rs 文档支持运行时手动 rebuild 填充，届时会用错误的 ef 检索）。
+            let fallback = HnswIndex::new();
+            fallback.set_ef_search(ef_search);
+            (fallback, 0)
         }
     }
 }
