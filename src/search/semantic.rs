@@ -137,6 +137,7 @@ pub fn semantic_search(
         let conn = p.get().map_err(|e| format!("semantic content backfill pool: {}", e))?;
         let mut batches_ok = 0usize;
         let mut batches_total = 0usize;
+        let mut hard_failed_batches = 0usize;
         for chunk in ids.chunks(BATCH) {
             batches_total += 1;
             let placeholders = vec!["?"; chunk.len()].join(",");
@@ -144,9 +145,14 @@ pub fn semantic_search(
                 "SELECT id, content FROM memories WHERE id IN ({})",
                 placeholders
             );
-            // 单批瞬时失败（连接抖动等）log-and-continue；若**所有**批都失败（系统性
+            // 单批瞬时失败（连接抖动等）log-and-continue；若**所有**批都硬失败（系统性
             // schema/列变更等），escalate 返回 Err——不再把"全量空正文"伪装成正常结果。
-            let mut batch_failed = false;
+            // #R41 bug/high：`hard_failed` 与 `partial_failed` 分离——部分行映射失败
+            // （如单条 NULL content）只是召回损失（剔该 id），**不算硬失败**；否则
+            // 候选跨多批时每条 NULL 都使 batches_ok=0，全批升级把整个语义通道打成 Err
+            // （hybrid.rs 丢弃语义信号），与 #R40"只剔失败行保留成功行"的意图直接矛盾。
+            let mut hard_failed = false;
+            let mut partial_failed = false;
             match conn.prepare(&sql) {
                 Ok(mut stmt) => match stmt.query_map(
                     rusqlite::params_from_iter(chunk.iter().map(|s| *s)),
@@ -175,22 +181,22 @@ pub fn semantic_search(
                             }
                         }
                         if inserted == 0 && row_errors > 0 {
-                            // 该批全部行映射失败 = 系统性列问题，不算成功批。
+                            // 该批全部行映射失败 = 系统性列问题，硬失败。
                             eprintln!(
                                 "[semantic] content backfill: batch of {} ids all failed row mapping",
                                 chunk.len()
                             );
-                            batch_failed = true;
+                            hard_failed = true;
                         } else if row_errors > 0 {
                             // #R40 bug/medium：**部分**行映射失败（如 content 为 NULL——
-                            // memories.content 可空）也须标失败批：失败行经 unwrap_or_default
-                            // 产出空正文、复现 P3-0 内容损坏（rrf_merge 首次插入锁定空正文）。
-                            // 剔除范围见下方——只剔未成功插入的 id，成功行保留。
+                            // memories.content 可空）：失败行经 unwrap_or_default 产出空
+                            // 正文、复现 P3-0 内容损坏。剔除范围见下方——只剔未成功插入
+                            // 的 id，成功行保留；本批仍算部分成功（不触发全批升级）。
                             eprintln!(
                                 "[semantic] content backfill: {row_errors} of {} rows failed mapping (dropping those ids)",
                                 chunk.len()
                             );
-                            batch_failed = true;
+                            partial_failed = true;
                         } else {
                             batches_ok += 1;
                         }
@@ -201,7 +207,7 @@ pub fn semantic_search(
                             chunk.len(),
                             e
                         );
-                        batch_failed = true;
+                        hard_failed = true;
                     }
                 },
                 Err(e) => {
@@ -210,21 +216,27 @@ pub fn semantic_search(
                         chunk.len(),
                         e
                     );
-                    batch_failed = true;
+                    hard_failed = true;
                 }
             }
-            if batch_failed {
-                // #R40 bug/medium：只剔除**未成功插入**的 id——部分行失败时成功行
-                // 正文完好，不应连同整批一起丢弃（只损失失败行召回，保留成功行）。
+            // 剔除失败行 id：硬失败整批未插入（contents 无这些 id），部分失败只剔
+            // 未插入的（成功行正文完好保留）。
+            if hard_failed || partial_failed {
                 for id in chunk.iter() {
                     if !contents.contains_key(*id) {
                         failed_batch_ids.insert((*id).clone());
                     }
                 }
             }
+            if hard_failed {
+                hard_failed_batches += 1;
+            }
         }
-        if batches_ok == 0 && batches_total > 0 {
-            return Err("semantic_search: content backfill failed for all batches".into());
+        // #R41 bug/high：全批升级只看**硬失败**（prepare/query 错误或 0 行插入）——
+        // 部分失败批已保留成功行，若计入会使单条 NULL content 触发整个语义通道 Err
+        // （hybrid.rs 丢弃语义信号）。全部批都硬失败（系统性故障）才升级。
+        if hard_failed_batches > 0 && hard_failed_batches == batches_total {
+            return Err("semantic_search: content backfill hard-failed for all batches".into());
         }
     }
 

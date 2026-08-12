@@ -27,6 +27,7 @@ import time
 import struct
 import sqlite3
 import urllib.request
+import urllib.error
 import argparse
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -108,6 +109,15 @@ def generate_question(content: str) -> str:
             if content_val is None:
                 return ""
             return str(content_val).strip().strip('"').strip("'")
+        except urllib.error.HTTPError as e:
+            # #R41 bug/medium：4xx（除 429 限流）是确定性配置错误（401 无效 key、400
+            # 未知模型/超长内容）——重试/重跑永远同样失败，直接 raise 免白付 3 次付费
+            # 调用且不污染 fail_ids（该文件承诺只含可修复的瞬时失败）。
+            if e.code != 429:
+                raise RuntimeError(f"chat HTTP {e.code}: {e}") from e
+            if attempt == 2:
+                raise RuntimeError(f"chat 429 限流重试耗尽: {e}") from e
+            time.sleep(min(2 ** attempt, 10))
         except Exception as e:
             if attempt == 2:
                 # #R38 bug/medium：重试耗尽 = 瞬时故障（网络/API 抖动），可重跑修复——
@@ -126,7 +136,6 @@ def embed(texts):
     """
     body = {"texts": texts, "normalize": False}
     headers = {"Content-Type": "application/json"}
-    last_err = None
     for attempt in range(3):
         try:
             req = urllib.request.Request(
@@ -135,11 +144,22 @@ def embed(texts):
             with urllib.request.urlopen(req, timeout=60) as r:
                 resp = json.loads(r.read().decode())
             return resp["embeddings"], resp.get("dim", 1024)
+        except urllib.error.HTTPError as e:
+            # 4xx（除 429）为确定性配置错误：直接 raise（与 generate_question 同款纪律）。
+            if e.code != 429:
+                raise RuntimeError(f"embed HTTP {e.code}: {e}") from e
+            if attempt == 2:
+                # #R41 maintainability/low：最终 attempt 内 raise 保留原始 traceback
+                # （urlopen/JSON 解析/取字段的失败点）——循环后 raise last_err 会把
+                # 栈指向 raise 行而非真实失败处，--all 5000+ 行时诊断困难。
+                raise RuntimeError(f"embed 429 限流重试耗尽: {e}") from e
+            time.sleep(min(2 ** attempt, 10))
         except Exception as e:
-            last_err = e
-            if attempt < 2:
-                time.sleep(min(2 ** attempt, 10))
-    raise last_err
+            if attempt == 2:
+                raise RuntimeError(f"embed 重试耗尽: {e}") from e
+            time.sleep(min(2 ** attempt, 10))
+    # 不可达（每轮必 return 或 raise），保留以防未来改动破坏不变式。
+    raise RuntimeError("embed: unreachable")
 
 
 def main():

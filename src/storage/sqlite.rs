@@ -721,13 +721,30 @@ pub fn migrate_hype_vectors(pool: &SqlitePool) -> Result<(), String> {
                 // 事务，若直接 `?` 传播，连接还池后后续查询静默跑在事务内、写锁不释放
                 // （其他写者 SQLITE_BUSY）。与事务体 Err 分支同款处理。
                 if let Err(e) = conn.execute_batch("COMMIT") {
-                    let _ = conn.execute_batch("ROLLBACK");
-                    return Err(format!("commit cleanup tx: {}", e));
+                    // #R41 bug/low：ROLLBACK 失败也要呈现（连接可能带着未关闭事务还池，
+                    // r2d2 的 test_on_check_out 检测不到）——吞掉会完全掩盖。
+                    match conn.execute_batch("ROLLBACK") {
+                        Ok(()) => return Err(format!("commit cleanup tx: {}", e)),
+                        Err(re) => {
+                            return Err(format!(
+                                "commit cleanup tx failed ({e}) AND rollback failed ({re}); \
+                                 connection may hold an open write transaction"
+                            ))
+                        }
+                    }
                 }
             }
             Err(e) => {
-                let _ = conn.execute_batch("ROLLBACK");
-                return Err(e);
+                // #R41 bug/low：事务体失败后的 ROLLBACK 失败同样呈现。
+                match conn.execute_batch("ROLLBACK") {
+                    Ok(()) => return Err(e),
+                    Err(re) => {
+                        return Err(format!(
+                            "cleanup tx body failed ({e}) AND rollback failed ({re}); \
+                             connection may hold an open write transaction"
+                        ))
+                    }
+                }
             }
         }
     }

@@ -125,7 +125,11 @@ fn put_vector_into(
     // 调用方均 `let _ =` 忽略返回值，故记忆仍照常写入、仅缺语义向量（退化为 keyword-only）。
     let norm_sq: f64 = vector.iter().map(|x| (*x as f64) * (*x as f64)).sum();
     if !norm_sq.is_finite() || norm_sq == 0.0 {
-        return Err(format!("{fn_name}: degenerate (zero/NaN) vector rejected"));
+        // #R41 maintainability/low：与维度分支一致地记录——调用方均 `let _ =` 忽略
+        // Result，零/NaN 写入若不 eprintln 与错长写入的可见性不对称。
+        let msg = format!("{fn_name}: degenerate (zero/NaN) vector rejected");
+        eprintln!("[persist] WARN: {msg}");
+        return Err(msg);
     }
     // 写入时校验维度：错误长度的向量落库后会被 rebuild 静默跳过（仅 stderr 告警），
     // 造成"API 接受但索引永远不含"的死行——fail fast 使写入/读取路径一致。
@@ -184,12 +188,30 @@ pub fn rebuild_hype_hnsw_from_store(pool: &SqlitePool, hnsw: &HnswIndex) -> Resu
 /// #R40 maintainability/low：**clamp** 而非过滤——`.filter(ef>=16)` 会把运维刻意配置的
 /// 低值（如 8，trade recall for latency）静默替换成默认 128 且无提示；`.map(ef.max(16))`
 /// 保留低值意图并夹到文档下限。
+/// #R41 other/low：补**上界** clamp（typo 如 100000000 会让 HNSW 每查询延迟/内存爆炸）
+/// 并在原始值非法/被 clamp 时告警——此前静默映射默认值无任何诊断。
 pub fn resolve_ef_search() -> usize {
-    std::env::var("MEMORIA_EF_SEARCH")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .map(|ef| ef.max(16))
-        .unwrap_or(128)
+    const EF_MAX: usize = 4096;
+    match std::env::var("MEMORIA_EF_SEARCH") {
+        Ok(v) => match v.trim().parse::<usize>() {
+            Ok(raw) => {
+                let ef = raw.clamp(16, EF_MAX);
+                if ef != raw {
+                    eprintln!(
+                        "[persist] WARN: MEMORIA_EF_SEARCH={raw} clamped to [16, {EF_MAX}] -> {ef}"
+                    );
+                }
+                ef
+            }
+            Err(_) => {
+                eprintln!(
+                    "[persist] WARN: MEMORIA_EF_SEARCH={v:?} not parseable, using default 128"
+                );
+                128
+            }
+        },
+        Err(_) => 128,
+    }
 }
 
 /// V1（2026-08-12）：构造并重建 HyPE 索引的**唯一入口**（main.rs 与 lib.rs 共用）。
@@ -262,7 +284,12 @@ fn rebuild_from_table(
             Ok((id, blob)) => {
                 rows_seen += 1;
                 let v = decode_vector(&blob);
-                if v.len() == DIM {
+                // #R41 bug/medium：读侧镜像写侧的退化检查——历史失败嵌入留下的全零/NaN
+                // 行（写侧 P0 防御的注释承认已存在）若只查维度会被**每次启动重新加载进
+                // HNSW**，写侧防御形同虚设。有限且非零范数才入索引，退化行计入 skipped
+                // 并出现在诊断里。
+                let norm_sq: f64 = v.iter().map(|x| (*x as f64) * (*x as f64)).sum();
+                if v.len() == DIM && norm_sq.is_finite() && norm_sq > 0.0 {
                     entries.push(VectorEntry { id, vector: v });
                 } else {
                     skipped += 1;

@@ -170,6 +170,12 @@ async fn memory_eval_semantic() {
                         }
                     }
                 } else {
+                    // #R41 maintainability/low：embed 失败要记录实际错误——若服务系统性地
+                    // 拒绝带前缀的 prompt，此分支对每条语料静默执行、只有最终覆盖率断言
+                    // 的猜测提示根因。记录后可直接诊断。
+                    eprintln!(
+                        "[eval_semantic] question embed failed for {rid:?} (skipping hype put/add)"
+                    );
                     hype_skipped += 1;
                 }
             }
