@@ -632,19 +632,38 @@ pub fn migrate_hype_vectors(pool: &SqlitePool) -> Result<(), String> {
     // 写锁不释放（其他写者 SQLITE_BUSY）。闭包返回 Result，错误统一 rollback 后传播。
     // #R39 performance/medium：持写锁做全表 COUNT+DELETE 相关扫描可能超 busy_timeout——
     // 空表直接短路（最常见的首次启动场景），减少持锁时间。
-    const CLEANUP_MARK: i64 = 0x1000;
-    let uv: i64 = conn
-        .query_row("PRAGMA user_version", [], |r| r.get(0))
-        .map_err(|e| format!("read user_version: {}", e))?;
-    if uv & CLEANUP_MARK == 0 {
+    // #R40 maintainability/low：门控用**独立 migration_flags 表**而非 user_version 位复用——
+    // health.rs 把 user_version 当纯 schema 版本号写（EXPECTED_SCHEMA_VERSION=2），位
+    // 复用会在任何"按版本号写 user_version"的未来路径上被静默清除（重跑昂贵清理）或
+    // 与升高的期望版本碰撞。key-value 表语义隔离、无耦合。
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS migration_flags (
+            flag TEXT PRIMARY KEY,
+            applied_at TEXT DEFAULT (datetime('now'))
+        )",
+    )
+    .map_err(|e| format!("create migration_flags: {}", e))?;
+    const CLEANUP_FLAG: &str = "orphan_vector_cleanup_v1";
+    let already: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM migration_flags WHERE flag = ?1",
+            rusqlite::params![CLEANUP_FLAG],
+            |r| r.get(0),
+        )
+        .map_err(|e| format!("check cleanup flag: {}", e))?;
+    if already == 0 {
         conn.execute_batch("BEGIN IMMEDIATE")
             .map_err(|e| format!("begin cleanup tx: {}", e))?;
         let r: Result<(), String> = (|| {
-            // 事务内重读 user_version（首个提交后此处看到已置位 → 跳过清理）。
-            let uv2: i64 = conn
-                .query_row("PRAGMA user_version", [], |r| r.get(0))
-                .map_err(|e| format!("read user_version (tx): {}", e))?;
-            if uv2 & CLEANUP_MARK != 0 {
+            // 事务内重读标记（首个提交后此处看到已置位 → 跳过清理）。
+            let already2: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM migration_flags WHERE flag = ?1",
+                    rusqlite::params![CLEANUP_FLAG],
+                    |r| r.get(0),
+                )
+                .map_err(|e| format!("check cleanup flag (tx): {}", e))?;
+            if already2 != 0 {
                 return Ok(());
             }
             // 空表短路：向量表无行时无需扫描（避免持写锁的全表相关扫描）。
@@ -688,15 +707,24 @@ pub fn migrate_hype_vectors(pool: &SqlitePool) -> Result<(), String> {
                     eprintln!("[Memoria] Migration: removed {orphans_hype} orphan memory_hype_vectors rows");
                 }
             }
-            // 置位标记（保留既有位，只或入新位）。
-            conn.execute_batch(&format!("PRAGMA user_version = {};", uv2 | CLEANUP_MARK))
-                .map_err(|e| format!("set user_version cleanup mark: {}", e))?;
+            // 置位标记：插入 migration_flags 行（事务内，提交后对并发进程可见）。
+            conn.execute(
+                "INSERT OR IGNORE INTO migration_flags (flag) VALUES (?1)",
+                rusqlite::params![CLEANUP_FLAG],
+            )
+            .map_err(|e| format!("set cleanup flag: {}", e))?;
             Ok(())
         })();
         match r {
-            Ok(()) => conn
-                .execute_batch("COMMIT")
-                .map_err(|e| format!("commit cleanup tx: {}", e))?,
+            Ok(()) => {
+                // #R40 bug/medium：COMMIT 失败同样必须 ROLLBACK——连接仍持有打开的写
+                // 事务，若直接 `?` 传播，连接还池后后续查询静默跑在事务内、写锁不释放
+                // （其他写者 SQLITE_BUSY）。与事务体 Err 分支同款处理。
+                if let Err(e) = conn.execute_batch("COMMIT") {
+                    let _ = conn.execute_batch("ROLLBACK");
+                    return Err(format!("commit cleanup tx: {}", e));
+                }
+            }
             Err(e) => {
                 let _ = conn.execute_batch("ROLLBACK");
                 return Err(e);
