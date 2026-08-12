@@ -30,6 +30,8 @@ pub struct AppState {
     pub pool: storage::SqlitePool,
     pub auth_pool: storage::SqlitePool,
     pub hnsw: Arc<memoria_core::vector::HnswIndex>,
+    /// V1（2026-08-12）：HyPE 假设问句索引（独立实例，memory_hype_vectors 重建）。
+    pub hype_hnsw: Arc<memoria_core::vector::HnswIndex>,
     pub hnsw_status: String,
     pub query_cache: Arc<memoria_core::vector::QueryCache>,
     pub admin_key: String,
@@ -1328,6 +1330,7 @@ fn dispatch(
                 ns,
                 search_depth,
                 Some(&state.hnsw),
+                Some(&state.hype_hnsw),
                 Some(&state.query_cache),
                 as_of,
                 include_superseded,
@@ -1628,6 +1631,7 @@ fn dispatch(
             match tools::profile::memory_context(
                 &state.pool,
                 Some(&state.hnsw),
+                Some(&state.hype_hnsw),
                 Some(&state.query_cache),
                 ns,
                 query,
@@ -3157,6 +3161,7 @@ mod tests {
             pool,
             auth_pool,
             hnsw: Arc::new(memoria_core::vector::HnswIndex::new()),
+            hype_hnsw: Arc::new(memoria_core::vector::HnswIndex::new()),
             hnsw_status: "uninitialized".to_string(),
             query_cache: Arc::new(memoria_core::vector::QueryCache::new()),
             admin_key: "test-admin-key".to_string(),

@@ -171,6 +171,7 @@ pub fn memory_profile(
 pub fn memory_context(
     pool: &SqlitePool,
     hnsw: Option<&HnswIndex>,
+    hype_hnsw: Option<&HnswIndex>,
     query_cache: Option<&QueryCache>,
     namespace: &str,
     query: Option<&str>,
@@ -195,6 +196,7 @@ pub fn memory_context(
                 namespace,
                 recall_k,
                 hnsw,
+                hype_hnsw,
                 query_cache,
                 as_of, // 透传 as_of；None → is_latest_now
                 false, // include_superseded=false

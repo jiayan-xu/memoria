@@ -19,6 +19,7 @@ pub fn hybrid_search(
     namespace: &str,
     max_results: u32,
     hnsw: Option<&HnswIndex>,
+    hype_hnsw: Option<&HnswIndex>,
     query_cache: Option<&QueryCache>,
     as_of: Option<&str>,
     include_superseded: bool,
@@ -60,13 +61,14 @@ pub fn hybrid_search(
         }
     }
 
-    // S2: Semantic (HNSW vector) — 宽召回
+    // S2: Semantic (HNSW vector) — 宽召回（V1：可选 HyPE 问句索引双路合并）
     if let (Some(hnsw), Some(qc)) = (hnsw, query_cache) {
         if let Ok(sem) = search::semantic::semantic_search(
             query,
             namespace,
             primary_limit,
             Some(hnsw),
+            hype_hnsw,
             Some(qc),
             Some(pool),
         ) {

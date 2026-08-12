@@ -101,3 +101,37 @@ pub fn rebuild_hnsw_from_store(pool: &SqlitePool, hnsw: &HnswIndex) -> Result<us
     }
     hnsw.add(&entries)
 }
+
+/// V1（2026-08-12）：从 `memory_hype_vectors` 表重建 HyPE 问句向量 HNSW 索引。
+///
+/// 与 `rebuild_hnsw_from_store` 平行，喂给**独立的 HyPE HNSW 实例**（内容索引与问句索引
+/// 分离，因 HnswIndex 按 id 去重、同一 memory_id 只能有一条向量）。调用方（main.rs/lib.rs）
+/// 在启动时对两个索引分别 rebuild；`semantic_search` 双路搜索后按 memory_id 取 max 合并。
+pub fn rebuild_hype_hnsw_from_store(
+    pool: &SqlitePool,
+    hnsw: &HnswIndex,
+) -> Result<usize, String> {
+    let conn = pool.get().map_err(|e| format!("pool: {}", e))?;
+    let mut stmt = conn
+        .prepare("SELECT id, vector FROM memory_hype_vectors")
+        .map_err(|e| format!("prepare hype: {}", e))?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+        })
+        .map_err(|e| format!("query hype: {}", e))?;
+
+    let mut entries: Vec<VectorEntry> = Vec::new();
+    for row in rows.flatten() {
+        let (id, blob) = row;
+        let v = decode_vector(&blob);
+        if v.len() == DIM {
+            entries.push(VectorEntry { id, vector: v });
+        }
+    }
+
+    if entries.is_empty() {
+        return Ok(0);
+    }
+    hnsw.add(&entries)
+}

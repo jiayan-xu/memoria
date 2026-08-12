@@ -256,6 +256,7 @@ pub fn init_core_tables(pool: &SqlitePool) -> Result<(), String> {
     migrate_evolution(pool)?;
     migrate_memory_relation_types(pool)?;
     migrate_access_count(pool)?;
+    migrate_hype_vectors(pool)?;
 
     Ok(())
 }
@@ -574,5 +575,31 @@ pub fn migrate_evolution(pool: &SqlitePool) -> Result<(), String> {
         )
         .map_err(|e| format!("add evolution_log.namespace: {}", e))?;
     }
+    Ok(())
+}
+
+/// V1（2026-08-12）：HyPE 假设问句向量表（写入侧增强，双向量检索）。
+///
+/// HyPE（Hypothetical Prompt Embeddings, IEEE Access 2025）：写入时用 LLM 为该记忆生成
+/// 「用户会怎么问」的假设问句，嵌入问句并与内容向量**并列**存储；检索时 query 同时匹配
+/// 内容向量与问句向量（question-question 匹配），缩小「问句式 query vs 陈述式记忆」的
+/// 措辞 gap。本表存问句向量（id=记忆 id，与 memory_vectors 平行），由 semantic_search
+/// 双路合并（取 max）。幂等迁移；HNSW 由 persist::rebuild_hype_hnsw_from_store 重建。
+pub fn migrate_hype_vectors(pool: &SqlitePool) -> Result<(), String> {
+    let conn = pool.get().map_err(|e| format!("pool get: {}", e))?;
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS memory_hype_vectors (
+            id TEXT PRIMARY KEY,
+            namespace TEXT NOT NULL DEFAULT 'default',
+            question TEXT,
+            vector BLOB NOT NULL,
+            updated_at TEXT DEFAULT (datetime('now'))
+        )",
+    )
+    .map_err(|e| format!("create memory_hype_vectors: {}", e))?;
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_hype_ns ON memory_hype_vectors(namespace)",
+    )
+    .map_err(|e| format!("create idx_hype_ns: {}", e))?;
     Ok(())
 }

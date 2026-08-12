@@ -77,6 +77,7 @@ fn as_of_resolves_contradictory_memories() {
         10,
         None,
         None,
+        None,
         Some("2025-06-01T00:00:00"),
         false,
     )
@@ -91,6 +92,7 @@ fn as_of_resolves_contradictory_memories() {
         "总部",
         ns,
         10,
+        None,
         None,
         None,
         Some("2026-06-01T00:00:00"),
@@ -109,6 +111,7 @@ fn as_of_resolves_contradictory_memories() {
         10,
         None,
         None,
+        None,
         Some("2026-07-12T00:00:00"),
         false,
     )
@@ -125,6 +128,7 @@ fn as_of_resolves_contradictory_memories() {
         10,
         None,
         None,
+        None,
         Some("2024-01-01T00:00:00"),
         false,
     )
@@ -136,7 +140,7 @@ fn as_of_resolves_contradictory_memories() {
 
     // None = is_latest_now（当前有效）：北京版 valid_to 已过 → 仅上海
     let r_now_default =
-        hybrid_search(&engine.pool, "总部", ns, 10, None, None, None, false).unwrap();
+        hybrid_search(&engine.pool, "总部", ns, 10, None, None, None, None, false).unwrap();
     let c_now_default: Vec<String> = r_now_default.iter().map(|r| r.content.clone()).collect();
     assert!(has(&c_now_default, "上海"), "None=is_latest_now：当前有效应命中上海版");
     assert!(
@@ -145,7 +149,7 @@ fn as_of_resolves_contradictory_memories() {
     );
 
     // include_superseded=true → 跳过整段过滤（含时序真值），两版均返回
-    let r_all = hybrid_search(&engine.pool, "总部", ns, 10, None, None, None, true).unwrap();
+    let r_all = hybrid_search(&engine.pool, "总部", ns, 10, None, None, None, None, true).unwrap();
     let c_all: Vec<String> = r_all.iter().map(|r| r.content.clone()).collect();
     assert!(has(&c_all, "北京"), "include_superseded=true 应看到北京版");
     assert!(has(&c_all, "上海"), "include_superseded=true 应看到上海版");
@@ -249,6 +253,7 @@ fn supersede_closes_old_valid_to_at_new_valid_from() {
         10,
         None,
         None,
+        None,
         Some("2026-03-01T00:00:00"),
         false,
     )
@@ -268,6 +273,7 @@ fn supersede_closes_old_valid_to_at_new_valid_from() {
         10,
         None,
         None,
+        None,
         Some("2026-07-20T00:00:00"),
         false,
     )
@@ -280,7 +286,7 @@ fn supersede_closes_old_valid_to_at_new_valid_from() {
     );
 
     // include_superseded=true → 两版均可见（历史不被丢弃）
-    let r_all = hybrid_search(&engine.pool, "工作", ns, 10, None, None, None, true).unwrap();
+    let r_all = hybrid_search(&engine.pool, "工作", ns, 10, None, None, None, None, true).unwrap();
     let c_all: Vec<String> = r_all.iter().map(|r| r.content.clone()).collect();
     assert!(has(&c_all, "A 公司"), "include_superseded=true 应看到 A 公司");
     assert!(has(&c_all, "B 公司"), "include_superseded=true 应看到 B 公司");
@@ -326,6 +332,7 @@ fn valid_to_open_ended_default() {
         10,
         None,
         None,
+        None,
         Some("2026-07-12T00:00:00"),
         false,
     )
@@ -343,6 +350,7 @@ fn valid_to_open_ended_default() {
         "长期有效",
         ns,
         10,
+        None,
         None,
         None,
         Some("2076-01-01T00:00:00"),

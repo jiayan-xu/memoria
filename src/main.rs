@@ -250,6 +250,18 @@ fn main() {
     }
     println!("[Memoria] HNSW vectors: {}", hnsw.len());
 
+    // V1（2026-08-12）：HyPE 假设问句索引（独立实例，memory_hype_vectors 为权威源）。
+    // 空表 → 空索引 → semantic_search 双路退化单路，行为与未启用一致（向后兼容）。
+    let hype_hnsw = memoria_core::vector::HnswIndex::new();
+    if let Err(e) =
+        memoria_core::vector::persist::rebuild_hype_hnsw_from_store(&pool, &hype_hnsw)
+    {
+        eprintln!("[Memoria] WARN: HYPE HNSW rebuild from memory_hype_vectors: {}", e);
+    }
+    if hype_hnsw.len() > 0 {
+        println!("[Memoria] HYPE HNSW vectors: {}", hype_hnsw.len());
+    }
+
     // ── P0: 启动健康检查 ──
     println!("[Memoria] Running startup health check...");
     let emb_url = std::env::var("MEMORIA_EMBEDDING_URL").unwrap_or_default();
@@ -285,6 +297,7 @@ fn main() {
         pool,
         auth_pool,
         hnsw: Arc::new(hnsw),
+        hype_hnsw: Arc::new(hype_hnsw),
         hnsw_status: hnsw_status.to_string(),
         query_cache: Arc::new(memoria_core::vector::QueryCache::new()),
         admin_key,

@@ -1,0 +1,183 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+V1（2026-08-12）：HyPE 假设问句补嵌脚本（A/B 验证用）。
+
+对 golden set（eval/hyde_queries.json）的记忆生成「假设问句」并嵌入，写入
+memory_hype_vectors 表（与 memory_vectors 平行）。semantic_search 双路合并后
+可验证 HyPE 是否提升 recall（论文：IEEE Access 2025, +42pp precision）。
+
+关键纪律：
+- **绝不用 golden 的 query 作为假设问句**（那是评测集，直接用了 = 数据泄漏/作弊）。
+  假设问句由 LLM 独立生成（模拟「用户会怎么问」），与 golden query 措辞不同。
+- 生成失败/嵌入失败 → 跳过该条（记日志），不中断、不伪造。
+- 幂等：已存在 id 的 hype 向量会 UPDATE（重跑安全）。
+- 只写新表，不动 memory_vectors / memories / HNSW 内容索引。
+
+用法：
+  python tools/offline/build_hype_vectors.py            # 默认 golden set 58 条
+  python tools/offline/build_hype_vectors.py --limit 10 # 只处理前 10 条（调试）
+  python tools/offline/build_hype_vectors.py --all      # 全库 5339 条（验证通过后）
+环境：SILICONFLOW_API_KEY（.env 或环境变量）；复用 embed_server 的 chat/embed 通道。
+"""
+import os
+import sys
+import json
+import time
+import sqlite3
+import urllib.request
+import argparse
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+REPO = os.path.normpath(os.path.join(HERE, "..", ".."))
+DB = os.environ.get(
+    "MEMORIA_DB_PATH",
+    os.path.join(os.path.dirname(REPO), "memoria", "data", "memoria.db"),
+)
+GOLDEN = os.path.join(REPO, "eval", "hyde_queries.json")
+ENV = os.path.join(os.path.dirname(REPO), "memoria", ".env")
+
+EMBED_URL = os.environ.get("MEMORIA_EMBEDDING_URL", "http://127.0.0.1:8777/embed")
+CHAT_URL = os.environ.get(
+    "SILICONFLOW_CHAT_URL", "https://api.siliconflow.cn/v1/chat/completions"
+)
+CHAT_MODEL = os.environ.get("MEMORIA_HYDE_MODEL", "Qwen/Qwen2.5-7B-Instruct")
+
+
+def get_secret(name, path):
+    try:
+        for line in open(path, encoding="utf-8-sig"):
+            line = line.strip()
+            if line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            if k.strip() == name:
+                return v.strip().strip('"').strip("'")
+    except FileNotFoundError:
+        pass
+    return None
+
+
+SF_KEY = os.environ.get("SILICONFLOW_API_KEY", "") or get_secret("SILICONFLOW_API_KEY", ENV) or ""
+
+
+def generate_question(content: str) -> str:
+    """LLM 生成「用户会怎么问才能找到这条记忆」的假设问句（与 golden query 独立）。"""
+    sys_prompt = (
+        "你是一个记忆检索优化器。给定一条知识库中的事实/记忆文本，请写一句"
+        "「用户将来会怎么提问来检索这条信息」的自然问句。要求：\n"
+        "1) 用口语化、自然的方式提问，不要照搬原文措辞；\n"
+        "2) 问句要具体，能通过这条记忆回答；\n"
+        "3) 只输出这一句问句，不要解释、不要引号、不要编号。\n"
+        "若原文明显不可检索（纯代码/乱码），输出空字符串。"
+    )
+    body = {
+        "model": CHAT_MODEL,
+        "messages": [
+            {"role": "system", "content": sys_prompt},
+            {"role": "user", "content": content},
+        ],
+        "max_tokens": 120,
+        "temperature": 0.7,
+        "stream": False,
+    }
+    headers = {"Authorization": f"Bearer {SF_KEY}", "Content-Type": "application/json"}
+    for attempt in range(3):
+        try:
+            req = urllib.request.Request(
+                CHAT_URL, data=json.dumps(body).encode(), headers=headers, method="POST"
+            )
+            with urllib.request.urlopen(req, timeout=30) as r:
+                resp = json.loads(r.read().decode())
+            return resp["choices"][0]["message"]["content"].strip().strip('"').strip("'")
+        except Exception as e:
+            if attempt == 2:
+                print(f"  [warn] chat 失败: {e}")
+                return ""
+            time.sleep(min(2 ** attempt, 10))
+    return ""
+
+
+def embed(texts):
+    """调本地 embed_server（siliconflow Qwen3-VL-8B），返回 (vectors, dim)。"""
+    body = {"texts": texts, "normalize": False}
+    req = urllib.request.Request(
+        EMBED_URL, data=json.dumps(body).encode(), headers={"Content-Type": "application/json"}, method="POST"
+    )
+    with urllib.request.urlopen(req, timeout=60) as r:
+        resp = json.loads(r.read().decode())
+    return resp["embeddings"], resp.get("dim", 1024)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--limit", type=int, default=None, help="只处理前 N 条")
+    ap.add_argument("--all", action="store_true", help="全库补嵌（验证通过后）")
+    ap.add_argument("--db", default=DB)
+    ap.add_argument("--dry-run", action="store_true", help="只生成问句不写库")
+    args = ap.parse_args()
+
+    if not SF_KEY:
+        print("错误: SILICONFLOW_API_KEY 未配置（.env 或环境变量）")
+        sys.exit(1)
+
+    # ── 目标记忆列表 ──
+    if args.all:
+        con = sqlite3.connect(args.db)
+        rows = con.execute(
+            "SELECT id, content FROM memories WHERE namespace='agent/xujiayan' "
+            "AND superseded_by IS NULL AND length(content) BETWEEN 10 AND 500"
+        ).fetchall()
+        con.close()
+        targets = [(mid, c) for mid, c in rows]
+        print(f"全库目标: {len(targets)} 条")
+    else:
+        d = json.load(open(GOLDEN, encoding="utf-8"))
+        targets = [(it["id"], it["content"]) for it in d["items"]]
+        print(f"golden 目标: {len(targets)} 条")
+
+    if args.limit:
+        targets = targets[: args.limit]
+
+    con = sqlite3.connect(args.db)
+    ok = skip = fail = 0
+    for i, (mid, content) in enumerate(targets, 1):
+        q = generate_question(content)
+        if not q or len(q) < 6:
+            print(f"[{i}/{len(targets)}] {mid[:8]} 问句生成失败/过短，跳过")
+            skip += 1
+            continue
+        try:
+            vecs, dim = embed([q])
+            v = vecs[0]
+        except Exception as e:
+            print(f"[{i}/{len(targets)}] {mid[:8]} 嵌入失败: {e}")
+            fail += 1
+            continue
+        if len(v) != 1024:
+            print(f"[{i}/{len(targets)}] {mid[:8]} 维度异常 {len(v)}≠1024，跳过")
+            fail += 1
+            continue
+        if args.dry_run:
+            print(f"[{i}/{len(targets)}] {mid[:8]} [dry] 问句: {q[:60]}")
+            ok += 1
+            continue
+        import struct
+
+        blob = struct.pack(f"<{len(v)}f", *v)
+        con.execute(
+            "INSERT OR REPLACE INTO memory_hype_vectors (id, namespace, question, vector, updated_at) "
+            "VALUES (?, 'agent/xujiayan', ?, ?, datetime('now'))",
+            (mid, q, blob),
+        )
+        con.commit()
+        ok += 1
+        if i % 10 == 0:
+            print(f"  ...{i}/{len(targets)}")
+
+    con.close()
+    print(f"\n完成: 写入 {ok} / 跳过 {skip} / 失败 {fail}")
+
+
+if __name__ == "__main__":
+    main()
