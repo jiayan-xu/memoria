@@ -272,14 +272,15 @@ fn probe_bin(bin: &str, budget: std::time::Duration) -> bool {
             }
             Ok(None) => {}
             Err(_) => {
-                let _ = child.kill();
-                let _ = child.wait();
+                // #R29（第29轮 bug/low）：kill 后的阻塞 `child.wait()` 无界——子进程若停在
+                // 不可杀状态（uninterruptible sleep）会挂死整个测试套件，违背"所有探测必有界"
+                // 不变式。用 `kill_then_wait_bounded`：kill 后轮询 try_wait 短窗口，超时放弃。
+                kill_then_wait_bounded(&mut child);
                 return false;
             }
         }
         if std::time::Instant::now() > deadline {
-            let _ = child.kill();
-            let _ = child.wait();
+            kill_then_wait_bounded(&mut child);
             return false;
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
@@ -290,10 +291,20 @@ fn probe_bin(bin: &str, budget: std::time::Duration) -> bool {
     // description**（同一文件偏移）。子进程写 `--help` 输出后共享偏移已在 EOF，直接
     // `read_to_end` 读到 0 字节 → 身份校验恒失败、所有候选被拒 → find_bin 判不可用 →
     // REQUIRE=1 下 panic（Linux/macOS 集测全红）。读前必须把父句柄 seek 回 0。
+    // #R29（第29轮 maintainability/low）：seek/read 的 I/O 错误不再 `let _ =` 静默吞掉——
+    // 若读取失败（杀软暂持文件/瞬时磁盘错误），out 为空、身份校验失败、健康二进制被误判
+    // 不可用（spurious SKIP / REQUIRE=1 假 panic），正是文件放宽 PROBE_TIMEOUT 要避免的
+    // 假拒绝模式。记录诊断（含原始 I/O 错误），让原因可排查而非隐形。
     use std::io::{Read, Seek, SeekFrom};
-    let _ = out_file.as_file().seek(SeekFrom::Start(0));
+    if let Err(e) = out_file.as_file().seek(SeekFrom::Start(0)) {
+        eprintln!("WARN: seek probe stdout of {bin:?} failed: {e}");
+        return false;
+    }
     let mut out = Vec::new();
-    let _ = out_file.as_file().read_to_end(&mut out);
+    if let Err(e) = out_file.as_file().read_to_end(&mut out) {
+        eprintln!("WARN: read probe stdout of {bin:?} failed: {e}");
+        return false;
+    }
     let text = String::from_utf8_lossy(&out);
     let lower = text.to_ascii_lowercase();
     if !lower.contains("open-ontologies") {
@@ -303,6 +314,26 @@ fn probe_bin(bin: &str, budget: std::time::Duration) -> bool {
         return false;
     }
     true
+}
+
+/// kill 后**有界**等待子进程回收（#R29 第29轮 bug/low）。
+/// 阻塞 `child.wait()` 无界：子进程停在不可杀状态（uninterruptible sleep 等）时会挂死调用方，
+/// 违背本文件"所有探测必有界/子进程必须超时"不变式。kill 后轮询 `try_wait` 短窗口（500ms），
+/// 超时则放弃等待（子进程随后自行退出或由 OS 回收；不阻塞测试）。
+fn kill_then_wait_bounded(child: &mut std::process::Child) {
+    let _ = child.kill();
+    let wait_deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return,
+            Ok(None) => {}
+            Err(_) => return,
+        }
+        if std::time::Instant::now() > wait_deadline {
+            return; // 不可杀状态：放弃等待，不阻塞测试
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
 }
 
 /// RAII 临时目录守卫（#1 第12轮 security/low）：改用 `tempfile::TempDir`——随机名 + O_EXCL
