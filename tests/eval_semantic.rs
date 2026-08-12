@@ -157,7 +157,7 @@ async fn memory_eval_semantic() {
         let start = Instant::now();
         let results = hybrid_search(
             &pool, q, ns, k,
-            Some(&engine.hnsw), Some(&engine.query_cache), None, false,
+            Some(&engine.hnsw), Some(&engine.hype_hnsw), Some(&engine.query_cache), None, false,
         )
         .unwrap_or_default();
         latencies.push(start.elapsed().as_secs_f64() * 1000.0);
@@ -222,7 +222,7 @@ async fn memory_eval_semantic() {
         }
         let results = hybrid_search(
             &pool, pq, ns, k,
-            Some(&engine.hnsw), Some(&engine.query_cache), None, false,
+            Some(&engine.hnsw), Some(&engine.hype_hnsw), Some(&engine.query_cache), None, false,
         )
         .unwrap_or_default();
         let result_ids: Vec<&str> = results.iter().map(|r| r.memory_id.as_str()).collect();

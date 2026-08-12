@@ -46,7 +46,7 @@ fn occurred_from_tags_distinct_from_mentioned() {
     .expect("remember");
 
     let ctx: Value =
-        memory_context(&engine.pool, None, None, &ns, Some("Alpha 启动"), 3, true, 12, 15, None)
+        memory_context(&engine.pool, None, None, None, &ns, Some("Alpha 启动"), 3, true, 12, 15, None)
             .expect("context");
     let recall = ctx["recall"].as_array().expect("recall array");
     assert!(!recall.is_empty(), "recall 不应为空");
@@ -98,6 +98,7 @@ fn entities_empty_without_mentions() {
         None,
         None,
         None,
+        None,
         false,
     )
     .expect("search");
@@ -136,6 +137,7 @@ fn occurred_falls_back_to_valid_from_without_tag() {
 
     let ctx: Value = memory_context(
         &engine.pool,
+        None,
         None,
         None,
         &ns,
@@ -204,6 +206,7 @@ fn prompt_block_compatible() {
     .expect("remember");
     let ctx: Value = memory_context(
         &engine.pool,
+        None,
         None,
         None,
         &ns,

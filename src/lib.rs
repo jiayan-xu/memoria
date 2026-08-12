@@ -25,6 +25,9 @@ pub struct MemoriaEngine {
     pub db_path: String,
     pub pool: Arc<SqlitePool>,
     pub hnsw: HnswIndex,
+    /// V1（2026-08-12）：HyPE 假设问句向量索引（可选）。由 memory_hype_vectors 表重建，
+    /// semantic_search 双路合并（取 max）。空索引=功能未启用，检索退化为单路内容向量。
+    pub hype_hnsw: HnswIndex,
     pub query_cache: QueryCache,
 }
 
@@ -72,10 +75,21 @@ impl MemoriaEngine {
             eprintln!("HNSW rebuild from memory_vectors: {}", e);
         }
 
+        // V1（2026-08-12）：HyPE 问句向量索引（独立实例，memory_hype_vectors 为权威源）。
+        // 表为空 → 索引空 → semantic_search 双路退化单路，行为与未启用一致（向后兼容）。
+        let hype_hnsw = HnswIndex::new();
+        if let Err(e) = vector::persist::rebuild_hype_hnsw_from_store(&pool, &hype_hnsw) {
+            eprintln!("HYPE HNSW rebuild from memory_hype_vectors: {}", e);
+        }
+        if hype_hnsw.len() > 0 {
+            println!("[Memoria] HYPE HNSW vectors: {}", hype_hnsw.len());
+        }
+
         Ok(Self {
             db_path: db_path.to_string(),
             pool: Arc::new(pool),
             hnsw,
+            hype_hnsw,
             query_cache: QueryCache::new(),
         })
     }
@@ -95,6 +109,7 @@ impl MemoriaEngine {
             namespace,
             max_results,
             Some(&self.hnsw),
+            Some(&self.hype_hnsw),
             Some(&self.query_cache),
             None,
             include_superseded,

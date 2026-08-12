@@ -46,7 +46,7 @@ fn ledger_includes_text_signals() {
   .expect("remember");
 
   let ctx: Value =
-    memory_context(&engine.pool, None, None, &ns, Some("120 吨 应急"), 5, true, 8, 8, None)
+    memory_context(&engine.pool, None, None, None, &ns, Some("120 吨 应急"), 5, true, 8, 8, None)
       .expect("context");
   let recall = ctx["recall"].as_array().expect("recall");
   assert!(!recall.is_empty(), "应有 recall");
@@ -117,7 +117,7 @@ fn search_boosts_on_numeric_query_overlap() {
   .expect("b");
   let mid_a = a.id.clone();
 
-  let fused = hybrid_search(&engine.pool, "120 吨", &ns, 10, None, None, None, false)
+  let fused = hybrid_search(&engine.pool, "120 吨", &ns, 10, None, None, None, None, false)
     .expect("search");
   assert!(!fused.is_empty());
   let top = &fused[0];
@@ -154,7 +154,7 @@ fn relative_date_in_ledger_signals() {
   .expect("remember");
 
   let ctx: Value =
-    memory_context(&engine.pool, None, None, &ns, Some("上周三 异常"), 5, true, 8, 8, None)
+    memory_context(&engine.pool, None, None, None, &ns, Some("上周三 异常"), 5, true, 8, 8, None)
       .expect("context");
   let row = &ctx["recall"].as_array().expect("recall")[0];
   let dates = row["text_signals"]["dates"].as_array().expect("dates");
@@ -197,7 +197,7 @@ fn text_signals_rerank_env_off() {
   unsafe {
     std::env::set_var("MEMORIA_TEXT_SIGNALS_RERANK", "0");
   }
-  let fused = hybrid_search(&engine.pool, "999", &ns, 5, None, None, None, false).expect("s");
+  let fused = hybrid_search(&engine.pool, "999", &ns, 5, None, None, None, None, false).expect("s");
   unsafe {
     std::env::remove_var("MEMORIA_TEXT_SIGNALS_RERANK");
   }
@@ -248,7 +248,7 @@ fn signal_tags_persisted_on_remember() {
   assert!(tags.contains("occurred:2026-07-12"));
 
   let ctx: Value =
-    memory_context(&engine.pool, None, None, &ns, Some("120 吨"), 5, true, 8, 8, None)
+    memory_context(&engine.pool, None, None, None, &ns, Some("120 吨"), 5, true, 8, 8, None)
       .expect("context");
   let row = &ctx["recall"].as_array().expect("recall")[0];
   let nums = row["text_signals"]["numbers"].as_array().expect("numbers");

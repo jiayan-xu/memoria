@@ -88,7 +88,7 @@ fn explicit_supersede_stamps_valid_to_and_hides_by_default() {
     assert!(row.1.is_some(), "方案 A：A.valid_to 必须已 stamp（非 NULL）");
 
     // 默认检索（include_superseded=false）：不返回旧记忆 A，返回新记忆 B
-    let def = hybrid_search(&engine.pool, "地址", ns, 10, None, None, None, false).unwrap();
+    let def = hybrid_search(&engine.pool, "地址", ns, 10, None, None, None, None, false).unwrap();
     let c_def = contents_of(&def);
     assert!(
         c_def.iter().any(|c| c.contains("上海")),
@@ -100,7 +100,7 @@ fn explicit_supersede_stamps_valid_to_and_hides_by_default() {
     );
 
     // include_superseded=true：旧记忆 A 也应出现（调试/链展开）
-    let inc = hybrid_search(&engine.pool, "地址", ns, 10, None, None, None, true).unwrap();
+    let inc = hybrid_search(&engine.pool, "地址", ns, 10, None, None, None, None, true).unwrap();
     let c_inc = contents_of(&inc);
     assert!(
         c_inc.iter().any(|c| c.contains("北京")),

@@ -12,19 +12,20 @@ use std::collections::{HashMap, HashSet};
 ///
 /// `pool` 用于按调用者 namespace 回查 `memories` 表，过滤 HNSW 全局索引返回的跨租户记忆
 /// （B2 修复：HNSW 无 namespace 维度，原实现完全忽略 ns 导致跨租户记忆泄露）。
+///
+/// `hype_hnsw`（V1 2026-08-12）：HyPE 假设问句索引（可选）。传入时双路搜索——同一 query
+/// 向量分别匹配「内容向量」（hnsw）与「问句向量」（hype_hnsw），按 memory_id 取两路
+/// cosine 最大值合并。问句向量与 query 同为「问句式」表达，缩小措辞 gap（IEEE Access
+/// 2025 HyPE）。两路结果分别过 ns 过滤后合并；任一索引缺失则退化为单路。
 pub fn semantic_search(
     query: &str,
     namespace: &str,
     limit: u32,
     hnsw: Option<&HnswIndex>,
+    hype_hnsw: Option<&HnswIndex>,
     query_cache: Option<&QueryCache>,
     pool: Option<&SqlitePool>,
 ) -> Result<Vec<SignalResult>, String> {
-    let hnsw = match hnsw {
-        Some(h) => h,
-        None => return Ok(vec![]),
-    };
-
     let cache = match query_cache {
         Some(c) => c,
         None => return Ok(vec![]),
@@ -44,25 +45,55 @@ pub fn semantic_search(
         return Ok(vec![]);
     }
 
-    // Search HNSW index.
-    // 关键修复（2026-07-26）：HNSW 是全局索引、无 namespace 维度（语义检索 B2 修复说明）。
-    // 若直接按 limit(=primary_limit) 取「全局 top-k」再按 ns 过滤，跨 ns 向量会占满名额，
-    // 导致目标 ns 内排名靠前（但全局排名靠后）的 gold 被砍掉 → 语义漏召（实测 ~67%）。
-    // 故先按远大于 limit 的窗口过取全局候选，再按 ns 过滤，保证目标 ns 拿到足够语义候选。
-    let cap = hnsw.len();
-    let overfetch = (limit as usize)
-        .saturating_mul(20)
-        .max(2048)
-        .min(cap.max(1));
-    let results = hnsw.search_with_ef(&vector, overfetch, overfetch)?;
-    if results.is_empty() {
+    // 收集两路候选：content 路（hnsw）+ hype 路（hype_hnsw），按 memory_id 合并取 max。
+    // HNSW 是全局索引、无 namespace 维度（语义检索 B2 修复说明）：
+    // 先按远大于 limit 的窗口过取全局候选，再按 ns 过滤，保证目标 ns 拿到足够语义候选。
+    let mut best: HashMap<String, f64> = HashMap::new(); // memory_id -> max cosine
+    if let Some(h) = hnsw {
+        let cap = h.len();
+        let overfetch = (limit as usize)
+            .saturating_mul(20)
+            .max(2048)
+            .min(cap.max(1));
+        if let Ok(results) = h.search_with_ef(&vector, overfetch, overfetch) {
+            for (memory_id, distance) in results {
+                let score = 1.0 - distance as f64;
+                if score.is_finite() && score > 0.0 {
+                    let e = best.entry(memory_id).or_insert(0.0);
+                    if score > *e {
+                        *e = score;
+                    }
+                }
+            }
+        }
+    }
+    if let Some(h) = hype_hnsw {
+        let cap = h.len();
+        let overfetch = (limit as usize)
+            .saturating_mul(20)
+            .max(2048)
+            .min(cap.max(1));
+        if let Ok(results) = h.search_with_ef(&vector, overfetch, overfetch) {
+            for (memory_id, distance) in results {
+                let score = 1.0 - distance as f64;
+                if score.is_finite() && score > 0.0 {
+                    let e = best.entry(memory_id).or_insert(0.0);
+                    if score > *e {
+                        *e = score;
+                    }
+                }
+            }
+        }
+    }
+    if best.is_empty() {
         return Ok(vec![]);
     }
 
     // HNSW 是全局索引，无 namespace 维度。按调用者 ns 回查 memories 表，
     // 仅保留归属当前 ns 的记忆，杜绝跨租户泄露。无 pool 时无法过滤，保守返回空。
+    let ids: Vec<&String> = best.keys().collect();
     let allowed: HashSet<String> = match pool {
-        Some(p) => match lookup_namespaces(p, &results) {
+        Some(p) => match lookup_namespaces(p, &ids) {
             Ok(map) => map
                 .into_iter()
                 .filter(|(_, ns)| ns == namespace)
@@ -72,10 +103,8 @@ pub fn semantic_search(
         },
         None => return Ok(vec![]),
     };
-
-    let mut out = Vec::with_capacity(allowed.len());
     if allowed.is_empty() {
-        return Ok(out);
+        return Ok(vec![]);
     }
 
     // P3-0 修复：语义结果此前 content 恒为空（只带 memory_id），
@@ -103,20 +132,20 @@ pub fn semantic_search(
         }
     }
 
-    for (memory_id, distance) in results {
-        let score = 1.0 - distance; // Convert cosine distance to similarity
-        // P0 防御：丢弃非有限 / 非正的分数。零向量在 DistCosine 下 distance≈0 → score≈1.0，
-        // 会伪造「完美匹配」污染召回；add() 已拦截退化向量入索引，此处为双保险。
-        if score.is_finite() && score > 0.0 && allowed.contains(&memory_id) {
-            let content = contents.get(&memory_id).cloned().unwrap_or_default();
+    let mut out: Vec<SignalResult> = Vec::with_capacity(allowed.len());
+    for memory_id in &allowed {
+        if let Some(score) = best.get(memory_id) {
+            let content = contents.get(memory_id).cloned().unwrap_or_default();
             out.push(SignalResult {
-                memory_id,
+                memory_id: memory_id.clone(),
                 content,
-                score: score as f64,
+                score: *score,
                 source: "hnsw_semantic".to_string(),
             });
         }
     }
+    // 按合并后分数降序（保持原语义：语义通道按相似度排序进入融合）。
+    out.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
     // 恢复「每通道贡献 limit 条」设计：过取后按 ns 过滤，再截断到本 ns 内 top-limit，
     // 避免把上千条跨 ns 候选灌进融合（既保平衡，又确保 gold 在正确的本 ns top 内）。
     out.truncate(limit as usize);
@@ -126,10 +155,10 @@ pub fn semantic_search(
 /// 批量回查 memory_id 的 namespace（单条 IN 查询，避免 N+1）。
 fn lookup_namespaces(
     pool: &SqlitePool,
-    results: &[(String, f32)],
+    results: &[&String],
 ) -> Result<HashMap<String, String>, String> {
     let conn = pool.get().map_err(|e| format!("pool: {}", e))?;
-    let ids: Vec<&String> = results.iter().map(|(id, _)| id).collect();
+    let ids: Vec<&String> = results.iter().map(|s| *s).collect();
     let placeholders = vec!["?"; ids.len()].join(",");
     let sql = format!(
         "SELECT id, namespace FROM memories WHERE id IN ({})",

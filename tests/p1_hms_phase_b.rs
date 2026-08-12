@@ -76,7 +76,7 @@ fn ledger_entities_empty_without_mentions() {
   .expect("remember");
 
   let ctx: Value =
-    memory_context(&engine.pool, None, None, &ns, Some("普通事实"), 3, true, 12, 15, None)
+    memory_context(&engine.pool, None, None, None, &ns, Some("普通事实"), 3, true, 12, 15, None)
       .expect("context");
   let row = &ctx["recall"].as_array().expect("recall")[0];
   assert_eq!(row["entities"].as_array().map(|a| a.len()).unwrap_or(99), 0);
@@ -128,7 +128,7 @@ fn ledger_entities_join_when_mentions_exist() {
   );
 
   let ctx: Value =
-    memory_context(&engine.pool, None, None, &ns, Some("Alpha 试点"), 5, true, 12, 15, None)
+    memory_context(&engine.pool, None, None, None, &ns, Some("Alpha 试点"), 5, true, 12, 15, None)
       .expect("context");
   let recall = ctx["recall"].as_array().expect("recall");
   assert!(!recall.is_empty());
@@ -221,7 +221,7 @@ fn cooccur_rerank_boosts_query_entity_hit() {
     "资源",
   );
 
-  let fused = hybrid_search(&engine.pool, "Alpha 试点", &ns, 10, None, None, None, false)
+  let fused = hybrid_search(&engine.pool, "Alpha 试点", &ns, 10, None, None, None, None, false)
     .expect("search");
   assert!(!fused.is_empty());
   let hit_a = fused.iter().find(|r| r.memory_id == mid_a);
@@ -299,7 +299,7 @@ fn pattern_conflict_uses_supersede_not_delete() {
     .unwrap();
   assert_eq!(sup.as_deref(), Some(new.id.as_str()));
 
-  let inc = hybrid_search(&engine.pool, "周末", &ns, 10, None, None, None, true).expect("all");
+  let inc = hybrid_search(&engine.pool, "周末", &ns, 10, None, None, None, None, true).expect("all");
   assert!(
     inc.iter().any(|r| r.memory_id == old_id),
     "include_superseded=true 应见到旧 pattern"
@@ -339,7 +339,7 @@ fn enrich_ledger_join_matches_context() {
     "ledger",
   );
 
-  let fused = hybrid_search(&engine.pool, "ledger JOIN", &ns, 5, None, None, None, false)
+  let fused = hybrid_search(&engine.pool, "ledger JOIN", &ns, 5, None, None, None, None, false)
     .expect("search");
   let ledger = enrich_ledger(&engine.pool, &ns, &fused);
   let row = ledger

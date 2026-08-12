@@ -185,7 +185,7 @@ fn pending_evolution_flag_annotated_in_search() {
     let id = remember(&engine.pool, "可演化的关键事实：公司主营固废处理", ns);
 
     // 未演化：检索应标 pending_evolution=true
-    let before = hybrid_search(&engine.pool, "固废处理", ns, 10, None, None, None, false).unwrap();
+    let before = hybrid_search(&engine.pool, "固废处理", ns, 10, None, None, None, None, false).unwrap();
     let hit = before.iter().find(|r| r.memory_id == id).expect("should find memory");
     assert!(hit.pending_evolution, "未演化记忆应标 pending_evolution=true");
     assert!(hit.evolved_at.is_none(), "未演化记忆 evolved_at 应为 NULL");
@@ -201,7 +201,7 @@ fn pending_evolution_flag_annotated_in_search() {
         "context_update",
     )
     .expect("evolve");
-    let after = hybrid_search(&engine.pool, "固废处理", ns, 10, None, None, None, false).unwrap();
+    let after = hybrid_search(&engine.pool, "固废处理", ns, 10, None, None, None, None, false).unwrap();
     let hit2 = after.iter().find(|r| r.memory_id == id).expect("should find memory after evolve");
     assert!(!hit2.pending_evolution, "演化后记忆应标 pending_evolution=false");
     assert!(hit2.evolved_at.is_some(), "演化后 evolved_at 应非空");
