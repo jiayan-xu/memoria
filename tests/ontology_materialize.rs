@@ -285,7 +285,13 @@ fn probe_bin(bin: &str, budget: std::time::Duration) -> bool {
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
     // 进程已退出：读临时文件内容校验身份（文件读有界，不依赖管道 EOF）。
-    use std::io::Read;
+    // #R28（第28轮 bug/high）：`tempfile::NamedTempFile::reopen()` 在 Unix 是 `dup()`——父进程
+    // 的 out_file、传给子进程的 out_handle、子进程继承的 stdout fd 共享**同一 open file
+    // description**（同一文件偏移）。子进程写 `--help` 输出后共享偏移已在 EOF，直接
+    // `read_to_end` 读到 0 字节 → 身份校验恒失败、所有候选被拒 → find_bin 判不可用 →
+    // REQUIRE=1 下 panic（Linux/macOS 集测全红）。读前必须把父句柄 seek 回 0。
+    use std::io::{Read, Seek, SeekFrom};
+    let _ = out_file.as_file().seek(SeekFrom::Start(0));
     let mut out = Vec::new();
     let _ = out_file.as_file().read_to_end(&mut out);
     let text = String::from_utf8_lossy(&out);
