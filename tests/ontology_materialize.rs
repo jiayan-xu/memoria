@@ -44,13 +44,21 @@ const DATA_TTL: &str = r#"@prefix : <http://memoria.ai/onto/> .
 ///   路径被 PATH 上另一个二进制掩盖，让套件假绿通过而不跑真实物化。
 /// - FAIL OPEN 关闭：`REQUIRE_ONTOLOGIES_BIN=1` 时找不到二进制直接 panic（CI 硬要求），而非
 ///   静默 skip——防止 CI 上"测试绿了但实际没跑真实物化"的假绿通过门禁。
+/// - #R30（第30轮 performance/medium）：结果用 `OnceLock` 缓存（`find_bin_cached`）——`cargo
+///   test` 并发跑多个 materialize 测试，每个测试若独立执行完整发现（PATH 扫描 + spawn --help
+///   探测，单次预算可达 10s），loaded runner 上一个探测超时另一个成功会产生不一致的 per-test
+///   结果（spurious SKIP / REQUIRE=1 假 panic）。全进程共享一次发现 + 探测，结果确定。
 fn find_bin() -> Option<String> {
     // REQUIRE_ONTOLOGIES_BIN 接受常见真值（1/true/yes/on）；空/"0"/"false"/"no"/"off" 视为未要求；
     // **任何已设置的其它值都视为要求**（fail-closed）——CI typo（"ture"）或尾随空格若静默当 unset
     // 会让"找不到二进制就 panic"的门禁悄悄失效、套件静默 skip（防假绿工具自身成了假绿源）。
     // 用 var_os + lossy 区分"未设置"(None) 与"设为非 UTF-8 值"(Some)——后者按 fail-closed 处理，
     // 与下方 OPEN_ONTOLOGIES_BIN 的 var_os 检测语义一致。
-    let require = match std::env::var_os("REQUIRE_ONTOLOGIES_BIN") {
+    // #R30（第30轮 other/low）：保留**原始观测值**（非仅 require 布尔）供下方 panic 消息插值——
+    // unrecognized 值（typo "ture"、尾随空格 "true "）同样走 require 路径，若消息硬编码 "=1" 会
+    // 误导排查（CI 实际是因 typo 失败却报成 "1"）。
+    let require_raw = std::env::var_os("REQUIRE_ONTOLOGIES_BIN");
+    let require = match &require_raw {
         None => false,
         Some(v) => {
             let t = v.to_string_lossy().trim().to_ascii_lowercase();
@@ -86,12 +94,36 @@ fn find_bin() -> Option<String> {
         );
     }
     if found.is_none() && require {
+        // #R30（第30轮 other/low）：消息插值**实际观测值**（require_raw 的 lossy 形式），
+        // 而非硬编码 "=1"——CI 因 typo（"ture"）失败时，报真实值才能定位根因。
+        let shown = require_raw
+            .as_deref()
+            .map(|v| v.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "1".to_string());
         panic!(
-            "REQUIRE_ONTOLOGIES_BIN=1 but open-ontologies binary not found \
-             (set OPEN_ONTOLOGIES_BIN or ensure it's on PATH)"
+            "REQUIRE_ONTOLOGIES_BIN={:?} but open-ontologies binary not found \
+             (set OPEN_ONTOLOGIES_BIN or ensure it's on PATH)",
+            shown
         );
     }
     found
+}
+
+/// 进程级缓存：二进制发现结果全进程共享一次（#R30 第30轮 performance/medium）。
+/// `cargo test` 并发跑多个 materialize 测试，各自独立执行完整发现（PATH 扫描 + spawn --help
+/// 探测，单次预算可达 10s）会产生不一致结果（一个探测超时另一个成功 → spurious SKIP / 假
+/// panic）。OnceLock 保证首个调用执行完整探测，后续调用直接复用——探测次数从 N 降到 1。
+/// 注意：REQUIRE=1 且找不到时 find_bin 会 panic（fail-closed），因此缓存里不会存"本应失败"
+/// 的 None；正常路径下缓存值确定。
+static CACHED_BIN: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+
+fn find_bin_cached() -> Option<String> {
+    CACHED_BIN
+        .get_or_init(|| {
+            // OnceLock 初始化闭包内 panic 会传播给首个调用者（REQUIRE=1 fail-closed 语义保持）。
+            find_bin()
+        })
+        .clone()
 }
 
 fn locate_bin(env_bin: &Option<std::ffi::OsString>) -> Option<String> {
@@ -255,6 +287,9 @@ fn probe_bin(bin: &str, budget: std::time::Duration) -> bool {
         .arg("--help")
         .stdout(std::process::Stdio::from(out_handle))
         .stderr(std::process::Stdio::null())
+        // #R30（第30轮 other/low）：stdin 置 null——候选的 --help 若读 stdin 会阻塞到探测
+        // deadline，徒增扫描延迟（最多 10s/坏候选）。与 stdout/stderr 的丢弃处理对称。
+        .stdin(std::process::Stdio::null())
         .spawn()
     {
         Ok(c) => c,
@@ -305,11 +340,18 @@ fn probe_bin(bin: &str, budget: std::time::Duration) -> bool {
         eprintln!("WARN: read probe stdout of {bin:?} failed: {e}");
         return false;
     }
+    // #R30（第30轮 performance/low）：--help 输出可能任意大（异常/误认的二进制），全量嵌入
+    // eprintln 诊断会耗尽内存并刷爆 CI 日志。只保留前 64KB 作身份判定 + 诊断前缀截断。
+    if out.len() > 64 * 1024 {
+        out.truncate(64 * 1024);
+    }
     let text = String::from_utf8_lossy(&out);
     let lower = text.to_ascii_lowercase();
     if !lower.contains("open-ontologies") {
+        // 诊断只打固定前缀（前 256 字节），避免未知二进制刷屏/注入换行混淆日志。
+        let diag: String = text.chars().take(256).collect();
         eprintln!(
-            "WARN: candidate binary {bin:?} --help output lacks 'open-ontologies' identity: {text:?}"
+            "WARN: candidate binary {bin:?} --help output lacks 'open-ontologies' identity: {diag:?}"
         );
         return false;
     }
@@ -354,7 +396,8 @@ fn temp_dir(tag: &str) -> tempfile::TempDir {
 fn setup_bin_and_fixtures(
     tag: &str,
 ) -> Option<(tempfile::TempDir, OntologyConfig, std::path::PathBuf)> {
-    let bin = find_bin()?; // 缺失则 None → 调用方 SKIP
+    // #R30（第30轮 performance/medium）：走进程级缓存，避免每个测试独立重复完整二进制发现。
+    let bin = find_bin_cached()?; // 缺失则 None → 调用方 SKIP
     let guard = temp_dir(tag);
     let dir = guard.path().to_path_buf();
     let schema = dir.join("schema.ttl");
