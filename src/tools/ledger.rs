@@ -74,7 +74,10 @@ pub fn merge_occurred_tag(tags_json: &str, occurred_tag: &str) -> String {
 /// 内（get(..10) None）均返回 None——短串或畸形值不进入 ledger 的 occurred 字段
 /// （下游 extract_text_signals 日期解析与 YYYY-MM-DD 约定不一致时会产生脏数据），
 /// 由调用方 valid_from 兜底。此路径曾是 `&s[..10]` 切片 panic 点（#R58）。
-pub fn legacy_occurred(legacy_et: &str) -> Option<String> {
+/// #R62 maintainability/low：校验为**分隔符级**（字节 4/7 == '-'，与 parse_occurred_tag
+/// 一致）——"2024-13-99" 之类数字非法但分隔符正确的串仍会通过（信号日期是字符串
+/// 比较而非解析，影响有限）；完整数字校验留待需要时。
+pub(crate) fn legacy_occurred(legacy_et: &str) -> Option<String> {
     if legacy_et.is_empty() {
         return None;
     }

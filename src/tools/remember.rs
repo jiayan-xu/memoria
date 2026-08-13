@@ -325,12 +325,13 @@ pub fn remember_with_dedup(
                     // #R61 maintainability/medium：**失败可见**——向量持久化/HNSW
                     // add 失败时记忆行照常提交、语义召回静默降级（此前的 let _
                     // 丢弃让 I/O 错误/BUSY 无痕）；失败属低频异常，直接 eprintln。
+                    // #R62 maintainability/low：**失败短路**——put 失败后不再 add
+                    // （否则向量只存内存、重启重建后消失——内存/持久态发散）。
                     if let Err(e) =
                         crate::vector::persist::put_stored_vector(pool, &mem_id, namespace, qv)
                     {
                         eprintln!("[remember] put_stored_vector failed for {mem_id}: {e}");
-                    }
-                    if let Err(e) = hnsw_idx.add(&[VectorEntry {
+                    } else if let Err(e) = hnsw_idx.add(&[VectorEntry {
                         id: mem_id.clone(),
                         vector: qv.clone(),
                     }]) {

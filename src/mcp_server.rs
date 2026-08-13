@@ -3231,6 +3231,14 @@ mod tests {
             (sem_cos - 1.0).abs() < 1e-3,
             "expected hype-road sem_cos ≈ 1.0, got {sem_cos}: {out}"
         );
+        // #R62 test/low：**归因断言补回**（注释声称的 attribution 覆盖要真实存在）——
+        // source 含 hype 作为辅助证据（顺序/分词依赖已在上方注释说明；归因回归
+        // 如恒标 content 路会在此红）。
+        let src = v["results"][0]["source"].as_str().unwrap_or("");
+        assert!(
+            src.contains("hype"),
+            "expected hype-road attribution, got source={src}: {out}"
+        );
     }
 
     fn build_test_state() -> Arc<AppState> {

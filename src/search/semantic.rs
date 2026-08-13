@@ -14,6 +14,7 @@ use std::collections::HashMap;
 /// query / 硬失败批等**不同** DB 故障合并一 key（并发异因互相压制）。枚举使 key
 /// 派生结构化为 match，错误消息可任意改写而不影响分类。
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum SemanticError {
     /// 查询向量维度 ≠ HNSW DIM（嵌入模型/配置漂移）
     QueryDim(usize),
@@ -50,6 +51,21 @@ impl std::fmt::Display for SemanticError {
 // 空 impl（无 source 链）使其可用于 Box<dyn Error>/anyhow/thiserror 等泛型错误
 // 处理代码。
 impl std::error::Error for SemanticError {}
+
+/// #R62 maintainability/low：**语义信号丢弃累计计数**——hybrid 每次 drop 语义通道
+/// 时递增；db_stats 暴露该计数，使持续降级（索引损坏/DB 故障）可被监控/健康检查
+/// 感知（stderr 冷却行对 MCP/Python 调用方不可见）。
+pub(crate) fn bump_semantic_drops() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static DROPS: AtomicU64 = AtomicU64::new(0);
+    DROPS.fetch_add(1, Ordering::Relaxed);
+}
+
+pub(crate) fn semantic_drop_count() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static DROPS: AtomicU64 = AtomicU64::new(0);
+    DROPS.load(Ordering::Relaxed)
+}
 
 /// 60s 冷却的 eprintln（#R50/#R51 maintainability/low）：语义检索路径多处诊断日志
 /// （road fail / degraded / fetch 批级 / stale 汇总 / hybrid drop）此前各自实现
@@ -402,9 +418,22 @@ fn fetch_memories_batch(
         let mut got = 0usize;
         // #R48 performance/low：连接**每批重新获取**——跨整循环持有会在并发搜索时
         // 把连接钉住 ~9 次往返时长，小池场景加剧耗尽（耗尽即整通道 Err）。
-        let conn = pool
-            .get()
-            .map_err(|e| format!("semantic fetch pool: {}", e))?;
+        // #R62 maintainability/low：pool 耗尽也走**统一聚合**（此前 `?` 直返绕过
+        // hard_failed_batches 汇总与 stale 汇总——与 #R47/#R61 的"所有基础设施
+        // 失败都进汇总 Err"契约不一致）。
+        let conn = match pool.get() {
+            Ok(c) => c,
+            Err(e) => {
+                if first_hard_err.is_none() {
+                    first_hard_err = Some(format!("pool: {e}"));
+                }
+                throttled_eprintln("fetch_pool", || {
+                    format!("pool get failed (batch {} ids): {}", chunk.len(), e)
+                });
+                hard_failed = true;
+                break;
+            }
+        };
         match conn.prepare(&sql) {
             Ok(mut stmt) => match stmt.query_map(
                 rusqlite::params_from_iter(
@@ -448,6 +477,14 @@ fn fetch_memories_batch(
                     // 比较请求数；含 stale 的混合批不升级——漏判但安全（#R48 承认）。
                     if got == 0 && row_errors > 0 {
                         if row_errors == chunk.len() {
+                            if first_hard_err.is_none() {
+                                // 行映射错误的文本在 Err(e) 分支可见——用行级 e 的
+                                // 内容不直接可得（循环外），记录类别级说明。
+                                first_hard_err = Some(format!(
+                                    "systematic column drift (all {} returned rows failed mapping)",
+                                    chunk.len()
+                                ));
+                            }
                             throttled_eprintln("fetch_systemic", || {
                                 format!(
                                     "all {} requested ids returned rows and ALL failed mapping (systematic column drift)",
