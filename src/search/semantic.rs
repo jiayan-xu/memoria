@@ -25,8 +25,6 @@ pub enum SemanticError {
     RoadsFailed,
     /// memories 回查硬失败（pool/prepare/query/整批硬失败）
     Fetch(String),
-    /// 其他未分类故障
-    Other(String),
 }
 
 impl std::fmt::Display for SemanticError {
@@ -44,7 +42,6 @@ impl std::fmt::Display for SemanticError {
                 )
             }
             SemanticError::Fetch(m) => write!(f, "semantic_search: memories fetch failed: {m}"),
-            SemanticError::Other(m) => write!(f, "semantic_search: {m}"),
         }
     }
 }
@@ -240,7 +237,7 @@ pub fn semantic_search(
     // #R48 performance/medium：ns 过滤推入 SQL（见 fetch_memories_batch doc）——
     // 返回行已属当前 ns，输出循环无需再判 ns。
     // #R53 performance/low：rows 容量由 fetch_memories_batch 内部按 ids.len() 预分配。
-    let mut rows: HashMap<String, (String, Option<String>)> = match pool {
+    let mut rows: HashMap<String, Option<String>> = match pool {
         Some(p) => fetch_memories_batch(p, &ids, namespace).map_err(SemanticError::Fetch)?,
         None => return Ok(vec![]),
     };
@@ -251,7 +248,8 @@ pub fn semantic_search(
         // 删除/失败行）在此直接跳过——正文缺失的命中若进入融合会被 rrf_merge 以空
         // 正文锁定（P3-0），不返回候选只损失召回、不污染正文。此前 `unwrap_or_default`
         // 兜底在此**不可达**（死默认掩盖了 P3-0 不变量），已删除。
-        let Some((_ns, content)) = rows.remove(*memory_id) else {
+        // #R58 performance/low：行元组已去 namespace（SQL 过滤保证），直接解构。
+        let Some(content) = rows.remove(*memory_id) else {
             continue;
         };
         // NULL content = 合法数据态，召回损失（剔 id）——与映射失败区分（#R42）。
@@ -370,7 +368,10 @@ fn fetch_memories_batch(
     pool: &SqlitePool,
     ids: &[&str],
     namespace: &str,
-) -> Result<HashMap<String, (String, Option<String>)>, String> {
+) -> Result<HashMap<String, Option<String>>, String> {
+    // #R58 performance/low：SQL 已按 namespace 过滤（AND namespace = ?），返回行的
+    // namespace 恒等于请求值——SELECT 与返回元组中的 namespace 是**死数据**（调用方
+    // 立即丢弃 `let Some((_ns, content))`）。热路径每行少读一列、少包一层元组。
     const BATCH: usize = 500;
     // #R53 performance/low：容量 = ids.len()（上界已知，避免 growth/rehash）。
     let mut out = HashMap::with_capacity(ids.len());
@@ -389,7 +390,7 @@ fn fetch_memories_batch(
         batches_total += 1;
         let placeholders = vec!["?"; chunk.len()].join(",");
         let sql = format!(
-            "SELECT id, namespace, content FROM memories WHERE id IN ({}) AND namespace = ?",
+            "SELECT id, content FROM memories WHERE id IN ({}) AND namespace = ?",
             placeholders
         );
         let mut hard_failed = false;
@@ -409,18 +410,14 @@ fn fetch_memories_batch(
                 // NULL 是合法数据态（单独计数），不当作行映射错误（#R42 bug/high：
                 // 否则全 NULL 批被误判为列漂移硬失败，触发全批升级）。
                 |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, Option<String>>(2)?,
-                    ))
+                    Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
                 },
             ) {
                 Ok(rows) => {
                     for r in rows {
                         match r {
-                            Ok((id, ns, content)) => {
-                                out.insert(id, (ns, content));
+                            Ok((id, content)) => {
+                                out.insert(id, content);
                                 got += 1;
                             }
                             Err(e) => {

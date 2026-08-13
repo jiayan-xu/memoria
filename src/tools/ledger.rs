@@ -28,8 +28,14 @@ pub fn parse_occurred_tag(tags_json: &str) -> Option<String> {
         if let Some(rest) = s.strip_prefix("occurred:") {
             let date = rest.trim();
             // 宽松：YYYY-MM-DD 或带时间的前 10 字符
+            // #R58 bug/low：`date.len()` 是**字节数**——用户标签含多字节字符
+            // （如 occurred:💥💥💥，12 字节）时 `&date[..10]` 会在 UTF-8 字符中间
+            // 切片 panic（remember 路径传调用方标签，可达）。`get(..10)` 对越界与
+            // 非字符边界都返回 None，天然安全。
             if date.len() >= 10 {
-                let d = &date[..10];
+                let Some(d) = date.get(..10) else {
+                    continue;
+                };
                 if d.as_bytes().get(4) == Some(&b'-') && d.as_bytes().get(7) == Some(&b'-') {
                     return Some(d.to_string());
                 }
@@ -42,8 +48,12 @@ pub fn parse_occurred_tag(tags_json: &str) -> Option<String> {
 /// 若 `event_time` 参数（ISO）可抽出日期，生成 `occurred:YYYY-MM-DD` tag（写入过渡，不写列）。
 pub fn occurred_tag_from_iso(iso: &str) -> Option<String> {
     let s = iso.trim();
+    // #R58 bug/low：同 parse_occurred_tag——`&s[..10]` 在多字节 ISO 输入上可 panic，
+    // get(..10) 安全（越界/非边界返回 None）。
     if s.len() >= 10 {
-        let d = &s[..10];
+        let Some(d) = s.get(..10) else {
+            return None;
+        };
         if d.as_bytes().get(4) == Some(&b'-') && d.as_bytes().get(7) == Some(&b'-') {
             return Some(format!("occurred:{}", d));
         }
@@ -243,7 +253,12 @@ pub fn enrich_ledger(
                     if legacy_et.is_empty() {
                         None
                     } else if legacy_et.len() >= 10 {
-                        Some(legacy_et[..10].to_string())
+                        // #R58 bug/low：同 parse_occurred_tag——多字节旧列值切片 panic
+                        // 风险，get(..10) 安全；取不到前 10 字符时退整串。
+                        legacy_et
+                            .get(..10)
+                            .map(str::to_string)
+                            .or(Some(legacy_et.clone()))
                     } else {
                         Some(legacy_et)
                     }

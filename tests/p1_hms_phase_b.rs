@@ -40,10 +40,10 @@ fn seed_entity_mention(
     )
     .unwrap();
     conn.execute(
-    "INSERT INTO entity_mentions(entity_id, memory_id, context, namespace) VALUES(?1, ?2, ?3, ?4)",
-    params![entity_id, memory_id, context, ns],
-  )
-  .unwrap();
+        "INSERT INTO entity_mentions(entity_id, memory_id, context, namespace) VALUES(?1, ?2, ?3, ?4)",
+        params![entity_id, memory_id, context, ns],
+    )
+    .unwrap();
 }
 
 #[test]
