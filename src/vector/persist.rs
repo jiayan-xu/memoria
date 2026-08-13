@@ -61,21 +61,35 @@ pub fn put_hype_stored_vector(
     put_vector_into(pool, id, namespace, vector, "memory_hype_vectors")
 }
 
-/// 向量表描述符（#R37 maintainability/low）：表名 → 公开函数名 + 日志 label 的
-/// **单一事实源**。此前三处 match 各自硬编码同一组字符串字面量——新增第三张向量表需
-/// 同步改三处，漏改会导致错误前缀错配或 SQL 不匹配。收口为 descriptor 后，新增表只改
-/// 这里。
-///
-/// #R49 maintainability/low：**SQL 不再存于 descriptor**——两张表的 select/insert SQL
-/// 只差表名（复制粘贴正是 descriptor 要消除的漂移源：改一张表的 upsert 列集而忘改另
-/// 一张会静默分裂两条写入路径）。表名经白名单 lookup 校验（无注入面），SQL 由
-/// `select_sql(table)` / `insert_sql(table)` 单源构建，表名占位拼接使分歧不可能发生。
+/// #R49/#R56 maintainability/medium：**SQL 由宏单源构建**——两张表的 select/insert
+/// SQL 只差表名，此前两个手写 concat! 块近乎逐字重复（#R49 注释声称"单源构建
+/// 分歧不可能发生"但实现是手写双份——改一张表的 upsert 列集而忘改另一张会静默
+/// 分裂两条写入路径，正是 descriptor 要消除的漂移源）。宏以表名作 `concat!` 参数
+/// 生成全部 SQL 字段，**表名只出现一次**（每表一行宏调用），模板固定、无注入面
+/// （表名是字面量）、无运行时分配。
+macro_rules! vector_table {
+    ($table:literal, $fn_name:literal, $label:literal, $error_on_all_skipped:expr) => {
+        VectorTable {
+            table: $table,
+            insert_sql: concat!(
+                "INSERT INTO ", $table, " (id, namespace, vector, updated_at) ",
+                "VALUES (?, ?, ?, datetime('now')) ",
+                "ON CONFLICT(id) DO UPDATE SET vector=excluded.vector, ",
+                "namespace=excluded.namespace, updated_at=excluded.updated_at"
+            ),
+            select_sql: concat!("SELECT id, vector FROM ", $table, " ORDER BY id"),
+            fn_name: $fn_name,
+            label: $label,
+            error_on_all_skipped: $error_on_all_skipped,
+        }
+    };
+}
+
 struct VectorTable {
     table: &'static str,
     /// #R53 performance/low：**预构建 SQL**（concat! 编译期拼接）——此前 insert_sql/
-    /// select_sql 每次写入/重建都 format! 分配；且函数式表名插值只靠"调用方碰巧过
-    /// 白名单"保证安全。字段字面量消除每调用分配与未来 typo/注入面。两表 SQL 模板
-    /// 一致仅表名不同（列集已统一 4 列，#R52），concat! 保证模板编译期固定。
+    /// select_sql 每次写入/重建都 format! 分配。字段字面量消除每调用分配与未来
+    /// typo/注入面。
     insert_sql: &'static str,
     select_sql: &'static str,
     fn_name: &'static str,
@@ -90,32 +104,8 @@ struct VectorTable {
 
 fn vector_tables() -> &'static [VectorTable] {
     static TABLES: [VectorTable; 2] = [
-        VectorTable {
-            table: "memory_vectors",
-            insert_sql: concat!(
-                "INSERT INTO memory_vectors (id, namespace, vector, updated_at) ",
-                "VALUES (?, ?, ?, datetime('now')) ",
-                "ON CONFLICT(id) DO UPDATE SET vector=excluded.vector, ",
-                "namespace=excluded.namespace, updated_at=excluded.updated_at"
-            ),
-            select_sql: "SELECT id, vector FROM memory_vectors ORDER BY id",
-            fn_name: "put_stored_vector",
-            label: "content",
-            error_on_all_skipped: false,
-        },
-        VectorTable {
-            table: "memory_hype_vectors",
-            insert_sql: concat!(
-                "INSERT INTO memory_hype_vectors (id, namespace, vector, updated_at) ",
-                "VALUES (?, ?, ?, datetime('now')) ",
-                "ON CONFLICT(id) DO UPDATE SET vector=excluded.vector, ",
-                "namespace=excluded.namespace, updated_at=excluded.updated_at"
-            ),
-            select_sql: "SELECT id, vector FROM memory_hype_vectors ORDER BY id",
-            fn_name: "put_hype_stored_vector",
-            label: "hype",
-            error_on_all_skipped: true,
-        },
+        vector_table!("memory_vectors", "put_stored_vector", "content", false),
+        vector_table!("memory_hype_vectors", "put_hype_stored_vector", "hype", true),
     ];
     &TABLES
 }

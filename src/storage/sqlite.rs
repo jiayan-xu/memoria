@@ -602,6 +602,12 @@ fn is_busy(e: &rusqlite::Error) -> bool {
 /// 2067/2323/2579）。此前按 extended_code==2001 匹配永不命中——check-then-act
 /// 竞态下对端进程刚提交同一 ALTER 时本进程仍 panic（守卫形同虚设）。按
 /// Unknown 主码 + 消息判定，消息匹配"已应用"幂等处理。
+/// #R56 实证（驳斥"应匹配 ErrorCode::Error"的说法）：rusqlite 0.32.1 的 `ErrorCode`
+/// 是 libsqlite3-sys 0.28.0 的 re-export（rusqlite/src/lib.rs:79 `pub use
+/// crate::ffi::ErrorCode`），该枚举**没有 Error 变体**；`Error::new` 的 `_ =>`
+/// catch-all 分支把 SQLITE_ERROR(1)（未在 match 中显式列出）归入 `Unknown`
+/// （libsqlite3-sys-0.28.0/src/error.rs `impl Error::new`）。`ErrorCode::Error`
+/// 无法编译（变体不存在）。BEGIN IMMEDIATE 事务仍是主防线，本守卫只作窗口兜底。
 fn is_duplicate_column(e: &rusqlite::Error) -> bool {
     match e {
         rusqlite::Error::SqliteFailure(se, msg) => {
@@ -636,6 +642,18 @@ fn execute_batch_retry(
             }
             Err(e) => return Err(format!("{label}: {}", e)),
         }
+    }
+}
+
+/// #R56 bug/medium：可选表 DDL 的**软降级包装**——execute_batch_retry 的失败（含
+/// 重试耗尽后的非 busy 错误）只 WARN 不传播：调用方（migrate_hype_vectors →
+/// init_core_tables → main.rs/mcp_server.rs .expect()）硬失败会中止整个启动，
+/// 而这三张附加表缺失时核心功能不受影响（见调用处注释），下次启动重试即可。
+fn ddl_soft(conn: &rusqlite::Connection, sql: &str, label: &str) {
+    if let Err(e) = execute_batch_retry(conn, sql, label) {
+        eprintln!(
+            "[Memoria] WARN: {label} failed (soft-degraded, will retry next start): {e}"
+        );
     }
 }
 
@@ -735,7 +753,16 @@ pub fn migrate_hype_vectors(pool: &SqlitePool) -> Result<(), String> {
                     }
                     if let Err(e) = tx.commit() {
                         // #R55 bug/high：drop-guard 已消费，显式回滚防"带写锁还池"。
-                        let _ = conn.execute_batch("ROLLBACK");
+                        // #R56 bug/medium：**ROLLBACK 结果检查**——回滚也失败（同一
+                        // 磁盘压力下可能 IOERR）时连接仍带写锁还池（r2d2 无
+                        // test_on_check_out），后续查询静默跑在未提交事务内；把
+                        // 回滚失败并入错误消息升级传播，让"带锁还池"显式可见。
+                        if let Err(rb) = conn.execute_batch("ROLLBACK") {
+                            return Err((
+                                format!("commit updated_at tx: {e}; rollback also failed: {rb}"),
+                                None,
+                            ));
+                        }
                         return Err((format!("commit updated_at tx: {}", e), None));
                     }
                     Ok(())
@@ -760,7 +787,12 @@ pub fn migrate_hype_vectors(pool: &SqlitePool) -> Result<(), String> {
     // #R49 bug/medium：DDL 用 BUSY 退避重试（见 execute_batch_retry）——并发首启时
     // 另一进程持写锁可能让本进程 DDL 立即 SQLITE_BUSY，.expect 硬失败会 panic 中止
     // 部署。
-    execute_batch_retry(
+    // #R56 bug/medium：三张**可选/附加**表的 DDL **软降级**——非 busy 失败（SQLITE_
+    // FULL 磁盘满 / IOERR / 权限）经 `?` 传播到 init_core_tables 的 .expect() 会硬
+    // 中止启动，与本迁移其余分支（PRAGMA / 触发器重建 / 孤儿清理均软降级 + 下次
+    // 重试）不一致；核心 memories/memory_vectors 无此三张表仍可运行（hype rebuild
+    // 已有 or_default 兜底、flag 读取已有软处理）。失败 WARN + 下次启动重试。
+    ddl_soft(
         &conn,
         "CREATE TABLE IF NOT EXISTS memory_hype_vectors (
             id TEXT PRIMARY KEY,
@@ -770,23 +802,25 @@ pub fn migrate_hype_vectors(pool: &SqlitePool) -> Result<(), String> {
             updated_at TEXT DEFAULT (datetime('now'))
         )",
         "create memory_hype_vectors",
-    )?;
-    execute_batch_retry(
+    );
+    ddl_soft(
         &conn,
         "CREATE INDEX IF NOT EXISTS idx_hype_ns ON memory_hype_vectors(namespace)",
         "create idx_hype_ns",
-    )?;
+    );
     // migration_flags 表（先建——触发器版本门控与下方孤儿清理共用；key-value 语义
     // 隔离，不复用 health.rs 的 user_version 位（#R40 maintainability/low：位复用会
-    // 在"按版本号写 user_version"的未来路径上被静默清除或碰撞）。
-    execute_batch_retry(
+    // 在"按版本号写 user_version"的未来路径上被静默清除或碰撞）。软降级同
+    // memory_hype_vectors（#R56 bug/medium）：缺表时 flag 读取软处理为未置位、
+    // 触发器/清理段各自软降级，下次启动重试。
+    ddl_soft(
         &conn,
         "CREATE TABLE IF NOT EXISTS migration_flags (
             flag TEXT PRIMARY KEY,
             applied_at TEXT DEFAULT (datetime('now'))
         )",
         "create migration_flags",
-    )?;
+    );
 
     // 删除联动：memories 行删除时清理两个向量表。注意：memory_vectors 同样存在孤儿
     // 问题（历史行为），一并覆盖。
@@ -851,7 +885,11 @@ pub fn migrate_hype_vectors(pool: &SqlitePool) -> Result<(), String> {
                 // 显式 ROLLBACK 防"带写锁还池"（r2d2 无 test_on_check_out，后续查询
                 // 静默跑在未提交事务内、写锁不释放）。三处 commit
                 // （updated_at/trigger/cleanup）同款处理。
-                let _ = conn.execute_batch("ROLLBACK");
+                if let Err(rb) = conn.execute_batch("ROLLBACK") {
+                    return Err(format!(
+                        "commit trigger tx: {e}; rollback also failed: {rb} (connection may hold write lock)"
+                    ));
+                }
                 return Err(format!("commit trigger tx: {}", e));
             }
             Ok(())
@@ -949,9 +987,15 @@ pub fn migrate_hype_vectors(pool: &SqlitePool) -> Result<(), String> {
                 .map_err(|e| format!("begin cleanup tx: {}", e))?;
             // 事务内重读**两个完成 flag**（#R52 bug/medium：并发首启时对端进程可能在
             // 本进程 gate 检查后、BEGIN 生效前完成——任一完成即短路）。
-            // #R51 bug/high：force 时**不能短路**——force gate（force_cleanup &&
-            // clean_vectors）存在的唯一意义就是覆盖已置位标记；无条件 return 会让
-            // 逃生通道永久 no-op（refused 态一旦持久化即死局）。非 force 保留短路。
+            // #R56 bug/high：短路必须**两段 flag 都在**（`done2 == 2`）——`done2 > 0`
+            // 把"任一完成 flag 存在"当"两段都完成"，但 gate 进入恰恰因为至少一段未
+            // 完成。两个可达坏例：① refused 后状态为 HYPE_FLAG+REFUSED_FLAG（CLEANUP_
+            // FLAG 未置位），运维按 WARN 指引删除 refused 行后下次启动进入 gate
+            // （!already && !refused_done），done2==1 短路 no-op——memory_vectors 段
+            // 永不重评、恢复路径静默死；② 存量库已有 CLEANUP_FLAG 但无 HYPE_FLAG
+            // （升级/部分部署）：gate 经 !hype_done 进入，done2==1 短路——hype 段
+            // 永不执行、其 flag 永不置位，孤儿 hype 行每启动重入 HNSW 且每次启动
+            // 仍获取写锁 no-op。逐段 gate 自己的 flag 语义即 `done2 == 2`。
             let done2: i64 = tx
                 .query_row(
                     "SELECT COUNT(*) FROM migration_flags WHERE flag IN (?1, ?2)",
@@ -959,11 +1003,15 @@ pub fn migrate_hype_vectors(pool: &SqlitePool) -> Result<(), String> {
                     |r| r.get(0),
                 )
                 .map_err(|e| format!("check cleanup flags (tx): {}", e))?;
-            if done2 > 0 && !(force_cleanup && clean_vectors) {
+            if done2 == 2 && !(force_cleanup && clean_vectors) {
                 if let Err(e) = tx.commit() {
                     // #R55 bug/high：commit 失败 drop-guard 已消费——显式回滚防带
                     // 写锁还池（同 updated_at/trigger 段）。
-                    let _ = conn.execute_batch("ROLLBACK");
+                    if let Err(rb) = conn.execute_batch("ROLLBACK") {
+                        return Err(format!(
+                            "commit cleanup tx (noop): {e}; rollback also failed: {rb}"
+                        ));
+                    }
                     return Err(format!("commit cleanup tx (noop): {}", e));
                 }
                 return Ok(());
@@ -1140,7 +1188,11 @@ pub fn migrate_hype_vectors(pool: &SqlitePool) -> Result<(), String> {
             // **事务内语句失败**成立（`?` 提前返回）；commit 本身失败时 drop-guard
             // 已消费——显式 ROLLBACK 防"带写锁还池"（同 updated_at/trigger 段）。
             if let Err(e) = tx.commit() {
-                let _ = conn.execute_batch("ROLLBACK");
+                if let Err(rb) = conn.execute_batch("ROLLBACK") {
+                    return Err(format!(
+                        "commit cleanup tx: {e}; rollback also failed: {rb} (connection may hold write lock)"
+                    ));
+                }
                 return Err(format!("commit cleanup tx: {}", e));
             }
             Ok(())

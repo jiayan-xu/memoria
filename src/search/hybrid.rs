@@ -2,6 +2,7 @@
 //!
 //! 替代 lib.rs hybrid_search 和 mcp_server.rs 中各自维护的搜索逻辑。
 
+use crate::search::semantic::{SemanticError, throttled_eprintln};
 use crate::search::{self, FusedResult, SignalResult};
 use crate::storage::SqlitePool;
 use crate::vector::{HnswIndex, QueryCache};
@@ -91,24 +92,21 @@ pub fn hybrid_search(
                 // #R49 performance/low：Err 是持久故障（RwLock poisoning/DB 持续故障）
                 // 时每查询刷一行 → 60s 冷却（共享 helper，#R51：按 key 隔离，不同故障
                 // 原因不互相抑制——单一全局 static 会让一种持续故障压住并发故障）。
-                // #R54 maintainability/low：key 按**错误类别**派生——此 Err 分支汇合
-                // 多种原因（query 向量 dim 不符 / 全路 poisoned / fetch DB 故障），
-                // 单一字面 key 只按调用点隔离：一种持续故障（如 DB 中断）会重置
-                // 时间戳、把并发出现的另一种原因压制满 60s（恰是注释声称避免的
-                // 跨抑制）。按消息前缀分类到独立 key。
+                // #R56 maintainability/medium：key 按**结构化错误变体**派生——此前
+                // 子串匹配 String 错误文本（"query vector dim"/"all HNSW roads failed"/
+                // fetch 类），文案改动会静默把故障重新归类进 other 桶（跨抑制回归）；
+                // 且 DB 类把 pool get/prepare/query/硬失败批合并一 key（并发异因
+                // 互相压制）。枚举 match 对消息改写免疫；Fetch 内部各因仍共享
+                // 60s 冷却（DB 故障恢复前持续压制同类噪音可接受）。
                 Err(e) => {
                     let msg = format!("[hybrid] semantic signal dropped: {e}");
-                    let key: &'static str = if e.starts_with("semantic_search: query vector dim") {
-                        "hybrid_drop_dim"
-                    } else if e.contains("all HNSW roads failed") {
-                        "hybrid_drop_roads"
-                    } else if e.contains("fetch") || e.contains("pool") || e.contains("backfill")
-                    {
-                        "hybrid_drop_db"
-                    } else {
-                        "hybrid_drop_other"
+                    let key: &'static str = match &e {
+                        SemanticError::QueryDim(_) => "hybrid_drop_dim",
+                        SemanticError::RoadsFailed(_) => "hybrid_drop_roads",
+                        SemanticError::Fetch(_) => "hybrid_drop_db",
+                        SemanticError::Other(_) => "hybrid_drop_other",
                     };
-                    crate::search::semantic::throttled_eprintln(key, msg);
+                    throttled_eprintln(key, msg);
                 }
             }
         }

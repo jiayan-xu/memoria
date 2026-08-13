@@ -32,9 +32,15 @@ pub struct AppState {
     pub hnsw: Arc<memoria_core::vector::HnswIndex>,
     /// V1（2026-08-12）：HyPE 假设问句索引（独立实例，memory_hype_vectors 重建）。
     /// **限制（#R38 maintainability/low）**：仅进程启动时构建一次；运行时
-    /// memory_hype_vectors 被外部重灌（如重跑 build_hype_vectors.py）不会自动刷新——
-    /// 需重启进程，或手动调 `persist::rebuild_hype_hnsw_from_store(&state.pool, &state.hype_hnsw)`
-    /// 刷新（与 MemoriaEngine.hype_hnsw 的说明一致）。
+    /// memory_hype_vectors 被外部重灌（如重跑 build_hype_vectors.py）不会自动刷新。
+    /// #R56 documentation/low：**不要**用
+    /// `persist::rebuild_hype_hnsw_from_store(&state.pool, &state.hype_hnsw)` 做运行时
+    /// 刷新——该函数是 in-place 重建：HnswIndex::add 按 id 去重，已存在 id 的向量
+    /// 更新被**静默忽略**（只追加新 id），恰是重跑脚本（upsert 存量行）的场景，
+    /// 照做会误以为已刷新实则仍陈旧。且 `hype_hnsw` 是 `Arc<HnswIndex>`，
+    /// fresh-index swap（MemoriaEngine::refresh_hype_index 的模式）在此不可达。
+    /// 正确路径：**重启进程**（构造时全新构建），或经 Python bindings 调
+    /// `MemoriaEngine.refresh_hype_index()`（fresh build + swap，仅 standalone 形态）。
     pub hype_hnsw: Arc<memoria_core::vector::HnswIndex>,
     pub hnsw_status: String,
     pub query_cache: Arc<memoria_core::vector::QueryCache>,
