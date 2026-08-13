@@ -53,6 +53,9 @@ message pointing you to `memoria-open`.
 5. A safety `pre-push` hook ships in `.githooks/pre-push`. After cloning, run
    `git config core.hooksPath .githooks` to activate it. It blocks direct-to-main, wrong-remote,
    branch-deletion, and `.NO_PUSH` checkouts.
+6. **After opening a PR, poll CI in the foreground** (`gh pr checks --watch`). Do not end the
+   turn and leave "waiting for CI" to the user. Report immediately when green; if red, enter the
+   fix loop at once. See `docs/PR_PROCESS.md` §3.4.
 
 ## Build provenance (version carries git SHA)
 `build.rs` injects `MEMORIA_BUILD_VERSION = "<pkg>-g<short-sha>[-dirty]"` at compile time
