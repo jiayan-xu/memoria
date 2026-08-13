@@ -595,6 +595,18 @@ fn is_busy(e: &rusqlite::Error) -> bool {
     )
 }
 
+/// #R53 bug/high：`duplicate column name`（SQLITE_ERROR 19 的扩展码 2001）判定——
+/// check-then-act 竞态下对端进程刚提交同一 ALTER 时本进程 ALTER 报此错，按
+/// "已应用"幂等处理（不中止启动）。
+fn is_duplicate_column(e: &rusqlite::Error) -> bool {
+    match e {
+        rusqlite::Error::SqliteFailure(se, _) => {
+            se.extended_code == 2001 && se.code == rusqlite::ErrorCode::ConstraintViolation
+        }
+        _ => false,
+    }
+}
+
 fn execute_batch_retry(
     conn: &rusqlite::Connection,
     sql: &str,
@@ -625,35 +637,57 @@ fn execute_batch_retry(
 /// （web_api/mcp_server 的 DELETE 只删 memories，不碰向量表）。
 pub fn migrate_hype_vectors(pool: &SqlitePool) -> Result<(), String> {
     let mut conn = pool.get().map_err(|e| format!("pool get: {}", e))?;
-    // #R52 bug/low：存量库的 memory_vectors 可能缺 updated_at 列（旧 schema 无此列、
-    // 无历史 ALTER 迁移）——补齐后所有写入统一 4 列 upsert（当前 schema 部署的时间戳
-    // 不再因 3 列 upsert 陈旧；imp_exp 导出该列，陈旧时间戳会出现在导出数据里）。
-    // pragma_table_info 幂等；缺列才 ALTER（busy 退避重试）。
-    let has_upd: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM pragma_table_info('memory_vectors') WHERE name='updated_at'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap_or(0);
-    if has_upd == 0 {
-        execute_batch_retry(
-            &conn,
-            "ALTER TABLE memory_vectors ADD COLUMN updated_at TEXT DEFAULT (datetime('now'))",
-            "add memory_vectors.updated_at",
-        )?;
-        eprintln!("[Memoria] Migration: added memory_vectors.updated_at column");
-    }
-    // #R43 bug/medium：busy_timeout 必须在**本函数所有 DDL/写操作之前**设置——连接来自
-    // 池（create_pool 无 per-connection init），迁移可能拿到默认 busy_timeout=0 的连接，
-    // 上面的 CREATE TABLE/INDEX/TRIGGER 与 migration_flags DDL 在并发首启场景下会立即
-    // SQLITE_BUSY（本迁移正是为三进程并发首启设计的）。统一函数入口设置（幂等，覆盖
+    // #R43 bug/medium：busy_timeout 必须在**本函数所有 DDL/读-写操作之前**设置——
+    // 连接来自池（create_pool 无 per-connection init），迁移可能拿到默认
+    // busy_timeout=0 的连接；下方的 pragma_table_info 读与 ALTER/CREATE DDL 在
+    // 并发首启场景下会立即 SQLITE_BUSY（#R53 bug/medium：has_upd 读此前跑在
+    // busy_timeout=0 上，读失败被 unwrap_or(0) 掩蔽成"列缺失"→ 无端 ALTER →
+    // 竞态下 duplicate column name 中止启动）。统一函数入口设置（幂等，覆盖
     // 池连接状态）。
     // #R52 bug/medium：PRAGMA 失败**软处理**（WARN 后继续）——PRAGMA 本身不依赖表
     // 存在、失败仅极端场景（连接已坏），硬失败会让 .expect 中止部署；后续 DDL 仍有
     // execute_batch_retry 兜底 BUSY。
     if let Err(e) = conn.execute_batch("PRAGMA busy_timeout = 5000;") {
         eprintln!("[Memoria] WARN: set busy_timeout failed (continuing): {e}");
+    }
+    // #R52 bug/low：存量库的 memory_vectors 可能缺 updated_at 列（旧 schema 无此列、
+    // 无历史 ALTER 迁移）——补齐后所有写入统一 4 列 upsert（当前 schema 部署的时间戳
+    // 不再因 3 列 upsert 陈旧；imp_exp 导出该列，陈旧时间戳会出现在导出数据里）。
+    // #R53 bug/high：**check + ALTER 包进 BEGIN IMMEDIATE 事务**——pragma_table_info
+    // 读与 ALTER 分开执行存在 check-then-act 竞态：两进程同时见列缺失，第一个提交
+    // ALTER 后第二个报 `duplicate column name`（SQLITE_ERROR，is_busy 不重试）→
+    // .expect 中止启动。事务内重读（首个提交后看到列已存在 → noop 提交），且
+    // 读失败**传播**（事务内 BEGIN 已按 busy_timeout 等待写锁，读失败即真实 DB 问题，
+    // 不再 unwrap_or(0) 掩蔽成"列缺失"）。`duplicate column name` 另作"已应用"处理
+    // （对端刚提交的窗口，幂等语义）。
+    {
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|e| format!("begin updated_at tx: {}", e))?;
+        let has_upd: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('memory_vectors') WHERE name='updated_at'",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(|e| format!("check memory_vectors.updated_at: {}", e))?;
+        if has_upd == 0 {
+            if let Err(e) = tx.execute_batch(
+                "ALTER TABLE memory_vectors ADD COLUMN updated_at TEXT DEFAULT (datetime('now'))",
+            ) {
+                // #R53 bug/high：`duplicate column name` = 对端进程刚提交了同一 ALTER
+                // （并发首启窗口）——按"已应用"处理，不中止启动。
+                if is_duplicate_column(&e) {
+                    eprintln!("[Memoria] Migration: memory_vectors.updated_at added by peer process");
+                } else {
+                    return Err(format!("add memory_vectors.updated_at: {}", e));
+                }
+            } else {
+                eprintln!("[Memoria] Migration: added memory_vectors.updated_at column");
+            }
+        }
+        tx.commit()
+            .map_err(|e| format!("commit updated_at tx: {}", e))?;
     }
     // #R49 bug/medium：DDL 用 BUSY 退避重试（见 execute_batch_retry）——并发首启时
     // 另一进程持写锁可能让本进程 DDL 立即 SQLITE_BUSY，.expect 硬失败会 panic 中止

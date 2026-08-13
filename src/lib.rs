@@ -118,6 +118,10 @@ impl MemoriaEngine {
     /// 本方法**永不返回 Err**（签名误导）：调用方（Python bindings/运维工具）无法
     /// 程序化区分"刷新成功"与"降级空重建"，count==0 同时可能是"未启用"或"失败"。
     /// Err 路径真实可达：失败保留旧快照（检索不中断）并向调用方显式报错。
+    /// #R53 maintainability/low 已知取舍：要求 `&mut self`——`build_hype_hnsw` 全量
+    /// 重读+重索引表（大表秒级），Arc<Mutex> 宿主在刷新期间持锁会阻塞并发检索；
+    /// 理想形态是构建锁外进行、仅最终 swap O(1) 同步（hype_hnsw 换内部可变槽），
+    /// 留待后续。当前正确性优先，宿主错峰刷新即可。
     pub fn refresh_hype_index(&mut self) -> Result<usize, String> {
         let ef_search = vector::persist::resolve_ef_search();
         let (fresh, count) = match vector::persist::build_hype_hnsw(&self.pool, ef_search) {
@@ -323,6 +327,16 @@ mod python {
         fn db_stats(&self) -> PyResult<String> {
             self.inner
                 .db_stats()
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))
+        }
+        // #R53 maintainability/low：PyEngine 暴露 refresh_hype_index——方法本身要求
+        // &mut self（构建期间独占引擎，见 MemoriaEngine::refresh_hype_index 的注释；
+        // Arc<Mutex> 宿主在刷新期间持锁，秒级构建会阻塞并发检索——当前取舍：
+        // 正确性优先，宿主可错峰刷新）。此前该方法无任何调用点（doc 声称给
+        // Python bindings 用但未绑定），refresh 不可达。
+        fn refresh_hype_index(&mut self) -> PyResult<usize> {
+            self.inner
+                .refresh_hype_index()
                 .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))
         }
         fn add_vectors(&self, ids: Vec<String>, vectors: Vec<Vec<f32>>) -> PyResult<usize> {
