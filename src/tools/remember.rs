@@ -190,6 +190,54 @@ pub fn set_event_time(pool: &SqlitePool, memory_id: &str, event_time: &str) -> R
     Ok(())
 }
 
+/// #R65 maintainability/medium：**三路统一的向量持久化+索引 helper**——put 失败
+/// 短路 add（防 memory-only 向量）；semantic_related 边仅 put+add 都成功才建
+/// （无向量的记忆不该有图边）；add 失败记录并注明重启 rebuild 自愈。返回
+/// put+add 是否都成功（edge 门控）。此前三路复制粘贴的 if/else-if 链让门控
+/// 语义漂移（更新/superseded 路 edge 无条件），抽单点防未来只改一路。
+/// （#R65 插入位置修正：原插在 pub 与 fn 之间。）
+/// 短路 add（防 memory-only 向量）；semantic_related 边仅 put+add 都成功才建
+/// （无向量的记忆不该有图边）；add 失败记录并注明重启 rebuild 自愈。返回
+/// put+add 是否都成功（edge 门控）。此前三路复制粘贴的 if/else-if 链让门控
+/// 语义漂移（更新/superseded 路 edge 无条件），抽单点防未来只改一路。
+fn persist_and_index(
+    pool: &SqlitePool,
+    hnsw: &HnswIndex,
+    id: &str,
+    ns: &str,
+    qv: &[f32],
+) -> bool {
+    let put_ok = match crate::vector::persist::put_stored_vector(pool, id, ns, qv) {
+        Ok(()) => true,
+        Err(e) => {
+            eprintln!("[remember] put_stored_vector failed for {id}: {e}");
+            false
+        }
+    };
+    let add_ok = put_ok
+        && match hnsw.add(&[VectorEntry {
+            id: id.to_string(),
+            vector: qv.to_vec(),
+        }]) {
+            Ok(_) => true,
+            Err(e) => {
+                // put 成功 add 失败：向量已持久化但内存索引缺失；外层
+                // get_stored_vector 守卫会让后续 remember 跳过 add（发散到重启，
+                // #R65：长期运行服务可能持续缺失——重启 rebuild 对齐权威表自愈）。
+                eprintln!("[remember] hnsw add failed for {id}: {e} (index rebuild at next start reconciles)");
+                false
+            }
+        };
+    if add_ok {
+        if let Err(e) = crate::search::semantic_edges::upsert_semantic_edges_for(
+            pool, hnsw, id, ns, qv,
+        ) {
+            eprintln!("[remember] upsert_semantic_edges failed for {id}: {e}");
+        }
+    }
+    add_ok
+}
+
 /// 带近义重复检测的 remember
 ///
 /// `supersedes_id`：显式取代目标；与 INSERT 同事务，失败 ROLLBACK。
@@ -287,26 +335,9 @@ pub fn remember_with_dedup(
                         // #R63 maintainability/medium：**与 updated 路径同款失败
                         // 处理**——put 失败短路 add（瞬态 BUSY 留 memory-only 向量、
                         // 重启后消失）；失败可见（低频异常直接 eprintln）。
-                        if let Err(e) =
-                            crate::vector::persist::put_stored_vector(pool, &mem_id, namespace, qv)
-                        {
-                            eprintln!("[remember] put_stored_vector failed for {mem_id}: {e}");
-                        } else if let Err(e) = hnsw_idx.add(&[VectorEntry {
-                            id: mem_id.clone(),
-                            vector: qv.clone(),
-                        }]) {
-                            // #R63 bug/low：put 成功 add 失败——向量已持久化但内存
-                            // 索引缺失；外层 get_stored_vector 守卫会让后续 remember
-                            // 跳过 add（索引与持久态发散到重启）。记录后由下次启动
-                            // rebuild（.bin 不含该 id → 对齐权威表）自愈。
-                            eprintln!("[remember] hnsw add failed for {mem_id}: {e} (index rebuild at next start reconciles)");
-                        }
-                    }
-                    // 增量补 semantic_related 边（闭环 Phase 1b）
-                    if let Err(e) = crate::search::semantic_edges::upsert_semantic_edges_for(
-                        pool, hnsw_idx, &mem_id, namespace, qv,
-                    ) {
-                        eprintln!("[remember] upsert_semantic_edges failed for {mem_id}: {e}");
+                        // #R65：共享 helper（put 失败短路 / edge 门控统一，
+                        // 见 persist_and_index doc）。
+                        let _ = persist_and_index(pool, hnsw_idx, &mem_id, namespace, qv);
                     }
                 }
             }
@@ -340,22 +371,8 @@ pub fn remember_with_dedup(
                     // 丢弃让 I/O 错误/BUSY 无痕）；失败属低频异常，直接 eprintln。
                     // #R62 maintainability/low：**失败短路**——put 失败后不再 add
                     // （否则向量只存内存、重启重建后消失——内存/持久态发散）。
-                    if let Err(e) =
-                        crate::vector::persist::put_stored_vector(pool, &mem_id, namespace, qv)
-                    {
-                        eprintln!("[remember] put_stored_vector failed for {mem_id}: {e}");
-                    } else if let Err(e) = hnsw_idx.add(&[VectorEntry {
-                        id: mem_id.clone(),
-                        vector: qv.clone(),
-                    }]) {
-                        eprintln!("[remember] hnsw add failed for {mem_id}: {e}");
-                    }
-                }
-                // 增量补 semantic_related 边（闭环 Phase 1b）
-                if let Err(e) = crate::search::semantic_edges::upsert_semantic_edges_for(
-                    pool, hnsw_idx, &mem_id, namespace, qv,
-                ) {
-                    eprintln!("[remember] upsert_semantic_edges failed for {mem_id}: {e}");
+                    // #R65：共享 helper（put 失败短路 / edge 门控统一）。
+                    let _ = persist_and_index(pool, hnsw_idx, &mem_id, namespace, qv);
                 }
             }
         }
@@ -502,35 +519,8 @@ pub fn remember_with_dedup(
     // 图边，且失败可见）。
     if near_dup_enabled() {
         if let (Some(hnsw_idx), Some(qv)) = (hnsw, candidate_vector.as_ref()) {
-            let put_ok = match crate::vector::persist::put_stored_vector(pool, &mem_id, namespace, qv) {
-                Ok(()) => true,
-                Err(e) => {
-                    eprintln!("[remember] put_stored_vector failed for {mem_id}: {e}");
-                    false
-                }
-            };
-            let add_ok = put_ok
-                && match hnsw_idx.add(&[VectorEntry {
-                    id: mem_id.clone(),
-                    vector: qv.clone(),
-                }]) {
-                    Ok(_) => true,
-                    Err(e) => {
-                        // put 成功 add 失败：向量已持久化但内存索引缺失；外层
-                        // get_stored_vector 守卫会让后续 remember 跳过 add（发散
-                        // 到重启）；下次启动 rebuild 对齐权威表自愈。
-                        eprintln!("[remember] hnsw add failed for {mem_id}: {e} (index rebuild at next start reconciles)");
-                        false
-                    }
-                };
-            if add_ok {
-                // 增量补 semantic_related 边（闭环 Phase 1b）——仅 put+add 都成功。
-                if let Err(e) = crate::search::semantic_edges::upsert_semantic_edges_for(
-                    pool, hnsw_idx, &mem_id, namespace, qv,
-                ) {
-                    eprintln!("[remember] upsert_semantic_edges failed for {mem_id}: {e}");
-                }
-            }
+            // #R65：共享 helper（put 失败短路 / edge 门控统一）。
+            let _ = persist_and_index(pool, hnsw_idx, &mem_id, namespace, qv);
         }
     }
 

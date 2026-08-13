@@ -173,10 +173,13 @@ fn warn_throttled(fn_name: &str, reason: &str, msg: &str) {
     // （生产调用方 let _ 丢弃 Result，长时间运行中可观测性持续退化）。
     // 窗口翻转：赢者（compare_exchange 成功）把计数清零，随后自己的 fetch_add
     // 成为新窗口第 1 条；输者计数可能被清零吞掉 1 次（诊断计数近似，可接受）。
-    let epoch = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() / 60)
-        .unwrap_or(0);
+    // #R65 bug/medium：**单调时钟基准（OnceLock<Instant>）**——SystemTime 墙钟
+    // 前后跳会误翻转窗口（WARN 风暴）或让预算耗尽（聚合行失效）；与
+    // query_hype_count_cached（#R63）/semantic #R54 的 Instant 纪律一致。
+    use std::sync::OnceLock;
+    static CLOCK_BASE: OnceLock<std::time::Instant> = OnceLock::new();
+    let base = *CLOCK_BASE.get_or_init(std::time::Instant::now);
+    let epoch = base.elapsed().as_secs() / 60;
     let se = &SLOT_EPOCHS[(h as usize) % SLOT_EPOCHS.len()];
     let old_epoch = se.load(Ordering::Relaxed);
     if old_epoch != epoch
@@ -208,10 +211,20 @@ fn put_vector_into(
     vector: &[f32],
     table: &str,
 ) -> Result<(), String> {
-    let conn = pool.get().map_err(|e| format!("pool: {}", e))?;
+    // #R65 other/low：pool.get 失败也走 warn_throttled——生产 add_vectors 路径
+    // `let _ =` 丢弃 Result，池耗尽/连接获取失败的反复出现会完全静默（正是限流
+    // 要 surface 的系统性故障类）。
     let td =
         lookup_table(table).ok_or_else(|| format!("put_vector_into: unknown table {table}"))?;
     let fn_name = td.fn_name;
+    let conn = match pool.get() {
+        Ok(c) => c,
+        Err(e) => {
+            let msg = format!("{fn_name}: pool: {e}");
+            warn_throttled(fn_name, "pool", &msg);
+            return Err(msg);
+        }
+    };
     // P0 防御：拒绝退化（零 / 非有限）向量落库。历史嵌入失败的写入会在 memory_vectors
     // 留下全 0 向量，污染 HNSW 语义召回（零向量被 DistCosine 误判为完美匹配）。
     // 调用方均 `let _ =` 忽略返回值，故记忆仍照常写入、仅缺语义向量（退化为 keyword-only）。
@@ -396,8 +409,17 @@ fn rebuild_from_table(pool: &SqlitePool, hnsw: &HnswIndex, table: &str) -> Resul
             hnsw.len()
         ));
     }
-    let conn = pool.get().map_err(|e| format!("pool: {}", e))?;
     let label = td.label;
+    // #R65 other/low：pool.get 失败也走 warn_throttled（rebuild 路径用 label 作
+    // 槽前缀——与写路径 fn_name 语义一致）。
+    let conn = match pool.get() {
+        Ok(c) => c,
+        Err(e) => {
+            let msg = format!("{label}: pool: {e}");
+            warn_throttled(label, "pool", &msg);
+            return Err(msg);
+        }
+    };
     let mut stmt = conn
         .prepare(td.select_sql)
         .map_err(|e| format!("prepare {}: {}", label, e))?;

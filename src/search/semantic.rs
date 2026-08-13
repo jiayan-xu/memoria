@@ -336,7 +336,10 @@ fn search_and_merge(
             for (memory_id, distance) in results {
                 let score = 1.0 - distance as f64;
                 if score.is_finite() && score > 0.0 {
-                    let e = best.entry(memory_id).or_insert((0.0, label));
+                    // #R65 maintainability/low：**直接插真实值**——score > 0.0 过滤
+                    // 保证新条目 score 必 > 0.0，or_insert((0.0, label)) 的默认
+                    // 恒被覆盖（死默认营造"fallback 归因"假象）。
+                    let e = best.entry(memory_id).or_insert((score, label));
                     if score > e.0 {
                         *e = (score, label);
                     }
@@ -521,7 +524,11 @@ fn fetch_memories_batch(
                                 )
                             });
                             hard_failed = true;
-                        } else {
+                        } else if !hard_failed {
+                            // #R65 other/low：**迭代级硬失败时不打 "rest stale"**——
+                            // 连接级故障（BUSY/IOERR）打断循环后未读行从未被获取，
+                            // 标 stale 是删除滞后误归因；硬失败已由 fetch_iterator
+                            // + Err 传播。
                             throttled_eprintln("fetch_mixed", || {
                                 format!(
                                     "batch of {} ids: {row_errors} row(s) failed mapping, 0 ok (row drops only; rest stale)",

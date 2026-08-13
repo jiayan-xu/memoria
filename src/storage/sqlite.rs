@@ -1197,14 +1197,29 @@ pub fn migrate_hype_vectors(pool: &SqlitePool) -> Result<(), String> {
                 )
                 .map_err(|e| format!("check hype flag (tx): {}", e))?;
             if hype_done2 == 0 || (force_cleanup && clean_vectors) {
-                let h_exists: i64 = tx
+                // #R65 bug/medium：**表存在检查先行**——hype 表 DDL 是 ddl_soft（可
+                // 软降级缺表），直接 query 会 no such table 中止整个清理事务
+                // （vec 段被连带，与触发器段的缺表保护一致）。
+                let h_tbl: i64 = tx
                     .query_row(
-                        "SELECT EXISTS(SELECT 1 FROM memory_hype_vectors LIMIT 1)",
+                        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='memory_hype_vectors'",
                         [],
                         |r| r.get(0),
                     )
-                    .map_err(|e| format!("check memory_hype_vectors exists: {}", e))?;
-                if h_exists > 0 {
+                    .map_err(|e| format!("check memory_hype_vectors table: {}", e))?;
+                if h_tbl == 0 {
+                    eprintln!(
+                        "[Memoria] WARN: memory_hype_vectors absent (DDL soft-degraded); skipping hype orphan segment"
+                    );
+                } else {
+                    let h_exists: i64 = tx
+                        .query_row(
+                            "SELECT EXISTS(SELECT 1 FROM memory_hype_vectors LIMIT 1)",
+                            [],
+                            |r| r.get(0),
+                        )
+                        .map_err(|e| format!("check memory_hype_vectors rows: {}", e))?;
+                    if h_exists > 0 {
                     let orphans_hype: i64 = tx
                         .query_row(
                             "SELECT COUNT(*) FROM memory_hype_vectors \
@@ -1265,11 +1280,12 @@ pub fn migrate_hype_vectors(pool: &SqlitePool) -> Result<(), String> {
                 // #R57 bug/low：hype 拒绝态**只由 HYPE_FLAG 记录**（不再写
                 // REFUSED_FLAG——该 flag 语义 = memory_vectors 段拒绝，混用会让
                 // vec 段干净完成也被标记拒绝、下次启动 WARN 误导归因）。
-                tx.execute(
-                    "INSERT OR IGNORE INTO migration_flags (flag) VALUES (?1)",
-                    rusqlite::params![HYPE_FLAG],
-                )
-                .map_err(|e| format!("set hype flag: {}", e))?;
+                    tx.execute(
+                        "INSERT OR IGNORE INTO migration_flags (flag) VALUES (?1)",
+                        rusqlite::params![HYPE_FLAG],
+                    )
+                    .map_err(|e| format!("set hype flag: {}", e))?;
+                }
             }
             // ── memory_vectors 段 ──
             // #R48 bug/high（数据安全）：**孤儿 COUNT 必须有**——DELETE 无差别销毁
@@ -1361,6 +1377,16 @@ pub fn migrate_hype_vectors(pool: &SqlitePool) -> Result<(), String> {
                     rusqlite::params![REFUSED_FLAG],
                 )
                 .map_err(|e| format!("set refused flag: {}", e))?;
+                // #R65 bug/medium：**拒绝时清 CLEANUP_FLAG**——升级路径（存量库已
+                // 有 CLEANUP_FLAG、gate 经 !hype_done 进入）上 vec 段拒绝会双 flag
+                // 并存：下次启动 gate `!already && !refused_done` 恒 false，删除
+                // refused 行的逃生通道失效（只剩双 env force）；两 flag 互斥，
+                // refused 记录 = 重新评估机会（#R49/#R55 语义）。
+                tx.execute(
+                    "DELETE FROM migration_flags WHERE flag = ?1",
+                    rusqlite::params![CLEANUP_FLAG],
+                )
+                .map_err(|e| format!("clear cleanup flag on refuse: {}", e))?;
             } else {
                 tx.execute(
                     "DELETE FROM migration_flags WHERE flag = ?1",

@@ -151,7 +151,11 @@ impl MemoriaEngine {
         }
         let count = fresh.len();
         self.hype_hnsw = fresh;
-        eprintln!("[Memoria] HYPE HNSW refreshed: {} vectors", count);
+        // #R65 maintainability/low：count==0 不打印（构造路径同款纪律 #R58——
+        // 空表周期刷新刷屏）。
+        if count > 0 {
+            eprintln!("[Memoria] HYPE HNSW refreshed: {} vectors", count);
+        }
     }
 
     pub fn refresh_hype_index(&mut self) -> Result<usize, String> {
@@ -163,6 +167,8 @@ impl MemoriaEngine {
             }
         };
         // 仅构建成功才替换；失败保留旧快照，检索不中断。
+        // #R65 bug/medium：pending 槽的失效由 PyEngine::refresh_hype_index 处理
+        // （字段属 PyEngine——两阶段 build/swap 与一步 refresh 不得混用，见其 doc）。
         self.swap_hype_index(fresh, count);
         Ok(count)
     }
@@ -344,21 +350,49 @@ fn query_hype_count_cached(conn: &rusqlite::Connection, db_path: &str) -> i64 {
     // （进程内多个 :memory: 引擎各自独立库却共享键 "…memory…"）：A 填充的 count
     // 会被 B 读到（降级检测启发 store>0 && live==0 被污染）。文件路径删除重建
     // 同路径 30s 内的陈旧也一并规避（直接查成本可接受）。
-    if db_path.starts_with(":memory:") || db_path.starts_with("file:") && db_path.contains("mode=memory") {
+    // #R65 style/low：显式括号（A || (B && C) 依赖 Rust 优先级易误读）；注释不夸大
+    // （文件路径删除重建的 30s 陈旧仍由缓存路径承担——此分支只覆盖内存标识）。
+    if db_path.starts_with(":memory:")
+        || (db_path.starts_with("file:") && db_path.contains("mode=memory"))
+    {
+        // #R65 maintainability/low：:memory: 分支 WARN 也走 60s 冷却（轮询刷屏
+        // 与缓存路径同款纪律）。
         return match conn.query_row("SELECT COUNT(*) FROM memory_hype_vectors", [], |r| {
             r.get::<_, i64>(0)
         }) {
             Ok(c) => c,
             Err(e) => {
-                eprintln!(
-                    "[Memoria] WARN: hype_vector_index_size query failed (db {db_path}): {e}"
-                );
+                let now = Instant::now();
+                let mut fe = FAIL_EPOCHS.lock().unwrap_or_else(|p| p.into_inner());
+                let fmap = fe.get_or_insert_with(HashMap::new);
+                let last = fmap.get(db_path).copied();
+                let due = match last {
+                    Some(at) => now.saturating_duration_since(at).as_secs() >= 60,
+                    None => true,
+                };
+                if due {
+                    fmap.insert(db_path.to_string(), now);
+                    drop(fe);
+                    eprintln!(
+                        "[Memoria] WARN: hype_vector_index_size query failed (db {db_path}): {e}"
+                    );
+                }
                 -1
             }
         };
     }
     static CACHE: Mutex<Option<HashMap<String, (Instant, i64)>>> = Mutex::new(None);
     static FAIL_EPOCHS: Mutex<Option<HashMap<String, Instant>>> = Mutex::new(None);
+    // #R65 performance/medium：**FAIL_EPOCHS 每次调用修剪**（此前只错误路径——大量
+    // db_path 各失败一次的长期进程条目永积，违背 #R57 不累积意图）。
+    {
+        let now = Instant::now();
+        if let Ok(mut fe) = FAIL_EPOCHS.lock() {
+            if let Some(fmap) = fe.as_mut() {
+                fmap.retain(|_, at| now.saturating_duration_since(*at).as_secs() < 60);
+            }
+        }
+    }
     {
         let mut cache = CACHE.lock().unwrap_or_else(|p| p.into_inner());
         let m = cache.get_or_insert_with(HashMap::new);
@@ -519,10 +553,23 @@ mod python {
         // O(1) 赋值（微秒级，PyBorrowError 窗口可忽略）。多线程宿主推荐此组合。
         fn refresh_hype_index(&mut self, py: Python<'_>) -> PyResult<usize> {
             let r: Result<usize, String> = py.detach(|| self.inner.refresh_hype_index());
+            // #R65 bug/medium：**清 pending + 失效旧 token**——两阶段流程若先
+            // build_hype_index()（pending 槽带 token N）后调 refresh，陈旧 pending
+            // 索引仍持有效 token，后续 swap(N) 会激活它静默回退本次刷新；清槽 +
+            // build_seq 递增使已发 token 全失效。一步 refresh 与两阶段流程
+            // 严格互斥。
+            *self
+                .pending_hype
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()) = None;
+            self.build_seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             r.map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))
         }
         /// #R60：两阶段 refresh 的构建阶段（&self——detach 下其他线程可并发
         /// 检索）；HnswIndex 不能过 PyO3 边界，结果暂存 pending_hype。
+        /// #R65 documentation/low：**同一实例的 build 与 swap 必须严格串行**——
+        /// build 期间 &self PyRef 借用存活（detach 闭包运行中），并发 &mut 调用
+        /// （swap）会阻塞/PyBorrowError 整个构建窗口；构建完成后才可 swap。
         /// #R61 bug/medium：**返回单调 token**——单槽 last-writer-wins 下并发 build
         /// 会让先者被静默丢弃、swap 激活错误索引且 count 不匹配；调用方须把
         /// 返回值传给 swap_hype_index(token) 配对，陈旧 build 被拒绝（fail-fast
