@@ -107,6 +107,23 @@ impl MemoriaEngine {
         })
     }
 
+    /// #R50 maintainability/medium：**运行时刷新 HyPE 索引**——hype_hnsw 是构造时
+    /// 快照，引擎存活期间 memory_hype_vectors 被外部写入（离线脚本重跑、未来工具
+    /// 运行时写）不会自动反映；此前只能重启，文档里的手动方案（新建索引+重建+swap）
+    /// 不是引擎方法、Python bindings 调不到。本方法执行"全新索引重建 → 整体替换"：
+    /// HnswIndex::add 按 id 去重，in-place rebuild 只追加新 id（#R44），已存在 id 的
+    /// 向量更新必须全新索引拾取。返回新索引加载的向量数；失败不改变现有索引
+    /// （保持旧快照，检索不中断）。
+    pub fn refresh_hype_index(&mut self) -> Result<usize, String> {
+        let ef_search = vector::persist::resolve_ef_search();
+        let (fresh, count) = vector::persist::build_hype_hnsw_or_default(&self.pool, ef_search);
+        // 先构建后替换：失败路径（build 内部已软降级为空索引 + WARN）不会留下
+        // 半初始化状态——替换是最后一步原子操作。
+        self.hype_hnsw = fresh;
+        eprintln!("[Memoria] HYPE HNSW refreshed: {} vectors", count);
+        Ok(count)
+    }
+
     pub fn hybrid_search(
         &self,
         query: &str,
@@ -173,9 +190,16 @@ impl MemoriaEngine {
         );
         // V1（#R37 maintainability/low）：HyPE 索引规模也纳入公开统计——
         // 否则 Python/standalone 宿主只能从启动 eprintln 行观察，API 无感知。
+        // #R50 maintainability/low：报告**权威表行数**而非内存快照——hype_hnsw 是
+        // 构造时快照，运行时表更新（离线脚本重跑）后内存 len 静默偏离现实（如
+        // 索引 0 会隐藏脚本已写入的向量，误导运维）；字段名也暗示反映存储。查询
+        // 失败（表缺失/DB 故障）时回退内存快照并保留可观测性。
+        let hype_store: i64 = conn
+            .query_row("SELECT COUNT(*) FROM memory_hype_vectors", [], |r| r.get(0))
+            .unwrap_or(self.hype_hnsw.len() as i64);
         m.insert(
             "hype_vector_index_size".to_string(),
-            serde_json::Value::Number((self.hype_hnsw.len() as i64).into()),
+            serde_json::Value::Number(hype_store.into()),
         );
         m.insert(
             "query_cache_size".to_string(),

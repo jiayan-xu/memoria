@@ -742,22 +742,35 @@ pub fn migrate_hype_vectors(pool: &SqlitePool) -> Result<(), String> {
     // 外部向量态）会让每次启动变慢并阻塞并发写者。refused 标记置位后清理分支整体
     // 跳过，直到运维处理（删除 migration_flags 中的 refused 行后重启，或设
     // MEMORIA_FORCE_ORPHAN_CLEANUP=1 + MEMORIA_ORPHAN_CLEANUP_VECTORS=1 强制）。
+    // #R50 bug/medium：force/opt-in env 在 **gate 之前**读取——若只在清理闭包内读，
+    // REFUSED_FLAG 置位后 gate（refused_done != 0）直接跳过、env 永不生效（文档承诺
+    // 的逃生通道静默失效，唯一出路变成手删 migration_flags 行）。force 时进入清理
+    // 分支（覆盖 refused 态），成功后再清除 refused 标记。
     const REFUSED_FLAG: &str = "orphan_vector_cleanup_refused_v1";
-    let already: i64 = conn
-        .query_row(
+    let force_cleanup = std::env::var("MEMORIA_FORCE_ORPHAN_CLEANUP")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    let clean_vectors = std::env::var("MEMORIA_ORPHAN_CLEANUP_VECTORS")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    // #R50 bug/low：flag 读取软降级（BUSY/DB 故障时按"未置位"处理）——硬失败会让
+    // 并发首启在 .expect 处 panic（与 DDL/清理的软降级意图一致）；读失败=0 只会让
+    // 清理多跑一次（清理本身软降级 + 事务内重读 + 幂等），安全。
+    let flag_set = |conn: &rusqlite::Connection, flag: &str| -> bool {
+        conn.query_row(
             "SELECT COUNT(*) FROM migration_flags WHERE flag = ?1",
-            rusqlite::params![CLEANUP_FLAG],
-            |r| r.get(0),
+            rusqlite::params![flag],
+            |r| r.get::<_, i64>(0),
         )
-        .map_err(|e| format!("check cleanup flag: {}", e))?;
-    let refused_done: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM migration_flags WHERE flag = ?1",
-            rusqlite::params![REFUSED_FLAG],
-            |r| r.get(0),
-        )
-        .map_err(|e| format!("check refused flag: {}", e))?;
-    if already == 0 && refused_done == 0 {
+        .map(|c| c > 0)
+        .unwrap_or_else(|e| {
+            eprintln!("[Memoria] WARN: check migration flag {flag} failed (treated as unset): {e}");
+            false
+        })
+    };
+    let already = flag_set(&conn, CLEANUP_FLAG);
+    let refused_done = flag_set(&conn, REFUSED_FLAG);
+    if (!already && !refused_done) || (force_cleanup && clean_vectors) {
         // 清理**软降级**（#R48 bug/medium）：BEGIN IMMEDIATE 阻塞超 busy_timeout（并发
         // 首启大库 DELETE 可超 5s）、或清理中任何 DB 错误，**不阻断启动**——main.rs/
         // mcp_server.rs 用 .expect()，硬失败会让并发首启部署直接 panic 中止。失败仅
@@ -770,11 +783,14 @@ pub fn migrate_hype_vectors(pool: &SqlitePool) -> Result<(), String> {
             let tx = conn
                 .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
                 .map_err(|e| format!("begin cleanup tx: {}", e))?;
-            // 事务内重读标记（首个提交后此处看到已置位 → 跳过清理）。
+            // 事务内重读**两个**标记（#R50 bug/medium：并发首启时对端进程可能在本进程
+            // gate 检查后、BEGIN 生效前提交 REFUSED_FLAG——只查 CLEANUP_FLAG 会漏掉，
+            // 本进程带着 opt-in env 继续 DELETE 对端明确拒绝删除的行。任一已置位即
+            // noop 提交跳过）。
             let already2: i64 = tx
                 .query_row(
-                    "SELECT COUNT(*) FROM migration_flags WHERE flag = ?1",
-                    rusqlite::params![CLEANUP_FLAG],
+                    "SELECT COUNT(*) FROM migration_flags WHERE flag IN (?1, ?2)",
+                    rusqlite::params![CLEANUP_FLAG, REFUSED_FLAG],
                     |r| r.get(0),
                 )
                 .map_err(|e| format!("check cleanup flag (tx): {}", e))?;
@@ -799,12 +815,8 @@ pub fn migrate_hype_vectors(pool: &SqlitePool) -> Result<(), String> {
             // MEMORIA_FORCE_ORPHAN_CLEANUP=1 约束）。memory_hype_vectors 是内部派生表
             // （无外部写入路径），保持自动清理。
             const ORPHAN_REFUSE_THRESHOLD: i64 = 5000;
-            let force_cleanup = std::env::var("MEMORIA_FORCE_ORPHAN_CLEANUP")
-                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-                .unwrap_or(false);
-            let clean_vectors = std::env::var("MEMORIA_ORPHAN_CLEANUP_VECTORS")
-                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-                .unwrap_or(false);
+            // force/opt-in env 在 gate 之前已读取（#R50 bug/medium，见函数上方）——
+            // 此处直接使用外层变量，不再重复读取。
             // 阈值/opt-in 拒绝时**不置位 CLEANUP_FLAG**，改为持久化 REFUSED_FLAG——
             // 避免每次启动重扫（#R49 performance/medium）；置位只发生在"无孤儿"或
             // "清理已执行"之后。
@@ -881,13 +893,28 @@ pub fn migrate_hype_vectors(pool: &SqlitePool) -> Result<(), String> {
             // 置位标记（事务内，提交后对并发进程可见）：正常完成（含"无孤儿"）→
             // CLEANUP_FLAG；阈值/opt-in 拒绝（refused）→ REFUSED_FLAG——持久化拒绝态
             // 使后续启动跳过整个清理（不再持写锁重扫相关扫描，#R49 performance/medium）。
-            // 运维处理完孤儿后需删除 migration_flags 中的 refused 行（或设两个 env
-            // 强制）才会重新评估。
-            tx.execute(
-                "INSERT OR IGNORE INTO migration_flags (flag) VALUES (?1)",
-                rusqlite::params![if refused { REFUSED_FLAG } else { CLEANUP_FLAG }],
-            )
-            .map_err(|e| format!("set cleanup flag: {}", e))?;
+            // #R50 bug/medium：**强制成功运行后清除 REFUSED_FLAG**——force gate
+            // （force_cleanup && clean_vectors）会无视 refused 态进入清理，若不清除
+            // 旧 refused 标记，后续普通启动（无 env）仍被 refused 挡住；清除后
+            // 正常状态由 CLEANUP_FLAG 覆盖。
+            if refused {
+                tx.execute(
+                    "INSERT OR IGNORE INTO migration_flags (flag) VALUES (?1)",
+                    rusqlite::params![REFUSED_FLAG],
+                )
+                .map_err(|e| format!("set refused flag: {}", e))?;
+            } else {
+                tx.execute(
+                    "DELETE FROM migration_flags WHERE flag = ?1",
+                    rusqlite::params![REFUSED_FLAG],
+                )
+                .map_err(|e| format!("clear refused flag: {}", e))?;
+                tx.execute(
+                    "INSERT OR IGNORE INTO migration_flags (flag) VALUES (?1)",
+                    rusqlite::params![CLEANUP_FLAG],
+                )
+                .map_err(|e| format!("set cleanup flag: {}", e))?;
+            }
             // #R43 bug/medium：commit 失败时 Transaction 的 Drop 自动回滚——连接不会
             // 带着未提交事务还池。
             tx.commit()

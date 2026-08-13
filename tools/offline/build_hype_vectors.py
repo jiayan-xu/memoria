@@ -177,7 +177,15 @@ def embed(texts):
             )
             with urllib.request.urlopen(req, timeout=60) as r:
                 resp = json.loads(r.read().decode())
-            return resp["embeddings"], resp.get("dim", 1024)
+            # #R50 bug/medium：2xx 但缺 embeddings key 是**确定性**畸形响应（服务配置
+            # 错误，同形状响应每次必现）——抛 DeterministicSkipError 计 skip；此前
+            # KeyError 经 3 次重试后变 RuntimeError 被主循环归为瞬时失败记入 fail_ids
+            # （永不收敛 + 每轮白付 chat/embed 调用）。
+            try:
+                vecs = resp["embeddings"]
+            except KeyError:
+                raise DeterministicSkipError("embed 响应缺 embeddings 字段（服务配置错误）")
+            return vecs, resp.get("dim", 1024)
         except urllib.error.HTTPError as e:
             # 4xx（除 429）为确定性配置错误：直接 raise（与 generate_question 同款纪律，
             # #R45：抛 DeterministicSkipError 供主循环按 skip 计数）。
@@ -192,6 +200,10 @@ def embed(texts):
                 # 栈指向 raise 行而非真实失败处，--all 5000+ 行时诊断困难。
                 raise RuntimeError(f"embed HTTP {e.code} 重试耗尽: {e}") from e
             time.sleep(min(2 ** attempt, 10))
+        except DeterministicSkipError:
+            # #R50 bug/medium：确定性错误（4xx 配置错/畸形响应缺字段）**穿透重试**——
+            # 重试同样失败，直接 raise 让主循环按 skip 计数。
+            raise
         except Exception as e:
             if attempt == 2:
                 raise RuntimeError(f"embed 重试耗尽: {e}") from e
@@ -266,64 +278,9 @@ def main():
     if args.limit is not None:
         targets = targets[: args.limit]
 
-    # connect + DDL 移到 dry-run 之后（#R36 bug/medium）：dry-run 承诺"只生成问句不写库"，
-    # 但 sqlite3.connect 会创建不存在的 DB 文件、CREATE TABLE/INDEX 会真实执行——
-    # 对生产库跑验证性 dry-run 也会产生副作用，与"完成(dry-run，未写库)"文案矛盾。
-    con = None
-    if not args.dry_run:
-        # #R43 bug/medium：**golden 路径**同样需要存在性检查——MEMORIA_DB_PATH/--db
-        # 缺失时 sqlite3.connect 静默创建空 DB，随后为 golden 记忆写入向量（memories
-        # 无对应行），报告"写入 N / 失败 0"假成功；孤儿行在下次启动被 Rust 清理，
-        # 整个运行是付费 no-op。镜像 --all 路径的诊断。
-        if not os.path.exists(args.db):
-            print(f"错误: 数据库不存在 {args.db}（请检查 MEMORIA_DB_PATH / --db）")
-            sys.exit(1)
-        con = sqlite3.connect(args.db)
-        # 自包含：表可能尚未经 Rust 迁移创建（离线补嵌先于服务启动时）——镜像
-        # src/storage/sqlite.rs 的 schema，确保首次运行不因缺表崩溃、幂等成立。
-        con.execute(
-            "CREATE TABLE IF NOT EXISTS memory_hype_vectors ("
-            "id TEXT PRIMARY KEY, namespace TEXT NOT NULL DEFAULT 'default', "
-            "question TEXT, vector BLOB NOT NULL, updated_at TEXT DEFAULT (datetime('now')))"
-        )
-        con.execute(
-            "CREATE INDEX IF NOT EXISTS idx_hype_ns ON memory_hype_vectors(namespace)"
-        )
     ok = skip = fail = 0
     fail_ids = []
     skip_ids = []
-    # #R45 bug/low：**golden 路径**预检 id 存在性/有效性——stale golden（id 已删/
-    # 过期/superseded，`eval_hyde_recall.py --build` 之后数据变化）写入的是无对应
-    # memories 行的孤儿，启动时被 Rust 清理，整次运行付费 no-op 却报"写入 N / 失败 0"
-    # 假成功（#R43 注释识别的失败模式只查了 DB 文件存在，未查 id 有效性）。镜像 --all
-    # 的 SQL 过滤做一次性预检，失效 id 计 skip 而非白付。
-    if not args.dry_run and not args.all:
-        gids = [mid for mid, _ in targets]
-        valid_ids = set()
-        # #R46 bug/medium：DB 文件存在但**未初始化**（无 memories 表）时裸抛
-        # OperationalError traceback——且此时 memory_hype_vectors 已作为副作用创建，
-        # 违背"友好诊断 / 失败无副作用"纪律。镜像 --all 分支的 try/except。
-        try:
-            for i in range(0, len(gids), 500):
-                chunk = gids[i : i + 500]
-                ph = ",".join("?" * len(chunk))
-                rows = con.execute(
-                    "SELECT id FROM memories WHERE id IN (" + ph + ") "
-                    "AND namespace='agent/xujiayan' AND superseded_by IS NULL "
-                    "AND (valid_to IS NULL OR valid_to='' OR valid_to > strftime('%Y-%m-%dT%H:%M:%S','now'))",
-                    chunk,
-                ).fetchall()
-                valid_ids.update(r[0] for r in rows)
-        except sqlite3.OperationalError as e:
-            con.close()
-            print(f"错误: 读取 {args.db} 的 memories 表失败（库未初始化/路径错误）: {e}")
-            sys.exit(1)
-        before = len(targets)
-        targets = [(m, c) for m, c in targets if m in valid_ids]
-        stale = before - len(targets)
-        if stale:
-            print(f"提示: {stale} 条 golden id 已失效（删除/过期/superseded），计 skip 跳过")
-            skip += stale
     # 已知限制（#R40 performance/low）：每轮一次 chat + 一次 embed 串行（--all 约 1 万次
     # 顺序请求）；embed 已支持 list 可批 16（仿 rebuild_vectors.py），但批量化需重构
     # 失败归因（批内单条失败 → 单独重嵌该条），留待后续优化，本轮保持正确性优先。
@@ -371,6 +328,73 @@ def main():
             except OSError as e:
                 print(f"  [warn] 清理旧 hype_failed_ids.txt 失败: {e}")
 
+    # connect + DDL 移到 preflight 之后（#R50 maintainability/low）：此前 DDL 在
+    # preflight 前执行——preflight 失败（服务不可达/bad key）sys.exit 时
+    # memory_hype_vectors 已被创建（失败副作用，违背"友好诊断 / 失败无副作用"纪律），
+    # 且只读 DB/磁盘满会裸抛 OperationalError traceback。preflight 全部通过后才
+    # 触碰 DB（#R36 bug/medium：dry-run 仍不触碰——connect 会创建不存在的 DB 文件、
+    # CREATE TABLE/INDEX 会真实执行，与"完成(dry-run，未写库)"文案矛盾）。
+    con = None
+    if not args.dry_run:
+        # #R43 bug/medium：**golden 路径**同样需要存在性检查——MEMORIA_DB_PATH/--db
+        # 缺失时 sqlite3.connect 静默创建空 DB，随后为 golden 记忆写入向量（memories
+        # 无对应行），报告"写入 N / 失败 0"假成功；孤儿行在下次启动被 Rust 清理，
+        # 整个运行是付费 no-op。镜像 --all 路径的诊断。
+        if not os.path.exists(args.db):
+            print(f"错误: 数据库不存在 {args.db}（请检查 MEMORIA_DB_PATH / --db）")
+            sys.exit(1)
+        # #R50 maintainability/low：DDL 包 try/except 友好诊断（只读/磁盘满/损坏）。
+        try:
+            con = sqlite3.connect(args.db)
+            # 自包含：表可能尚未经 Rust 迁移创建（离线补嵌先于服务启动时）——镜像
+            # src/storage/sqlite.rs 的 schema，确保首次运行不因缺表崩溃、幂等成立。
+            con.execute(
+                "CREATE TABLE IF NOT EXISTS memory_hype_vectors ("
+                "id TEXT PRIMARY KEY, namespace TEXT NOT NULL DEFAULT 'default', "
+                "question TEXT, vector BLOB NOT NULL, updated_at TEXT DEFAULT (datetime('now')))"
+            )
+            con.execute(
+                "CREATE INDEX IF NOT EXISTS idx_hype_ns ON memory_hype_vectors(namespace)"
+            )
+        except sqlite3.Error as e:
+            if con is not None:
+                con.close()
+            print(f"错误: 打开/初始化 {args.db} 失败（只读/磁盘满/损坏）: {e}")
+            sys.exit(1)
+
+    # #R45 bug/low：**golden 路径**预检 id 存在性/有效性——stale golden（id 已删/
+    # 过期/superseded，`eval_hyde_recall.py --build` 之后数据变化）写入的是无对应
+    # memories 行的孤儿，启动时被 Rust 清理，整次运行付费 no-op 却报"写入 N / 失败 0"
+    # 假成功（#R43 注释识别的失败模式只查了 DB 文件存在，未查 id 有效性）。镜像 --all
+    # 的 SQL 过滤做一次性预检，失效 id 计 skip 而非白付。
+    if not args.dry_run and not args.all:
+        gids = [mid for mid, _ in targets]
+        valid_ids = set()
+        # #R46 bug/medium：DB 文件存在但**未初始化**（无 memories 表）时裸抛
+        # OperationalError traceback——且此时 memory_hype_vectors 已作为副作用创建，
+        # 违背"友好诊断 / 失败无副作用"纪律。镜像 --all 分支的 try/except。
+        try:
+            for i in range(0, len(gids), 500):
+                chunk = gids[i : i + 500]
+                ph = ",".join("?" * len(chunk))
+                rows = con.execute(
+                    "SELECT id FROM memories WHERE id IN (" + ph + ") "
+                    "AND namespace='agent/xujiayan' AND superseded_by IS NULL "
+                    "AND (valid_to IS NULL OR valid_to='' OR valid_to > strftime('%Y-%m-%dT%H:%M:%S','now'))",
+                    chunk,
+                ).fetchall()
+                valid_ids.update(r[0] for r in rows)
+        except sqlite3.OperationalError as e:
+            con.close()
+            print(f"错误: 读取 {args.db} 的 memories 表失败（库未初始化/路径错误）: {e}")
+            sys.exit(1)
+        before = len(targets)
+        targets = [(m, c) for m, c in targets if m in valid_ids]
+        stale = before - len(targets)
+        if stale:
+            print(f"提示: {stale} 条 golden id 已失效（删除/过期/superseded），计 skip 跳过")
+            skip += stale
+
     def record_fail(mid):
         """失败 id **立即追加**落盘（#R40 bug/medium）：脚本中断（Ctrl+C/崩溃）时
         已累计的失败清单不丢——"可定点重跑"承诺依赖该文件，删除旧清单后若只在循环
@@ -417,8 +441,16 @@ def main():
             continue
         try:
             vecs, dim = embed([q])
-            v = vecs[0]
-            # 维度校验与 pack 也在 try 内：畸形响应（非序列/非数值）抛异常 →
+            # #R50 bug/medium：空 embeddings 列表（v = vecs[0] 抛 IndexError）与
+            # struct.pack 失败（非数值向量抛 struct.error）都是**确定性**畸形响应
+            # ——显式转 DeterministicSkipError 计 skip；否则经 catch-all 归为瞬时
+            # 失败记入 fail_ids（永不收敛 + 每轮白付 chat/embed）。
+            try:
+                v = vecs[0]
+                blob = struct.pack(f"<{len(v)}f", *v)
+            except (IndexError, struct.error, TypeError, ValueError) as e:
+                raise DeterministicSkipError(f"embed 响应向量畸形（{type(e).__name__}: {e}）") from e
+            # 维度校验也在 try 内：畸形响应（非序列/非数值）抛异常 →
             # 按失败计数跳过而非中断整个 --all 批（否则 5339 条白跑且无 fail_ids）。
             # 同时校验 embed_server 的 dim 与 Rust 侧 DIM 一致：服务器若跑 local 模型
             # （768d），len(v)==dim 会通过但 rebuild 侧全部静默跳过——必须显式拒绝。
@@ -430,7 +462,6 @@ def main():
                 raise DeterministicSkipError(f"服务维度 {dim}≠Rust DIM {RUST_DIM}（模型不匹配）")
             if len(v) != dim:
                 raise DeterministicSkipError(f"维度异常 {len(v)}≠{dim}")
-            blob = struct.pack(f"<{len(v)}f", *v)
             # 写入也在此 try 内（#R35 bug/medium）：服务运行中 DB 可能被锁/磁盘满，
             # 单行写失败若抛到外层会中断整批且 fail_ids 永不落盘——违背
             # "不中断、可定点重跑"承诺。写失败按失败计数跳过并记录 id。

@@ -59,21 +59,20 @@ impl<T> Pipe for T {}
 /// 抖动（连接 reset/限流）若落在某 rid 首次遭遇，fail-once 策略会把它永久排除在
 /// HyPE 覆盖外，小语料上覆盖率断言（≥80%）可能假红。一次 500ms 退避重试吞掉
 /// 绝大多数瞬时抖动。
-/// #R47 other/low：重试须**分类**——embed 现返回结构化错误（`http status 4xx` 表示
-/// 服务明确拒绝，如维度校验失败/路径错误，属系统性），对 4xx 直接放弃不重试；
-/// 其余（网络/解析/5xx）视为瞬时抖动重试一次。此前对所有错误都重试，系统性拒绝
-/// 时每条语料多付 500ms + 一次必然失败的请求（22 条 → 10s+ 浪费）。
-/// #R48 bug/medium：4xx 中 **429（限流）/408（请求超时）是瞬时**——本地 embed_server
-/// 限流时按永久跳过会静默丢语料、触发覆盖率假红（正是有界重试要防的故障模式）。
-/// #R49 performance/low：**parse/missing/bad vector 也是确定性**——它们来自 2xx 响应
-/// 的畸形/错误 payload（系统性服务配置错误，同形状响应每次必现），重试只多付
-/// 500ms + 重复请求。仅 send 失败（`embed http: ...` 无 status 前缀，网络抖动）与
-/// 429/408 视为瞬时。字符串前缀分类脆弱（错误格式改动会静默改变重试行为），
-/// 结构化错误留待后续。
+/// 瞬时错误（见 is_transient_embed_err）：send 失败 / 429 / 408 / 5xx；确定性错误
+/// （其余 4xx、2xx 畸形 payload）不重试——系统性配置错误重试只多付 500ms + 必然
+/// 失败的重复请求。
+/// #R50 bug/medium：重试策略与文档对齐——**瞬时 = send 失败（网络抖动）+ 429/408
+/// （限流/超时）+ 5xx（服务过载/OOM 重载）**；确定性 = 其余 4xx（维度校验/路径错误）
+/// 与 2xx 畸形 payload（parse/missing/bad vector——同形状响应每次必现）。
+/// 5xx 若不重试，embed_server 瞬时过载会让该 rid 永久排除在 HyPE 覆盖外、触发
+/// 覆盖率断言假红（正是有界重试要防的故障模式）。字符串前缀分类脆弱（错误格式
+/// 改动会静默改变重试行为），结构化错误留待后续。
 fn is_transient_embed_err(e: &str) -> bool {
     (e.starts_with("embed http:") && !e.starts_with("embed http status"))
         || e.starts_with("embed http status 429")
         || e.starts_with("embed http status 408")
+        || e.starts_with("embed http status 5")
 }
 
 async fn embed_with_retry(client: &reqwest::Client, text: &str) -> Result<Vec<f32>, String> {

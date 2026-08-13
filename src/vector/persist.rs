@@ -358,7 +358,7 @@ fn rebuild_from_table(
                     skipped_dim += 1;
                 } else if blob.len() != DIM * 4 {
                     skipped_blob += 1;
-                } else if !norm_sq.is_finite() || norm_sq <= 0.0 {
+                } else if !norm_sq.is_finite() || norm_sq == 0.0 {
                     skipped_degenerate += 1;
                 } else {
                     entries.push(VectorEntry { id, vector: v });
