@@ -72,7 +72,7 @@ pub fn put_hype_stored_vector(
 /// 生成全部 SQL 字段，**表名只出现一次**（每表一行宏调用），模板固定、无注入面
 /// （表名是字面量）、无运行时分配。
 macro_rules! vector_table {
-    ($table:literal, $fn_name:literal, $label:literal, $error_on_all_skipped:expr) => {
+    ($table:literal, $fn_name:literal, $label:literal, $error_on_all_skipped:expr, $require_fresh:expr) => {
         VectorTable {
             table: $table,
             insert_sql: concat!(
@@ -87,6 +87,7 @@ macro_rules! vector_table {
             fn_name: $fn_name,
             label: $label,
             error_on_all_skipped: $error_on_all_skipped,
+            require_fresh: $require_fresh,
         }
     };
 }
@@ -107,15 +108,20 @@ struct VectorTable {
     /// content 表保持 Ok(0)（历史兼容：遗留全坏行不该让启动 Err）；hype 表 Err
     /// （区分"功能未启用"与"表数据全损坏"）。
     error_on_all_skipped: bool,
+    /// #R62 bug/high：**fresh-index 契约按表**——content 表公开 API 承诺
+    /// ".bin 已加载也能安全增量补齐"；hype 表必须全新索引（add 按 id 去重）。
+    /// 共享 guard 曾一视同仁拒绝 content 增量（正常重启每次 Err）。
+    require_fresh: bool,
 }
 
 fn vector_tables() -> &'static [VectorTable] {
     static TABLES: [VectorTable; 2] = [
-        vector_table!("memory_vectors", "put_stored_vector", "content", false),
+        vector_table!("memory_vectors", "put_stored_vector", "content", false, false),
         vector_table!(
             "memory_hype_vectors",
             "put_hype_stored_vector",
             "hype",
+            true,
             true
         ),
     ];

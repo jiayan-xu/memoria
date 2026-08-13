@@ -363,6 +363,10 @@ def main():
         import atexit
 
         def _flush_pending_on_exit():
+            # #R62 bug/low：**全量门控**——fail_ids 清单只属于全量运行（#R46/#R48）；
+            # 调试运行（--limit N）中断时把子集 id 追加进去会污染累积清单。
+            if not (args.all and args.limit is None):
+                return
             try:
                 if pending_batch:
                     with open(failed_ids_path, "a", encoding="utf-8") as f:
@@ -619,16 +623,17 @@ def main():
             except sqlite3.Error:
                 pass
             print(f"[{i}/{len(targets)}] {mid[:8]} 写入失败: {e}")
-            fail += 1
             record_fail(mid)
+            # #R62 bug/low：**off-by-one 修正**——当前行可能已在 pending_batch
+            # （execute 成功、commit 失败）或不在（execute 本身失败）。统一按
+            # pending 集合处理：本批丢弃行数 = len(pending_batch)（含当前行时
+            # 不再单独 +1），这些行此前已计入 ok（每行各自迭代 ok += 1）——
+            # ok -= len(pending)、fail += len(pending) 精确反映真实落库。
+            pending_ok = len(pending_batch)
+            ok = max(0, ok - pending_ok)
+            fail += pending_ok
             for pid in pending_batch:
                 record_fail(pid)
-            # #R61 bug/medium：**ok 计数修正**——本批已 execute 未 commit 的行此前
-            # 已在各自迭代计入 ok（批 commit 失败回滚丢弃后虚高）；摘要必须反映
-            # 真实落库数（ok -= len(pending_batch)，fail += 同数保持总数一致）。
-            if pending_batch:
-                ok = max(0, ok - len(pending_batch))
-                fail += len(pending_batch)
             pending_batch.clear()
             continue
         except Exception as e:

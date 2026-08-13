@@ -157,9 +157,10 @@ mod unit_tests {
 
     // #R58 test/low：**真实调用** rerank_by_cooccurrence——此前只断言新空 Vec 为空
     // （函数被删也会通过，假覆盖）。
-    // #R59 test/medium：**no-op 契约测试**——空结果集在 load_memory_entities 之前
-    // 提前返回（不触库），空进空出、不 panic。查询路径的真实覆盖由
-    // rerank_with_data 承担（建 schema + seed 实体行，两记忆共现同实体时排序生效）。
+    // #R59 test/medium：**no-op 契约测试**——空结果集空进空出、不 panic。
+    // #R62 test/low 注释修正：本测试**无法区分**空集提前返回与静默失败路径
+    // （load_memory_entities 对空 id 短路、match_query_entities 吞缺表错误），
+    // 只验证"空进空出"行为本身；查询路径的真实覆盖由 rerank_with_data 承担。
     #[test]
     fn empty_results_noop() {
         let pool = crate::storage::create_pool(":memory:", 1).expect("pool");
@@ -241,9 +242,11 @@ mod unit_tests {
         rerank_by_cooccurrence(&pool, "agent/test", "张三", &mut results);
         // #R60 test/medium：断言**可观察效果**——提及实体的记忆 boost 应用后
         // rrf_score 抬升（>0.5 初始值）且 source 带 cooccur 标记（仅 rerank 路径
-        // 追加）；此断言在 load_memory_entities/match_query_entities 静默失败或
-        // boost/排序逻辑被删时必红（此前 ids.contains 恒真，正是要消除的假覆盖）。
-        // 负控制 m_c 无 boost（0.5、无标记）——分开断言。
+        // 追加）；此断言在 load_memory_entities 静默失败或 boost 逻辑被删时必红
+        // （此前 ids.contains 恒真，正是要消除的假覆盖）。
+        // #R62 test/low 注释修正：match_query_entities 失败时 PAIRWISE_BOOST 仍会
+        // 触发（m_a/m_b 同实体），query-hit 路径未被本断言独立验证（负控制 m_c
+        // 无 boost、排最后）。负控制 m_c 分开断言。
         let boosted: Vec<&FusedResult> = results
             .iter()
             .filter(|r| r.memory_id != "m_c")

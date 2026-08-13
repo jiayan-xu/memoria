@@ -245,6 +245,15 @@ impl MemoriaEngine {
             "query_cache_size".to_string(),
             serde_json::Value::Number((self.query_cache.len() as i64).into()),
         );
+        // #R62 maintainability/low：**语义信号丢弃累计计数**——hybrid drop 语义
+        // 通道时递增（semantic::bump_semantic_drops）；持续降级（索引损坏/DB
+        // 故障）不再只对 tail stderr 的人可见，健康检查可据此告警。
+        m.insert(
+            "semantic_signal_drops".to_string(),
+            serde_json::Value::Number(
+                (search::semantic::semantic_drop_count() as i64).into(),
+            ),
+        );
         serde_json::to_string(&serde_json::Value::Object(m)).map_err(|e| e.to_string())
     }
 
@@ -497,23 +506,29 @@ mod python {
             Ok(token)
         }
         fn swap_hype_index(&mut self, token: u64) -> PyResult<usize> {
-            let taken = self
+            // #R62 bug/high：**先校验后 take**——`.take()` 在 token 校验前消费槽：
+            // 陈旧 token 调用会把当前 pending（有效）索引移除并 drop，合法所有者的
+            // 后续 swap 报 "no pending"（秒级重建白费 + "latest was" 误导）。
+            let mut slot = self
                 .pending_hype
                 .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .take();
-            match taken {
-                Some((fresh, count, t)) if t == token => {
-                    self.inner.swap_hype_index(fresh, count);
-                    Ok(count)
+                .unwrap_or_else(|p| p.into_inner());
+            match &*slot {
+                None => {
+                    return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                        "no pending hype index; call build_hype_index first",
+                    ))
                 }
-                Some((_fresh, _count, t)) => Err(pyo3::exceptions::PyRuntimeError::new_err(
-                    format!("stale build token {token} (latest was {t}); rebuild and swap with its token"),
-                )),
-                None => Err(pyo3::exceptions::PyRuntimeError::new_err(
-                    "no pending hype index; call build_hype_index first",
-                )),
+                Some((_, _, t)) if *t != token => {
+                    return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "stale build token {token} (latest was {t}); rebuild and swap with its token"
+                    )))
+                }
+                _ => {}
             }
+            let (fresh, count, _) = slot.take().unwrap();
+            self.inner.swap_hype_index(fresh, count);
+            Ok(count)
         }
         fn add_vectors(&self, ids: Vec<String>, vectors: Vec<Vec<f32>>) -> PyResult<usize> {
             self.inner

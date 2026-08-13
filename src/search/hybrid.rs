@@ -2,7 +2,7 @@
 //!
 //! 替代 lib.rs hybrid_search 和 mcp_server.rs 中各自维护的搜索逻辑。
 
-use crate::search::semantic::{SemanticError, throttled_eprintln};
+use crate::search::semantic::{SemanticError, bump_semantic_drops, throttled_eprintln};
 use crate::search::{self, FusedResult, SignalResult};
 use crate::storage::SqlitePool;
 use crate::vector::{HnswIndex, QueryCache};
@@ -106,6 +106,9 @@ pub fn hybrid_search(
                         SemanticError::Fetch(_) => "hybrid_drop_db",
                     };
                     // 闭包求值：冷却期间零分配（#R57）。
+                    // #R62 maintainability/low：累计计数（db_stats 暴露，见
+                    // semantic::bump_semantic_drops doc）。
+                    bump_semantic_drops();
                     throttled_eprintln(key, || format!("[hybrid] semantic signal dropped: {e}"));
                 }
             }

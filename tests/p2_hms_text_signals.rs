@@ -23,7 +23,6 @@ fn fresh_engine(tag: &str) -> (MemoriaEngine, String) {
 
 #[test]
 fn ledger_includes_text_signals() {
-    let _env_guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let (engine, ns) = fresh_engine("ledger");
     let _ = remember_with_dedup(
         &engine.pool,
@@ -92,7 +91,26 @@ static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[test]
 fn search_boosts_on_numeric_query_overlap() {
+    // #R62 test/medium：**显式 pin enabled**——强化断言依赖 rerank 默认开启；环境
+    // 预设 MEMORIA_TEXT_SIGNALS_RERANK=0（dev shell/CI）会让正确代码假红。
+    // ENV_LOCK 只串行化本二进制内的变异，管不到环境预设。
     let _env_guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    struct PinEnabled(Option<std::ffi::OsString>);
+    impl Drop for PinEnabled {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.0 {
+                    Some(v) => std::env::set_var("MEMORIA_TEXT_SIGNALS_RERANK", v),
+                    None => std::env::remove_var("MEMORIA_TEXT_SIGNALS_RERANK"),
+                }
+            }
+        }
+    }
+    let prev = std::env::var_os("MEMORIA_TEXT_SIGNALS_RERANK");
+    unsafe {
+        std::env::set_var("MEMORIA_TEXT_SIGNALS_RERANK", "1");
+    }
+    let _pin = PinEnabled(prev);
     let (engine, ns) = fresh_engine("rerank");
     let a = remember_with_dedup(
         &engine.pool,
@@ -163,7 +181,6 @@ fn search_boosts_on_numeric_query_overlap() {
 
 #[test]
 fn relative_date_in_ledger_signals() {
-    let _env_guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let (engine, ns) = fresh_engine("reldate");
     let _ = remember_with_dedup(
         &engine.pool,
@@ -248,7 +265,7 @@ fn text_signals_rerank_env_off() {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     // #R61 bug/medium：**恢复原值而非无条件 remove**——进程启动时若 env 已带预设
     // 值（CI 配置/harness），无条件 remove 会永久抹除、改变后续依赖预设值的行为。
-    struct EnvRestore(Option<String>);
+    struct EnvRestore(Option<std::ffi::OsString>);
     impl Drop for EnvRestore {
         fn drop(&mut self) {
             unsafe {
@@ -259,7 +276,9 @@ fn text_signals_rerank_env_off() {
             }
         }
     }
-    let prev = std::env::var("MEMORIA_TEXT_SIGNALS_RERANK").ok();
+    // #R62 bug/low：var_os 无损快照——var().ok() 把非 Unicode 预设值归 None，
+    // Drop 时误执行 remove_var（违反"恢复原值"契约）。
+    let prev = std::env::var_os("MEMORIA_TEXT_SIGNALS_RERANK");
     unsafe {
         std::env::set_var("MEMORIA_TEXT_SIGNALS_RERANK", "0");
     }
@@ -274,7 +293,6 @@ fn text_signals_rerank_env_off() {
 
 #[test]
 fn signal_tags_persisted_on_remember() {
-    let _env_guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let (engine, ns) = fresh_engine("sigtags");
     let result = remember_with_dedup(
         &engine.pool,

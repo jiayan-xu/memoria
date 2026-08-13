@@ -313,6 +313,15 @@ async fn memory_eval_semantic_inner() {
     // fixture DB
     let db = std::env::temp_dir().join(format!("memoria_eval_sem_{}.db", std::process::id()));
     let _ = std::fs::remove_file(&db);
+    // #R62 test/low：**RAII 清理**——timeout 中止（inner future 被 drop）时函数尾的
+    // remove_file 不执行，temp DB 泄漏；guard 的 Drop 在 unwind/正常路径都清理。
+    struct DbCleanup(std::path::PathBuf);
+    impl Drop for DbCleanup {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+    let _db_guard = DbCleanup(db.clone());
     let pool = create_pool(db.to_str().unwrap(), 4).expect("create_pool");
     init_schema(&pool).expect("init_schema");
     init_core_tables(&pool).expect("init_core_tables");
@@ -639,6 +648,13 @@ async fn memory_eval_semantic_inner() {
     }
     eprintln!("=================================================");
 
+    // #R62 test/medium：**skip 硬断言前置**——退化语料（跳过项）先于 recall 断言
+    // 大声失败且根因直接可见（此前 WARN 在 recall assert 之后、且跳过项不被任何
+    // case 引用时测试静默通过——"显式失败"意图落空）。
+    assert_eq!(
+        corpus_skipped, 0,
+        "{corpus_skipped} corpus item(s) skipped due to embed failures; expect_indices referencing them will fail"
+    );
     assert!(
         recall >= RECALL_FLOOR,
         "召回@k {:.2} 低于下限 {:.2}",
@@ -646,13 +662,6 @@ async fn memory_eval_semantic_inner() {
         RECALL_FLOOR
     );
     assert_eq!(zero_rate, 0.0, "存在零结果用例");
-    if corpus_skipped > 0 {
-        // #R61：跳过项显式报告（占位符会让引用其位置的 case 失败，且近义去重
-        // 漂移使错位失败指向无关位置）——把根因摆到台面再断言。
-        eprintln!(
-            "[eval_semantic] WARNING: {corpus_skipped} corpus item(s) skipped due to embed failures (expect_indices referencing them will fail)"
-        );
-    }
     assert!(failures.is_empty(), "共 {} 个评测失败", failures.len());
 
     drop(engine);

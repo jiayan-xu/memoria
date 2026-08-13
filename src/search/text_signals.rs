@@ -563,6 +563,6 @@ mod unit_tests {
         ];
         rerank_by_text_signals("120 吨", &mut results);
         assert_eq!(results[0].memory_id, "a");
-        assert!(results[0].source.contains("text_signals"));
+        assert!(results[0].source.contains(SOURCE_MARKER));
     }
 }
