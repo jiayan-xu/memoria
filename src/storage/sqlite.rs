@@ -700,32 +700,50 @@ pub fn migrate_hype_vectors(pool: &SqlitePool) -> Result<(), String> {
         )
         .map_err(|e| format!("check cleanup flag: {}", e))?;
     if already == 0 {
-        // #R43 bug/medium：改用 rusqlite 的 transaction_with_behavior(TransactionBehavior::
-        // Immediate) 替代手动 BEGIN/COMMIT/ROLLBACK——Transaction 在 Drop 时自动回滚，
-        // 任何 `?` 提前返回或 panic 都不会把"仍持有写锁的连接"还给池（r2d2 无
-        // test_on_check_out，归还后后续查询会静默跑在未提交事务内、写锁不释放，其他写者
-        // SQLITE_BUSY）。错误路径免疫未来编辑/panic，与模块其余代码风格一致。
-        let tx = conn
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-            .map_err(|e| format!("begin cleanup tx: {}", e))?;
-        // 事务内重读标记（首个提交后此处看到已置位 → 跳过清理）。
-        let already2: i64 = tx
-            .query_row(
-                "SELECT COUNT(*) FROM migration_flags WHERE flag = ?1",
-                rusqlite::params![CLEANUP_FLAG],
-                |r| r.get(0),
-            )
-            .map_err(|e| format!("check cleanup flag (tx): {}", e))?;
-        if already2 == 0 {
-            // #R47 performance/medium：持写锁期间**每张表只跑一趟**——DELETE 的返回
-            // 值即删除行数，可同时 gate 与喂日志（省掉独立的孤儿 COUNT 全表扫描）；
-            // 空表短路用 EXISTS(LIMIT 1)（全 COUNT 扫描换首行命中即停）。
+        // 清理**软降级**（#R48 bug/medium）：BEGIN IMMEDIATE 阻塞超 busy_timeout（并发
+        // 首启大库 DELETE 可超 5s）、或清理中任何 DB 错误，**不阻断启动**——main.rs/
+        // mcp_server.rs 用 .expect()，硬失败会让并发首启部署直接 panic 中止。失败仅
+        // log + 不置位 flag（下次启动重试）；孤儿的影响只是索引内存/重建耗时，可后补。
+        // 正常完成（含"无孤儿"）才置位。
+        let cleanup = (|| -> Result<(), String> {
+            // #R43 bug/medium：rusqlite transaction_with_behavior(Immediate)——Transaction
+            // Drop 时自动回滚，任何 `?` 提前返回或 panic 都不会把"仍持有写锁的连接"还给
+            // 池（r2d2 无 test_on_check_out，归还后后续查询会静默跑在未提交事务内）。
+            let tx = conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .map_err(|e| format!("begin cleanup tx: {}", e))?;
+            // 事务内重读标记（首个提交后此处看到已置位 → 跳过清理）。
+            let already2: i64 = tx
+                .query_row(
+                    "SELECT COUNT(*) FROM migration_flags WHERE flag = ?1",
+                    rusqlite::params![CLEANUP_FLAG],
+                    |r| r.get(0),
+                )
+                .map_err(|e| format!("check cleanup flag (tx): {}", e))?;
+            if already2 != 0 {
+                tx.commit()
+                    .map_err(|e| format!("commit cleanup tx (noop): {}", e))?;
+                return Ok(());
+            }
+            // #R47 performance/medium：空表短路用 EXISTS(LIMIT 1)（全 COUNT 扫描换首行
+            // 命中即停），避免持写锁做无谓全表扫描。
             // #R42/#R44 performance/medium：**单条** DELETE（一次相关扫描）——分批
-            // LIMIT 1000 在同一个 BEGIN IMMEDIATE 事务内**不降低**持锁时间：NOT EXISTS
-            // 无索引可走，每批都是全表扫描，总工作量 O(批数 × 表大小) 而非 O(孤儿数)；
-            // 大库（孤儿恰在此累积）上启动被拖慢，并发首启的另一进程可能超 5000ms
-            // busy_timeout 而 SQLITE_BUSY 中止启动（main.rs .expect 直接 panic）。
+            // LIMIT 1000 在同一个 BEGIN IMMEDIATE 事务内不降低持锁时间（每批全表扫描）。
             // #R43 maintainability/low：SQL 规范化 + 错误消息内嵌 SQL 片段便于审计。
+            // #R48 bug/high（数据安全）：**孤儿 COUNT 必须有**——DELETE 无差别销毁
+            // 所有"无 memories 行的向量行"，但代码库并不强制该不变量：add_vectors
+            // （Python bindings，lib.rs:280）接受任意调用方 id、persist::lookup_namespace
+            // 对无 memories 行回退 'default'、vector_search 不 join memories——外部注册
+            // 向量/待重导入/合成 id 是合法数据态。孤儿数超阈值时**拒绝自动删除**（只
+            // 报告 + 不置位，下次启动重试），需人工确认后设 MEMORIA_FORCE_ORPHAN_CLEANUP=1
+            // 强制（或先验证不变量再放行）。
+            const ORPHAN_REFUSE_THRESHOLD: i64 = 5000;
+            let force_cleanup = std::env::var("MEMORIA_FORCE_ORPHAN_CLEANUP")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
+            // 阈值拒绝时**不置位 flag**——下次启动重新评估（数据态可能已变化）；置位
+            // 只发生在"无孤儿"或"清理已执行"之后。
+            let mut refused = false;
             let v_exists: i64 = tx
                 .query_row(
                     "SELECT EXISTS(SELECT 1 FROM memory_vectors LIMIT 1)",
@@ -734,13 +752,28 @@ pub fn migrate_hype_vectors(pool: &SqlitePool) -> Result<(), String> {
                 )
                 .map_err(|e| format!("check memory_vectors exists: {}", e))?;
             if v_exists > 0 {
-                const DEL_VEC: &str = "DELETE FROM memory_vectors \
-                    WHERE NOT EXISTS (SELECT 1 FROM memories m WHERE m.id = memory_vectors.id)";
-                let removed_vec = tx.execute(DEL_VEC, []).map_err(|e| {
-                    format!("clean memory_vectors orphans: {e} [SQL: {DEL_VEC}]")
-                })?;
-                if removed_vec > 0 {
-                    eprintln!("[Memoria] Migration: removed {removed_vec} orphan memory_vectors rows");
+                let orphans_vec: i64 = tx
+                    .query_row(
+                        "SELECT COUNT(*) FROM memory_vectors \
+                         WHERE NOT EXISTS (SELECT 1 FROM memories m WHERE m.id = memory_vectors.id)",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .map_err(|e| format!("count memory_vectors orphans: {}", e))?;
+                if orphans_vec > 0 {
+                    if orphans_vec > ORPHAN_REFUSE_THRESHOLD && !force_cleanup {
+                        eprintln!(
+                            "[Memoria] WARN: {orphans_vec} orphan memory_vectors rows ABOVE safety threshold {ORPHAN_REFUSE_THRESHOLD}; refusing auto-delete (may be legit external vectors via add_vectors; set MEMORIA_FORCE_ORPHAN_CLEANUP=1 to force)"
+                        );
+                        refused = true;
+                    } else {
+                        const DEL_VEC: &str = "DELETE FROM memory_vectors \
+                            WHERE NOT EXISTS (SELECT 1 FROM memories m WHERE m.id = memory_vectors.id)";
+                        tx.execute(DEL_VEC, []).map_err(|e| {
+                            format!("clean memory_vectors orphans: {e} [SQL: {DEL_VEC}]")
+                        })?;
+                        eprintln!("[Memoria] Migration: removed {orphans_vec} orphan memory_vectors rows");
+                    }
                 }
             }
             let h_exists: i64 = tx
@@ -751,26 +784,50 @@ pub fn migrate_hype_vectors(pool: &SqlitePool) -> Result<(), String> {
                 )
                 .map_err(|e| format!("check memory_hype_vectors exists: {}", e))?;
             if h_exists > 0 {
-                const DEL_HYPE: &str = "DELETE FROM memory_hype_vectors \
-                    WHERE NOT EXISTS (SELECT 1 FROM memories m WHERE m.id = memory_hype_vectors.id)";
-                let removed_hype = tx.execute(DEL_HYPE, []).map_err(|e| {
-                    format!("clean memory_hype_vectors orphans: {e} [SQL: {DEL_HYPE}]")
-                })?;
-                if removed_hype > 0 {
-                    eprintln!("[Memoria] Migration: removed {removed_hype} orphan memory_hype_vectors rows");
+                let orphans_hype: i64 = tx
+                    .query_row(
+                        "SELECT COUNT(*) FROM memory_hype_vectors \
+                         WHERE NOT EXISTS (SELECT 1 FROM memories m WHERE m.id = memory_hype_vectors.id)",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .map_err(|e| format!("count memory_hype_vectors orphans: {}", e))?;
+                if orphans_hype > 0 {
+                    if orphans_hype > ORPHAN_REFUSE_THRESHOLD && !force_cleanup {
+                        eprintln!(
+                            "[Memoria] WARN: {orphans_hype} orphan memory_hype_vectors rows ABOVE safety threshold {ORPHAN_REFUSE_THRESHOLD}; refusing auto-delete (set MEMORIA_FORCE_ORPHAN_CLEANUP=1 to force)"
+                        );
+                        refused = true;
+                    } else {
+                        const DEL_HYPE: &str = "DELETE FROM memory_hype_vectors \
+                            WHERE NOT EXISTS (SELECT 1 FROM memories m WHERE m.id = memory_hype_vectors.id)";
+                        tx.execute(DEL_HYPE, []).map_err(|e| {
+                            format!("clean memory_hype_vectors orphans: {e} [SQL: {DEL_HYPE}]")
+                        })?;
+                        eprintln!("[Memoria] Migration: removed {orphans_hype} orphan memory_hype_vectors rows");
+                    }
                 }
             }
             // 置位标记：插入 migration_flags 行（事务内，提交后对并发进程可见）。
-            tx.execute(
-                "INSERT OR IGNORE INTO migration_flags (flag) VALUES (?1)",
-                rusqlite::params![CLEANUP_FLAG],
-            )
-            .map_err(|e| format!("set cleanup flag: {}", e))?;
+            // 注意：阈值拒绝（refused）时**不置位**——下次启动重新评估（数据态可能
+            // 已变化；#R48 bug/high）。
+            if !refused {
+                tx.execute(
+                    "INSERT OR IGNORE INTO migration_flags (flag) VALUES (?1)",
+                    rusqlite::params![CLEANUP_FLAG],
+                )
+                .map_err(|e| format!("set cleanup flag: {}", e))?;
+            }
+            // #R43 bug/medium：commit 失败时 Transaction 的 Drop 自动回滚——连接不会
+            // 带着未提交事务还池。
+            tx.commit()
+                .map_err(|e| format!("commit cleanup tx: {}", e))?;
+            Ok(())
+        })();
+        if let Err(e) = cleanup {
+            // #R48 bug/medium：清理失败不阻断启动（软降级，flag 未置位 → 下次重试）。
+            eprintln!("[Memoria] WARN: orphan cleanup skipped (will retry next start): {e}");
         }
-        // #R43 bug/medium：commit 失败时 Transaction 的 Drop 自动回滚——连接不会带着
-        // 未提交事务还池（手动 COMMIT 失败还需手动 ROLLBACK 的双失败路径已消除）。
-        tx.commit()
-            .map_err(|e| format!("commit cleanup tx: {}", e))?;
     }
     Ok(())
 }
