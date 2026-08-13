@@ -5,7 +5,7 @@ use crate::QueryCache;
 use crate::search::keyword::SignalResult;
 use crate::storage::SqlitePool;
 use crate::vector::HnswIndex;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 /// Semantic search via HNSW vector similarity.
 /// Python must call cache_query_vector() first to provide the query embedding.
@@ -93,12 +93,16 @@ pub fn semantic_search(
     }
     // #R44 bug/medium：升级缺口——一路失败但幸存路**合法返回 0 结果**时（如 hype 空
     // 索引 + content 索引损坏，或反之），`roads_ok==1` 且 best 空会走 Ok(vec![])，
-    // 掩盖坏路、语义通道静默降级（#R34 "区分索引空与索引坏"的目标在此组合下未达成，
-    // hybrid.rs 把损坏索引误当"该 ns 无匹配"）。任何失败路存在且幸存路无匹配 → Err。
+    // 掩盖坏路、语义通道静默降级（#R34 "区分索引空与索引坏"的目标在此组合下未达成）。
+    // #R45 bug/low：但**不升级为 Err**——search_with_ef 只在 RwLock poisoning（持久
+    // 条件）时失败，幸存路合法返回 0 匹配是大多数查询的常态（多数 query 无近邻），
+    // 升级会把每个此类查询误报为通道损坏、刷错误日志直到重启；且 hybrid.rs 对 Err
+    // 与空结果同等处理（仅记录后丢弃），升级无新增诊断价值。search_and_merge 已逐次
+    // eprintln 失败路——降级以日志呈现，返回值仍 Ok(vec![])。
     if roads_failed > 0 && best.is_empty() {
-        return Err(format!(
-            "semantic_search: {roads_failed} road(s) failed and survivors returned no matches"
-        ));
+        eprintln!(
+            "semantic_search: {roads_failed} road(s) failed and survivors returned no matches (degraded)"
+        );
     }
     if best.is_empty() {
         return Ok(vec![]);
@@ -107,187 +111,44 @@ pub fn semantic_search(
     // 合并上限说明（#R33 maintainability/low）：`search_with_ef(overfetch, overfetch)` 每路
     // 至多返回 overfetch 条，best 按 memory_id 去重后 len ≤ ovf_content + ovf_hype ≤ 2×ovf——
     // 因此无需（也无法）在此截断；曾有的 sort/truncate 分支是 dead code，已移除。
-    // ns 回查的 IN(...) 规模即 ≤ 2×ovf（默认 ~6000，远低于 SQLite 32766 变量上限；
-    // 若未来索引规模使 2×ovf 逼近上限，需在 lookup_namespaces 内分批，见该函数注释）。
 
-    // HNSW 是全局索引，无 namespace 维度。按调用者 ns 回查 memories 表，
-    // 仅保留归属当前 ns 的记忆，杜绝跨租户泄露。无 pool 时无法过滤，保守返回空。
+    // HNSW 是全局索引，无 namespace 维度。按调用者 ns 单趟回查 memories 表取
+    // (namespace, content)，Rust 侧过滤 ns（杜绝跨租户泄露）。无 pool 时无法过滤，
+    // 保守返回空。
     // #R44 performance/low：ids 排序后再分批——HashMap 键遍历随机序下，部分批失败时
     // 被剔除的 id 子集跨运行不确定（召回损失不可复现、日志难关联）；排序与最终输出
     // 的 memory_id 决胜一致，使失败行为确定。
+    // #R45 performance/low：ns 回查与 content 回填**合并为一趟**查询——原两趟各 ~9 次
+    // prepare+query（默认 recall_depth=50 时 best ~4096 id、BATCH=500），热路径最多
+    // ~18 次串行 SQLite 往返；合并减半且关闭两趟之间的 TOCTOU 窗口（id 在 ns 回查后、
+    // content 回填前被并发删除时，原实现静默丢正文）。
     let mut ids: Vec<&str> = best.keys().map(|s| s.as_str()).collect();
     ids.sort_unstable();
-    let allowed: HashSet<String> = match pool {
-        Some(p) => match lookup_namespaces(p, &ids) {
-            Ok(map) => map
-                .into_iter()
-                .filter(|(_, ns)| ns == namespace)
-                .map(|(id, _)| id)
-                .collect(),
-            // #R39 bug/medium：ns 回查全批失败（memories 表系统性故障）的 Err 必须
-            // **传播**而非转回 Ok(vec![])——否则与"该 ns 无结果"不可区分，语义通道
-            // 静默关闭（#R38 升级被自己的调用方架空成死代码）。hybrid.rs 会记录该
-            // 降级（与 content backfill 全批失败升级一致）。
-            Err(e) => return Err(e),
-        },
+    let rows: HashMap<String, (String, Option<String>)> = match pool {
+        Some(p) => fetch_memories_batch(p, &ids)?,
         None => return Ok(vec![]),
     };
-    if allowed.is_empty() {
-        return Ok(vec![]);
-    }
 
-    // P3-0 修复：语义结果此前 content 恒为空（只带 memory_id），
-    // 经 rrf_merge 首次插入即锁定空正文，导致「仅被语义命中」的记忆在 fusion 后丢失正文，
-    // benchmark 拼上下文时得不到内容、答案必错。此处按 allowed id 批量回取 content 补齐。
-    // #R34 performance/medium：与 lookup_namespaces 同款分批（BATCH=500）——allowed 规模
-    // 与 best 同量级（可达 ~12000），单条 IN(...) 在旧 SQLite（999 变量上限）会 prepare
-    // 失败且被 if let Ok 静默吞掉，导致全部语义结果正文为空却无任何告警。
-    let mut contents: HashMap<String, String> = HashMap::new();
-    // #R39 bug/low：部分批失败时，失败批的 id 从结果集**剔除**而非输出空正文——
-    // rrf_merge 在首次插入时锁定正文，空正文命中会复现 P3-0 内容损坏（见该处注释）。
-    let mut failed_batch_ids: HashSet<String> = HashSet::new();
-    if let Some(p) = pool {
-        const BATCH: usize = 500;
-        // #R44 performance/low：排序后再分批（与 lookup_namespaces 调用侧同款），
-        // 失败批剔除的 id 子集跨运行确定。
-        let mut ids: Vec<&String> = allowed.iter().collect();
-        ids.sort();
-        // pool.get 提到循环外并**传播**失败（与 lookup_namespaces 一致）：连接级错误
-        // 对每批都会失败，循环内 log-and-continue 会让所有批失败却仍返回 Ok + 空正文
-        // 结果——P3-0 内容丢失 bug 的全量复发（#R36 bug/medium）。
-        let conn = p.get().map_err(|e| format!("semantic content backfill pool: {}", e))?;
-        let mut batches_total = 0usize;
-        let mut hard_failed_batches = 0usize;
-        for chunk in ids.chunks(BATCH) {
-            batches_total += 1;
-            let placeholders = vec!["?"; chunk.len()].join(",");
-            let sql = format!(
-                "SELECT id, content FROM memories WHERE id IN ({})",
-                placeholders
-            );
-            // 单批瞬时失败（连接抖动等）log-and-continue；若**所有**批都硬失败（系统性
-            // schema/列变更等），escalate 返回 Err——不再把"全量空正文"伪装成正常结果。
-            // #R41 bug/high：`hard_failed` 与 `partial_failed` 分离——部分行映射失败
-            // （如单条 NULL content）只是召回损失（剔该 id），**不算硬失败**；否则
-            // 候选跨多批时每条 NULL 都使 batches_ok=0，全批升级把整个语义通道打成 Err
-            // （hybrid.rs 丢弃语义信号），与 #R40"只剔失败行保留成功行"的意图直接矛盾。
-            let mut hard_failed = false;
-            match conn.prepare(&sql) {
-                Ok(mut stmt) => match stmt.query_map(
-                    rusqlite::params_from_iter(chunk.iter().map(|s| *s)),
-                    // #R42 bug/high：content 可空（schema `content TEXT` 无 NOT NULL）——
-                    // 用 Option<String> 读取，NULL 单独计数（合法数据态），不当作行映射
-                    // 错误；否则全 NULL 批会被误判为"系统性列问题"硬失败，所有批都如此
-                    // 时触发全批升级、整个语义通道被 hybrid.rs 丢弃。
-                    |row| {
-                        Ok((
-                            row.get::<_, String>(0)?,
-                            row.get::<_, Option<String>>(1)?,
-                        ))
-                    },
-                ) {
-                    Ok(rows) => {
-                        // #R38 bug/low：行级反序列化错误（列类型漂移等）不能 flatten 静默
-                        // 丢弃——query_map 可能每批都 Ok 但 0 行插入，全批升级守卫被绕过，
-                        // P3-0 空正文在列漂移下无告警复发。累计行级错误并在全部为空时升级。
-                        let mut row_errors = 0usize;
-                        let mut inserted = 0usize;
-                        let mut null_content = 0usize;
-                        for r in rows {
-                            match r {
-                                Ok((id, content_opt)) => {
-                                    match content_opt {
-                                        Some(c) => {
-                                            contents.insert(id.clone(), c);
-                                            inserted += 1;
-                                        }
-                                        None => {
-                                            // NULL content = 合法数据态，召回损失（剔 id）
-                                            null_content += 1;
-                                        }
-                                    }
-                                }
-                                Err(e) => {
-                                    row_errors += 1;
-                                    eprintln!(
-                                        "[semantic] content backfill row mapping failed (batch {} ids): {}",
-                                        chunk.len(),
-                                        e
-                                    );
-                                }
-                            }
-                        }
-                        if inserted == 0 && row_errors > 0 && null_content == 0 {
-                            // 仅当全部映射失败且不含 NULL content（真正的列类型漂移）
-                            // 才算硬失败；全 NULL content 是合法数据态，按召回损失处理。
-                            eprintln!(
-                                "[semantic] content backfill: batch of {} ids all failed row mapping",
-                                chunk.len()
-                            );
-                            hard_failed = true;
-                        } else if row_errors > 0 || null_content > 0 {
-                            // #R40/#R41 bug/medium：部分行失败（映射错误或 NULL content）
-                            // 的 id 经 unwrap_or_default 会产出空正文、复现 P3-0 内容损坏。
-                            // 剔除由下方**无条件**剔除逻辑覆盖（contents 缺失即剔），
-                            // 此处仅记录诊断（#R44 maintainability/low：partial_failed
-                            // 变量曾是死代码——赋值后从未读取，已删除）。
-                            eprintln!(
-                                "[semantic] content backfill: {row_errors} row errors + {null_content} NULL content of {} ids (dropping those ids)",
-                                chunk.len()
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!(
-                            "[semantic] content backfill query failed (batch {} ids): {}",
-                            chunk.len(),
-                            e
-                        );
-                        hard_failed = true;
-                    }
-                },
-                Err(e) => {
-                    eprintln!(
-                        "[semantic] content backfill prepare failed (batch {} ids): {}",
-                        chunk.len(),
-                        e
-                    );
-                    hard_failed = true;
-                }
-            }
-            // #R43 bug/medium：**无条件**剔除未成功插入的 id——返回行数 < 请求数
-            // （并发删除/悬空 id 的 TOCTOU）既非硬失败也非部分失败，原守卫会放过它们，
-            // 最终 unwrap_or_default 产出空正文、复现 P3-0 内容损坏（rrf_merge 首次插入
-            // 即锁定空正文）。成功插入的 id 在 contents 中，天然保留。
-            for id in chunk.iter() {
-                if !contents.contains_key(*id) {
-                    failed_batch_ids.insert((*id).clone());
-                }
-            }
-            if hard_failed {
-                hard_failed_batches += 1;
-            }
-        }
-        // #R41 bug/high：全批升级只看**硬失败**（prepare/query 错误或 0 行插入）——
-        // 部分失败批已保留成功行，若计入会使单条 NULL content 触发整个语义通道 Err
-        // （hybrid.rs 丢弃语义信号）。全部批都硬失败（系统性故障）才升级。
-        if hard_failed_batches > 0 && hard_failed_batches == batches_total {
-            return Err("semantic_search: content backfill hard-failed for all batches".into());
-        }
-    }
-
-    let mut out: Vec<SignalResult> = Vec::with_capacity(allowed.len());
-    for memory_id in &allowed {
-        // 失败批的 id 剔除（#R39 bug/low）：正文缺失的命中若进入融合会被 rrf_merge
-        // 以空正文锁定——不如直接不返回该候选（只损失该批召回，不污染正文）。
-        if failed_batch_ids.contains(memory_id) {
+    let mut out: Vec<SignalResult> = Vec::with_capacity(ids.len());
+    for memory_id in &ids {
+        // 不变量（#R45 maintainability/low）：fetch_memories_batch 未返回的 id（stale/
+        // 删除/失败行）在此直接跳过——正文缺失的命中若进入融合会被 rrf_merge 以空
+        // 正文锁定（P3-0），不返回候选只损失召回、不污染正文。此前 `unwrap_or_default`
+        // 兜底在此**不可达**（死默认掩盖了 P3-0 不变量），已删除。
+        let Some((ns, content)) = rows.get(*memory_id) else {
+            continue;
+        };
+        if ns != namespace {
             continue;
         }
-        if let Some((score, road)) = best.get(memory_id) {
-            let content = contents.get(memory_id).cloned().unwrap_or_default();
+        // NULL content = 合法数据态，召回损失（剔 id）——与映射失败区分（#R42）。
+        let Some(content) = content else {
+            continue;
+        };
+        if let Some((score, road)) = best.get(*memory_id) {
             out.push(SignalResult {
-                memory_id: memory_id.clone(),
-                content,
+                memory_id: (*memory_id).to_string(),
+                content: content.clone(),
                 score: *score,
                 // 归因：winning road 标记进 source（#R35 maintainability/low）——
                 // rrf.rs 的 channel_of 按子串匹配通道，";hype" 后缀不影响现有融合，
@@ -356,98 +217,117 @@ fn search_and_merge(
     }
 }
 
-/// 批量回查 memory_id 的 namespace（分批 IN 查询，避免 N+1 且不超 SQLite 变量上限）。
+/// 单趟批量回查 memories：id → (namespace, content Option<String>)。
 ///
-/// 双路合并后 id 数可达 ~12000（limit=300 时 2×overfetch），单条 IN(...) 逼近/超过
-/// SQLITE_MAX_VARIABLE_NUMBER（bundled 32766；旧库可能 999）会 prepare 失败并静默降级。
-/// 每批最多 500 个占位符，分批查询后合并（#R33 performance/medium）。
-fn lookup_namespaces(
+/// 合并原 lookup_namespaces（ns 回查）与 content backfill（正文回填）两趟 IN(...)
+/// 查询为一趟（#R45 performance/low：热路径 SQLite 往返减半——默认 recall_depth=50
+/// 时 best ~4096 id、BATCH=500，原两趟共 ~18 次 prepare+query，合并后 ~9 次；且关闭
+/// 两趟之间并发删除的 TOCTOU 窗口）。分批 BATCH=500（旧 SQLite 999 变量上限）。
+///
+/// 错误语义（#R45 bug/medium）：**0 行匹配不算失败**——运行时删除不修剪内存 HNSW
+/// （web_api/mcp_server 只删 memories；mem_ad_vec 触发器清向量表，但内存索引到重启/
+/// 重建才更新），悬空 id 是预期数据滞后态；用户删光记忆或恢复不带向量的备份后，
+/// 全批 stale 是正常结果，升级 Err 会把良性状态误报为系统性故障、刷
+/// `[hybrid] semantic signal dropped` 日志。仅 prepare/query/行映射错误（列类型漂移
+/// 等系统性故障）且**全部批**都硬失败才 escalate。
+fn fetch_memories_batch(
     pool: &SqlitePool,
-    results: &[&str],
-) -> Result<HashMap<String, String>, String> {
+    ids: &[&str],
+) -> Result<HashMap<String, (String, Option<String>)>, String> {
     const BATCH: usize = 500;
-    let conn = pool.get().map_err(|e| format!("pool: {}", e))?;
-    let mut map = HashMap::new();
-    let mut mid_failure: Option<String> = None;
-    for chunk in results.chunks(BATCH) {
+    let conn = pool.get().map_err(|e| format!("semantic fetch pool: {}", e))?;
+    let mut out = HashMap::new();
+    let mut batches_total = 0usize;
+    let mut hard_failed_batches = 0usize;
+    for chunk in ids.chunks(BATCH) {
+        batches_total += 1;
         let placeholders = vec!["?"; chunk.len()].join(",");
         let sql = format!(
-            "SELECT id, namespace FROM memories WHERE id IN ({})",
+            "SELECT id, namespace, content FROM memories WHERE id IN ({})",
             placeholders
         );
-        // 单批失败：**保留已收集的映射**（只降低召回，ns 过滤仍安全），记录并继续——
-        // 而不是 `?` 丢弃全部（#R36 bug/low：中途失败会把前面批次的成果一起扔掉，
-        // 变成"索引空"不可区分的全空结果）。
+        let mut hard_failed = false;
         match conn.prepare(&sql) {
             Ok(mut stmt) => match stmt.query_map(
                 rusqlite::params_from_iter(chunk.iter().map(|s| *s)),
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                // content 可空（schema `content TEXT` 无 NOT NULL）：Option 读取，
+                // NULL 是合法数据态（单独计数），不当作行映射错误（#R42 bug/high：
+                // 否则全 NULL 批被误判为列漂移硬失败，触发全批升级）。
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                },
             ) {
                 Ok(rows) => {
-                    // #R39 bug/medium：行级映射错误（列类型/值漂移）不能 flatten 静默
-                    // 丢弃——query_map 可能 Ok 但每行 Err，map 空 + mid_failure None，
-                    // "全批失败"升级被绕过、通道静默返回空。逐行计数，全批行错记 mid_failure。
-                    let mut inserted = 0usize;
                     let mut row_errors = 0usize;
-                    for row in rows {
-                        match row {
-                            Ok(v) => {
-                                map.insert(v.0, v.1);
-                                inserted += 1;
+                    let mut got = 0usize;
+                    for r in rows {
+                        match r {
+                            Ok((id, ns, content)) => {
+                                out.insert(id, (ns, content));
+                                got += 1;
                             }
                             Err(e) => {
                                 row_errors += 1;
                                 eprintln!(
-                                    "[semantic] ns lookup row mapping failed (batch {} ids): {}",
+                                    "[semantic] fetch row mapping failed (batch {} ids): {}",
                                     chunk.len(),
                                     e
                                 );
                             }
                         }
                     }
-                    if inserted == 0 && row_errors > 0 {
-                        mid_failure.get_or_insert(format!(
-                            "row mapping: {row_errors} rows failed in batch of {}",
-                            chunk.len()
-                        ));
-                    } else if inserted == 0 && row_errors == 0 {
-                        // #R43 bug/low：0 行且无错误 = 请求的 id 在 memories 中全不存在
-                        // （悬空 HNSW id / 表被清空）——静默消失会让"系统性数据流损坏"
-                        // 与"该 ns 无结果"不可区分（全批升级被绕过）。记录使降级可见。
+                    if got == 0 && row_errors > 0 {
+                        // 全部行映射失败 = 系统性列问题（列类型漂移），硬失败。
                         eprintln!(
-                            "[semantic] ns lookup: batch of {} ids matched 0 memories rows (stale ids?)",
+                            "[semantic] fetch: batch of {} ids all failed row mapping",
                             chunk.len()
                         );
-                        mid_failure.get_or_insert(format!(
-                            "0 rows matched for batch of {} (stale ids)",
+                        hard_failed = true;
+                    } else if got == 0 {
+                        // 0 行无错误 = stale ids（并发删除/悬空 HNSW id）——预期数据
+                        // 滞后态，仅记录不升级（#R45 bug/medium，见函数 doc）。
+                        eprintln!(
+                            "[semantic] fetch: batch of {} ids matched 0 rows (stale ids)",
                             chunk.len()
-                        ));
+                        );
+                    } else if row_errors > 0 {
+                        eprintln!(
+                            "[semantic] fetch: {row_errors} of {} rows failed mapping (dropping those ids)",
+                            chunk.len()
+                        );
                     }
                 }
                 Err(e) => {
-                    eprintln!("[semantic] ns lookup query failed (batch {} ids): {}", chunk.len(), e);
-                    mid_failure.get_or_insert(format!("query: {e}"));
+                    eprintln!(
+                        "[semantic] fetch query failed (batch {} ids): {}",
+                        chunk.len(),
+                        e
+                    );
+                    hard_failed = true;
                 }
             },
             Err(e) => {
-                eprintln!("[semantic] ns lookup prepare failed (batch {} ids): {}", chunk.len(), e);
-                mid_failure.get_or_insert(format!("prepare: {e}"));
+                eprintln!(
+                    "[semantic] fetch prepare failed (batch {} ids): {}",
+                    chunk.len(),
+                    e
+                );
+                hard_failed = true;
             }
         }
-    }
-    if let Some(e) = mid_failure {
-        // 部分失败：返回已收集映射 + 告警（调用方按部分映射过滤，比全空好）。
-        eprintln!("[semantic] ns lookup partial failure, continuing with {} namespaces: {}", map.len(), e);
-        // #R38 bug/medium：**所有批次都失败**（memories 表系统性故障：schema/列漂移、
-        // DB 不可用）时升级为 Err——否则调用方把 allowed 判空返回 Ok(vec![])，与
-        // "该 ns 确实无结果"不可区分，语义通道被静默关闭。与 content backfill
-        // 全批失败升级（#R36）保持一致。
-        if map.is_empty() {
-            return Err(format!(
-                "semantic ns lookup: all batches failed, no namespaces resolved ({})",
-                e
-            ));
+        if hard_failed {
+            hard_failed_batches += 1;
         }
     }
-    Ok(map)
+    // 全批升级只看**硬失败**（prepare/query 错误或全行映射失败）：部分失败批已保留
+    // 成功行（只损失失败行召回），stale 批不计数——全部批都硬失败（系统性故障）才
+    // escalate（#R41 bug/high 语义保留）。
+    if hard_failed_batches > 0 && hard_failed_batches == batches_total {
+        return Err("semantic_search: memories fetch hard-failed for all batches".into());
+    }
+    Ok(out)
 }

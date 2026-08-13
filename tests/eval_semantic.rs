@@ -49,6 +49,23 @@ trait Pipe: Sized {
 }
 impl<T> Pipe for T {}
 
+/// embed 带**一次有界重试**（#R45 test/low）：embed() 是单发 POST 无重试——瞬时服务
+/// 抖动（连接 reset/限流）若落在某 rid 首次遭遇，fail-once 策略会把它永久排除在
+/// HyPE 覆盖外，小语料上覆盖率断言（≥80%）可能假红。一次 500ms 退避重试吞掉
+/// 绝大多数瞬时抖动，同时不放大"系统性故障"（两次都失败照常记 skip）。
+async fn embed_with_retry(client: &reqwest::Client, text: &str) -> Result<Vec<f32>, String> {
+    match embed(client, text).await {
+        Ok(v) => Ok(v),
+        Err(e) => {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            match embed(client, text).await {
+                Ok(v) => Ok(v),
+                Err(e2) => Err(format!("{e}; retry also failed: {e2}")),
+            }
+        }
+    }
+}
+
 /// 单条记忆的 HyPE 补嵌结果（#R44 maintainability/low：四个失败分支的簿记收口）。
 enum HypeOutcome {
     /// 问句化 embed → put → add 全链路成功且索引真正加入（n>0）。
@@ -59,13 +76,12 @@ enum HypeOutcome {
 
 /// 问句化改写嵌入 → 落库 → 入 hype 索引，一次调用完成（#R44 maintainability/low：
 /// 此前整个 embed/put/add 金字塔嵌套在语料循环体内，四个失败分支重复
-/// `hype_failed_once.insert / hype_skipped += 1 / hype_processed.remove` 簿记，
-/// 深嵌套让策略矛盾难以发现。抽出后成败簿记集中在调用方一处）。
+/// `hype_skipped += 1 / hype_processed.remove` 簿记，深嵌套让策略矛盾难以发现。
+/// 抽出后成败簿记集中在调用方一处）。
 ///
-/// #R44 bug/medium 策略（与 #R43 注释对齐）：**失败一次即永久跳过，不重试**——
-/// 近义重复条目对同一 rid 重试 = 重复付费 embed；系统性故障（服务拒绝前缀 prompt）
-/// 重试同样失败，仅瞬时抖动受益，而覆盖率断言（≥80%）已把持续性失败暴露为测试
-/// 失败。故调用方对 Skipped 结果入 `hype_failed_once` 后不再处理该 rid。
+/// #R44/#R45 bug/medium 策略：**失败即跳过，不重试整个链路**——近义重复条目对同一
+/// rid 重试 = 重复付费 embed；系统性故障（服务拒绝前缀 prompt）重试同样失败。
+/// 瞬时抖动由 embed_with_retry 的一次有界重试覆盖，不再需要跨重复条目的重试机制。
 async fn hype_upsert_one(
     client: &reqwest::Client,
     engine: &MemoriaEngine,
@@ -77,7 +93,7 @@ async fn hype_upsert_one(
     // 问句化改写：与内容向量不同（否则双路合并无意义）。嵌入失败则跳过（不 put/add）
     // ——fallback 到内容向量会让两路恒等、退化为内容通道，且把内容向量写进 question
     // 列与离线脚本的问句向量不一致，rebuild 后会混入两种形态。
-    match embed(client, &format!("用户提问：{content}")).await {
+    match embed_with_retry(client, &format!("用户提问：{content}")).await {
         Err(e) => HypeOutcome::Skipped(format!("question embed failed: {e}")),
         Ok(hv) => {
             // put 可能因退化向量（零/NaN）/维度/DB 失败返回 Err——内容路容忍静默跳过，
@@ -142,10 +158,6 @@ async fn memory_eval_semantic() {
     let mut ids: Vec<String> = Vec::with_capacity(corpus.len());
     let mut hype_seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut hype_processed: std::collections::HashSet<String> = std::collections::HashSet::new();
-    // #R43 bug/low：记录已失败过的唯一 rid——持久失败（如系统性拒绝前缀 prompt）的
-    // rid 每次近义重复都会重试（付费 embed × N），且 hype_skipped 计尝试非唯一记忆。
-    // 失败一次即标记，后续重复直接跳过（不再重试），hype_skipped 只对唯一失败记忆 +1。
-    let mut hype_failed_once: std::collections::HashSet<String> = std::collections::HashSet::new();
     // #R43 bug/medium：total 独立计数（首次遇到即 +1，无论成败）——processed 失败时
     // 会 remove（允许重试），断言时只剩成功的，用它作分母是重言式。
     let mut hype_total = 0usize;
@@ -200,10 +212,11 @@ async fn memory_eval_semantic() {
             // 失败时把 rid 从 processed 移除以便重试，断言时 processed 只剩成功的，
             // `hype_covered >= processed.len()*0.8` 恒真（重言式），无法防 no-op 假绿。
             // 用 total 作分母：若问句化 embed 对多数记忆持续失败，覆盖断言真实失败。
-            // #R44 bug/medium：策略统一为**失败一次即永久跳过**（hype_failed_once）——
-            // 移除死代码 `hype_processed.remove(&rid)`（失败后 failed_once 已拦后续
-            // 重复，remove 无效果）；processed 仅作"已处理（成功或失败）"去重集。
-            if !hype_processed.contains(&rid) && !hype_failed_once.contains(&rid) {
+            // #R44/#R45 maintainability/low：**processed 即唯一去重集**（成功+失败都在
+            // 内，每个 rid 至多处理一次）——曾有的 hype_failed_once 恒为 processed 子集
+            // （insert 先于一切簿记执行），guard 冗余、conditional 计数死代码，已删除；
+            // 瞬时失败由 embed_with_retry 覆盖，无需跨重复条目的重试。
+            if !hype_processed.contains(&rid) {
                 hype_processed.insert(rid.clone());
                 hype_total += 1;
                 match hype_upsert_one(&client, &engine, &pool, &rid, ns, content).await {
@@ -213,9 +226,7 @@ async fn memory_eval_semantic() {
                     }
                     HypeOutcome::Skipped(reason) => {
                         eprintln!("[eval_semantic] hype skipped for {rid:?}: {reason}");
-                        if hype_failed_once.insert(rid.clone()) {
-                            hype_skipped += 1;
-                        }
+                        hype_skipped += 1;
                     }
                 }
             }

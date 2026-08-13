@@ -73,6 +73,17 @@ def get_secret(name, path):
 SF_KEY = os.environ.get("SILICONFLOW_API_KEY", "") or get_secret("SILICONFLOW_API_KEY", ENV) or ""
 
 
+class DeterministicSkipError(RuntimeError):
+    """确定性失败（配置错误/内容过滤拒绝等）：重跑永远同样失败，按 skip 计数。
+
+    #R45 bug/medium：主循环的 catch-all `except Exception` 曾把 generate_question/embed
+    抛出的确定性错误（非 429 4xx：401 无效 key、400 未知模型、内容过滤拒绝）重新归类
+    为"重试耗尽瞬时故障"写入 fail_ids——这类 id 每次重跑同样失败，清单永不收敛且每轮
+    白付付费调用，直接违反"fail_ids 只含可修复瞬时失败"的契约。专用异常类型让主循环
+    用独立 except 分支区分：确定性 → skip（计数 skip_ids），瞬时 → fail（record_fail）。
+    """
+
+
 def generate_question(content: str) -> str:
     """LLM 生成「用户会怎么问才能找到这条记忆」的假设问句（与 golden query 独立）。"""
     sys_prompt = (
@@ -124,8 +135,11 @@ def generate_question(content: str) -> str:
             # #R41 bug/medium：4xx（除 429 限流）是确定性配置错误（401 无效 key、400
             # 未知模型/超长内容）——重试/重跑永远同样失败，直接 raise 免白付 3 次付费
             # 调用且不污染 fail_ids（该文件承诺只含可修复的瞬时失败）。
+            # #R45 bug/medium：抛 DeterministicSkipError——主循环据此按 skip 计数而非
+            # 记入 fail_ids（catch-all except Exception 会把 RuntimeError 重新归类为
+            # 瞬时失败，让 400 之类的每轮重跑同样失败、清单永不收敛）。
             if e.code != 429:
-                raise RuntimeError(f"chat HTTP {e.code}: {e}") from e
+                raise DeterministicSkipError(f"chat HTTP {e.code}: {e}") from e
             if attempt == 2:
                 raise RuntimeError(f"chat 429 限流重试耗尽: {e}") from e
             time.sleep(min(2 ** attempt, 10))
@@ -156,9 +170,10 @@ def embed(texts):
                 resp = json.loads(r.read().decode())
             return resp["embeddings"], resp.get("dim", 1024)
         except urllib.error.HTTPError as e:
-            # 4xx（除 429）为确定性配置错误：直接 raise（与 generate_question 同款纪律）。
+            # 4xx（除 429）为确定性配置错误：直接 raise（与 generate_question 同款纪律，
+            # #R45：抛 DeterministicSkipError 供主循环按 skip 计数）。
             if e.code != 429:
-                raise RuntimeError(f"embed HTTP {e.code}: {e}") from e
+                raise DeterministicSkipError(f"embed HTTP {e.code}: {e}") from e
             if attempt == 2:
                 # #R41 maintainability/low：最终 attempt 内 raise 保留原始 traceback
                 # （urlopen/JSON 解析/取字段的失败点）——循环后 raise last_err 会把
@@ -265,6 +280,30 @@ def main():
     ok = skip = fail = 0
     fail_ids = []
     skip_ids = []
+    # #R45 bug/low：**golden 路径**预检 id 存在性/有效性——stale golden（id 已删/
+    # 过期/superseded，`eval_hyde_recall.py --build` 之后数据变化）写入的是无对应
+    # memories 行的孤儿，启动时被 Rust 清理，整次运行付费 no-op 却报"写入 N / 失败 0"
+    # 假成功（#R43 注释识别的失败模式只查了 DB 文件存在，未查 id 有效性）。镜像 --all
+    # 的 SQL 过滤做一次性预检，失效 id 计 skip 而非白付。
+    if not args.dry_run and not args.all:
+        gids = [mid for mid, _ in targets]
+        valid_ids = set()
+        for i in range(0, len(gids), 500):
+            chunk = gids[i : i + 500]
+            ph = ",".join("?" * len(chunk))
+            rows = con.execute(
+                "SELECT id FROM memories WHERE id IN (" + ph + ") "
+                "AND namespace='agent/xujiayan' AND superseded_by IS NULL "
+                "AND (valid_to IS NULL OR valid_to='' OR valid_to > strftime('%Y-%m-%dT%H:%M:%S','now'))",
+                chunk,
+            ).fetchall()
+            valid_ids.update(r[0] for r in rows)
+        before = len(targets)
+        targets = [(m, c) for m, c in targets if m in valid_ids]
+        stale = before - len(targets)
+        if stale:
+            print(f"提示: {stale} 条 golden id 已失效（删除/过期/superseded），计 skip 跳过")
+            skip += stale
     # 已知限制（#R40 performance/low）：每轮一次 chat + 一次 embed 串行（--all 约 1 万次
     # 顺序请求）；embed 已支持 list 可批 16（仿 rebuild_vectors.py），但批量化需重构
     # 失败归因（批内单条失败 → 单独重嵌该条），留待后续优化，本轮保持正确性优先。
@@ -320,6 +359,13 @@ def main():
     for i, (mid, content) in enumerate(targets, 1):
         try:
             q = generate_question(content)
+        except DeterministicSkipError as e:
+            # #R45 bug/medium：确定性失败（4xx 配置错误/内容过滤拒绝）重跑永远同样失败
+            # ——计 skip（skip_ids 提示），不进 fail_ids，避免清单永不收敛。
+            print(f"[{i}/{len(targets)}] {mid[:8]} 问句生成确定性失败，跳过: {e}")
+            skip += 1
+            skip_ids.append(mid)
+            continue
         except Exception as e:
             # 重试耗尽的瞬时故障：记入 fail_ids（可定点重跑），非确定性 skip。
             print(f"[{i}/{len(targets)}] {mid[:8]} 问句生成瞬时失败: {e}")
@@ -362,6 +408,12 @@ def main():
                 (mid, q, blob),
             )
             con.commit()
+        except DeterministicSkipError as e:
+            # #R45 bug/medium：embed 侧确定性失败（4xx 配置错误）计 skip 不进 fail_ids。
+            print(f"[{i}/{len(targets)}] {mid[:8]} 嵌入确定性失败，跳过: {e}")
+            skip += 1
+            skip_ids.append(mid)
+            continue
         except Exception as e:
             print(f"[{i}/{len(targets)}] {mid[:8]} 嵌入/写入异常: {e}")
             fail += 1

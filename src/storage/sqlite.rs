@@ -618,15 +618,25 @@ pub fn migrate_hype_vectors(pool: &SqlitePool) -> Result<(), String> {
     // 修改联动体（新增第三张向量表/修 bug）对新库生效、对已部署库静默失效（CREATE
     // 被跳过），孤儿预防契约无法演进。DROP+CREATE 每次启动重放（DDL 微秒级，幂等），
     // 保证 body 恒为当前代码定义；并发首启各进程执行同一 body，最终一致。
-    conn.execute_batch("DROP TRIGGER IF EXISTS mem_ad_vec")
-        .map_err(|e| format!("drop mem_ad_vec trigger: {}", e))?;
-    conn.execute_batch(
-        "CREATE TRIGGER mem_ad_vec AFTER DELETE ON memories BEGIN
-            DELETE FROM memory_vectors WHERE id = old.id;
-            DELETE FROM memory_hype_vectors WHERE id = old.id;
-        END",
-    )
-    .map_err(|e| format!("create mem_ad_vec trigger: {}", e))?;
+    // #R45 other/low：DROP+CREATE 包进 BEGIN IMMEDIATE 事务——避免并发进程在
+    // DROP 与 CREATE 之间读到"触发器不存在"的中间态（DELETE 瞬间漏清向量表）。
+    // busy_timeout 已在函数入口设置，事务竞争按 busy 等待而非失败。
+    {
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|e| format!("begin trigger tx: {}", e))?;
+        tx.execute_batch("DROP TRIGGER IF EXISTS mem_ad_vec")
+            .map_err(|e| format!("drop mem_ad_vec trigger: {}", e))?;
+        tx.execute_batch(
+            "CREATE TRIGGER mem_ad_vec AFTER DELETE ON memories BEGIN
+                DELETE FROM memory_vectors WHERE id = old.id;
+                DELETE FROM memory_hype_vectors WHERE id = old.id;
+            END",
+        )
+        .map_err(|e| format!("create mem_ad_vec trigger: {}", e))?;
+        tx.commit()
+            .map_err(|e| format!("commit trigger tx: {}", e))?;
+    }
     // 一次性清理**存量**孤儿行（#R36 maintainability/low）：触发器只挡未来，
     // 历史删除留下的 memory_vectors 孤儿（无对应 memories 行）仍会被启动 rebuild
     // 重新加入 HNSW，浪费索引内存/存储。迁移内清理彻底闭环。
