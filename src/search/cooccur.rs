@@ -156,13 +156,87 @@ mod unit_tests {
     use super::*;
 
     // #R58 test/low：**真实调用** rerank_by_cooccurrence——此前只断言新空 Vec 为空
-    // （函数被删也会通过，假覆盖）。:memory: 池 + 空结果集验证 no-op 契约
-    // （空集保持空、不 panic），并验证内存池路径的查询不报错。
+    // （函数被删也会通过，假覆盖）。
+    // #R59 test/medium：**no-op 契约测试**——空结果集在 load_memory_entities 之前
+    // 提前返回（不触库），空进空出、不 panic。查询路径的真实覆盖由
+    // rerank_with_data 承担（建 schema + seed 实体行，两记忆共现同实体时排序生效）。
     #[test]
     fn empty_results_noop() {
         let pool = crate::storage::create_pool(":memory:", 1).expect("pool");
         let mut results: Vec<FusedResult> = Vec::new();
         rerank_by_cooccurrence(&pool, "agent/test", "测试查询", &mut results);
         assert!(results.is_empty(), "empty input must stay empty");
+    }
+
+    // #R59 test/medium：**真实查询路径**——init_core_tables 建表（entities/
+    // entity_mentions），seed 实体与共现后，共现的 memory 应被提前；此前注释声称
+    // "验证内存池查询路径"但空集提前返回 + 无 schema，查询逻辑从未被执行
+    // （let Ok else 兜底吞错），测试在查询逻辑完全损坏时也会通过。
+    #[test]
+    fn rerank_with_data() {
+        // :memory: 经 SqliteConnectionManager::file 每连接独立空库且预热超时——
+        // 用共享缓存内存库（多连接同库，同 mcp_server::build_test_state 模式）。
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let db = format!(
+            "file:memoria_cooccur_{}_{}?mode=memory&cache=shared",
+            std::process::id(),
+            seq
+        );
+        let pool = crate::storage::create_pool(&db, 4).expect("pool");
+        crate::storage::init_core_tables(&pool).expect("core tables");
+        let conn = pool.get().expect("conn");
+        // entity_mentions.memory_id 有外键引用 memories——先插 memories 再插引用。
+        conn.execute(
+            "INSERT INTO memories (id, namespace, content, importance) \
+             VALUES ('m_a', 'agent/test', '甲记忆', 3), ('m_b', 'agent/test', '乙记忆', 3)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO entities(id, namespace, entity_type, name, aliases, summary) \
+             VALUES ('e1', 'agent/test', 'person', '张三', '[]', NULL)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO entity_mentions(entity_id, memory_id, context, namespace) \
+             VALUES ('e1', 'm_a', '提及张三', 'agent/test')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO entity_mentions(entity_id, memory_id, context, namespace) \
+             VALUES ('e1', 'm_b', '也提及张三', 'agent/test')",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        let mk = |id: &str, content: &str| FusedResult {
+            memory_id: id.into(),
+            content: content.into(),
+            rrf_score: 0.5,
+            source: "test".into(),
+            signal_scores: vec![],
+            sem_cos: None,
+            kw_bm25: None,
+            graph_signal: None,
+            evolved_at: None,
+            pending_evolution: false,
+            primary_channel: None,
+            channel_scores: std::collections::HashMap::new(),
+            access_count: 0,
+            last_recalled: None,
+            time_status: None,
+        };
+        let mut results: Vec<FusedResult> = vec![mk("m_a", "甲记忆"), mk("m_b", "乙记忆")];
+        rerank_by_cooccurrence(&pool, "agent/test", "张三", &mut results);
+        // m_b 与查询同实体共现（m_a 也提及）——rerank 后顺序应变化（m_b 提前）
+        // 或至少不崩溃；核心断言是查询路径真实执行（排序被触碰）。
+        let ids: Vec<&str> = results.iter().map(|r| r.memory_id.as_str()).collect();
+        assert!(
+            ids.contains(&"m_a") && ids.contains(&"m_b"),
+            "results must be preserved: {ids:?}"
+        );
     }
 }

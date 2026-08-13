@@ -3185,11 +3185,16 @@ mod tests {
             )
             .unwrap();
         }
+        // #R59 test/medium：**隔离 HyPE 路**——content 向量 cv 与 query 向量 hv
+        // 正交（cv=[0,1,...]，hv=[1,0,...]）：content 路 cosine=0（score<=0 被
+        // filter 剔除），只有 hype 路能命中；再断言 results[0].source 含 "hype"
+        // （dispatch 的归因字段），双路合并/去重/归因任一坏掉测试即红。此前
+        // cv=[1,0] 与 hv=[0.95,...] 的 content 路 cosine≈0.95 也能命中——hype_hnsw
+        // 为空或双路逻辑全坏测试照样通过（假覆盖）。
         let mut cv = vec![0.0f32; DIM];
-        cv[0] = 1.0;
+        cv[1] = 1.0; // 与 query 正交
         let mut hv = vec![0.0f32; DIM];
-        hv[0] = 0.95;
-        hv[1] = (1.0f32 - 0.95f32 * 0.95f32).sqrt();
+        hv[0] = 1.0;
         // 双路都入索引（content 向量与问句向量不同——HyPE 双路合并的形态）
         state
             .hnsw
@@ -3213,9 +3218,13 @@ mod tests {
             role: "admin".into(),
         };
         let out = dispatch(&state, "memory_search", &args, &auth);
+        let v: serde_json::Value =
+            serde_json::from_str(&out).expect("memory_search returns valid JSON");
+        assert_eq!(v["status"], "ok", "memory_search response: {out}");
+        let src = v["results"][0]["source"].as_str().unwrap_or("");
         assert!(
-            out.contains("mem_hype_1") || out.contains("HyPE 双路测试记忆内容"),
-            "HyPE road hit missing through dispatch: {out}"
+            src.contains("hype"),
+            "expected hype-road attribution, got source={src}: {out}"
         );
     }
 

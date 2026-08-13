@@ -134,6 +134,12 @@ fn lookup_table(table: &str) -> Option<&'static VectorTable> {
 /// （如嵌入模型产出零向量）会耗尽 3 条详情预算，压制更可操作的错误（BUSY/磁盘满/
 /// 约束冲突）；聚合行只含 fn_name + 计数、无错误文本，多因并发事故被掩盖。reason
 /// 入槽后每类独立预算，聚合行含 reason 使计数可归因。
+/// #R59 refute（性能评论）：**消息构造不惰性化**——调用方传 `&msg` 前已 `format!`
+/// 一次，该 String **同时是 `Err(msg)` 的返回体**（put_vector_into 的 Result 契约）：
+/// 每次失败必有 1 次分配（构造错误消息），与被抑制无关。若把 warn 改闭包（打印才
+/// 求值），打印路径反而多 1 次分配（闭包求值 + Err 构造），净变差；唯一能省的是
+/// 让 Err 也惰性——不可能（错误消息立即需要）。当前"共享同一 String"已是该约束下
+/// 最优。调用方 `let _ =` 丢弃是它们的显式选择，不改变 API 契约。
 fn warn_throttled(fn_name: &str, reason: &str, msg: &str) {
     // #R52 bug/medium：**按槽分**（32 槽 fnv，key=fn_name+reason）——此前两个全局
     // static 被所有写路径共享：先失败的路径消耗前 3 条详情预算（另一路径早期失败

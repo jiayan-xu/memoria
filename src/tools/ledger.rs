@@ -254,11 +254,13 @@ pub fn enrich_ledger(
                         None
                     } else if legacy_et.len() >= 10 {
                         // #R58 bug/low：同 parse_occurred_tag——多字节旧列值切片 panic
-                        // 风险，get(..10) 安全；取不到前 10 字符时退整串。
-                        legacy_et
-                            .get(..10)
-                            .map(str::to_string)
-                            .or(Some(legacy_et.clone()))
+                        // 风险，get(..10) 安全。
+                        // #R59 bug/low：取不到前 10 字符（字节 10 落在多字节字符内）时
+                        // **返回 None** 而非退回整串——整串作为 occurred 会把非
+                        // YYYY-MM-DD 值写进 ledger JSON 并喂给 extract_text_signals
+                        // 日期解析（与 #R58 另两处 continue/None 的退化语义不一致）；
+                        // None 让 unwrap_or_else 用 valid_from 兜底（真实日期）。
+                        legacy_et.get(..10).map(str::to_string)
                     } else {
                         Some(legacy_et)
                     }
@@ -313,5 +315,29 @@ mod unit_tests {
         assert!(tags.contains(&"a".to_string()));
         assert!(tags.contains(&"occurred:2024-03-01".to_string()));
         assert!(!tags.iter().any(|t| t == "occurred:2020-01-01"));
+    }
+
+    // #R59 test/low：**多字节回归测试**——#R58 修的 &s[..10] 切片 panic 由调用方
+    // 标签可达（occurred:💥💥💥 12 字节）；无回归用例则未来重构可静默重引入。
+    #[test]
+    fn parse_occurred_tag_multibyte_safe() {
+        // 字节 10 落在多字节字符内：get(..10) None → 整体 None（不 panic、不误判）
+        assert_eq!(parse_occurred_tag(r#"["occurred:💥💥💥"]"#), None);
+        // 前 10 字节恰好是完整日期（2024-03-01 是 10 ASCII 字节）→ 正常解析，
+        // 后续多字节尾巴不影响
+        assert_eq!(
+            parse_occurred_tag(r#"["occurred:2024-03-01💥"]"#).as_deref(),
+            Some("2024-03-01")
+        );
+        // occurred_tag_from_iso 同样多字节安全（返回带 occurred: 前缀）
+        assert_eq!(
+            occurred_tag_from_iso("2024-03-01T12:00:00").as_deref(),
+            Some("occurred:2024-03-01")
+        );
+        assert_eq!(
+            occurred_tag_from_iso("2024-03-01💥extra").as_deref(),
+            Some("occurred:2024-03-01")
+        );
+        assert_eq!(occurred_tag_from_iso("💥💥💥💥💥"), None);
     }
 }
