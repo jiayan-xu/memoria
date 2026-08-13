@@ -254,6 +254,10 @@ fn relative_date_in_ledger_signals() {
 
 #[test]
 fn text_signals_rerank_env_off() {
+    // #R65 bug/medium：**锁在 fresh_engine 之前**——fresh_engine/remember_with_dedup
+    // 读 env（MEMORIA_NEAR_DUP_ENABLED/PERSIST/POOL_SIZE），与变异测试的 set_var
+    // 窗口重叠即 UB（edition 2024 set_var 的并发访问契约）。
+    let _guard = ENV_LOCK.write().unwrap_or_else(|p| p.into_inner());
     let (engine, ns) = fresh_engine("envoff");
     let _ = remember_with_dedup(
         &engine.pool,
@@ -276,12 +280,8 @@ fn text_signals_rerank_env_off() {
     )
     .expect("mem");
 
-    // #R60 test/medium：env 变异加 **Drop guard 恢复 + 共享串行锁**——`set_var`
-    // 变异进程全局状态（edition 2024 中 unsafe 正是为此）：同二进制并行测试可
-    // 观察到瞬时的 "0"（flaky，依赖默认值的 search_boosts 会静默跳过 rerank），
-    // 断言 panic 时 remove_var 不执行则变量泄漏污染后续测试。guard 的 Drop 在
-    // unwind 路径也恢复；ENV_LOCK 为文件级（与 search_boosts 共享，见上）。
-    let _guard = ENV_LOCK.write().unwrap_or_else(|p| p.into_inner());
+    // #R60 test/medium：env 变异加 **Drop guard 恢复**——断言 panic 时 remove_var
+    // 不执行则变量泄漏污染后续测试（guard 的 Drop 在 unwind 路径恢复）。
     // #R61 bug/medium：**恢复原值而非无条件 remove**——进程启动时若 env 已带预设
     // 值（CI 配置/harness），无条件 remove 会永久抹除、改变后续依赖预设值的行为。
 

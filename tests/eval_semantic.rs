@@ -261,7 +261,10 @@ async fn hype_upsert_one(
                             // 向量的病态服务会通过 hv≠v 检查但贡献单点退化索引；
                             // 唯一性在最终断言中验证（HV_POOL 文件级）。hv 在
                             // add 用 clone 后仍可用（闭包借用）。
-                            if let Ok(mut g) = HV_POOL.lock() {
+                            let mut g = HV_POOL
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner());
+                            {
                                 let pool = g.get_or_insert_with(Vec::new);
                                 if !pool.iter().any(|q| {
                                     q.len() == hv.len()
@@ -356,6 +359,14 @@ async fn memory_eval_semantic_inner() {
     let mut ids: Vec<String> = Vec::with_capacity(corpus.len());
     // #R61：corpus embed 跳过计数（见 skip 路径注释）。
     let mut corpus_skipped = 0usize;
+    // #R65 maintainability/low：**HV_POOL 重置**——进程内多调用/rerun 时陈旧向量
+    // 会掩盖退化服务（恒等映射）；锁失败按硬错误（静默降级 = 非确定性守卫）。
+    {
+        let mut g = HV_POOL
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        *g = None;
+    }
     let mut hype_processed: std::collections::HashSet<String> = std::collections::HashSet::new();
     // #R43 bug/medium：total 独立计数（首次遇到即 +1，无论成败）——processed 失败时
     // 会 remove（允许重试），断言时只剩成功的，用它作分母是重言式。
@@ -496,9 +507,12 @@ async fn memory_eval_semantic_inner() {
     // 所有 hv 相同 → 1 个唯一向量，双路合并退化单路而覆盖断言全绿）。
     {
         use std::sync::Mutex;
+        // #R65：锁失败硬错误（unwrap_or(0) 会把毒锁误报为"0 唯一向量"）。
         let uniq = HV_POOL
             .lock()
-            .map(|g| g.as_ref().map(|v| v.len()).unwrap_or(0))
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+            .map(|v| v.len())
             .unwrap_or(0);
         let floor = (hype_total as f64 * 0.3).ceil() as usize;
         assert!(
@@ -692,36 +706,50 @@ async fn memory_eval_semantic_inner() {
     // 让 ~25 分钟评测整体 flake，引用的 case 会显式失败暴露缺口）。
     if corpus_skipped > 0 {
         use std::collections::HashSet;
-        let mut referenced: HashSet<usize> = HashSet::new();
+        // #R65 other/low：**expect/paraphrase 与 must_not 分开**——占位符 id 永不
+        // 被 hybrid_search 返回：expect/paraphrase 引用它 = 期望 id 永不入 top-k
+        // （recall 断言不可靠 → 硬失败）；must_not 引用它平凡满足（vacuously
+        // pass）→ 只 WARN。
+        let mut expect_ref: HashSet<usize> = HashSet::new();
         for c in &cases {
             if let Some(arr) = c["expect_indices"].as_array() {
                 for v in arr {
                     if let Some(i) = v.as_u64() {
-                        referenced.insert(i as usize);
+                        expect_ref.insert(i as usize);
                     }
                 }
             }
+        }
+        let mut must_not_ref: HashSet<usize> = HashSet::new();
+        for c in &cases {
             if let Some(arr) = c["must_not_indices"].as_array() {
                 for v in arr {
                     if let Some(i) = v.as_u64() {
-                        referenced.insert(i as usize);
+                        must_not_ref.insert(i as usize);
                     }
                 }
             }
         }
         for (_, idx) in &paraphrase_cases {
-            referenced.insert(*idx);
+            expect_ref.insert(*idx);
         }
         // 占位符形如 "<embed-failed-N>"，N = corpus 索引。
         let skipped_idx: HashSet<usize> = ids
             .iter()
             .filter_map(|id| id.strip_prefix("<embed-failed-").and_then(|s| s.parse::<usize>().ok()))
             .collect();
-        let overlapping: Vec<usize> = skipped_idx.intersection(&referenced).copied().collect();
-        if !overlapping.is_empty() {
+        let overlapping_expect: Vec<usize> =
+            skipped_idx.intersection(&expect_ref).copied().collect();
+        let overlapping_must_not: Vec<usize> =
+            skipped_idx.intersection(&must_not_ref).copied().collect();
+        if !overlapping_expect.is_empty() {
             assert_eq!(
                 corpus_skipped, 0,
-                "{corpus_skipped} corpus item(s) skipped; skipped positions {overlapping:?} are referenced by cases - recall assertions unreliable"
+                "{corpus_skipped} corpus item(s) skipped; expect/paraphrase positions {overlapping_expect:?} referenced - recall assertions unreliable"
+            );
+        } else if !overlapping_must_not.is_empty() {
+            eprintln!(
+                "[eval_semantic] WARN: {corpus_skipped} corpus item(s) skipped; must_not positions {overlapping_must_not:?} vacuously satisfied by placeholder - recall unaffected"
             );
         } else {
             eprintln!(
