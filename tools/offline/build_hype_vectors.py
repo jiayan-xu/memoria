@@ -306,7 +306,14 @@ def main():
             print(f"错误: id 清单文件不存在 {ids_file}")
             sys.exit(1)
         with open(ids_file, encoding="utf-8") as f:
-            wanted = {ln.strip() for ln in f if ln.strip()}
+            # #R54 maintainability/low：支持逗号分隔（帮助文本承诺）——每行按逗号
+            # split 后再收进集合（此前整行作一个 id，逗号文件全被当作不存在的 id）。
+            wanted = set()
+            for ln in f:
+                for part in ln.strip().split(","):
+                    part = part.strip()
+                    if part:
+                        wanted.add(part)
         by_id = {mid: c for mid, c in targets}
         targets = [(m, by_id[m]) for m in wanted if m in by_id]
         missing = wanted - set(by_id)
@@ -517,7 +524,10 @@ def main():
                 "VALUES (?, 'agent/xujiayan', ?, ?, datetime('now'))",
                 (mid, q, blob),
             )
-            con.commit()
+            # #R54 performance/low：批量 commit（每 50 行 + 循环后最终一次）——--all
+            # 5339 行逐行 commit 每次 fsync；INSERT OR REPLACE 幂等保证无正确性影响。
+            if i % 50 == 0:
+                con.commit()
         except DeterministicSkipError as e:
             # #R45 bug/medium：embed 侧确定性失败（4xx 配置错误）计 skip 不进 fail_ids。
             print(f"[{i}/{len(targets)}] {mid[:8]} 嵌入确定性失败，跳过: {e}")
@@ -532,6 +542,9 @@ def main():
         ok += 1
         if i % 10 == 0:
             print(f"  ...{i}/{len(targets)}")
+    # #R54 performance/low：循环结束最终 commit（最后一批不足 50 行的部分）。
+    if not args.dry_run and con is not None:
+        con.commit()
 
     if con is not None:
         con.close()

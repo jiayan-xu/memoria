@@ -595,13 +595,20 @@ fn is_busy(e: &rusqlite::Error) -> bool {
     )
 }
 
-/// #R53 bug/high：`duplicate column name`（SQLITE_ERROR 19 的扩展码 2001）判定——
-/// check-then-act 竞态下对端进程刚提交同一 ALTER 时本进程 ALTER 报此错，按
-/// "已应用"幂等处理（不中止启动）。
+/// #R53 bug/high：`duplicate column name` 判定——SQLite 的 ALTER ADD COLUMN 重复列
+/// 报 **SQLITE_ERROR（主码 1）+ 消息含 "duplicate column name"**；libsqlite3-sys 把
+/// 未显式映射的码（含 SQLITE_ERROR=1）归为 `ErrorCode::Unknown`（extended_code
+/// 2001 不存在——合法 SQLITE_CONSTRAINT 子码是 275/531/787/1043/1299/1555/1811/
+/// 2067/2323/2579）。此前按 extended_code==2001 匹配永不命中——check-then-act
+/// 竞态下对端进程刚提交同一 ALTER 时本进程仍 panic（守卫形同虚设）。按
+/// Unknown 主码 + 消息判定，消息匹配"已应用"幂等处理。
 fn is_duplicate_column(e: &rusqlite::Error) -> bool {
     match e {
-        rusqlite::Error::SqliteFailure(se, _) => {
-            se.extended_code == 2001 && se.code == rusqlite::ErrorCode::ConstraintViolation
+        rusqlite::Error::SqliteFailure(se, msg) => {
+            se.code == rusqlite::ErrorCode::Unknown
+                && msg
+                    .as_deref()
+                    .map_or(false, |m| m.contains("duplicate column name"))
         }
         _ => false,
     }
@@ -660,34 +667,54 @@ pub fn migrate_hype_vectors(pool: &SqlitePool) -> Result<(), String> {
     // 读失败**传播**（事务内 BEGIN 已按 busy_timeout 等待写锁，读失败即真实 DB 问题，
     // 不再 unwrap_or(0) 掩蔽成"列缺失"）。`duplicate column name` 另作"已应用"处理
     // （对端刚提交的窗口，幂等语义）。
+    // #R54 bug/high：整个块 **BEGIN BUSY 退避重试**——并发首启时对端持写锁（大库
+    // 孤儿 DELETE 可超 5s busy_timeout，或对端自身的 ALTER）会让本进程 BEGIN 直接
+    // DatabaseBusy 并 ? 传播到 .expect 中止启动（本函数唯一既无 execute_batch_retry
+    // 也无软降级的 DDL 路径）。退避与 execute_batch_retry 同款（3 次 500/1000/1500ms）。
     {
-        let tx = conn
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-            .map_err(|e| format!("begin updated_at tx: {}", e))?;
-        let has_upd: i64 = tx
-            .query_row(
-                "SELECT COUNT(*) FROM pragma_table_info('memory_vectors') WHERE name='updated_at'",
-                [],
-                |r| r.get(0),
-            )
-            .map_err(|e| format!("check memory_vectors.updated_at: {}", e))?;
-        if has_upd == 0 {
-            if let Err(e) = tx.execute_batch(
-                "ALTER TABLE memory_vectors ADD COLUMN updated_at TEXT DEFAULT (datetime('now'))",
-            ) {
-                // #R53 bug/high：`duplicate column name` = 对端进程刚提交了同一 ALTER
-                // （并发首启窗口）——按"已应用"处理，不中止启动。
-                if is_duplicate_column(&e) {
-                    eprintln!("[Memoria] Migration: memory_vectors.updated_at added by peer process");
-                } else {
-                    return Err(format!("add memory_vectors.updated_at: {}", e));
+        let mut attempt = 0;
+        loop {
+            // BEGIN 失败携带原始 rusqlite 错误供 busy 判定；其余错误只带消息
+            // （重试只对 BEGIN 的锁竞争有意义——事务内语句失败是真实 DB 问题）。
+            let r: Result<(), (String, Option<rusqlite::Error>)> = (|| {
+                let tx = conn
+                    .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                    .map_err(|e| (format!("begin updated_at tx: {}", e), Some(e)))?;
+                let has_upd: i64 = tx
+                    .query_row(
+                        "SELECT COUNT(*) FROM pragma_table_info('memory_vectors') WHERE name='updated_at'",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .map_err(|e| (format!("check memory_vectors.updated_at: {}", e), None))?;
+                if has_upd == 0 {
+                    if let Err(e) = tx.execute_batch(
+                        "ALTER TABLE memory_vectors ADD COLUMN updated_at TEXT DEFAULT (datetime('now'))",
+                    ) {
+                        // #R53 bug/high：`duplicate column name` = 对端进程刚提交了
+                        // 同一 ALTER（并发首启窗口）——按"已应用"处理，不中止启动。
+                        if is_duplicate_column(&e) {
+                            eprintln!("[Memoria] Migration: memory_vectors.updated_at added by peer process");
+                        } else {
+                            return Err((format!("add memory_vectors.updated_at: {}", e), None));
+                        }
+                    } else {
+                        eprintln!("[Memoria] Migration: added memory_vectors.updated_at column");
+                    }
                 }
-            } else {
-                eprintln!("[Memoria] Migration: added memory_vectors.updated_at column");
+                tx.commit()
+                    .map_err(|e| (format!("commit updated_at tx: {}", e), None))?;
+                Ok(())
+            })();
+            match r {
+                Ok(()) => break,
+                Err((_msg, Some(e))) if is_busy(&e) && attempt < 3 => {
+                    attempt += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(500 * attempt as u64));
+                }
+                Err((msg, _)) => return Err(msg),
             }
         }
-        tx.commit()
-            .map_err(|e| format!("commit updated_at tx: {}", e))?;
     }
     // #R49 bug/medium：DDL 用 BUSY 退避重试（见 execute_batch_retry）——并发首启时
     // 另一进程持写锁可能让本进程 DDL 立即 SQLITE_BUSY，.expect 硬失败会 panic 中止
@@ -840,13 +867,18 @@ pub fn migrate_hype_vectors(pool: &SqlitePool) -> Result<(), String> {
         })
     };
     let already = flag_set(&conn, CLEANUP_FLAG);
-    let refused_done = flag_set(&conn, REFUSED_FLAG);
-    // #R52 bug/medium：外层 gate **只由 CLEANUP_FLAG 门控**——refused 态只应跳过
-    // memory_vectors 段（事务内判定），此前 `!refused_done` 会把整个清理（含 hype
-    // 孤儿清理）跳过：用户仅忘记设 opt-in env 就会永久禁用 hype 清理（hype 行按
-    // 注释必为垃圾、无合法态），唯一出路是手删 migration_flags 行或 force env 对。
+    // #R54 bug/low：refused 态不再外层读取——事务内重读（refused2，与完成 flag
+    // 同款并发语义）；外层快照会在对端提交 REFUSED 的窗口内过期。
+    // #R54 performance/medium：hype 段**独立完成 flag**——此前 refused（memory_vectors
+    // 拒绝）时 CLEANUP_FLAG 不置位、gate 每次启动都进，hype 段的 EXISTS+COUNT 相关
+    // 扫描（大表 O(n)）在持写锁事务里每启动重跑一遍（#R49 拒绝态持久化的初衷就是
+    // 避免这个）。HYPE_FLAG = "hype 段已评估（删除或拒绝）"；force 时仍重新评估。
+    const HYPE_FLAG: &str = "hype_orphan_cleanup_v1";
+    let hype_done = flag_set(&conn, HYPE_FLAG);
+    // #R52 bug/medium：外层 gate 由两个完成 flag 门控（任一未完成即进）——refused 态
+    // 只跳过 memory_vectors 段的评估（事务内判定），不再跳过整个清理。
     // force gate 保留（覆盖已置位标记的逃生通道，#R50/#R51）。
-    if !already || (force_cleanup && clean_vectors) {
+    if !already || !hype_done || (force_cleanup && clean_vectors) {
         // 清理**软降级**（#R48 bug/medium）：BEGIN IMMEDIATE 阻塞超 busy_timeout（并发
         // 首启大库 DELETE 可超 5s）、或清理中任何 DB 错误，**不阻断启动**——main.rs/
         // mcp_server.rs 用 .expect()，硬失败会让并发首启部署直接 panic 中止。失败仅
@@ -859,76 +891,115 @@ pub fn migrate_hype_vectors(pool: &SqlitePool) -> Result<(), String> {
             let tx = conn
                 .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
                 .map_err(|e| format!("begin cleanup tx: {}", e))?;
-            // 事务内重读**CLEANUP_FLAG**（#R52 bug/medium：并发首启时对端进程可能在
-            // 本进程 gate 检查后、BEGIN 生效前完成清理——只查 CLEANUP_FLAG；refused
-            // 不再参与短路（refused 只门控 memory_vectors 段，hype 段始终执行）。
-            let already2: i64 = tx
+            // 事务内重读**两个完成 flag**（#R52 bug/medium：并发首启时对端进程可能在
+            // 本进程 gate 检查后、BEGIN 生效前完成——任一完成即短路）。
+            // #R51 bug/high：force 时**不能短路**——force gate（force_cleanup &&
+            // clean_vectors）存在的唯一意义就是覆盖已置位标记；无条件 return 会让
+            // 逃生通道永久 no-op（refused 态一旦持久化即死局）。非 force 保留短路。
+            let done2: i64 = tx
                 .query_row(
-                    "SELECT COUNT(*) FROM migration_flags WHERE flag = ?1",
-                    rusqlite::params![CLEANUP_FLAG],
+                    "SELECT COUNT(*) FROM migration_flags WHERE flag IN (?1, ?2)",
+                    rusqlite::params![CLEANUP_FLAG, HYPE_FLAG],
                     |r| r.get(0),
                 )
-                .map_err(|e| format!("check cleanup flag (tx): {}", e))?;
-            // #R51 bug/high：force 时**不能短路**——force gate（force_cleanup &&
-            // clean_vectors）存在的唯一意义就是覆盖已置位的 CLEANUP/REFUSED 标记；
-            // 此处 `already2 != 0` 无条件 return 会让逃生通道永久 no-op（refused 态
-            // 一旦持久化，普通 gate 不再进入、force gate 进入又被短路——死局，只能
-            // 手删 migration_flags 行）。非 force 时保留短路（对端进程已完成）。
-            if already2 != 0 && !(force_cleanup && clean_vectors) {
+                .map_err(|e| format!("check cleanup flags (tx): {}", e))?;
+            if done2 > 0 && !(force_cleanup && clean_vectors) {
                 tx.commit()
                     .map_err(|e| format!("commit cleanup tx (noop): {}", e))?;
                 return Ok(());
             }
+            // #R54 bug/low：refused 态**事务内重读**（与完成 flag 一致）——对端进程
+            // 可能在本进程 gate 检查后、BEGIN 生效前提交 REFUSED_FLAG；用外层快照
+            // 会基于过期拒绝重跑 memory_vectors 评估（浪费全扫、可能覆盖刚持久化
+            // 的拒绝态）。
+            let refused2: i64 = tx
+                .query_row(
+                    "SELECT COUNT(*) FROM migration_flags WHERE flag = ?1",
+                    rusqlite::params![REFUSED_FLAG],
+                    |r| r.get(0),
+                )
+                .map_err(|e| format!("check refused flag (tx): {}", e))?;
             // #R47 performance/medium：空表短路用 EXISTS(LIMIT 1)（全 COUNT 扫描换首行
             // 命中即停），避免持写锁做无谓全表扫描。
             // #R42/#R44 performance/medium：**单条** DELETE（一次相关扫描）——分批
             // LIMIT 1000 在同一个 BEGIN IMMEDIATE 事务内不降低持锁时间（每批全表扫描）。
             // #R43 maintainability/low：SQL 规范化 + 错误消息内嵌 SQL 片段便于审计。
-            // #R51 maintainability/medium：**hype 段与 memory_vectors 段分离**——
-            // memory_hype_vectors 可由离线脚本重写（lib.rs/mcp_server.rs 文档），但
-            // 内容始终派生自 memories（问句向量），无 memories 行的 hype 行必为孤儿
-            // 垃圾、无合法态——不需要 opt-in/阈值；且 refused（仅由 memory_vectors
-            // 触发）不得禁用 hype 清理（此前共享 REFUSED_FLAG 让 memory_vectors 的
-            // 拒绝永久跳过两表清理）。
-            let h_exists: i64 = tx
-                .query_row(
-                    "SELECT EXISTS(SELECT 1 FROM memory_hype_vectors LIMIT 1)",
-                    [],
-                    |r| r.get(0),
-                )
-                .map_err(|e| format!("check memory_hype_vectors exists: {}", e))?;
-            if h_exists > 0 {
-                let orphans_hype: i64 = tx
-                    .query_row(
-                        "SELECT COUNT(*) FROM memory_hype_vectors \
-                         WHERE NOT EXISTS (SELECT 1 FROM memories m WHERE m.id = memory_hype_vectors.id)",
-                        [],
-                        |r| r.get(0),
-                    )
-                    .map_err(|e| format!("count memory_hype_vectors orphans: {}", e))?;
-                if orphans_hype > 0 {
-                    const DEL_HYPE: &str = "DELETE FROM memory_hype_vectors \
-                        WHERE NOT EXISTS (SELECT 1 FROM memories m WHERE m.id = memory_hype_vectors.id)";
-                    tx.execute(DEL_HYPE, []).map_err(|e| {
-                        format!("clean memory_hype_vectors orphans: {e} [SQL: {DEL_HYPE}]")
-                    })?;
-                    eprintln!("[Memoria] Migration: removed {orphans_hype} orphan memory_hype_vectors rows");
-                }
-            }
-            // #R48 bug/high（数据安全）：memory_vectors 的**孤儿 COUNT 必须有**——
-            // DELETE 无差别销毁所有"无 memories 行的向量行"，但代码库并不强制该
-            // 不变量：add_vectors（Python bindings，lib.rs:280）接受任意调用方 id、
-            // persist::lookup_namespace 对无 memories 行回退 'default'、vector_search
-            // 不 join memories——外部注册向量/待重导入/合成 id 是合法数据态。
-            // #R49 bug/high：memory_vectors 孤儿删除 **opt-in**——默认只报告不删除，
-            // 设 MEMORIA_ORPHAN_CLEANUP_VECTORS=1 才删（仍受阈值与
-            // MEMORIA_FORCE_ORPHAN_CLEANUP=1 约束）。
-            // #R51 maintainability/medium：此前 refused（refused_done）→ 本段跳过——
-            // 非 force 时保持拒绝态（不再重扫评估）；force 时重新评估。
+            // #R54 bug/medium：hype 段与 memory_vectors **统一守卫**——put_hype_
+            // stored_vector 是公开 API 接受任意 id（与 put_stored_vector 镜像），
+            // 外部工具可能在对应 memories 行之前/独立 stage hype 行（分批导入/部分
+            // 写入/外部 id）；"hype 行必为垃圾"的不变量未在写侧强制。默认只报告
+            // 不删除（opt-in MEMORIA_ORPHAN_CLEANUP_VECTORS=1），阈值/force 语义
+            // 与 memory_vectors 段一致。
             const ORPHAN_REFUSE_THRESHOLD: i64 = 5000;
             // force/opt-in env 在 gate 之前已读取（#R50 bug/medium，见函数上方）。
             let mut refused = false;
-            if refused_done && !(force_cleanup && clean_vectors) {
+            // ── hype 段（HYPE_FLAG 未评估时）──
+            let hype_done2: i64 = tx
+                .query_row(
+                    "SELECT COUNT(*) FROM migration_flags WHERE flag = ?1",
+                    rusqlite::params![HYPE_FLAG],
+                    |r| r.get(0),
+                )
+                .map_err(|e| format!("check hype flag (tx): {}", e))?;
+            if hype_done2 == 0 {
+                let h_exists: i64 = tx
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM memory_hype_vectors LIMIT 1)",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .map_err(|e| format!("check memory_hype_vectors exists: {}", e))?;
+                if h_exists > 0 {
+                    let orphans_hype: i64 = tx
+                        .query_row(
+                            "SELECT COUNT(*) FROM memory_hype_vectors \
+                             WHERE NOT EXISTS (SELECT 1 FROM memories m WHERE m.id = memory_hype_vectors.id)",
+                            [],
+                            |r| r.get(0),
+                        )
+                        .map_err(|e| format!("count memory_hype_vectors orphans: {}", e))?;
+                    if orphans_hype > 0 {
+                        if !clean_vectors {
+                            eprintln!(
+                                "[Memoria] WARN: {orphans_hype} orphan memory_hype_vectors rows (possible staged/external hype rows); NOT deleting - set MEMORIA_ORPHAN_CLEANUP_VECTORS=1 to enable (MEMORIA_FORCE_ORPHAN_CLEANUP=1 bypasses the {ORPHAN_REFUSE_THRESHOLD} threshold)"
+                            );
+                            refused = true;
+                        } else if orphans_hype > ORPHAN_REFUSE_THRESHOLD && !force_cleanup {
+                            eprintln!(
+                                "[Memoria] WARN: {orphans_hype} orphan memory_hype_vectors rows ABOVE safety threshold {ORPHAN_REFUSE_THRESHOLD}; refusing auto-delete (set MEMORIA_FORCE_ORPHAN_CLEANUP=1 to force)"
+                            );
+                            refused = true;
+                        } else {
+                            const DEL_HYPE: &str = "DELETE FROM memory_hype_vectors \
+                                WHERE NOT EXISTS (SELECT 1 FROM memories m WHERE m.id = memory_hype_vectors.id)";
+                            tx.execute(DEL_HYPE, []).map_err(|e| {
+                                format!("clean memory_hype_vectors orphans: {e} [SQL: {DEL_HYPE}]")
+                            })?;
+                            eprintln!("[Memoria] Migration: removed {orphans_hype} orphan memory_hype_vectors rows");
+                        }
+                    }
+                }
+                // #R54 performance/medium：段完成（删除或拒绝）都置 HYPE_FLAG——
+                // 拒绝态由 REFUSED_FLAG 记录（语义与 memory_vectors 段一致：
+                // 评估过即跳过后续启动的持锁重扫，force 覆盖重新评估）。
+                tx.execute(
+                    "INSERT OR IGNORE INTO migration_flags (flag) VALUES (?1)",
+                    rusqlite::params![HYPE_FLAG],
+                )
+                .map_err(|e| format!("set hype flag: {}", e))?;
+            }
+            // ── memory_vectors 段 ──
+            // #R48 bug/high（数据安全）：**孤儿 COUNT 必须有**——DELETE 无差别销毁
+            // 所有"无 memories 行的向量行"，但代码库并不强制该不变量：add_vectors
+            // （Python bindings，lib.rs:280）接受任意调用方 id、persist::lookup_namespace
+            // 对无 memories 行回退 'default'、vector_search 不 join memories——外部注册
+            // 向量/待重导入/合成 id 是合法数据态。
+            // #R49 bug/high：memory_vectors 孤儿删除 **opt-in**——默认只报告不删除，
+            // 设 MEMORIA_ORPHAN_CLEANUP_VECTORS=1 才删（仍受阈值与
+            // MEMORIA_FORCE_ORPHAN_CLEANUP=1 约束）。
+            // #R51 maintainability/medium：此前 refused（refused2）→ 本段跳过——
+            // 非 force 时保持拒绝态（不再重扫评估）；force 时重新评估。
+            if refused2 > 0 && !(force_cleanup && clean_vectors) {
                 // #R51：WARN 文案明确**两个 env 都要**（此前只提示 FORCE，而 gate
                 // 还要求 OPT_IN——误导运维）。
                 eprintln!(
@@ -976,7 +1047,8 @@ pub fn migrate_hype_vectors(pool: &SqlitePool) -> Result<(), String> {
             }
             // 置位标记（事务内，提交后对并发进程可见）：正常完成（含"无孤儿"）→
             // CLEANUP_FLAG；阈值/opt-in 拒绝（refused）→ REFUSED_FLAG——持久化拒绝态
-            // 使后续启动跳过整个清理（不再持写锁重扫相关扫描，#R49 performance/medium）。
+            // 使后续启动跳过 memory_vectors 段评估（不再持写锁重扫相关扫描，
+            // #R49 performance/medium；hype 段由 HYPE_FLAG 独立跳过）。
             // #R50 bug/medium：**强制成功运行后清除 REFUSED_FLAG**——force gate
             // （force_cleanup && clean_vectors）会无视 refused 态进入清理，若不清除
             // 旧 refused 标记，后续普通启动（无 env）仍被 refused 挡住；清除后

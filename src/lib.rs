@@ -119,11 +119,16 @@ impl MemoriaEngine {
     /// 程序化区分"刷新成功"与"降级空重建"，count==0 同时可能是"未启用"或"失败"。
     /// Err 路径真实可达：失败保留旧快照（检索不中断）并向调用方显式报错。
     /// #R53 maintainability/low 已知取舍：要求 `&mut self`——`build_hype_hnsw` 全量
-    /// 重读+重索引表（大表秒级），Arc<Mutex> 宿主在刷新期间持锁会阻塞并发检索；
-    /// 理想形态是构建锁外进行、仅最终 swap O(1) 同步（hype_hnsw 换内部可变槽），
-    /// 留待后续。当前正确性优先，宿主错峰刷新即可。
+    /// 重读+重索引表（大表秒级），Arc<Mutex> 宿主在刷新期间持锁会阻塞并发检索。
+    /// **推荐模式（#R54 performance/medium）**：构建在锁外进行——`persist::
+    /// build_hype_hnsw(&pool, ef)` 是自由函数只取 &pool，宿主可在无锁下构建新索引，
+    /// 然后仅持锁执行 O(1) swap（`engine.hype_hnsw = fresh`）——锁内窗口从"秒级
+    /// 构建"缩到"一次赋值"。本方法（&mut self 形态）面向简单宿主，构建在锁内。
+    /// #R54 maintainability/low：刷新时复用 **content 索引当前的 ef**（self.hnsw
+    /// 构造时解析并应用）——重新解析 env 会在长驻进程里 env 变更后让双路 ef 分裂
+    /// （content 保持构造时值、hype 用新值），违背 ef 对齐目标。
     pub fn refresh_hype_index(&mut self) -> Result<usize, String> {
-        let ef_search = vector::persist::resolve_ef_search();
+        let ef_search = self.hnsw.ef_search();
         let (fresh, count) = match vector::persist::build_hype_hnsw(&self.pool, ef_search) {
             Ok(x) => x,
             Err(e) => {
@@ -203,12 +208,11 @@ impl MemoriaEngine {
         );
         // V1（#R37 maintainability/low）：HyPE 索引规模也纳入公开统计——
         // 否则 Python/standalone 宿主只能从启动 eprintln 行观察，API 无感知。
-        // #R50 maintainability/medium：报告**权威表行数**而非内存快照——hype_hnsw 是
-        // 构造时快照，运行时表更新（离线脚本重跑）后内存 len 静默偏离现实（如
-        // 索引 0 会隐藏脚本已写入的向量，误导运维）；字段名也暗示反映存储。
-        // #R51 maintainability/medium：查询失败**显式标记为 -1** 并 eprintln——此前
-        // unwrap_or(内存 len) 把任何查询失败（缺表/锁）伪装成合理数字，运维无法区分
-        // "HyPE 未启用（空表 0）"与"统计查询失败（-1）"，正是要 surface 的故障。
+        // #R50/#R54 maintainability/low：**同时暴露 store 行数与 live 索引 len**——
+        // 只报 store 会在 HyPE 构建降级（or_default 失败 → 内存索引空而表有行）时
+        // 返回正值、看起来健康（API-only 宿主不解析启动 WARN 就无从发现单路退化）。
+        // 双字段对照：store > 0 且 live == 0 = 构建降级，一眼可见。
+        // 查询失败显式标记为 -1（#R51：缺表/锁不被伪装成合理数字）。
         let hype_store: i64 = match conn.query_row(
             "SELECT COUNT(*) FROM memory_hype_vectors",
             [],
@@ -223,6 +227,10 @@ impl MemoriaEngine {
         m.insert(
             "hype_vector_index_size".to_string(),
             serde_json::Value::Number(hype_store.into()),
+        );
+        m.insert(
+            "hype_vector_index_live".to_string(),
+            serde_json::Value::Number((self.hype_hnsw.len() as i64).into()),
         );
         m.insert(
             "query_cache_size".to_string(),
