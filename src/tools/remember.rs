@@ -190,13 +190,10 @@ pub fn set_event_time(pool: &SqlitePool, memory_id: &str, event_time: &str) -> R
     Ok(())
 }
 
-/// #R65 maintainability/medium：**三路统一的向量持久化+索引 helper**——put 失败
-/// 短路 add（防 memory-only 向量）；add 失败记录并注明重启 rebuild 自愈。
-/// 此前三路复制粘贴的 if/else-if 链让失败语义漂移，抽单点防未来只改一路。
-/// #R66 bug/medium：**semantic_related 边移出本函数**——edge 刷新是幂等维护
-/// （已存在向量的记忆也应重算邻接），不能与 put+add 成功条件耦合；由调用方
-/// 在 is_none 守卫**之外**统一调用 edge_refresh。本函数只管 put+add，返回 ()
-/// （bool 返回值无消费者，是误导性 API）。
+/// 三路统一的向量持久化+索引 helper（此前复制粘贴的 if/else-if 链让失败语义
+/// 漂移，抽单点防未来只改一路）：put 失败短路 add（防 memory-only 向量）；
+/// add 失败记录并注明重启 rebuild 自愈。semantic_related 边的幂等刷新由调用方
+/// 在 is_none 守卫之外统一调 edge_refresh（本函数只管 put+add，返回 ()）。
 /// 短路 add（防 memory-only 向量）；semantic_related 边仅 put+add 都成功才建
 /// （无向量的记忆不该有图边）；add 失败记录并注明重启 rebuild 自愈。返回
 /// put+add 是否都成功（edge 门控）。此前三路复制粘贴的 if/else-if 链让门控
@@ -230,6 +227,9 @@ fn persist_and_index(
 
 /// #R66：semantic_related 边的**幂等刷新**——is_none 守卫之外统一调用（已存在
 /// 向量的记忆也应重算邻接，删除旧出边 + 按当前 HNSW 邻域重算）；失败可见。
+/// #R67 bug/medium：**向量落库门控**——put/add 失败时该记忆无持久/索引向量，
+/// 建边会留 dangling edges（重启 rebuild 只从持久向量重建索引、不重算边，
+/// 反向邻接永不再现）；refresh 前重查 get_stored_vector，无向量则跳过。
 fn edge_refresh(
     pool: &SqlitePool,
     hnsw: &HnswIndex,
@@ -237,6 +237,12 @@ fn edge_refresh(
     ns: &str,
     qv: &[f32],
 ) {
+    if crate::vector::persist::get_stored_vector(pool, id).is_none() {
+        eprintln!(
+            "[remember] edge_refresh skipped for {id}: no persisted vector (put/add failed earlier)"
+        );
+        return;
+    }
     if let Err(e) = crate::search::semantic_edges::upsert_semantic_edges_for(pool, hnsw, id, ns, qv)
     {
         eprintln!("[remember] upsert_semantic_edges failed for {id}: {e}");

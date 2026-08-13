@@ -30,7 +30,9 @@ impl Default for RrfWeights {
 }
 
 /// A fused result after RRF merge.
-#[derive(Debug, Clone)]
+/// #R67 maintainability/low：derive Default——测试/构造场景（cooccur 单元测试的
+/// mk_result）用 `..Default::default()` 免逐字段枚举（结构演进不再机械改测试）。
+#[derive(Debug, Clone, Default)]
 pub struct FusedResult {
     pub memory_id: String,
     pub content: String,

@@ -363,6 +363,16 @@ fn query_hype_count_cached(conn: &rusqlite::Connection, db_path: &str) -> i64 {
     {
         // #R65 maintainability/low：:memory: 分支 WARN 也走 60s 冷却（轮询刷屏
         // 与缓存路径同款纪律）。
+        // #R67 performance/low：**同样修剪过期条目**（此前只插不删——多内存 URI
+        // 各失败一次长期累积）。
+        {
+            let now = Instant::now();
+            if let Ok(mut fe) = FAIL_EPOCHS.lock() {
+                if let Some(fmap) = fe.as_mut() {
+                    fmap.retain(|_, at| now.saturating_duration_since(*at).as_secs() < 60);
+                }
+            }
+        }
         return match conn.query_row("SELECT COUNT(*) FROM memory_hype_vectors", [], |r| {
             r.get::<_, i64>(0)
         }) {
@@ -563,14 +573,17 @@ mod python {
             let r: Result<usize, String> = py.detach(|| self.inner.refresh_hype_index());
             // #R65 bug/medium：**清 pending + 失效旧 token**——两阶段流程若先
             // build_hype_index()（pending 槽带 token N）后调 refresh，陈旧 pending
-            // 索引仍持有效 token，后续 swap(N) 会激活它静默回退本次刷新；清槽 +
-            // build_seq 递增使已发 token 全失效。一步 refresh 与两阶段流程
-            // 严格互斥。
-            *self
-                .pending_hype
-                .lock()
-                .unwrap_or_else(|p| p.into_inner()) = None;
-            self.build_seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            // 索引仍持有效 token，后续 swap(N) 会激活它静默回退本次刷新。
+            // #R67 bug/medium：**仅成功时清**——refresh 失败（瞬时 DB busy）时
+            // 保留 pending 槽与已发 token：调用方仍可 swap(N) 落地上一个
+            // 已知良好的索引（此前无条件清槽把有效快照连同逃生通道一起丢弃）。
+            if r.is_ok() {
+                *self
+                    .pending_hype
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner()) = None;
+                self.build_seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             r.map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))
         }
         /// #R60：两阶段 refresh 的构建阶段（&self——detach 下其他线程可并发

@@ -13,11 +13,9 @@ const MAX_NUMBERS: usize = 8;
 const MAX_DATES: usize = 4;
 const MAX_UPDATE_MARKERS: usize = 4;
 
-/// #R61 maintainability/low：text-signal 通道标记（source 追加后缀）——库内共享
-/// 常量：**生产代码**的追加/去重逻辑引用常量（单一事实源）。
-/// #R65 documentation/low 政策澄清：**wire-format 测试钉字面量**——FusedResult.source
-/// 直接序列化进 API 响应，测试引用常量是自证重言式（改值/typo 全绿）；
-/// 见 rerank_boosts_numeric_overlap 的 #R64 断言。
+/// text-signal 通道标记（source 追加后缀），生产代码的追加/去重逻辑引用此常量。
+/// 注意：FusedResult.source 直接序列化进 API 响应（wire format）——测试断言
+/// 刻意钉字面量而非引用本常量（常量值被改/typo 时测试才能红）。
 pub const SOURCE_MARKER: &str = "text_signals";
 // #R63 test/low：**字面量钉住**——FusedResult.source 直接序列化进 API 响应
 // （wire format），测试若只引用常量则改值/typo 时全绿（自证重言式）。
@@ -226,7 +224,9 @@ pub fn rerank_by_text_signals(query: &str, results: &mut Vec<FusedResult>) {
         if boost > 0.0 {
             r.rrf_score += boost;
             if !r.source.contains(SOURCE_MARKER) {
-                r.source = format!("{};{}", r.source, SOURCE_MARKER);
+                // #R67 performance/low：原地追加（热路径免 format! 分配）。
+                r.source.push(';');
+                r.source.push_str(SOURCE_MARKER);
             }
         }
     }

@@ -345,7 +345,9 @@ def main():
                         wanted.append(part)
         by_id = {mid: c for mid, c in targets}
         targets = [(m, by_id[m]) for m in wanted if m in by_id]
-        missing = wanted - set(by_id)
+        # #R67 bug/high：wanted 是 list（#R66 顺序保持）——set 差集前必须转换
+        # （list - set 抛 TypeError，每次 --ids 崩溃）。
+        missing = set(wanted) - set(by_id)
         if missing:
             print(f"提示: {len(missing)} 个 id 不在目标集中（已删除/失效），忽略")
         print(f"--ids 定点目标: {len(targets)} 条")
@@ -524,10 +526,14 @@ def main():
             sys.exit(1)
         before = len(targets)
         targets = [(m, c) for m, c in targets if m in valid_ids]
-        stale = before - len(targets)
+        stale_ids = [m for m, _ in targets if m not in valid_ids]
+        targets = [(m, c) for m, c in targets if m in valid_ids]
+        stale = len(stale_ids)
         if stale:
             print(f"提示: {stale} 条 golden id 已失效（删除/过期/superseded），计 skip 跳过")
             skip += stale
+            # #R67 other/low：失效 id 也进 skip_ids——摘要的"确定性跳过"数与 skip 一致。
+            skip_ids.extend(stale_ids)
 
     def record_fail(mid):
         """失败 id **立即追加**落盘（#R40 bug/medium）：脚本中断（Ctrl+C/崩溃）时

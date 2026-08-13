@@ -52,6 +52,10 @@ pub fn put_stored_vector(
 
 /// V1（2026-08-12）：写入/覆盖某记忆的 HyPE 问句向量（与 `put_stored_vector` 对称，
 /// 落 `memory_hype_vectors` 表）。同款退化/维度防御；共享 `put_vector_into` 实现。
+/// #R67 other/low 已知限制：本 API 不写 `question` 列（新建行 question=NULL）——
+/// 与离线流水线（build_hype_vectors.py 恒写 question）分歧；问题向量检索只依赖
+/// vector 列，NULL question 不影响召回，但会与脚本产物形态不一。未来生产调用方
+/// 若需要完整行语义，应扩展可选 question 参数（镜像脚本写契约）。
 /// #R57 maintainability/low：`src/` 内无调用者（生产 HyPE 写入走离线脚本
 /// build_hype_vectors.py 的原始 INSERT ... ON CONFLICT DO UPDATE，维护 question 列），
 /// 但 tests/eval_semantic.rs 的 HyPE upsert 路径实测调用——测试覆盖使其非死代码，
@@ -176,10 +180,13 @@ fn warn_throttled(fn_name: &str, reason: &str, msg: &str) {
     // #R65 bug/medium：**单调时钟基准（OnceLock<Instant>）**——SystemTime 墙钟
     // 前后跳会误翻转窗口（WARN 风暴）或让预算耗尽（聚合行失效）；与
     // query_hype_count_cached（#R63）/semantic #R54 的 Instant 纪律一致。
+    // #R67 other/medium：**窗口 3600s**——60s 窗口让 ≤3/min 的持续故障每窗口重开
+    // 3 条详情预算（~1440 行/天，恰是 #R51 要抑制的刷屏）；小时级窗口下慢速
+    // 故障只有每小时前 3 条详情 + 聚合行。
     use std::sync::OnceLock;
     static CLOCK_BASE: OnceLock<std::time::Instant> = OnceLock::new();
     let base = *CLOCK_BASE.get_or_init(std::time::Instant::now);
-    let epoch = base.elapsed().as_secs() / 60;
+    let epoch = base.elapsed().as_secs() / 3600;
     let se = &SLOT_EPOCHS[(h as usize) % SLOT_EPOCHS.len()];
     let old_epoch = se.load(Ordering::Relaxed);
     if old_epoch != epoch
