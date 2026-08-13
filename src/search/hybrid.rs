@@ -104,7 +104,6 @@ pub fn hybrid_search(
                         SemanticError::QueryDim(_) => "hybrid_drop_dim",
                         SemanticError::RoadsFailed => "hybrid_drop_roads",
                         SemanticError::Fetch(_) => "hybrid_drop_db",
-                        SemanticError::Other(_) => "hybrid_drop_other",
                     };
                     // 闭包求值：冷却期间零分配（#R57）。
                     throttled_eprintln(key, || format!("[hybrid] semantic signal dropped: {e}"));
