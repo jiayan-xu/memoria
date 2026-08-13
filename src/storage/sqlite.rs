@@ -682,6 +682,14 @@ fn ddl_soft(conn: &rusqlite::Connection, sql: &str, label: &str) {
 /// 清理（#R35 maintainability/low）：memories 删除时经触发器同步删本表与 memory_vectors
 /// 的行——否则孤儿向量行在每次启动 rebuild 时被重新加入 HNSW，永久浪费索引内存/存储
 /// （web_api/mcp_server 的 DELETE 只删 memories，不碰向量表）。
+///
+/// #R60 maintainability/low **控制流总览**（各段详细 rationale 见段内 #R 注释）：
+/// ① busy_timeout PRAGMA（软处理）→ ② memory_vectors.updated_at 补列（只读快速路径 +
+/// BEGIN 退避重试 + 必要列验证传播，不软降级）→ ③ 三张可选表 DDL（ddl_soft 软降级）+
+/// schema 契约检查 → ④ 触发器重建（版本 flag 门控 + 软降级）→ ⑤ 孤儿向量清理
+/// （hype 段独立 HYPE_FLAG / vec 段 REFUSED_FLAG，删除需 OPT_IN+FORCE 双 env，
+/// 软降级 + 下次重试）。整体设计目标：并发首启存活（软降级）+ 数据安全（外部向量
+/// 不误删）+ 幂等（migration_flags 门控）。
 pub fn migrate_hype_vectors(pool: &SqlitePool) -> Result<(), String> {
     let mut conn = pool.get().map_err(|e| format!("pool get: {}", e))?;
     // #R43 bug/medium：busy_timeout 必须在**本函数所有 DDL/读-写操作之前**设置——
@@ -799,16 +807,30 @@ pub fn migrate_hype_vectors(pool: &SqlitePool) -> Result<(), String> {
                         std::thread::sleep(std::time::Duration::from_millis(500 * attempt as u64));
                     }
                     Err((msg, _)) => {
-                        // #R57 bug/medium：**软降级**——本块是 migrate_hype_vectors 内
-                        // 唯一的重试耗尽后硬失败路径（BEGIN 每次尝试可等满 5s
-                        // busy_timeout，3 次 ≈15-18s）：对端进程持写锁超预算（如它自己
-                        // 的大库孤儿 COUNT/DELETE）时 Err 经 init_core_tables 传播到
-                        // .expect() 中止启动——与本函数其余分支（ddl_soft 三表/触发器
-                        // 重建/孤儿清理均软降级 + 下次重试）的并发首启存活目标相悖。
-                        // 缺列后果（4 列 upsert 报 no such column）只在存量旧库出现且
-                        // 下次启动重试，可接受。
+                        // #R57 bug/medium：**软降级曾在此 break**——#R60 bug/medium
+                        // 推翻：updated_at 是**写路径必要列**（persist vector_table!
+                        // 的 4 列 upsert 引用它，无该列则每次写入报 no such column；
+                        // 生产调用方 let _ 丢弃 Result，失败只以限流 WARN 呈现）。
+                        // 与 ddl_soft 的**可选**附加表（缺表只是 HyPE 功能降级）
+                        // 不同，此处软降级 = 核心写路径静默损坏而进程"健康"。
+                        // 重试耗尽后**验证列实际存在**：对端进程可能已成功 ALTER
+                        // （本进程失败仅因锁竞争）→ 通过；否则传播错误（启动失败
+                        // 显式暴露，运维可重试）。
+                        let has_upd_after: i64 = conn
+                            .query_row(
+                                "SELECT COUNT(*) FROM pragma_table_info('memory_vectors') \
+                                 WHERE name='updated_at'",
+                                [],
+                                |r| r.get(0),
+                            )
+                            .unwrap_or(0);
+                        if has_upd_after == 0 {
+                            return Err(format!(
+                                "memory_vectors.updated_at missing after retries (core write path requires it): {msg}"
+                            ));
+                        }
                         eprintln!(
-                            "[Memoria] WARN: updated_at migration failed after retries (soft-degraded, will retry next start): {msg}"
+                            "[Memoria] updated_at migration retries exhausted but column present (peer applied it): {msg}"
                         );
                         break;
                     }
@@ -861,7 +883,10 @@ pub fn migrate_hype_vectors(pool: &SqlitePool) -> Result<(), String> {
     // 列集校验：期望列缺一即 WARN（不阻断——flag/重建路径已有软处理，缺失只影响
     // 4 列 upsert 与双路检索，可下次启动修复后自愈）。
     {
-        let expect: [&str; 4] = ["id", "namespace", "vector", "updated_at"];
+        // #R60 maintainability/low：期望列含 **question**——离线 HyPE builder
+        // （build_hype_vectors.py 插入 id/namespace/question/vector/updated_at）依赖
+        // 它；此前漏检会让未来 schema 变更静默破坏离线写入路径。
+        let expect: [&str; 5] = ["id", "namespace", "question", "vector", "updated_at"];
         let have: Vec<String> = match conn
             .prepare("SELECT name FROM pragma_table_info('memory_hype_vectors')")
         {
@@ -1127,6 +1152,14 @@ pub fn migrate_hype_vectors(pool: &SqlitePool) -> Result<(), String> {
                             eprintln!(
                                 "[Memoria] WARN: {orphans_hype} orphan memory_hype_vectors rows ABOVE safety threshold {ORPHAN_REFUSE_THRESHOLD}; refusing auto-delete (set MEMORIA_FORCE_ORPHAN_CLEANUP=1 to force; once refused state is recorded, BOTH envs are required to re-enter)"
                             );
+                        } else if !force_cleanup {
+                            // #R60 bug/high：**单 OPT_IN 只报告不删**——"无 memories 行
+                            // ⇒ 垃圾"非强制不变量（外部/暂存向量是合法态）；删除执行
+                            // 必须 OPT_IN + FORCE 双 env 显式确认（样本审计 + 阈值只
+                            // 缓解可见性/数量，不修正分类正确性）。
+                            eprintln!(
+                                "[Memoria] WARN: {orphans_hype} orphan memory_hype_vectors rows detected (possible staged/external hype rows); NOT deleting - MEMORIA_ORPHAN_CLEANUP_VECTORS=1 AND MEMORIA_FORCE_ORPHAN_CLEANUP=1 are both required to delete"
+                            );
                         } else {
                             // #R57 bug/medium：**删除前打印样本**——opt-in 时 DELETE
                             // 永久销毁所有无 memories 行的向量行，但 add_vectors/
@@ -1208,6 +1241,12 @@ pub fn migrate_hype_vectors(pool: &SqlitePool) -> Result<(), String> {
                         } else if orphans_vec > ORPHAN_REFUSE_THRESHOLD && !force_cleanup {
                             eprintln!(
                                 "[Memoria] WARN: {orphans_vec} orphan memory_vectors rows ABOVE safety threshold {ORPHAN_REFUSE_THRESHOLD}; refusing auto-delete (set MEMORIA_FORCE_ORPHAN_CLEANUP=1 to force; once refused state is recorded, BOTH envs are required to re-enter)"
+                            );
+                            refused = true;
+                        } else if !force_cleanup {
+                            // #R60 bug/high：单 OPT_IN 只报告不删（同 hype 段理由）。
+                            eprintln!(
+                                "[Memoria] WARN: {orphans_vec} orphan memory_vectors rows detected (possible legit external vectors via add_vectors); NOT deleting - MEMORIA_ORPHAN_CLEANUP_VECTORS=1 AND MEMORIA_FORCE_ORPHAN_CLEANUP=1 are both required to delete"
                             );
                             refused = true;
                         } else {

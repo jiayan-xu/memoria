@@ -85,8 +85,13 @@ fn ledger_includes_text_signals() {
     );
 }
 
+// #R60：变异 MEMORIA_TEXT_SIGNALS_RERANK 的测试与依赖其默认值的测试共享串行锁
+// （见 text_signals_rerank_env_off）。
+static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[test]
 fn search_boosts_on_numeric_query_overlap() {
+    let _env_guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let (engine, ns) = fresh_engine("rerank");
     let a = remember_with_dedup(
         &engine.pool,
@@ -145,9 +150,12 @@ fn search_boosts_on_numeric_query_overlap() {
     assert!(!fused.is_empty());
     let top = &fused[0];
     assert_eq!(top.memory_id, mid_a, "P2.1c: 数字重叠应抬升含 120 的记忆");
+    // #R60 test/low：**只断言通道标记**——`rrf_score > 0.0` 是平凡断言（任何成功
+    // 融合结果都有正 RRF，text_signals 零贡献也通过）；source 含 text_signals 仅
+    // 在数字/日期 boost >0 实际应用时追加，P2.1c 回归必红。
     assert!(
-        top.source.contains("text_signals") || top.rrf_score > 0.0,
-        "source={}",
+        top.source.contains("text_signals"),
+        "text-signal boost must be applied: source={}",
         top.source
     );
 }
@@ -230,14 +238,26 @@ fn text_signals_rerank_env_off() {
     )
     .expect("mem");
 
+    // #R60 test/medium：env 变异加 **Drop guard 恢复 + 共享串行锁**——`set_var`
+    // 变异进程全局状态（edition 2024 中 unsafe 正是为此）：同二进制并行测试可
+    // 观察到瞬时的 "0"（flaky，依赖默认值的 search_boosts 会静默跳过 rerank），
+    // 断言 panic 时 remove_var 不执行则变量泄漏污染后续测试。guard 的 Drop 在
+    // unwind 路径也恢复；ENV_LOCK 为文件级（与 search_boosts 共享，见上）。
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    struct EnvRestore;
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            unsafe {
+                std::env::remove_var("MEMORIA_TEXT_SIGNALS_RERANK");
+            }
+        }
+    }
     unsafe {
         std::env::set_var("MEMORIA_TEXT_SIGNALS_RERANK", "0");
     }
+    let _restore = EnvRestore;
     let fused =
         hybrid_search(&engine.pool, "999", &ns, 5, None, None, None, None, false).expect("s");
-    unsafe {
-        std::env::remove_var("MEMORIA_TEXT_SIGNALS_RERANK");
-    }
     assert!(
         fused.iter().all(|r| !r.source.contains("text_signals")),
         "关闭 rerank 时不应出现 text_signals 通道标记"

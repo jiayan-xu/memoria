@@ -231,12 +231,17 @@ mod unit_tests {
         };
         let mut results: Vec<FusedResult> = vec![mk("m_a", "甲记忆"), mk("m_b", "乙记忆")];
         rerank_by_cooccurrence(&pool, "agent/test", "张三", &mut results);
-        // m_b 与查询同实体共现（m_a 也提及）——rerank 后顺序应变化（m_b 提前）
-        // 或至少不崩溃；核心断言是查询路径真实执行（排序被触碰）。
-        let ids: Vec<&str> = results.iter().map(|r| r.memory_id.as_str()).collect();
+        // #R60 test/medium：断言**可观察效果**——boost 应用后每个结果 rrf_score
+        // 抬升（>0.5 初始值）且 source 带 cooccur 标记（仅 rerank 路径追加）；
+        // 此断言在 load_memory_entities/match_query_entities 静默失败或 boost/排序
+        // 逻辑被删时必红（此前 ids.contains 恒真，正是要消除的假覆盖）。
         assert!(
-            ids.contains(&"m_a") && ids.contains(&"m_b"),
-            "results must be preserved: {ids:?}"
+            results.iter().all(|r| r.rrf_score > 0.5 && r.source.contains("cooccur")),
+            "cooccur boost must be applied: {:?}",
+            results
+                .iter()
+                .map(|r| (&r.memory_id, r.rrf_score, &r.source))
+                .collect::<Vec<_>>()
         );
     }
 }

@@ -355,6 +355,9 @@ def main():
     ok = skip = fail = 0
     fail_ids = []
     skip_ids = []
+    # #R60：**待提交批跟踪**——本批已 execute 未 commit 的 id；批/最终 commit 失败
+    # 时这些行未落库（回滚丢弃），必须补记 fail_ids 否则静默丢失且无重跑路径。
+    pending_batch = []
     # 已知限制（#R40 performance/low）：每轮一次 chat + 一次 embed 串行（--all 约 1 万次
     # 顺序请求）；embed 已支持 list 可批 16（仿 rebuild_vectors.py），但批量化需重构
     # 失败归因（批内单条失败 → 单独重嵌该条），留待后续优化，本轮保持正确性优先。
@@ -576,15 +579,33 @@ def main():
                 "namespace=excluded.namespace, updated_at=excluded.updated_at",
                 (mid, q, blob),
             )
+            pending_batch.append(mid)
             # #R54 performance/low：批量 commit（每 50 行 + 循环后最终一次）——--all
-            # 5339 行逐行 commit 每次 fsync；INSERT OR REPLACE 幂等保证无正确性影响。
+            # 5339 行逐行 commit 每次 fsync；ON CONFLICT DO UPDATE 幂等保证无正确性影响。
             if i % 50 == 0:
                 con.commit()
+                pending_batch.clear()
         except DeterministicSkipError as e:
             # #R45 bug/medium：embed 侧确定性失败（4xx 配置错误）计 skip 不进 fail_ids。
             print(f"[{i}/{len(targets)}] {mid[:8]} 嵌入确定性失败，跳过: {e}")
             skip += 1
             skip_ids.append(mid)
+            continue
+        except sqlite3.Error as e:
+            # #R60 bug/medium：**rollback 清中止事务态**——失败 DML/COMMIT 让
+            # 隐式事务进入 aborted 态，不 rollback 则后续每行 execute 持续失败
+            # （一次 BUSY/磁盘满级联成整批失败，每行各付一次 chat 调用）；
+            # 同时本批已 execute 未 commit 的行被丢弃，补记 fail_ids 防静默丢失。
+            try:
+                con.rollback()
+            except sqlite3.Error:
+                pass
+            print(f"[{i}/{len(targets)}] {mid[:8]} 写入失败: {e}")
+            fail += 1
+            record_fail(mid)
+            for pid in pending_batch:
+                record_fail(pid)
+            pending_batch.clear()
             continue
         except Exception as e:
             print(f"[{i}/{len(targets)}] {mid[:8]} 嵌入/写入异常: {e}")

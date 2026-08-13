@@ -69,6 +69,23 @@ pub fn merge_occurred_tag(tags_json: &str, occurred_tag: &str) -> String {
     serde_json::to_string(&tags).unwrap_or_else(|_| "[]".to_string())
 }
 
+/// #R60 test/low：O2 旧列 `event_time_legacy` → occurred 的**纯函数**（enrich_ledger
+/// 的 fallback 抽出，可单测）。语义：空串 / 不足 10 字节 / 前 10 字节落在多字节字符
+/// 内（get(..10) None）均返回 None——短串或畸形值不进入 ledger 的 occurred 字段
+/// （下游 extract_text_signals 日期解析与 YYYY-MM-DD 约定不一致时会产生脏数据），
+/// 由调用方 valid_from 兜底。此路径曾是 `&s[..10]` 切片 panic 点（#R58）。
+pub fn legacy_occurred(legacy_et: &str) -> Option<String> {
+    if legacy_et.is_empty() {
+        return None;
+    }
+    if legacy_et.len() < 10 {
+        // #R60 other/low：短串（非 ISO 日期形态）返回 None——此前直接返回原始串
+        // 会把非日期值写进 occurred（目标"不喂非日期值给下游"只达成一半）。
+        return None;
+    }
+    legacy_et.get(..10).map(str::to_string)
+}
+
 /// Phase B：是否 JOIN entities 填 ledger（默认开；`MEMORIA_LEDGER_JOIN_ENTITIES=0/false/off` 关）。
 pub fn ledger_join_entities_enabled() -> bool {
     match std::env::var("MEMORIA_LEDGER_JOIN_ENTITIES") {
@@ -249,22 +266,7 @@ pub fn enrich_ledger(
 
             // O3 优先 tags；O2 旧列只读兜底；再退到 valid_from
             let occurred = parse_occurred_tag(tags_json)
-                .or_else(|| {
-                    if legacy_et.is_empty() {
-                        None
-                    } else if legacy_et.len() >= 10 {
-                        // #R58 bug/low：同 parse_occurred_tag——多字节旧列值切片 panic
-                        // 风险，get(..10) 安全。
-                        // #R59 bug/low：取不到前 10 字符（字节 10 落在多字节字符内）时
-                        // **返回 None** 而非退回整串——整串作为 occurred 会把非
-                        // YYYY-MM-DD 值写进 ledger JSON 并喂给 extract_text_signals
-                        // 日期解析（与 #R58 另两处 continue/None 的退化语义不一致）；
-                        // None 让 unwrap_or_else 用 valid_from 兜底（真实日期）。
-                        legacy_et.get(..10).map(str::to_string)
-                    } else {
-                        Some(legacy_et)
-                    }
-                })
+                .or_else(|| legacy_occurred(&legacy_et))
                 .unwrap_or_else(|| valid_from.clone());
 
             let entities = entities_map.get(&f.memory_id).cloned().unwrap_or_default();
@@ -339,5 +341,17 @@ mod unit_tests {
             Some("occurred:2024-03-01")
         );
         assert_eq!(occurred_tag_from_iso("💥💥💥💥💥"), None);
+    }
+
+    // #R60 test/low：legacy_occurred 单测——enrich_ledger 的 O2 fallback（#R59 唯一
+    // 实际改动的路径）此前无任何覆盖：多字节截断 / 短串 / 空串 / 正常日期。
+    #[test]
+    fn legacy_occurred_cases() {
+        assert_eq!(legacy_occurred(""), None);
+        assert_eq!(legacy_occurred("2024"), None); // 短串（<10 字节）→ None
+        assert_eq!(legacy_occurred("2024-03-01T12:00:00").as_deref(), Some("2024-03-01"));
+        // 前 10 字节落在多字节字符内 → None（#R58 panic 点的安全退化）
+        assert_eq!(legacy_occurred("💥💥💥💥💥"), None);
+        assert_eq!(legacy_occurred("2024-03-01💥extra").as_deref(), Some("2024-03-01"));
     }
 }

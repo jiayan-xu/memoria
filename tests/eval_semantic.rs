@@ -98,9 +98,17 @@ async fn embed(
     let first = arr
         .first()
         .ok_or_else(|| EmbedError::Malformed("empty embeddings".to_string()))?;
-    first
+    // #R60 bug/medium：**空向量归 Malformed**——`{"embeddings": [[]]}` 经 first()/
+    // as_array() 后空迭代器 collect 成 Ok(vec![]) 静默通过：空向量与缺字段/非数值
+    // 同属确定性畸形，但它会一路流到 cache_query_vector/remember_with_dedup，只在
+    // put 的退化检查处被拦（与 payload 缺陷无关联），语义覆盖悄然降级。
+    let vector = first
         .as_array()
-        .ok_or_else(|| EmbedError::Malformed("bad vector".to_string()))?
+        .ok_or_else(|| EmbedError::Malformed("bad vector".to_string()))?;
+    if vector.is_empty() {
+        return Err(EmbedError::Malformed("empty vector".to_string()));
+    }
+    vector
         .iter()
         .map(|x| {
             x.as_f64()
@@ -245,21 +253,25 @@ async fn hype_upsert_one(
     }
 }
 
-// #R55 test/low：**测试级超时**——retry 路径最坏 ~70.5s/rid（~21 rid ≈ 25 分钟）
-// 仅当 embed_server 挂死（accept 不响应）时出现；#[tokio::test] 默认无全局超时，
-// CI 里挂死服务会拖垮整个 suite 数十分钟才暴露首个失败。600s 上限远高于正常
-// 运行（~1-2 分钟）但能快速 fail 挂死场景，与逐 attempt 超时互补。
+// #R55 test/low：**测试级超时**——retry 路径最坏 ~70.5s/调用（~58 次 embed：
+// 22 corpus + ~21 hype + ~15 query/paraphrase ≈ 最坏 4090s，仅当服务挂死时）；
+// #[tokio::test] 默认无全局超时，CI 里挂死服务会拖垮整个 suite 数十分钟才暴露
+// 首个失败。
+// #R60 other/low：上限提到 **1800s**——600s 低于最坏情形：慢但存活的 embed 服务
+// （逐 attempt 超时内响应，如 10-15s/请求）会被误杀且消息误导为 "hung"；1800s 仍
+// 远高于正常运行（~1-2 分钟），对真挂死（60s+10s 超时堆积）也足够（全最坏情形
+// 4090s 属"每次调用都耗满超时"的极端，1800s 覆盖到 ~25 次全超时）。
 // 注：tokio-macros 2.x 的 #[tokio::test] 已移除 timeout 属性（Unknown attribute），
 // 用 tokio::time::timeout 手动包装等价实现。
 #[tokio::test]
 async fn memory_eval_semantic() {
     let inner = memory_eval_semantic_inner();
     tokio::pin!(inner);
-    if tokio::time::timeout(std::time::Duration::from_secs(600), inner)
+    if tokio::time::timeout(std::time::Duration::from_secs(1800), inner)
         .await
         .is_err()
     {
-        panic!("memory_eval_semantic timed out after 600s (embed server hung?)");
+        panic!("memory_eval_semantic timed out after 1800s (embed server hung or pathologically slow)");
     }
 }
 
@@ -322,11 +334,16 @@ async fn memory_eval_semantic_inner() {
         // skip+eprintln 纪律一致）；embed 服务恢复后 rerun 覆盖缺口。此前
         // `.expect("corpus embed")` 用 Debug 渲染 EmbedError 且不指明哪条语料，
         // ~25 分钟评测死于低诊断 panic。
+        // #R60 bug/high：**push 占位保持 ids 位置对齐**——ids 按 corpus 位置索引，
+        // 后续 expect_indices/must_not_indices/paraphrase 用 `ids.get(i)` 定位；
+        // 裸 continue 会让后续索引整体漂移（ids.get(5) 解析到错误记忆，断言错指
+        // 或错对）。占位符使跳过项在 case 断言中**显式失败**（而非静默错位）。
         let Ok(v) = embed_with_retry(&client, content).await else {
             eprintln!(
-                "[eval_semantic] corpus embed failed for {:?}; skipping this item",
+                "[eval_semantic] corpus embed failed for {:?}; skipping this item (placeholder keeps id alignment)",
                 content.get(..content.floor_char_boundary(min(content.len(), 80)))
             );
+            ids.push(format!("<embed-failed-{}>", ids.len()));
             continue;
         };
         // v 用于内容路（cache_query_vector）；HyPE 块需内容向量副本校验「问句向量与内容
