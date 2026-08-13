@@ -229,19 +229,41 @@ mod unit_tests {
             last_recalled: None,
             time_status: None,
         };
-        let mut results: Vec<FusedResult> = vec![mk("m_a", "甲记忆"), mk("m_b", "乙记忆")];
+        // #R61 test/medium：**负控制**——m_c 无任何实体提及（与 m_a/m_b 相同初始
+        // rrf_score 0.5）：boosting 记忆应排在它前面（排序契约真正被检验；此前
+        // m_a/m_b boost 相同、sort_by 不改变相对序，断言在 sort_by 被删/反向时
+        // 也通过）。
+        let mut results: Vec<FusedResult> = vec![
+            mk("m_a", "甲记忆"),
+            mk("m_b", "乙记忆"),
+            mk("m_c", "丙记忆（无实体）"),
+        ];
         rerank_by_cooccurrence(&pool, "agent/test", "张三", &mut results);
-        // #R60 test/medium：断言**可观察效果**——boost 应用后每个结果 rrf_score
-        // 抬升（>0.5 初始值）且 source 带 cooccur 标记（仅 rerank 路径追加）；
-        // 此断言在 load_memory_entities/match_query_entities 静默失败或 boost/排序
-        // 逻辑被删时必红（此前 ids.contains 恒真，正是要消除的假覆盖）。
+        // #R60 test/medium：断言**可观察效果**——提及实体的记忆 boost 应用后
+        // rrf_score 抬升（>0.5 初始值）且 source 带 cooccur 标记（仅 rerank 路径
+        // 追加）；此断言在 load_memory_entities/match_query_entities 静默失败或
+        // boost/排序逻辑被删时必红（此前 ids.contains 恒真，正是要消除的假覆盖）。
+        // 负控制 m_c 无 boost（0.5、无标记）——分开断言。
+        let boosted: Vec<&FusedResult> = results
+            .iter()
+            .filter(|r| r.memory_id != "m_c")
+            .collect();
         assert!(
-            results.iter().all(|r| r.rrf_score > 0.5 && r.source.contains("cooccur")),
+            boosted
+                .iter()
+                .all(|r| r.rrf_score > 0.5 && r.source.contains("cooccur")),
             "cooccur boost must be applied: {:?}",
             results
                 .iter()
                 .map(|r| (&r.memory_id, r.rrf_score, &r.source))
                 .collect::<Vec<_>>()
+        );
+        // 负控制：无实体提及的 m_c 排在最后（排序契约）。
+        assert_eq!(
+            results.last().map(|r| r.memory_id.as_str()),
+            Some("m_c"),
+            "negative control must rank last: {:?}",
+            results.iter().map(|r| r.memory_id.as_str()).collect::<Vec<_>>()
         );
     }
 }

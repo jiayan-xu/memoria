@@ -322,16 +322,27 @@ pub fn remember_with_dedup(
         if near_dup_enabled() {
             if let (Some(hnsw_idx), Some(qv)) = (hnsw, &candidate_vector) {
                 if crate::vector::persist::get_stored_vector(pool, &mem_id).is_none() {
-                    let _ = crate::vector::persist::put_stored_vector(pool, &mem_id, namespace, qv);
-                    let _ = hnsw_idx.add(&[VectorEntry {
+                    // #R61 maintainability/medium：**失败可见**——向量持久化/HNSW
+                    // add 失败时记忆行照常提交、语义召回静默降级（此前的 let _
+                    // 丢弃让 I/O 错误/BUSY 无痕）；失败属低频异常，直接 eprintln。
+                    if let Err(e) =
+                        crate::vector::persist::put_stored_vector(pool, &mem_id, namespace, qv)
+                    {
+                        eprintln!("[remember] put_stored_vector failed for {mem_id}: {e}");
+                    }
+                    if let Err(e) = hnsw_idx.add(&[VectorEntry {
                         id: mem_id.clone(),
                         vector: qv.clone(),
-                    }]);
+                    }]) {
+                        eprintln!("[remember] hnsw add failed for {mem_id}: {e}");
+                    }
                 }
                 // 增量补 semantic_related 边（闭环 Phase 1b）
-                let _ = crate::search::semantic_edges::upsert_semantic_edges_for(
+                if let Err(e) = crate::search::semantic_edges::upsert_semantic_edges_for(
                     pool, hnsw_idx, &mem_id, namespace, qv,
-                );
+                ) {
+                    eprintln!("[remember] upsert_semantic_edges failed for {mem_id}: {e}");
+                }
             }
         }
 

@@ -414,7 +414,9 @@ mod python {
         /// #R60：两阶段 refresh 的**暂存槽**——HnswIndex 不能过 PyO3 边界，构建
         /// 结果（&self 方法，detach 期间其他线程可并发检索）先存此处，随后
         /// swap_hype_index（&mut self，O(1) 窗口）落地到引擎。
-        pending_hype: std::sync::Mutex<Option<(HnswIndex, usize)>>,
+        pending_hype: std::sync::Mutex<Option<(HnswIndex, usize, u64)>>,
+        /// #R61：build/swap 配对 token 序列（单调递增，见 build_hype_index doc）。
+        build_seq: std::sync::atomic::AtomicU64,
     }
 
     #[pymethods]
@@ -426,6 +428,7 @@ mod python {
                 .map(|e| PyEngine {
                     inner: e,
                     pending_hype: std::sync::Mutex::new(None),
+                    build_seq: std::sync::atomic::AtomicU64::new(0),
                 })
                 .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))
         }
@@ -476,30 +479,37 @@ mod python {
             r.map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))
         }
         /// #R60：两阶段 refresh 的构建阶段（&self——detach 下其他线程可并发
-        /// 检索）；HnswIndex 不能过 PyO3 边界，结果暂存 pending_hype，
-        /// 返回 count；swap_hype_index 以 O(1) 窗口落地。
-        fn build_hype_index(&self, py: Python<'_>) -> PyResult<usize> {
+        /// 检索）；HnswIndex 不能过 PyO3 边界，结果暂存 pending_hype。
+        /// #R61 bug/medium：**返回单调 token**——单槽 last-writer-wins 下并发 build
+        /// 会让先者被静默丢弃、swap 激活错误索引且 count 不匹配；调用方须把
+        /// 返回值传给 swap_hype_index(token) 配对，陈旧 build 被拒绝（fail-fast
+        /// 而非覆盖）。
+        fn build_hype_index(&self, py: Python<'_>) -> PyResult<u64> {
             let r: Result<(HnswIndex, usize), String> =
                 py.detach(|| self.inner.build_hype_index_fresh());
             let (fresh, count) =
                 r.map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
+            let token = self.build_seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
             *self
                 .pending_hype
                 .lock()
-                .unwrap_or_else(|p| p.into_inner()) = Some((fresh, count));
-            Ok(count)
+                .unwrap_or_else(|p| p.into_inner()) = Some((fresh, count, token));
+            Ok(token)
         }
-        fn swap_hype_index(&mut self) -> PyResult<usize> {
+        fn swap_hype_index(&mut self, token: u64) -> PyResult<usize> {
             let taken = self
                 .pending_hype
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .take();
             match taken {
-                Some((fresh, count)) => {
+                Some((fresh, count, t)) if t == token => {
                     self.inner.swap_hype_index(fresh, count);
                     Ok(count)
                 }
+                Some((_fresh, _count, t)) => Err(pyo3::exceptions::PyRuntimeError::new_err(
+                    format!("stale build token {token} (latest was {t}); rebuild and swap with its token"),
+                )),
                 None => Err(pyo3::exceptions::PyRuntimeError::new_err(
                     "no pending hype index; call build_hype_index first",
                 )),
