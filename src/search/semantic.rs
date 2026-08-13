@@ -12,30 +12,25 @@ use std::collections::HashMap;
 /// static 冷却——复制到第 4 处时收敛为共享 helper，冷却语义一致；按 **key** 分开
 /// 计数（不同故障原因/路/调用点不互相抑制——单个全局 static 会让先失败的路径
 /// 永久压住后失败的路径）。
-/// #R52 maintainability/low：**64 槽 + SipHash（DefaultHasher）**——16 槽 FNV 有
-/// 实际碰撞破坏隔离：`fetch_row_mapping` 与 `fetch_systemic` 同槽（系统性漂移批的
-/// 逐行错误先于聚合升级行触发，聚合被同批压掉）；`fetch_stale`（删除后几乎每查询
-/// 触发）与 `hype` 同槽（压掉首条 road-fail 详情）。64 槽把碰撞概率降到可忽略。
+/// #R52/#R53 maintainability/low：**Mutex<HashMap> 无碰撞存储**——固定槽数组
+/// （16/64 槽）总有确定性碰撞（DefaultHasher 固定 key，11 个键 64 槽碰撞概率
+/// ~58%；碰撞是永久性的，正是 16 槽 FNV 的跨抑制问题）。60s 冷却下锁竞争无关
+/// 紧要，per-key 精确隔离。
 pub(crate) fn throttled_eprintln(key: &'static str, msg: String) {
     const COOLDOWN_SECS: u64 = 60;
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::collections::HashMap;
+    use std::sync::Mutex;
     use std::time::{SystemTime, UNIX_EPOCH};
-    static LAST_LOGS: [AtomicU64; 64] = [const { AtomicU64::new(0) }; 64];
-    let mut h = DefaultHasher::new();
-    key.hash(&mut h);
-    let slot = &LAST_LOGS[(h.finish() as usize) % LAST_LOGS.len()];
+    static LAST_LOGS: Mutex<Option<HashMap<&'static str, u64>>> = Mutex::new(None);
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let last = slot.load(Ordering::Relaxed);
-    if now.saturating_sub(last) >= COOLDOWN_SECS
-        && slot
-            .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
-            .is_ok()
-    {
+    let mut guard = LAST_LOGS.lock().unwrap_or_else(|p| p.into_inner());
+    let m = guard.get_or_insert_with(HashMap::new);
+    let last = m.get(key).copied().unwrap_or(0);
+    if now.saturating_sub(last) >= COOLDOWN_SECS {
+        m.insert(key, now);
         eprintln!("{msg} (at most once per {COOLDOWN_SECS}s)");
     }
 }
@@ -100,7 +95,11 @@ pub fn semantic_search(
     // `best` 值 = (max cosine, winning road label)——记录哪一路胜出，供下游归因
     // （#R35 maintainability/low：此前只存分数，source 恒为 hnsw_semantic，无法区分
     // 命中来自内容路还是 HyPE 路）。
-    let mut best: HashMap<String, (f64, &'static str)> = HashMap::new();
+    // #R53 performance/low：容量提示——best 上界 ~2×overfetch（默认 recall_depth=50
+    // 时 ~4096 条/查询），HashMap::new() 每查询多次 rehash/growth；rows 上界
+    // ids.len()（排序后已知）。热路径一致优化的自然补全。
+    let best_cap = (limit as usize).saturating_mul(40).max(4096);
+    let mut best: HashMap<String, (f64, &'static str)> = HashMap::with_capacity(best_cap);
     // 两路分别搜索；`roads_ok` 统计成功路数——若**所有存在的路**都失败（如 RwLock
     // poisoned），返回 Err 而非空集，使调用方能区分"索引空"与"索引坏了"（#R34 other/low：
     // 此前全失败静默映射为空结果，健康检查无法发现语义通道悄悄降级）。
@@ -170,6 +169,7 @@ pub fn semantic_search(
     ids.sort_unstable();
     // #R48 performance/medium：ns 过滤推入 SQL（见 fetch_memories_batch doc）——
     // 返回行已属当前 ns，输出循环无需再判 ns。
+    // #R53 performance/low：rows 容量由 fetch_memories_batch 内部按 ids.len() 预分配。
     let mut rows: HashMap<String, (String, Option<String>)> = match pool {
         Some(p) => fetch_memories_batch(p, &ids, namespace)?,
         None => return Ok(vec![]),
@@ -303,7 +303,8 @@ fn fetch_memories_batch(
     namespace: &str,
 ) -> Result<HashMap<String, (String, Option<String>)>, String> {
     const BATCH: usize = 500;
-    let mut out = HashMap::new();
+    // #R53 performance/low：容量 = ids.len()（上界已知，避免 growth/rehash）。
+    let mut out = HashMap::with_capacity(ids.len());
     let mut batches_total = 0usize;
     let mut hard_failed_batches = 0usize;
     // #R48 performance/medium：stale id 日志**聚合**——内存 HNSW 不随删除修剪

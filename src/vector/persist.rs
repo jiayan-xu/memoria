@@ -72,6 +72,12 @@ pub fn put_hype_stored_vector(
 /// `select_sql(table)` / `insert_sql(table)` 单源构建，表名占位拼接使分歧不可能发生。
 struct VectorTable {
     table: &'static str,
+    /// #R53 performance/low：**预构建 SQL**（concat! 编译期拼接）——此前 insert_sql/
+    /// select_sql 每次写入/重建都 format! 分配；且函数式表名插值只靠"调用方碰巧过
+    /// 白名单"保证安全。字段字面量消除每调用分配与未来 typo/注入面。两表 SQL 模板
+    /// 一致仅表名不同（列集已统一 4 列，#R52），concat! 保证模板编译期固定。
+    insert_sql: &'static str,
+    select_sql: &'static str,
     fn_name: &'static str,
     label: &'static str,
     /// #R44 maintainability/medium：全 skip 时的错误语义（Err vs Ok(0)+WARN）作为**显式
@@ -82,44 +88,30 @@ struct VectorTable {
     error_on_all_skipped: bool,
 }
 
-/// 读取 SQL（#R49 maintainability/low 单源；#R49 maintainability/low ORDER BY id——
-/// HNSW 图结构依赖插入顺序，无排序则同数据的 rebuild 跨运行不可复现，recall 对比/
-/// 质量调试噪声大；id 是 TEXT PRIMARY KEY，ORDER BY 走 PK 索引，代价可忽略）。
-fn select_sql(table: &str) -> String {
-    format!("SELECT id, vector FROM {table} ORDER BY id")
-}
-
-/// 写入 SQL（ON CONFLICT upsert 而非 INSERT OR REPLACE——REPLACE 会整行删除重建，
-/// 把 `memory_hype_vectors.question`（离线脚本写入的假设问句）静默抹成 NULL）。
-/// #R51 bug/medium：**按表区分列集**——memory_vectors 的旧库可能没有 updated_at 列
-/// （CREATE TABLE 只在 sqlite.rs 建表时生效，存量库无 ALTER 迁移补列）；共享四列
-/// SQL 会让存量部署的每次 put_stored_vector 报 "no column named updated_at" 且
-/// 生产调用方 let _ 丢弃 Result（向量持久化静默停止，仅 WARN 可见）。memory_vectors
-/// 保持原三列；updated_at 只写给 migration 显式创建该列的 memory_hype_vectors。
-/// #R51/#R52：**统一 4 列**——migrate_hype_vectors 已幂等补齐 memory_vectors 的
-/// updated_at 列（存量库缺列时 ALTER ADD，见 sqlite.rs #R52），两表列集一致、
-/// 写入路径无表级分歧（此前 3/4 列双形态靠表名 match 区分——第三张表/typo 会静默
-/// 选错形态，正是 descriptor 收口要消灭的漂移源）。
-fn insert_sql(table: &str) -> String {
-    format!(
-        "INSERT INTO {table} (id, namespace, vector, updated_at) \
-         VALUES (?, ?, ?, datetime('now')) \
-         ON CONFLICT(id) DO UPDATE SET vector=excluded.vector, \
-                                        namespace=excluded.namespace, \
-                                        updated_at=excluded.updated_at"
-    )
-}
-
 fn vector_tables() -> &'static [VectorTable] {
     static TABLES: [VectorTable; 2] = [
         VectorTable {
             table: "memory_vectors",
+            insert_sql: concat!(
+                "INSERT INTO memory_vectors (id, namespace, vector, updated_at) ",
+                "VALUES (?, ?, ?, datetime('now')) ",
+                "ON CONFLICT(id) DO UPDATE SET vector=excluded.vector, ",
+                "namespace=excluded.namespace, updated_at=excluded.updated_at"
+            ),
+            select_sql: "SELECT id, vector FROM memory_vectors ORDER BY id",
             fn_name: "put_stored_vector",
             label: "content",
             error_on_all_skipped: false,
         },
         VectorTable {
             table: "memory_hype_vectors",
+            insert_sql: concat!(
+                "INSERT INTO memory_hype_vectors (id, namespace, vector, updated_at) ",
+                "VALUES (?, ?, ?, datetime('now')) ",
+                "ON CONFLICT(id) DO UPDATE SET vector=excluded.vector, ",
+                "namespace=excluded.namespace, updated_at=excluded.updated_at"
+            ),
+            select_sql: "SELECT id, vector FROM memory_hype_vectors ORDER BY id",
             fn_name: "put_hype_stored_vector",
             label: "hype",
             error_on_all_skipped: true,
@@ -204,7 +196,7 @@ fn put_vector_into(
         return Err(msg);
     }
     conn.execute(
-        &insert_sql(td.table),
+        td.insert_sql,
         rusqlite::params![id, namespace, encode_vector(vector)],
     )
         .map(|_| ())
@@ -350,7 +342,7 @@ fn rebuild_from_table(
         .ok_or_else(|| format!("rebuild_from_table: unknown rebuild table {table}"))?;
     let label = td.label;
     let mut stmt = conn
-        .prepare(&select_sql(td.table))
+        .prepare(td.select_sql)
         .map_err(|e| format!("prepare {}: {}", label, e))?;
     let rows = stmt
         .query_map([], |row| {
@@ -376,27 +368,26 @@ fn rebuild_from_table(
         match row {
             Ok((id, blob)) => {
                 rows_seen += 1;
+                // #R53 performance/low：**blob 字节长度在 decode 前判定**——损坏/超长
+                // blob 先全量解码分配再被拒（恰是要防的损坏场景）；chunks_exact(4)
+                // 语义下分类完全由 blob.len() 决定：短于 DIM*4 → 维度漂移（dim 桶，
+                // 与 #R48"dim 先于 blob"一致）；长于 DIM*4 → 尾部垃圾/超长（blob 桶）。
+                // 仅恰好 DIM*4 才需要解码（此时 v.len() 恒为 DIM，dim 检查冗余）。
+                if blob.len() < DIM * 4 {
+                    skipped_dim += 1;
+                    continue;
+                }
+                if blob.len() > DIM * 4 {
+                    skipped_blob += 1;
+                    continue;
+                }
                 let v = decode_vector(&blob);
                 // #R41 bug/medium：读侧镜像写侧的退化检查——历史失败嵌入留下的全零/NaN
                 // 行（写侧 P0 防御的注释承认已存在）若只查维度会被**每次启动重新加载进
                 // HNSW**，写侧防御形同虚设。有限且非零范数才入索引，退化行计入 skipped
                 // 并出现在诊断里。
-                // #R45 bug/low：`decode_vector` 用 chunks_exact(4)——blob 长度
-                // DIM*4+1..3 字节时恰好解出 DIM 个 float，能通过 `v.len() == DIM`，
-                // 把截断向量静默装入索引。显式校验 blob 字节长度 = DIM*4 彻底关闭
-                // 小尾部损坏缝隙（"损坏行被跳过"的保证对尾部损坏同样成立）。
                 let norm_sq: f64 = v.iter().map(|x| (*x as f64) * (*x as f64)).sum();
-                // #R48 maintainability/low：**dim 检查先于 blob 长度**——decode_vector 用
-                // chunks_exact(4)：blob 恰为 DIM*4 字节时必解出 DIM 个 float（此前
-                // `else if v.len() != DIM` 分支不可达、skipped_dim 恒 0，真实维度漂移
-                // （如嵌入模型 1024→768，短 blob）被误报为 corrupt blob）。先查 dim：
-                // 短 blob/维度漂移 → dim 桶；恰 DIM 个 float 但字节超 DIM*4（尾部垃圾）
-                // → blob 桶；退化（零/NaN）→ degenerate 桶。
-                if v.len() != DIM {
-                    skipped_dim += 1;
-                } else if blob.len() != DIM * 4 {
-                    skipped_blob += 1;
-                } else if !norm_sq.is_finite() || norm_sq == 0.0 {
+                if !norm_sq.is_finite() || norm_sq == 0.0 {
                     skipped_degenerate += 1;
                 } else {
                     entries.push(VectorEntry { id, vector: v });

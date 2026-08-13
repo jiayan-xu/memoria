@@ -49,7 +49,13 @@ EMBED_URL = os.environ.get("MEMORIA_EMBEDDING_URL", "http://127.0.0.1:8777/embed
 # Rust 侧 HNSW 维度硬约束（src/vector/hnsw.rs DIM=1024）。仅校验 embed_server 返回的 dim
 # 不够——服务器可能跑 local 模型（text2vec 768d），len(v)==dim 通过但 rebuild 侧
 # v.len()!=DIM 会静默跳过每一行，整批"看起来成功"而索引恒空（#R34 bug/medium）。
-RUST_DIM = int(os.environ.get("MEMORIA_EMBED_DIM", "1024"))
+# #R53 bug/medium：**硬编码 1024，不读 MEMORIA_EMBED_DIM**——该 env 同时配置
+# embed_server 的输出维度（embed_server.py:83 默认 768，注释还声称 768 对齐 hnsw.rs）；
+# 共用同一 knob 会让运维按 embed_server 注释设 MEMORIA_EMBED_DIM=768 时 RUST_DIM 也变
+# 768：预检与逐行 len 检查全部通过、768d 向量落库，而 Rust rebuild（DIM=1024）静默
+# 跳过每一行——"写入 N / 失败 0"假成功恰好被同一配置制造出来。守卫常量必须独立于
+# 模型输出维度 knob。
+RUST_DIM = 1024
 CHAT_URL = os.environ.get(
     "SILICONFLOW_CHAT_URL", "https://api.siliconflow.cn/v1/chat/completions"
 )
@@ -176,7 +182,16 @@ def embed(texts):
                 EMBED_URL, data=json.dumps(body).encode(), headers=headers, method="POST"
             )
             with urllib.request.urlopen(req, timeout=60) as r:
-                resp = json.loads(r.read().decode())
+                try:
+                    resp = json.loads(r.read().decode())
+                except json.JSONDecodeError as e:
+                    # #R53 bug/low：非 JSON 的 2xx 体是确定性畸形响应（同形状每次必现）——
+                    # 直接抛确定性异常，不重试（此前 JSONDecodeError 经 3 次重试后
+                    # 以 RuntimeError 被归为瞬时失败进 fail_ids，清单永不收敛）。
+                    raise DeterministicSkipError(f"embed 响应非 JSON: {e}")
+                if not isinstance(resp, dict):
+                    # 2xx 但体不是 dict（如 list）——确定性畸形，同样不重试。
+                    raise DeterministicSkipError(f"embed 响应非 dict: {type(resp).__name__}")
             # #R50 bug/medium：2xx 但缺 embeddings key 是**确定性**畸形响应（服务配置
             # 错误，同形状响应每次必现）——抛 DeterministicSkipError 计 skip；此前
             # KeyError 经 3 次重试后变 RuntimeError 被主循环归为瞬时失败记入 fail_ids
@@ -215,6 +230,12 @@ def embed(texts):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--limit", type=int, default=None, help="只处理前 N 条")
+    ap.add_argument(
+        "--ids",
+        default=None,
+        help="定点重跑：读取 hype_failed_ids.txt（或逗号分隔 id 列表文件）仅处理这些 id "
+        "（与 --all 的 fail_ids 清单闭环，#R53：此前清单只写不读，唯一重跑路径是全量 --all）",
+    )
     ap.add_argument("--all", action="store_true", help="全库补嵌（验证通过后）")
     ap.add_argument("--db", default=DB)
     ap.add_argument("--dry-run", action="store_true", help="只生成问句不写库")
@@ -275,6 +296,23 @@ def main():
         else:
             print(f"golden 目标: {len(targets)} 条")
 
+    # #R53 maintainability/low：--ids 定点重跑——从文件读 id 清单（每行一个 id），
+    # 从全库/golden 目标中筛出这些 id（不存在的 id 忽略并提示）。闭环
+    # hype_failed_ids.txt 的"可定点重跑"承诺：失败清单可低成本重试，无需全量 --all
+    # 重付几千次付费调用。
+    if args.ids:
+        ids_file = args.ids
+        if not os.path.exists(ids_file):
+            print(f"错误: id 清单文件不存在 {ids_file}")
+            sys.exit(1)
+        with open(ids_file, encoding="utf-8") as f:
+            wanted = {ln.strip() for ln in f if ln.strip()}
+        by_id = {mid: c for mid, c in targets}
+        targets = [(m, by_id[m]) for m in wanted if m in by_id]
+        missing = wanted - set(by_id)
+        if missing:
+            print(f"提示: {len(missing)} 个 id 不在目标集中（已删除/失效），忽略")
+        print(f"--ids 定点目标: {len(targets)} 条")
     if args.limit is not None:
         targets = targets[: args.limit]
 

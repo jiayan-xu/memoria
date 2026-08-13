@@ -38,7 +38,10 @@ impl std::fmt::Display for EmbedError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             EmbedError::Transport(e) => write!(f, "embed http: {e}"),
-            EmbedError::Status(c, r) => write!(f, "embed http status {c} {r}"),
+            // #R53 style/low：r 已含数字 code 与原因短语（"503 Service Unavailable"），
+            // 再拼 {c} 会渲染成 "503 503 Service Unavailable"（重试路径里进一步
+            // 复合）——只保留 r。
+            EmbedError::Status(_c, r) => write!(f, "embed http status {r}"),
             EmbedError::Malformed(m) => write!(f, "embed: {m}"),
         }
     }
