@@ -150,6 +150,7 @@ fn warn_throttled(fn_name: &str, reason: &str, msg: &str) {
     // 只造成两 key 共享预算，可接受（与 throttled_eprintln 同款权衡）。
     use std::sync::atomic::{AtomicU64, Ordering};
     static SLOTS: [AtomicU64; 32] = [const { AtomicU64::new(0) }; 32];
+    static SLOT_EPOCHS: [AtomicU64; 32] = [const { AtomicU64::new(0) }; 32];
     let mut h: u64 = 0xcbf29ce484222325;
     // #R58 performance/low：**免中间 String**——`format!("{fn_name}:{reason}")` 在
     // 每次失败调用都堆分配（含被抑制的大多数：n>3 且非 1000 倍数）；此函数专为
@@ -160,6 +161,24 @@ fn warn_throttled(fn_name: &str, reason: &str, msg: &str) {
         h = h.wrapping_mul(0x100000001b3);
     }
     let slot = &SLOTS[(h as usize) % SLOTS.len()];
+    // #R61 maintainability/low：**60s 时间窗重置**——此前 process-lifetime 计数永不
+    // 归零：execute 槽（合并 BUSY/磁盘满/约束/schema 漂移）的 3 条详情预算被早期
+    // 瞬时失败永久耗尽，后续更严重故障只在下一个 1000 倍数出现一次简短聚合
+    // （生产调用方 let _ 丢弃 Result，长时间运行中可观测性持续退化）。
+    // 窗口翻转：赢者（compare_exchange 成功）把计数清零，随后自己的 fetch_add
+    // 成为新窗口第 1 条；输者计数可能被清零吞掉 1 次（诊断计数近似，可接受）。
+    let epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() / 60)
+        .unwrap_or(0);
+    let se = &SLOT_EPOCHS[(h as usize) % SLOT_EPOCHS.len()];
+    let old_epoch = se.load(Ordering::Relaxed);
+    if old_epoch != epoch
+        && se.compare_exchange(old_epoch, epoch, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+    {
+        slot.store(0, Ordering::Relaxed);
+    }
     let n = slot.fetch_add(1, Ordering::Relaxed) + 1;
     if n <= 3 {
         eprintln!("[persist] WARN: {msg}");
@@ -353,6 +372,17 @@ pub fn build_hype_hnsw_or_default(pool: &SqlitePool, ef_search: usize) -> (HnswI
 /// 统计并告警被跳过的行（解码失败 / 维度 ≠ DIM），使索引健康度可观测——
 /// 数据损坏不再被静默吞掉。表名**白名单 dispatch**（descriptor 查找，非字符串插值）。
 fn rebuild_from_table(pool: &SqlitePool, hnsw: &HnswIndex, table: &str) -> Result<usize, String> {
+    // #R61 maintainability/medium：**fresh-index 契约强制**——HnswIndex::add 按 id
+    // 去重：已填充索引上 rebuild 只追加新 id、已有 id 的向量更新被静默忽略，而
+    // "rebuild" 名字与 Ok(count) 暗示全量刷新（调用方拿到陈旧结果不自知）。doc
+    // 警告只是软防线；非空索引直接 Err，误用响亮失败（refresh 路径用全新索引
+    // 构造，不受影响）。
+    if hnsw.len() > 0 {
+        return Err(format!(
+            "rebuild_from_table({table}): index already populated ({} ids) - rebuild requires a fresh index; in-place rebuild silently ignores existing-id updates",
+            hnsw.len()
+        ));
+    }
     let conn = pool.get().map_err(|e| format!("pool: {}", e))?;
     let td = lookup_table(table)
         .ok_or_else(|| format!("rebuild_from_table: unknown rebuild table {table}"))?;

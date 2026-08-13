@@ -83,7 +83,15 @@ pub fn legacy_occurred(legacy_et: &str) -> Option<String> {
         // 会把非日期值写进 occurred（目标"不喂非日期值给下游"只达成一半）。
         return None;
     }
-    legacy_et.get(..10).map(str::to_string)
+    // #R61 maintainability/low：**'-' 分隔符校验**（与 parse_occurred_tag 一致）——
+    // ≥10 字节的非日期 ASCII（如 "hello-world"）此前会作为 occurred 流入
+    // extract_text_signals 日期解析（doc 声称"畸形值不进 ledger"但未实现）。
+    let d = legacy_et.get(..10)?;
+    if d.as_bytes().get(4) == Some(&b'-') && d.as_bytes().get(7) == Some(&b'-') {
+        Some(d.to_string())
+    } else {
+        None
+    }
 }
 
 /// Phase B：是否 JOIN entities 填 ledger（默认开；`MEMORIA_LEDGER_JOIN_ENTITIES=0/false/off` 关）。
@@ -265,6 +273,11 @@ pub fn enrich_ledger(
             let legacy_et = m.map(|x| x.event_time_legacy.clone()).unwrap_or_default();
 
             // O3 优先 tags；O2 旧列只读兜底；再退到 valid_from
+            // #R61 other/low 行为变化记录：legacy_occurred 对短串/畸形值返回 None 后
+            // 回退 valid_from（可能为空）——O2 旧行的 occurred 从"原始串透传"变为
+            // "None/valid_from"；下游（mcp_server ledger/profile、extract_text_signals
+            // 日期解析）对空 occurred 容忍（None 分支已存在），符合"不喂非日期值"
+            // 的既定目标。
             let occurred = parse_occurred_tag(tags_json)
                 .or_else(|| legacy_occurred(&legacy_et))
                 .unwrap_or_else(|| valid_from.clone());

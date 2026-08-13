@@ -355,6 +355,24 @@ def main():
     ok = skip = fail = 0
     fail_ids = []
     skip_ids = []
+    if not args.dry_run and con is not None:
+        # #R61 bug/low：**中断安全**——Ctrl+C/SIGINT 时最后未提交批（最多 49 条
+        # 已付费行）被解释器回滚且不进 fail_ids（record_fail 的"中断不丢清单"
+        # 承诺只覆盖已 append 的 id）；atexit 在退出路径（含 KeyboardInterrupt
+        # 传播）把 pending 冲进清单——付费工作不静默丢失。
+        import atexit
+
+        def _flush_pending_on_exit():
+            try:
+                if pending_batch:
+                    with open(failed_ids_path, "a", encoding="utf-8") as f:
+                        for pid in pending_batch:
+                            f.write(pid + "\n")
+                    print(f"  [warn] 中断退出: {len(pending_batch)} 条未提交行已追加到 fail_ids")
+            except OSError as e:
+                print(f"  [warn] 中断退出时写 fail_ids 失败: {e}")
+
+        atexit.register(_flush_pending_on_exit)
     # #R60：**待提交批跟踪**——本批已 execute 未 commit 的 id；批/最终 commit 失败
     # 时这些行未落库（回滚丢弃），必须补记 fail_ids 否则静默丢失且无重跑路径。
     pending_batch = []
@@ -605,6 +623,12 @@ def main():
             record_fail(mid)
             for pid in pending_batch:
                 record_fail(pid)
+            # #R61 bug/medium：**ok 计数修正**——本批已 execute 未 commit 的行此前
+            # 已在各自迭代计入 ok（批 commit 失败回滚丢弃后虚高）；摘要必须反映
+            # 真实落库数（ok -= len(pending_batch)，fail += 同数保持总数一致）。
+            if pending_batch:
+                ok = max(0, ok - len(pending_batch))
+                fail += len(pending_batch)
             pending_batch.clear()
             continue
         except Exception as e:
@@ -623,11 +647,21 @@ def main():
     if not args.dry_run and con is not None:
         try:
             con.commit()
+            pending_batch.clear()
         except sqlite3.Error as e:
             try:
                 con.rollback()
             except sqlite3.Error:
                 pass
+            # #R61 bug/medium：**最终 commit 失败补记 pending**——最后一批（<50 行）
+            # 已 execute 未 commit 的行被回滚丢弃：此前既不在库也不在 fail_ids
+            # （静默丢失 + 假成功）；镜像行级 handler，补记 + ok 修正。
+            for pid in pending_batch:
+                record_fail(pid)
+            if pending_batch:
+                ok = max(0, ok - len(pending_batch))
+                fail += len(pending_batch)
+            pending_batch.clear()
             print(f"  [warn] 最终 commit 失败: {e}")
 
     if con is not None:

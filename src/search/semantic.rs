@@ -244,25 +244,26 @@ pub fn semantic_search(
     };
 
     let mut out: Vec<SignalResult> = Vec::with_capacity(ids.len());
-    for memory_id in &ids {
+    // #R61 performance/low：**drain best 移动 String**——`(*memory_id).to_string()`
+    // 每候选 clone 一次（热路径 ~8k/查询）；best 在此循环后即弃，且最终
+    // out.sort_by 使迭代顺序无关结果。先 drop(ids) 释放借用，再 for 移动
+    // best 的 owned String 进 SignalResult（每行省一次堆分配）。
+    drop(ids);
+    for (memory_id, (score, road)) in best {
         // 不变量（#R45 maintainability/low）：fetch_memories_batch 未返回的 id（stale/
         // 删除/失败行）在此直接跳过——正文缺失的命中若进入融合会被 rrf_merge 以空
         // 正文锁定（P3-0），不返回候选只损失召回、不污染正文。此前 `unwrap_or_default`
         // 兜底在此**不可达**（死默认掩盖了 P3-0 不变量），已删除。
         // #R58 performance/low：行元组已去 namespace（SQL 过滤保证），直接解构。
-        let Some(content) = rows.remove(*memory_id) else {
+        let Some(content) = rows.remove(&memory_id) else {
             continue;
         };
         // NULL content = 合法数据态，召回损失（剔 id）——与映射失败区分（#R42）。
         let Some(content) = content else {
             continue;
         };
-        // #R49 performance/low：`best.get` guard 是死逻辑——ids 直接来自 best.keys()，
-        // 每个迭代 id 必然在 best 中（原 guard 掩盖了循环不变量）。rows.remove 移出
-        // content（每 id 恰访问一次，省 clone 分配；~8k/查询）。
-        let (score, road) = best[*memory_id];
         out.push(SignalResult {
-            memory_id: (*memory_id).to_string(),
+            memory_id,
             content,
             score,
             // 归因：winning road 标记进 source（#R35 maintainability/low）——
@@ -387,6 +388,8 @@ fn fetch_memories_batch(
     // 行映射样本（具体错误文本）经同一冷却，60s 窗口内保留最近一条（#R51
     // performance/medium：无冷却时 cap-3 样本每查询刷 3 行）。
     let mut stale_ids_total = 0usize;
+    // #R61：首个硬失败（prepare/query）的底层错误文本（见函数尾 Err 组装）。
+    let mut first_hard_err: Option<String> = None;
     for chunk in ids.chunks(BATCH) {
         batches_total += 1;
         let placeholders = vec!["?"; chunk.len()].join(",");
@@ -470,6 +473,9 @@ fn fetch_memories_batch(
                     }
                 }
                 Err(e) => {
+                    if first_hard_err.is_none() {
+                        first_hard_err = Some(format!("query: {e}"));
+                    }
                     throttled_eprintln("fetch_query", || {
                         format!("query failed (batch {} ids): {}", chunk.len(), e)
                     });
@@ -477,6 +483,9 @@ fn fetch_memories_batch(
                 }
             },
             Err(e) => {
+                if first_hard_err.is_none() {
+                    first_hard_err = Some(format!("prepare: {e}"));
+                }
                 throttled_eprintln("fetch_prepare", || {
                     format!("prepare failed (batch {} ids): {}", chunk.len(), e)
                 });
@@ -513,8 +522,16 @@ fn fetch_memories_batch(
     // `semantic signal dropped`，降级可观测。瞬时 BUSY 重试成本低（下次查询恢复），
     // 选择可观测性优先。
     if hard_failed_batches > 0 {
+        // #R61 maintainability/medium：**首个底层错误嵌入 Err**——prepare/query 的
+        // 具体 rusqlite 错误此前只出现在 60s 冷却的 stderr 行；hybrid.rs 每查询
+        // 打 `semantic signal dropped: {e}` 却无根因。first_hard_err 在失败分支
+        // 记录首个错误文本，跨过错误边界（operator 读传播日志即可定位）。
+        let detail = first_hard_err
+            .as_deref()
+            .map(|d| format!(" (first error: {d})"))
+            .unwrap_or_default();
         return Err(format!(
-            "memories fetch hard-failed for {hard_failed_batches} of {batches_total} batches"
+            "memories fetch hard-failed for {hard_failed_batches} of {batches_total} batches{detail}"
         ));
     }
     Ok(out)

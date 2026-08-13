@@ -13,6 +13,10 @@ const MAX_NUMBERS: usize = 8;
 const MAX_DATES: usize = 4;
 const MAX_UPDATE_MARKERS: usize = 4;
 
+/// #R61 maintainability/low：text-signal 通道标记（source 追加后缀）——库内共享
+/// 常量，测试断言引用同一常量而非裸字符串（改名/改格式不产生假失败）。
+pub const SOURCE_MARKER: &str = "text_signals";
+
 const NUMBER_HIT_BOOST: f64 = 0.010;
 const DATE_HIT_BOOST: f64 = 0.015;
 const MAX_TOTAL_BOOST: f64 = 0.05;
@@ -216,8 +220,8 @@ pub fn rerank_by_text_signals(query: &str, results: &mut Vec<FusedResult>) {
         }
         if boost > 0.0 {
             r.rrf_score += boost;
-            if !r.source.contains("text_signals") {
-                r.source = format!("{};text_signals", r.source);
+            if !r.source.contains(SOURCE_MARKER) {
+                r.source = format!("{};{}", r.source, SOURCE_MARKER);
             }
         }
     }

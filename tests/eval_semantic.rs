@@ -111,9 +111,19 @@ async fn embed(
     vector
         .iter()
         .map(|x| {
-            x.as_f64()
-                .map(|f| f as f32)
-                .ok_or_else(|| EmbedError::Malformed("non-numeric vector element".to_string()))
+            // #R61 bug/medium：**收窄溢出校验**——1e300 等合法 JSON 数字经 f64→f32
+            // 收窄变 +inf，静默流入 cache_query_vector/remember（put 退化检查才拦，
+            // 与 payload 缺陷无关联）；在此按确定性畸形（Malformed）拒绝。
+            let f = x
+                .as_f64()
+                .ok_or_else(|| EmbedError::Malformed("non-numeric vector element".to_string()))?;
+            let f32 = f as f32;
+            if !f32.is_finite() {
+                return Err(EmbedError::Malformed(format!(
+                    "non-finite vector element after f32 narrowing: {f}"
+                )));
+            }
+            Ok(f32)
         })
         .collect()
 }
@@ -313,6 +323,8 @@ async fn memory_eval_semantic_inner() {
 
     // 1) 语料嵌入 + 写入（向量入 QueryCache → HNSW）
     let mut ids: Vec<String> = Vec::with_capacity(corpus.len());
+    // #R61：corpus embed 跳过计数（见 skip 路径注释）。
+    let mut corpus_skipped = 0usize;
     let mut hype_processed: std::collections::HashSet<String> = std::collections::HashSet::new();
     // #R43 bug/medium：total 独立计数（首次遇到即 +1，无论成败）——processed 失败时
     // 会 remove（允许重试），断言时只剩成功的，用它作分母是重言式。
@@ -343,6 +355,10 @@ async fn memory_eval_semantic_inner() {
                 "[eval_semantic] corpus embed failed for {:?}; skipping this item (placeholder keeps id alignment)",
                 content.get(..content.floor_char_boundary(min(content.len(), 80)))
             );
+            // #R61 bug/medium：**corpus_skipped 计数**——占位符使引用该位置的
+            // expect_indices 必败且后续近义去重漂移（错位假红）；计数在最终
+            // 断言前显式报告，根因直指 embed skip 而非索引错位的召回失败。
+            corpus_skipped += 1;
             ids.push(format!("<embed-failed-{}>", ids.len()));
             continue;
         };
@@ -630,6 +646,13 @@ async fn memory_eval_semantic_inner() {
         RECALL_FLOOR
     );
     assert_eq!(zero_rate, 0.0, "存在零结果用例");
+    if corpus_skipped > 0 {
+        // #R61：跳过项显式报告（占位符会让引用其位置的 case 失败，且近义去重
+        // 漂移使错位失败指向无关位置）——把根因摆到台面再断言。
+        eprintln!(
+            "[eval_semantic] WARNING: {corpus_skipped} corpus item(s) skipped due to embed failures (expect_indices referencing them will fail)"
+        );
+    }
     assert!(failures.is_empty(), "共 {} 个评测失败", failures.len());
 
     drop(engine);

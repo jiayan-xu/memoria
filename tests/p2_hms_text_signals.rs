@@ -23,6 +23,7 @@ fn fresh_engine(tag: &str) -> (MemoriaEngine, String) {
 
 #[test]
 fn ledger_includes_text_signals() {
+    let _env_guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let (engine, ns) = fresh_engine("ledger");
     let _ = remember_with_dedup(
         &engine.pool,
@@ -154,7 +155,7 @@ fn search_boosts_on_numeric_query_overlap() {
     // 融合结果都有正 RRF，text_signals 零贡献也通过）；source 含 text_signals 仅
     // 在数字/日期 boost >0 实际应用时追加，P2.1c 回归必红。
     assert!(
-        top.source.contains("text_signals"),
+        top.source.contains(memoria_core::search::text_signals::SOURCE_MARKER),
         "text-signal boost must be applied: source={}",
         top.source
     );
@@ -162,6 +163,7 @@ fn search_boosts_on_numeric_query_overlap() {
 
 #[test]
 fn relative_date_in_ledger_signals() {
+    let _env_guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let (engine, ns) = fresh_engine("reldate");
     let _ = remember_with_dedup(
         &engine.pool,
@@ -244,28 +246,35 @@ fn text_signals_rerank_env_off() {
     // 断言 panic 时 remove_var 不执行则变量泄漏污染后续测试。guard 的 Drop 在
     // unwind 路径也恢复；ENV_LOCK 为文件级（与 search_boosts 共享，见上）。
     let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-    struct EnvRestore;
+    // #R61 bug/medium：**恢复原值而非无条件 remove**——进程启动时若 env 已带预设
+    // 值（CI 配置/harness），无条件 remove 会永久抹除、改变后续依赖预设值的行为。
+    struct EnvRestore(Option<String>);
     impl Drop for EnvRestore {
         fn drop(&mut self) {
             unsafe {
-                std::env::remove_var("MEMORIA_TEXT_SIGNALS_RERANK");
+                match &self.0 {
+                    Some(v) => std::env::set_var("MEMORIA_TEXT_SIGNALS_RERANK", v),
+                    None => std::env::remove_var("MEMORIA_TEXT_SIGNALS_RERANK"),
+                }
             }
         }
     }
+    let prev = std::env::var("MEMORIA_TEXT_SIGNALS_RERANK").ok();
     unsafe {
         std::env::set_var("MEMORIA_TEXT_SIGNALS_RERANK", "0");
     }
-    let _restore = EnvRestore;
+    let _restore = EnvRestore(prev);
     let fused =
         hybrid_search(&engine.pool, "999", &ns, 5, None, None, None, None, false).expect("s");
     assert!(
-        fused.iter().all(|r| !r.source.contains("text_signals")),
+        fused.iter().all(|r| !r.source.contains(memoria_core::search::text_signals::SOURCE_MARKER)),
         "关闭 rerank 时不应出现 text_signals 通道标记"
     );
 }
 
 #[test]
 fn signal_tags_persisted_on_remember() {
+    let _env_guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let (engine, ns) = fresh_engine("sigtags");
     let result = remember_with_dedup(
         &engine.pool,
