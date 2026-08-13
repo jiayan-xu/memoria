@@ -155,11 +155,14 @@ fn match_query_entities(pool: &SqlitePool, namespace: &str, query: &str) -> Hash
 mod unit_tests {
     use super::*;
 
+    // #R58 test/low：**真实调用** rerank_by_cooccurrence——此前只断言新空 Vec 为空
+    // （函数被删也会通过，假覆盖）。:memory: 池 + 空结果集验证 no-op 契约
+    // （空集保持空、不 panic），并验证内存池路径的查询不报错。
     #[test]
     fn empty_results_noop() {
-        let mut v: Vec<String> = Vec::new();
-        // pool 不可用时也不应 panic —— 用假路径会拿不到 pool；这里只测空输入
-        assert!(v.is_empty());
-        let _ = &mut v;
+        let pool = crate::storage::create_pool(":memory:", 1).expect("pool");
+        let mut results: Vec<FusedResult> = Vec::new();
+        rerank_by_cooccurrence(&pool, "agent/test", "测试查询", &mut results);
+        assert!(results.is_empty(), "empty input must stay empty");
     }
 }

@@ -93,9 +93,12 @@ impl MemoriaEngine {
         // 与 main.rs 共用 build_hype_hnsw_or_default（build + 软降级 + WARN 单一实现）：
         // 库路径不因 HyPE 故障 panic（Python bindings 宿主健壮性）。
         let (hype_hnsw, hype_count) = vector::persist::build_hype_hnsw_or_default(&pool, ef_search);
-        // 库代码（Python bindings 等宿主）不污染 stdout——用 eprintln；且无条件打印
-        // （0 也打），与 main.rs 一致：空表（未启用）与 rebuild 静默降级可区分。
-        eprintln!("[Memoria] HYPE HNSW vectors: {}", hype_count);
+        // #R58 style/low：**成功路径静默**——MemoriaEngine::new 是库入口（Python
+        // bindings / per-test 引擎创建），无条件打印让每个实例构造都刷一行 stderr
+        // （含 n=0）；build_hype_hnsw_or_default 内部已有降级 WARN，空表（未启用）
+        // 由 db_stats 的 store/live 对照呈现，无需构造期噪音。仅在 n==0 且表非空
+        // （构建降级）时由 helper 的 WARN 覆盖——此处不重复。
+        let _ = hype_count;
 
         Ok(Self {
             db_path: db_path.to_string(),
@@ -329,15 +332,28 @@ fn query_hype_count_cached(conn: &rusqlite::Connection, db_path: &str) -> i64 {
         }
         Err(e) => {
             // 失败也缓存（-1，同 TTL）——见函数 doc #R57。
+            // #R58 bug/medium：**-1 不覆盖新鲜成功值**——check-then-act 窗口内对端
+            // 线程可能刚写入成功（本线程 miss 缓存后才跑 COUNT）；瞬时失败（BUSY）
+            // 用 -1 覆盖成功会污染 `hype_vector_index_size`（store>0 && live==0 的
+            // 降级检测指标）最多 30s。仅当无非 stale 成功值时才写 -1。
             let mut cache = CACHE.lock().unwrap_or_else(|p| p.into_inner());
             let m = cache.get_or_insert_with(HashMap::new);
-            m.insert(db_path.to_string(), (Instant::now(), -1));
+            let preserve_success = match m.get(db_path) {
+                Some((at, v)) if *v != -1 && at.elapsed().as_secs() < 30 => true,
+                _ => false,
+            };
+            if !preserve_success {
+                m.insert(db_path.to_string(), (Instant::now(), -1));
+            }
+            // 失败冷却按 db_path 键控（#R57）；#R58 bug/low：**条目淘汰**——FAIL_EPOCHS
+            // 与 CACHE 同目标（多 db 路径进程不累积），>60s 冷却窗口的旧条目无用。
             let epoch = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs() as i64)
                 .unwrap_or(0);
             let mut fe = FAIL_EPOCHS.lock().unwrap_or_else(|p| p.into_inner());
             let fmap = fe.get_or_insert_with(HashMap::new);
+            fmap.retain(|_, last| epoch.saturating_sub(*last) < 60);
             let last = fmap.get(db_path).copied().unwrap_or(0);
             if epoch.saturating_sub(last) >= 60 {
                 fmap.insert(db_path.to_string(), epoch);

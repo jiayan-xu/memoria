@@ -581,7 +581,9 @@ pub fn migrate_evolution(pool: &SqlitePool) -> Result<(), String> {
     Ok(())
 }
 
-/// #R57 maintainability/low：**共享 commit helper**——四处 commit（updated_at/trigger/
+/// #R58 maintainability/high：**共享 commit helper**（改名 commit_tx——名字如实地
+/// 描述"只 commit、回滚由 Drop 兜底"的行为，原 commit_or_rollback 承诺显式回滚路径
+/// 误导读者去"修复"一个不可能形态）。四处 commit（updated_at/trigger/
 /// cleanup-noop/cleanup）此前各自重复"commit 失败 + 显式 ROLLBACK"模式。
 /// #R57 实证修正（推翻 R25 评论 10 的"drop-guard 已清除"说法）：rusqlite 0.32.1 的
 /// `Transaction` Drop 语义（transaction.rs:242-247 finish_）用 **is_autocommit()** 判定
@@ -590,7 +592,7 @@ pub fn migrate_evolution(pool: &SqlitePool) -> Result<(), String> {
 /// R25 加的显式 ROLLBACK 是画蛇添足（且与 `&mut conn` 借用冲突，helper 无法取
 /// conn 引用）。commit 成功则 is_autocommit=true，Drop no-op。helper 只收口错误
 /// 消息格式，防四处文案漂移。
-fn commit_or_rollback(tx: rusqlite::Transaction, label: &str) -> Result<(), String> {
+fn commit_tx(tx: rusqlite::Transaction, label: &str) -> Result<(), String> {
     tx.commit().map_err(|e| format!("{label}: {e}"))
 }
 
@@ -618,12 +620,15 @@ fn is_busy(e: &rusqlite::Error) -> bool {
 /// 2067/2323/2579）。此前按 extended_code==2001 匹配永不命中——check-then-act
 /// 竞态下对端进程刚提交同一 ALTER 时本进程仍 panic（守卫形同虚设）。按
 /// Unknown 主码 + 消息判定，消息匹配"已应用"幂等处理。
-/// #R56 实证（驳斥"应匹配 ErrorCode::Error"的说法）：rusqlite 0.32.1 的 `ErrorCode`
-/// 是 libsqlite3-sys 0.28.0 的 re-export（rusqlite/src/lib.rs:79 `pub use
+/// #R56/#R58 实证（驳斥"应匹配 ErrorCode::Error"的说法）：rusqlite 0.32.1 的
+/// `ErrorCode` 是 libsqlite3-sys 的 re-export（rusqlite/src/lib.rs:79 `pub use
 /// crate::ffi::ErrorCode`），该枚举**没有 Error 变体**；`Error::new` 的 `_ =>`
-/// catch-all 分支把 SQLITE_ERROR(1)（未在 match 中显式列出）归入 `Unknown`
-/// （libsqlite3-sys-0.28.0/src/error.rs `impl Error::new`）。`ErrorCode::Error`
-/// 无法编译（变体不存在）。BEGIN IMMEDIATE 事务仍是主防线，本守卫只作窗口兜底。
+/// catch-all 分支把 SQLITE_ERROR(1)（未在 match 中显式列出）归入 `Unknown`。
+/// #R58 已按 Cargo.lock 实际锁定的 libsqlite3-sys **0.30.1** 复核
+/// （libsqlite3-sys-0.30.1/src/error.rs:67-92 `impl Error::new`）：映射与 0.28.0
+/// 完全一致（SQLITE_ERROR 无显式分支 → Unknown），heuristic 成立。`ErrorCode::Error`
+/// 无法编译（变体不存在）。BEGIN IMMEDIATE 事务仍是主防线，本守卫只作窗口兜底，
+/// 依赖英文消息 'duplicate column name' 的 best-effort 语义如实记录。
 fn is_duplicate_column(e: &rusqlite::Error) -> bool {
     match e {
         rusqlite::Error::SqliteFailure(se, msg) => {
@@ -716,11 +721,10 @@ pub fn migrate_hype_vectors(pool: &SqlitePool) -> Result<(), String> {
     // non-constant default" SQLITE_ERROR），恰在此迁移要服务的存量库上每次必现且
     // 不是 duplicate-column 分支 → 传播到 .expect 中止启动。常量默认即可：4 列
     // upsert 每次写入都会 SET updated_at=datetime('now')，存量行的 '' 只占位。
-    // #R55 bug/high：`tx.commit()` 失败时 Transaction 的 drop-guard **已清除**
-    // （rusqlite 在发 COMMIT 前消费 drop 保护），drop 不会执行 ROLLBACK——连接带着
-    // 未提交写事务还池（r2d2 无 test_on_check_out），后续查询静默跑在事务内、写锁
-    // 不释放。commit 失败路径显式 `ROLLBACK` 再传播。事务内语句失败（`?` 提前返回）
-    // 仍由 Transaction::drop 正常回滚。
+    // #R58 注释统一（修正 #R55 与 #R57 的矛盾）：rusqlite 0.32.1 Transaction 的
+    // Drop 用 is_autocommit() 判定（transaction.rs finish_），commit 失败时事务仍
+    // 活跃 → 默认 DropBehavior::Rollback **自动回滚**，不存在"带写锁还池"；
+    // 事务内语句失败（`?` 提前返回）同样由 Drop 回滚。见 commit_tx helper doc。
     {
         // 只读快速路径：新库基表已含该列（常见情形）→ 零写锁。
         let fast_has_upd: i64 = conn
@@ -757,9 +761,16 @@ pub fn migrate_hype_vectors(pool: &SqlitePool) -> Result<(), String> {
                                     "[Memoria] Migration: memory_vectors.updated_at added by peer process"
                                 );
                             } else {
+                                // #R58 bug/medium：**携带原始错误（Some(e)）供 busy
+                                // 重试**——BEGIN IMMEDIATE 只获取 RESERVED 锁，ALTER
+                                // 需要 EXCLUSIVE 锁升级；并发首启时对端事务中（或长
+                                // 读事务）可让 ALTER 报 SQLITE_BUSY 即使 BEGIN 已成功。
+                                // 此前归 None 立即软降级：列永不补、旧库 4 列 upsert
+                                // 运行时报 no such column。busy/locked 的 ALTER 错误
+                                // 走重试循环（其余错误仍即时返回）。
                                 return Err((
                                     format!("add memory_vectors.updated_at: {}", e),
-                                    None,
+                                    Some(e),
                                 ));
                             }
                         } else {
@@ -768,10 +779,10 @@ pub fn migrate_hype_vectors(pool: &SqlitePool) -> Result<(), String> {
                             );
                         }
                     }
-                    // #R57 maintainability/low：共享 commit_or_rollback（commit 失败
-                    // drop-guard 已消费 + ROLLBACK 结果检查，见 helper doc）。元组
-                    // 形态保留：commit 失败不重试（与 BEGIN 的锁竞争语义无关）。
-                    commit_or_rollback(tx, "commit updated_at tx")
+                    // #R58 maintainability/low：共享 commit_tx（Drop 自动回滚，
+                    // 见 helper doc）。元组形态保留：commit 失败不重试（与 BEGIN
+                    // 的锁竞争语义无关）。
+                    commit_tx(tx, "commit updated_at tx")
                         .map_err(|m| (m, None))?;
                     Ok(())
                 })();
@@ -843,6 +854,35 @@ pub fn migrate_hype_vectors(pool: &SqlitePool) -> Result<(), String> {
         "create migration_flags",
     );
 
+    // #R58 maintainability/low：**schema 契约检查**——ddl_soft 吞掉所有失败（schema
+    // typo/权限/磁盘满），若此后无验证，CREATE 结果与消费方（persist vector_table!
+    // upsert id/namespace/vector/updated_at；rebuild 读 id/vector；离线脚本写 question）
+    // 的漂移会让 HyPE 每启动静默失效而进程照常"健康"（孤儿清理段也查询该表）。轻量
+    // 列集校验：期望列缺一即 WARN（不阻断——flag/重建路径已有软处理，缺失只影响
+    // 4 列 upsert 与双路检索，可下次启动修复后自愈）。
+    {
+        let expect: [&str; 4] = ["id", "namespace", "vector", "updated_at"];
+        let have: Vec<String> = match conn
+            .prepare("SELECT name FROM pragma_table_info('memory_hype_vectors')")
+        {
+            Ok(mut stmt) => stmt
+                .query_map([], |r| r.get::<_, String>(0))
+                .map(|rows| rows.filter_map(|r| r.ok()).collect())
+                .unwrap_or_default(),
+            Err(_) => vec![],
+        };
+        let missing: Vec<&str> = expect
+            .iter()
+            .copied()
+            .filter(|c| !have.iter().any(|h| h.as_str() == *c))
+            .collect();
+        if !missing.is_empty() {
+            eprintln!(
+                "[Memoria] WARN: memory_hype_vectors schema drift - missing columns {missing:?} (HyPE feature degraded until next successful migration)"
+            );
+        }
+    }
+
     // 删除联动：memories 行删除时清理两个向量表。注意：memory_vectors 同样存在孤儿
     // 问题（历史行为），一并覆盖。
     // #R44 maintainability/low：`DROP TRIGGER IF EXISTS` + `CREATE TRIGGER` 而非仅
@@ -901,8 +941,8 @@ pub fn migrate_hype_vectors(pool: &SqlitePool) -> Result<(), String> {
                 rusqlite::params![TRIGGER_VERSION],
             )
             .map_err(|e| format!("set trigger version flag: {}", e))?;
-            // #R57 maintainability/low：共享 commit_or_rollback（见 helper doc）。
-            commit_or_rollback(tx, "commit trigger tx")?;
+            // #R58 maintainability/low：共享 commit_tx（见 helper doc）。
+            commit_tx(tx, "commit trigger tx")?;
             Ok(())
         })();
         if let Err(e) = trig {
@@ -1015,8 +1055,8 @@ pub fn migrate_hype_vectors(pool: &SqlitePool) -> Result<(), String> {
                 )
                 .map_err(|e| format!("check cleanup flags (tx): {}", e))?;
             if done2 == 2 && !(force_cleanup && clean_vectors) {
-                // #R57 maintainability/low：共享 commit_or_rollback（见 helper doc）。
-                commit_or_rollback(tx, "commit cleanup tx (noop)")?;
+                // #R58 maintainability/low：共享 commit_tx（见 helper doc）。
+                commit_tx(tx, "commit cleanup tx (noop)")?;
                 return Ok(());
             }
             // #R54 bug/low：refused 态**事务内重读**（与完成 flag 一致）——对端进程
@@ -1077,7 +1117,7 @@ pub fn migrate_hype_vectors(pool: &SqlitePool) -> Result<(), String> {
                     if orphans_hype > 0 {
                         if !clean_vectors {
                             eprintln!(
-                                "[Memoria] WARN: {orphans_hype} orphan memory_hype_vectors rows (possible staged/external hype rows); NOT deleting - set MEMORIA_ORPHAN_CLEANUP_VECTORS=1 to enable (MEMORIA_FORCE_ORPHAN_CLEANUP=1 bypasses the {ORPHAN_REFUSE_THRESHOLD} threshold)"
+                                "[Memoria] WARN: {orphans_hype} orphan memory_hype_vectors rows (possible staged/external hype rows); NOT deleting - set MEMORIA_ORPHAN_CLEANUP_VECTORS=1 to enable (MEMORIA_FORCE_ORPHAN_CLEANUP=1 bypasses the {ORPHAN_REFUSE_THRESHOLD} threshold; once refused state is recorded, BOTH envs are required to re-enter)"
                             );
                             // #R57 bug/low：hype 段拒绝**不置 refused**——REFUSED_FLAG
                             // 语义 = memory_vectors 段拒绝（见下）；hype 拒绝态由
@@ -1085,7 +1125,7 @@ pub fn migrate_hype_vectors(pool: &SqlitePool) -> Result<(), String> {
                             // 干净完成也被标记 refused、下次启动 WARN 误导归因。
                         } else if orphans_hype > ORPHAN_REFUSE_THRESHOLD && !force_cleanup {
                             eprintln!(
-                                "[Memoria] WARN: {orphans_hype} orphan memory_hype_vectors rows ABOVE safety threshold {ORPHAN_REFUSE_THRESHOLD}; refusing auto-delete (set MEMORIA_FORCE_ORPHAN_CLEANUP=1 to force)"
+                                "[Memoria] WARN: {orphans_hype} orphan memory_hype_vectors rows ABOVE safety threshold {ORPHAN_REFUSE_THRESHOLD}; refusing auto-delete (set MEMORIA_FORCE_ORPHAN_CLEANUP=1 to force; once refused state is recorded, BOTH envs are required to re-enter)"
                             );
                         } else {
                             // #R57 bug/medium：**删除前打印样本**——opt-in 时 DELETE
@@ -1162,12 +1202,12 @@ pub fn migrate_hype_vectors(pool: &SqlitePool) -> Result<(), String> {
                     if orphans_vec > 0 {
                         if !clean_vectors {
                             eprintln!(
-                                "[Memoria] WARN: {orphans_vec} orphan memory_vectors rows (possible legit external vectors via add_vectors); NOT deleting - set MEMORIA_ORPHAN_CLEANUP_VECTORS=1 to enable (MEMORIA_FORCE_ORPHAN_CLEANUP=1 bypasses the {ORPHAN_REFUSE_THRESHOLD} threshold)"
+                                "[Memoria] WARN: {orphans_vec} orphan memory_vectors rows (possible legit external vectors via add_vectors); NOT deleting - set MEMORIA_ORPHAN_CLEANUP_VECTORS=1 to enable (MEMORIA_FORCE_ORPHAN_CLEANUP=1 bypasses the {ORPHAN_REFUSE_THRESHOLD} threshold; once refused state is recorded, BOTH envs are required to re-enter)"
                             );
                             refused = true;
                         } else if orphans_vec > ORPHAN_REFUSE_THRESHOLD && !force_cleanup {
                             eprintln!(
-                                "[Memoria] WARN: {orphans_vec} orphan memory_vectors rows ABOVE safety threshold {ORPHAN_REFUSE_THRESHOLD}; refusing auto-delete (set MEMORIA_FORCE_ORPHAN_CLEANUP=1 to force)"
+                                "[Memoria] WARN: {orphans_vec} orphan memory_vectors rows ABOVE safety threshold {ORPHAN_REFUSE_THRESHOLD}; refusing auto-delete (set MEMORIA_FORCE_ORPHAN_CLEANUP=1 to force; once refused state is recorded, BOTH envs are required to re-enter)"
                             );
                             refused = true;
                         } else {
@@ -1220,9 +1260,8 @@ pub fn migrate_hype_vectors(pool: &SqlitePool) -> Result<(), String> {
                 )
                 .map_err(|e| format!("set cleanup flag: {}", e))?;
             }
-            // #R57 maintainability/low：共享 commit_or_rollback（commit 失败时
-            // drop-guard 已消费、显式 ROLLBACK 防"带写锁还池"，见 helper doc）。
-            commit_or_rollback(tx, "commit cleanup tx")?;
+            // #R58 maintainability/low：共享 commit_tx（Drop 自动回滚，见 helper doc）。
+            commit_tx(tx, "commit cleanup tx")?;
             Ok(())
         })();
         if let Err(e) = cleanup {

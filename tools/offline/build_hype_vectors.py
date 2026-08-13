@@ -250,7 +250,8 @@ def main():
     ap.add_argument(
         "--ids",
         default=None,
-        help="定点重跑：读取 hype_failed_ids.txt（或逗号分隔 id 列表文件）仅处理这些 id "
+        help=f"定点重跑：读取 id 清单文件（默认清单位置: {os.path.join(HERE, 'hype_failed_ids.txt')}，"
+        "或任意逗号分隔 id 列表文件）仅处理这些 id "
         "（与 --all 的 fail_ids 清单闭环，#R53：此前清单只写不读，唯一重跑路径是全量 --all）",
     )
     ap.add_argument("--all", action="store_true", help="全库补嵌（验证通过后）")
@@ -344,6 +345,13 @@ def main():
     if args.limit is not None:
         targets = targets[: args.limit]
 
+    # #R58 bug/low：**空目标 fail-fast 前置**——--ids 全部失效/--all 0 行（库错/
+    # ns 过滤不匹配）时在此退出：付费 preflight（embed + chat 各一次）尚未发生，
+    # fail-fast-before-spending 覆盖空目标（原检查在 preflight 之后，白付两次调用）。
+    if not targets:
+        print(f"错误: 目标集为空（{args.db} 无匹配行 / --ids 全部失效 / ns 过滤不匹配）——已中止")
+        sys.exit(1)
+
     ok = skip = fail = 0
     fail_ids = []
     skip_ids = []
@@ -393,13 +401,6 @@ def main():
         # 运行静默抹掉上次全量运行累积的失败清单（"定点重跑"工件），运维先 --limit
         # 调试再定点重跑时清单已丢，被迫全量 --all 再付几千次付费调用。dry-run 与
         # preflight 失败已有守卫，部分运行此前漏网。
-        # #R56 bug/medium：**清理前 fail-fast 空目标**——--all 选 0 行（库路径错/
-        # ns 过滤不匹配/库是冷的）时继续走到这里会删掉上次全量累积的清单，然后
-        # 零迭代退出 0 报"写入 0 / 跳过 0 / 失败 0"假成功：误配置的运行静默销毁了
-        # 它本应服务的重跑工件。
-        if not targets:
-            print(f"错误: 目标集为空（{args.db} 无匹配行或 ns 过滤不匹配）——已中止，未清理 fail_ids")
-            sys.exit(1)
         if args.all and args.limit is None:
             try:
                 if os.path.exists(failed_ids_path):
@@ -425,6 +426,21 @@ def main():
         # #R50 maintainability/low：DDL 包 try/except 友好诊断（只读/磁盘满/损坏）。
         try:
             con = sqlite3.connect(args.db)
+            # #R58 bug/low：**DDL 前探测 memories 表**（golden 模式）——库文件存在但
+            # 未初始化（无 memories 表）时，后续 golden 校验 SELECT 失败退出，但若
+            # DDL 已执行则 memory_hype_vectors 与其索引被留在失败路径上（写副作用，
+            # 违背"失败无副作用"纪律）。connect 后先查 memories 存在性，未初始化
+            # 即友好退出（DDL 尚未执行，无副作用）。
+            try:
+                has_memories = con.execute(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='memories'"
+                ).fetchone()[0]
+            except sqlite3.Error:
+                has_memories = 0
+            if not has_memories:
+                con.close()
+                print(f"错误: {args.db} 未初始化（无 memories 表，请先启动服务或导入 schema）")
+                sys.exit(1)
             # 自包含：表可能尚未经 Rust 迁移创建（离线补嵌先于服务启动时）——镜像
             # src/storage/sqlite.rs 的 schema，确保首次运行不因缺表崩溃、幂等成立。
             con.execute(
@@ -579,8 +595,19 @@ def main():
         if i % 10 == 0:
             print(f"  ...{i}/{len(targets)}")
     # #R54 performance/low：循环结束最终 commit（最后一批不足 50 行的部分）。
+    # #R58 bug/medium：**守卫**——此前逐行写错误被捕获后连接留在失败事务态
+    # （未 rollback）或并发服务持锁时，con.commit() 裸抛 sqlite3.OperationalError
+    # traceback，死在摘要打印与 hype_failed_ids.txt 原子重写之前（重跑清单丢失）。
+    # rollback 清失败态使连接可复用/安全关闭。
     if not args.dry_run and con is not None:
-        con.commit()
+        try:
+            con.commit()
+        except sqlite3.Error as e:
+            try:
+                con.rollback()
+            except sqlite3.Error:
+                pass
+            print(f"  [warn] 最终 commit 失败: {e}")
 
     if con is not None:
         con.close()

@@ -7,6 +7,7 @@
 //! 运行：`cargo test --test eval_semantic -- --nocapture`
 //! 前置：embed_server.py 运行于 127.0.0.1:8777（MEMORIA_EMBEDDING_URL）。
 
+use std::cmp::min;
 use memoria_core::MemoriaEngine;
 use memoria_core::search::hybrid::hybrid_search;
 use memoria_core::storage::{SqlitePool, create_pool, init_core_tables, init_schema};
@@ -315,9 +316,18 @@ async fn memory_eval_semantic_inner() {
         // #R52 test/low：content-embed 也走 embed_with_retry——瞬时 Transport/429/5xx
         // 在任一语料项上会 panic 整个测试（embed_with_retry 引入的初衷正是吸收
         // 本测试的瞬时抖动，HyPE 侧已用、内容侧此前漏用）。
-        let v = embed_with_retry(&client, content)
-            .await
-            .expect("corpus embed");
+        // #R58 other/low：**双 attempt 全败不 panic 整个评测**——持续瞬时（服务
+        // 重启中）时此条无内容向量，skip 该记忆并记录（与 HyPE/query 路径的
+        // skip+eprintln 纪律一致）；embed 服务恢复后 rerun 覆盖缺口。此前
+        // `.expect("corpus embed")` 用 Debug 渲染 EmbedError 且不指明哪条语料，
+        // ~25 分钟评测死于低诊断 panic。
+        let Ok(v) = embed_with_retry(&client, content).await else {
+            eprintln!(
+                "[eval_semantic] corpus embed failed for {:?}; skipping this item",
+                content.get(..min(content.len(), 80))
+            );
+            continue;
+        };
         // v 用于内容路（cache_query_vector）；HyPE 块需内容向量副本校验「问句向量与内容
         // 向量确实不同」核心不变量（#R46 test/medium）——clone 一次（1024 维，廉价）。
         engine.cache_query_vector(content, v.clone());

@@ -3167,6 +3167,58 @@ fn matches_memory_tags(pool: &storage::SqlitePool, memory_id: &str, tags: &[Stri
 mod tests {
     use super::*;
 
+    // #R58 test/low：HyPE 双路经 **dispatch 路径**的实测——build_test_state 恒用空
+    // hype_hnsw，Some(&state.hype_hnsw) 的双路合并/去重/归因此前只在引擎级
+    // （eval_semantic）间接覆盖。填充双索引（DIM=1024）+ query 缓存后经
+    // memory_search dispatch 断言命中被返回（content 回查要求 memories 行存在）。
+    #[test]
+    fn test_dispatch_memory_search_hype_road() {
+        use memoria_core::vector::{DIM, VectorEntry};
+        let state = build_test_state();
+        // 写 memories 行（hybrid 的 ns 回查/content 回填需要）
+        {
+            let conn = state.pool.get().unwrap();
+            conn.execute(
+                "INSERT OR IGNORE INTO memories (id, namespace, content, importance) \
+                 VALUES (?1, 'agent/test', ?2, 3)",
+                rusqlite::params!["mem_hype_1", "HyPE 双路测试记忆内容"],
+            )
+            .unwrap();
+        }
+        let mut cv = vec![0.0f32; DIM];
+        cv[0] = 1.0;
+        let mut hv = vec![0.0f32; DIM];
+        hv[0] = 0.95;
+        hv[1] = (1.0f32 - 0.95f32 * 0.95f32).sqrt();
+        // 双路都入索引（content 向量与问句向量不同——HyPE 双路合并的形态）
+        state
+            .hnsw
+            .add(&[VectorEntry { id: "mem_hype_1".into(), vector: cv }])
+            .unwrap();
+        state
+            .hype_hnsw
+            .add(&[VectorEntry { id: "mem_hype_1".into(), vector: hv.clone() }])
+            .unwrap();
+        state.query_cache.put("查询测试", hv.clone());
+        let mut args = serde_json::Map::new();
+        args.insert("query".into(), serde_json::Value::String("查询测试".into()));
+        args.insert(
+            "namespace".into(),
+            serde_json::Value::String("agent/test".into()),
+        );
+        args.insert("max_results".into(), serde_json::Value::from(5));
+        let auth = AuthResult {
+            agent_id: "tester".into(),
+            allowed_ns: vec!["agent/test".into()],
+            role: "admin".into(),
+        };
+        let out = dispatch(&state, "memory_search", &args, &auth);
+        assert!(
+            out.contains("mem_hype_1") || out.contains("HyPE 双路测试记忆内容"),
+            "HyPE road hit missing through dispatch: {out}"
+        );
+    }
+
     fn build_test_state() -> Arc<AppState> {
         // 每个测试用独立的共享内存库名，避免 :memory: 进程级共享导致的配额/数据串扰
         static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);

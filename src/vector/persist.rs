@@ -144,7 +144,11 @@ fn warn_throttled(fn_name: &str, reason: &str, msg: &str) {
     use std::sync::atomic::{AtomicU64, Ordering};
     static SLOTS: [AtomicU64; 32] = [const { AtomicU64::new(0) }; 32];
     let mut h: u64 = 0xcbf29ce484222325;
-    for b in format!("{fn_name}:{reason}").bytes() {
+    // #R58 performance/low：**免中间 String**——`format!("{fn_name}:{reason}")` 在
+    // 每次失败调用都堆分配（含被抑制的大多数：n>3 且非 1000 倍数）；此函数专为
+    // 写失败风暴设计（生产调用方 `let _ =` 丢弃 Result 的紧循环），与文件自身的
+    // no-runtime-allocation 纪律（#R53）对齐。直接 chain 字节序列哈希。
+    for b in fn_name.bytes().chain([b':']).chain(reason.bytes()) {
         h ^= b as u64;
         h = h.wrapping_mul(0x100000001b3);
     }
@@ -381,6 +385,15 @@ fn rebuild_from_table(pool: &SqlitePool, hnsw: &HnswIndex, table: &str) -> Resul
                 // 截断 blob 被误读成 1024→768 模型漂移、DIM*4+2 被归"超长"（而
                 // chunks_exact 恰好解出 DIM 个有效 f32 本可入索引）。all-skipped 的
                 // Err 现在门控 hype 启动路径，归因错误会把运维引向错误根因。
+                // #R58 other/low：**空/极短 blob 先归 corrupt（skipped_blob）**——
+                // 0 字节或单个 float（4 字节）通过对齐检查后被归 skipped_dim（模型
+                // 漂移）会误导运维往"换模型"方向查（而 0/4 字节更可能是截断/损坏）；
+                // 这些计数器喂给 hype 启动路径的 all-skipped 归因（error_on_all_
+                // skipped）。空 blob 在此单独短路。
+                if blob.is_empty() {
+                    skipped_blob += 1;
+                    continue;
+                }
                 if blob.len() % 4 != 0 {
                     skipped_blob += 1;
                     continue;
