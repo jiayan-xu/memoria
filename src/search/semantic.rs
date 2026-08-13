@@ -55,16 +55,19 @@ impl std::error::Error for SemanticError {}
 /// #R62 maintainability/low：**语义信号丢弃累计计数**——hybrid 每次 drop 语义通道
 /// 时递增；db_stats 暴露该计数，使持续降级（索引损坏/DB 故障）可被监控/健康检查
 /// 感知（stderr 冷却行对 MCP/Python 调用方不可见）。
+/// #R63 bug/high：**单一模块级 static**——两个函数各自的 function-local static 是
+/// 两个独立实例（bump 递增的与 read 读取的不是同一个），计数恒 0、可观测性
+/// 死路。
+static SEMANTIC_DROPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 pub(crate) fn bump_semantic_drops() {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static DROPS: AtomicU64 = AtomicU64::new(0);
-    DROPS.fetch_add(1, Ordering::Relaxed);
+    use std::sync::atomic::Ordering;
+    SEMANTIC_DROPS.fetch_add(1, Ordering::Relaxed);
 }
 
 pub(crate) fn semantic_drop_count() -> u64 {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static DROPS: AtomicU64 = AtomicU64::new(0);
-    DROPS.load(Ordering::Relaxed)
+    use std::sync::atomic::Ordering;
+    SEMANTIC_DROPS.load(Ordering::Relaxed)
 }
 
 /// 60s 冷却的 eprintln（#R50/#R51 maintainability/low）：语义检索路径多处诊断日志
@@ -431,6 +434,10 @@ fn fetch_memories_batch(
                     format!("pool get failed (batch {} ids): {}", chunk.len(), e)
                 });
                 hard_failed = true;
+                // #R63 bug/medium：break 前**计入硬失败批**——函数尾按
+                // hard_failed_batches 汇总（此前漏计 → 返回 Ok(partial) 而非 Err，
+                // #R47"任一硬失败即 Err"契约被绕过，hybrid 视作成功低召回查询）。
+                hard_failed_batches += 1;
                 break;
             }
         };

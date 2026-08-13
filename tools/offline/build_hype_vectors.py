@@ -355,6 +355,10 @@ def main():
     ok = skip = fail = 0
     fail_ids = []
     skip_ids = []
+    # #R62 bug/high：con 在此初始化（preflight 后段另有赋值）——atexit 注册段对
+    # 非 --all 模式（golden/--ids）引用 con 时未定义 → UnboundLocalError 崩溃
+    # 脚本主用法；--all 模式则避免误用旧连接对象。
+    con = None
     if not args.dry_run and con is not None:
         # #R61 bug/low：**中断安全**——Ctrl+C/SIGINT 时最后未提交批（最多 49 条
         # 已付费行）被解释器回滚且不进 fail_ids（record_fail 的"中断不丢清单"
@@ -624,14 +628,16 @@ def main():
                 pass
             print(f"[{i}/{len(targets)}] {mid[:8]} 写入失败: {e}")
             record_fail(mid)
-            # #R62 bug/low：**off-by-one 修正**——当前行可能已在 pending_batch
-            # （execute 成功、commit 失败）或不在（execute 本身失败）。统一按
-            # pending 集合处理：本批丢弃行数 = len(pending_batch)（含当前行时
-            # 不再单独 +1），这些行此前已计入 ok（每行各自迭代 ok += 1）——
-            # ok -= len(pending)、fail += len(pending) 精确反映真实落库。
+            # #R63 bug/low：**ok/fail 计数精确化**——两个失败模式分别处理：
+            # (1) INSERT 失败：当前行不在 pending、ok 未 +1 → fail 只加
+            #     len(pending)（此前少计 1）；
+            # (2) 批 commit 失败：当前行在 pending、ok += 1 未执行 → ok 恢复该行
+            #     （此前多减 1）。公式：ok -= len(pending) - (1 if 当前行在 pending)，
+            #     fail += len(pending) + (0 if 当前行在 pending)。
+            in_pending = mid in pending_batch
             pending_ok = len(pending_batch)
-            ok = max(0, ok - pending_ok)
-            fail += pending_ok
+            ok = max(0, ok - pending_ok + (1 if in_pending else 0))
+            fail += pending_ok + (0 if in_pending else 1)
             for pid in pending_batch:
                 record_fail(pid)
             pending_batch.clear()

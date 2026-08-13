@@ -23,6 +23,11 @@ fn fresh_engine(tag: &str) -> (MemoriaEngine, String) {
 
 #[test]
 fn ledger_includes_text_signals() {
+    // #R63 test/medium：持 ENV_LOCK——本测试经 memory_context→hybrid_search→
+    // text_signals_rerank_enabled() 读取 MEMORIA_TEXT_SIGNALS_RERANK；并行下与
+    // env 变异测试的 set_var/remove_var 窗口重叠 = 数据竞争（set_var 在 edition
+    // 2024 为 unsafe 正是为此）。
+    let _env_guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let (engine, ns) = fresh_engine("ledger");
     let _ = remember_with_dedup(
         &engine.pool,
@@ -85,9 +90,26 @@ fn ledger_includes_text_signals() {
     );
 }
 
-// #R60：变异 MEMORIA_TEXT_SIGNALS_RERANK 的测试与依赖其默认值的测试共享串行锁
-// （见 text_signals_rerank_env_off）。
+// #R60：变异 MEMORIA_TEXT_SIGNALS_RERANK 的测试与读取它的测试共享串行锁
+// （R33 曾移除 3 个"不依赖"测试的锁，#R63 加回——它们经 memory_context→
+// hybrid_search 每次搜索都读该 env，并行下与 set_var 窗口重叠是数据竞争 UB）。
 static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// #R63 maintainability/low：共享 env 恢复 guard——Option<OsString> 无损快照 +
+/// Drop 恢复原值（含 unwind）；search_boosts（pin enabled）与 env_off 共用，
+/// 防两份恢复语义静默分歧。
+struct EnvRestore(Option<std::ffi::OsString>);
+impl Drop for EnvRestore {
+    fn drop(&mut self) {
+        // SAFETY: 恢复在 ENV_LOCK 串行区内（所有变异/读取测试共享该锁）。
+        unsafe {
+            match &self.0 {
+                Some(v) => std::env::set_var("MEMORIA_TEXT_SIGNALS_RERANK", v),
+                None => std::env::remove_var("MEMORIA_TEXT_SIGNALS_RERANK"),
+            }
+        }
+    }
+}
 
 #[test]
 fn search_boosts_on_numeric_query_overlap() {
@@ -95,22 +117,15 @@ fn search_boosts_on_numeric_query_overlap() {
     // 预设 MEMORIA_TEXT_SIGNALS_RERANK=0（dev shell/CI）会让正确代码假红。
     // ENV_LOCK 只串行化本二进制内的变异，管不到环境预设。
     let _env_guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-    struct PinEnabled(Option<std::ffi::OsString>);
-    impl Drop for PinEnabled {
-        fn drop(&mut self) {
-            unsafe {
-                match &self.0 {
-                    Some(v) => std::env::set_var("MEMORIA_TEXT_SIGNALS_RERANK", v),
-                    None => std::env::remove_var("MEMORIA_TEXT_SIGNALS_RERANK"),
-                }
-            }
-        }
-    }
+    // #R63 maintainability/low：共享 guard（EnvRestore 同款，见下——防两份恢复
+    // 语义静默分歧）。
     let prev = std::env::var_os("MEMORIA_TEXT_SIGNALS_RERANK");
+    // SAFETY: 在 ENV_LOCK 串行区内变异进程级 env（本文件全部测试共享该锁，
+    // 无并发读/写）；恢复由 guard 的 Drop 保证（含 unwind）。
     unsafe {
         std::env::set_var("MEMORIA_TEXT_SIGNALS_RERANK", "1");
     }
-    let _pin = PinEnabled(prev);
+    let _pin = EnvRestore(prev);
     let (engine, ns) = fresh_engine("rerank");
     let a = remember_with_dedup(
         &engine.pool,
@@ -181,6 +196,7 @@ fn search_boosts_on_numeric_query_overlap() {
 
 #[test]
 fn relative_date_in_ledger_signals() {
+    let _env_guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let (engine, ns) = fresh_engine("reldate");
     let _ = remember_with_dedup(
         &engine.pool,
@@ -265,17 +281,7 @@ fn text_signals_rerank_env_off() {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     // #R61 bug/medium：**恢复原值而非无条件 remove**——进程启动时若 env 已带预设
     // 值（CI 配置/harness），无条件 remove 会永久抹除、改变后续依赖预设值的行为。
-    struct EnvRestore(Option<std::ffi::OsString>);
-    impl Drop for EnvRestore {
-        fn drop(&mut self) {
-            unsafe {
-                match &self.0 {
-                    Some(v) => std::env::set_var("MEMORIA_TEXT_SIGNALS_RERANK", v),
-                    None => std::env::remove_var("MEMORIA_TEXT_SIGNALS_RERANK"),
-                }
-            }
-        }
-    }
+
     // #R62 bug/low：var_os 无损快照——var().ok() 把非 Unicode 预设值归 None，
     // Drop 时误执行 remove_var（违反"恢复原值"契约）。
     let prev = std::env::var_os("MEMORIA_TEXT_SIGNALS_RERANK");
@@ -285,6 +291,7 @@ fn text_signals_rerank_env_off() {
     let _restore = EnvRestore(prev);
     let fused =
         hybrid_search(&engine.pool, "999", &ns, 5, None, None, None, None, false).expect("s");
+    assert!(!fused.is_empty(), "rerank-off search for '999' should return the memory");
     assert!(
         fused.iter().all(|r| !r.source.contains(memoria_core::search::text_signals::SOURCE_MARKER)),
         "关闭 rerank 时不应出现 text_signals 通道标记"
@@ -293,6 +300,7 @@ fn text_signals_rerank_env_off() {
 
 #[test]
 fn signal_tags_persisted_on_remember() {
+    let _env_guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let (engine, ns) = fresh_engine("sigtags");
     let result = remember_with_dedup(
         &engine.pool,

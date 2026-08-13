@@ -284,17 +284,30 @@ pub fn remember_with_dedup(
             if near_dup_enabled() {
                 if let (Some(hnsw_idx), Some(qv)) = (hnsw, &candidate_vector) {
                     if crate::vector::persist::get_stored_vector(pool, &mem_id).is_none() {
-                        let _ =
-                            crate::vector::persist::put_stored_vector(pool, &mem_id, namespace, qv);
-                        let _ = hnsw_idx.add(&[VectorEntry {
+                        // #R63 maintainability/medium：**与 updated 路径同款失败
+                        // 处理**——put 失败短路 add（瞬态 BUSY 留 memory-only 向量、
+                        // 重启后消失）；失败可见（低频异常直接 eprintln）。
+                        if let Err(e) =
+                            crate::vector::persist::put_stored_vector(pool, &mem_id, namespace, qv)
+                        {
+                            eprintln!("[remember] put_stored_vector failed for {mem_id}: {e}");
+                        } else if let Err(e) = hnsw_idx.add(&[VectorEntry {
                             id: mem_id.clone(),
                             vector: qv.clone(),
-                        }]);
+                        }]) {
+                            // #R63 bug/low：put 成功 add 失败——向量已持久化但内存
+                            // 索引缺失；外层 get_stored_vector 守卫会让后续 remember
+                            // 跳过 add（索引与持久态发散到重启）。记录后由下次启动
+                            // rebuild（.bin 不含该 id → 对齐权威表）自愈。
+                            eprintln!("[remember] hnsw add failed for {mem_id}: {e} (index rebuild at next start reconciles)");
+                        }
                     }
                     // 增量补 semantic_related 边（闭环 Phase 1b）
-                    let _ = crate::search::semantic_edges::upsert_semantic_edges_for(
+                    if let Err(e) = crate::search::semantic_edges::upsert_semantic_edges_for(
                         pool, hnsw_idx, &mem_id, namespace, qv,
-                    );
+                    ) {
+                        eprintln!("[remember] upsert_semantic_edges failed for {mem_id}: {e}");
+                    }
                 }
             }
 

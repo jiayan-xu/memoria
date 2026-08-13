@@ -369,5 +369,9 @@ mod unit_tests {
         // 前 10 字节落在多字节字符内 → None（#R58 panic 点的安全退化）
         assert_eq!(legacy_occurred("💥💥💥💥💥"), None);
         assert_eq!(legacy_occurred("2024-03-01💥extra").as_deref(), Some("2024-03-01"));
+        // #R63 test/low：≥10 字节但分隔符非 '-' 的 ASCII 串——#R61 修复的核心
+        // 路径（此前透传前 10 字节 "hello-worl" 进 extract_text_signals），必须
+        // 有直接用例锁住。
+        assert_eq!(legacy_occurred("hello-world"), None);
     }
 }

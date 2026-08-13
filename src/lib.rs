@@ -140,6 +140,16 @@ impl MemoriaEngine {
     }
 
     pub fn swap_hype_index(&mut self, fresh: HnswIndex, count: usize) {
+        // #R63 maintainability/low：**API 边界校验**——count 与 fresh.len() 不匹配的
+        // 发布会让 db_stats 的降级检测启发（store>0 && live==0）被歪曲；调用方
+        // 传错时如实报告（Python 两阶段流程经 token 保护不受影响）。
+        if count != fresh.len() {
+            eprintln!(
+                "[Memoria] WARN: swap_hype_index count mismatch (count={count}, index={}); reporting actual index len",
+                fresh.len()
+            );
+        }
+        let count = fresh.len();
         self.hype_hnsw = fresh;
         eprintln!("[Memoria] HYPE HNSW refreshed: {} vectors", count);
     }
@@ -329,7 +339,7 @@ fn query_hype_count_cached(conn: &rusqlite::Connection, db_path: &str) -> i64 {
     use std::sync::Mutex;
     use std::time::Instant;
     static CACHE: Mutex<Option<HashMap<String, (Instant, i64)>>> = Mutex::new(None);
-    static FAIL_EPOCHS: Mutex<Option<HashMap<String, i64>>> = Mutex::new(None);
+    static FAIL_EPOCHS: Mutex<Option<HashMap<String, Instant>>> = Mutex::new(None);
     {
         let mut cache = CACHE.lock().unwrap_or_else(|p| p.into_inner());
         let m = cache.get_or_insert_with(HashMap::new);
@@ -379,16 +389,21 @@ fn query_hype_count_cached(conn: &rusqlite::Connection, db_path: &str) -> i64 {
             }
             // 失败冷却按 db_path 键控（#R57）；#R58 bug/low：**条目淘汰**——FAIL_EPOCHS
             // 与 CACHE 同目标（多 db 路径进程不累积），>60s 冷却窗口的旧条目无用。
-            let epoch = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or(0);
+            // #R63 maintainability/low：**Instant 单调时钟**——SystemTime 墙钟回拨时
+            // saturating_sub 恒 <60s 静默压制所有 WARN（恰在故障场景失效），前跳则
+            // 提前清冷却引发 WARN 风暴；与 CACHE 的 Instant 纪律一致（semantic #R54
+            // 同款理由）。
+            let now_instant = Instant::now();
             let mut fe = FAIL_EPOCHS.lock().unwrap_or_else(|p| p.into_inner());
             let fmap = fe.get_or_insert_with(HashMap::new);
-            fmap.retain(|_, last| epoch.saturating_sub(*last) < 60);
-            let last = fmap.get(db_path).copied().unwrap_or(0);
-            if epoch.saturating_sub(last) >= 60 {
-                fmap.insert(db_path.to_string(), epoch);
+            fmap.retain(|_, at| now_instant.saturating_duration_since(*at).as_secs() < 60);
+            let last = fmap.get(db_path).copied();
+            let due = match last {
+                Some(at) => now_instant.saturating_duration_since(at).as_secs() >= 60,
+                None => true,
+            };
+            if due {
+                fmap.insert(db_path.to_string(), now_instant);
                 drop(fe);
                 eprintln!(
                     "[Memoria] WARN: hype_vector_index_size query failed (db {db_path}): {e}"
