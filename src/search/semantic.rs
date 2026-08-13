@@ -69,7 +69,6 @@ impl std::error::Error for SemanticError {}
 /// 通过后才求值闭包，被抑制的调用零分配。
 pub(crate) fn throttled_eprintln(key: &'static str, msg: impl FnOnce() -> String) {
     const COOLDOWN_SECS: u64 = 60;
-    use std::collections::HashMap;
     use std::sync::Mutex;
     use std::time::Instant;
     static LAST_LOGS: Mutex<Option<HashMap<&'static str, Instant>>> = Mutex::new(None);
@@ -158,13 +157,15 @@ pub fn semantic_search(
     // max_results=1e9 时 ≈120e9：with_capacity 要么 32 位容量溢出 panic、
     // 要么 64 位多 TB 分配 OOM 中止进程——热请求路径。overfetch 本身恒被
     // h.len() 钳制，真实合并集 ≤ 双索引容量；容量提示随索引规模走即可。
-    // #R55 performance/low：**去掉 .max(4096) 地板**——默认 primary_limit=50 时
-    // 40*50=2000 恒 < 4096，地板总是胜出、min(cap_total+2) 对小索引的钳制被架空；
-    // 空/小索引每查询仍分配 ~4096 槽（数十 KB）热路径开销。with_capacity 只是提示，
-    // 真实合并集恒被索引容量钳制，随 (limit*40).min(cap_total+2) 走即可。
+    // #R55 performance/low：**4096 floor 曾删除、#R59 恢复**——R55 的理由是默认
+    // primary_limit=50 时 40*50=2000 < 4096 地板总胜出、小索引白分配；但
+    // search_and_merge 每路 overfetch 有 `.max(2048)` 地板，合并集可达
+    // 2×2048=4096，`limit*40` 只覆盖 ~一半，>2000 合并 id 仍触发 rehash。
+    // #R55 的担忧已由 `.min(cap_total+2)` 钳制小索引消除，恢复 floor 匹配真实界。
     let cap_total = hnsw.map_or(0, |h| h.len()) + hype_hnsw.map_or(0, |h| h.len());
     let best_cap = (limit as usize)
         .saturating_mul(40)
+        .max(4096)
         .min(cap_total.saturating_add(2));
     let mut best: HashMap<String, (f64, &'static str)> = HashMap::with_capacity(best_cap);
     // 两路分别搜索；`roads_ok` 统计成功路数——若**所有存在的路**都失败（如 RwLock
@@ -513,7 +514,7 @@ fn fetch_memories_batch(
     // 选择可观测性优先。
     if hard_failed_batches > 0 {
         return Err(format!(
-            "semantic_search: memories fetch hard-failed for {hard_failed_batches} of {batches_total} batches"
+            "memories fetch hard-failed for {hard_failed_batches} of {batches_total} batches"
         ));
     }
     Ok(out)

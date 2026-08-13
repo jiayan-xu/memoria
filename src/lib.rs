@@ -336,14 +336,20 @@ fn query_hype_count_cached(conn: &rusqlite::Connection, db_path: &str) -> i64 {
             // 线程可能刚写入成功（本线程 miss 缓存后才跑 COUNT）；瞬时失败（BUSY）
             // 用 -1 覆盖成功会污染 `hype_vector_index_size`（store>0 && live==0 的
             // 降级检测指标）最多 30s。仅当无非 stale 成功值时才写 -1。
-            let mut cache = CACHE.lock().unwrap_or_else(|p| p.into_inner());
-            let m = cache.get_or_insert_with(HashMap::new);
-            let preserve_success = match m.get(db_path) {
-                Some((at, v)) if *v != -1 && at.elapsed().as_secs() < 30 => true,
-                _ => false,
-            };
-            if !preserve_success {
-                m.insert(db_path.to_string(), (Instant::now(), -1));
+            // #R59 performance/low：CACHE guard **尽早释放**——此前 guard 存活到
+            // FAIL_EPOCHS.lock() 与 eprintln 之后：stderr 重定向到慢管道时写阻塞
+            // 会持 CACHE 锁卡住所有 db_stats 调用者；双锁嵌套还引入锁序约束。
+            // 作用域只覆盖 preserve_success 检查 + 插入。
+            {
+                let mut cache = CACHE.lock().unwrap_or_else(|p| p.into_inner());
+                let m = cache.get_or_insert_with(HashMap::new);
+                let preserve_success = match m.get(db_path) {
+                    Some((at, v)) if *v != -1 && at.elapsed().as_secs() < 30 => true,
+                    _ => false,
+                };
+                if !preserve_success {
+                    m.insert(db_path.to_string(), (Instant::now(), -1));
+                }
             }
             // 失败冷却按 db_path 键控（#R57）；#R58 bug/low：**条目淘汰**——FAIL_EPOCHS
             // 与 CACHE 同目标（多 db 路径进程不累积），>60s 冷却窗口的旧条目无用。
@@ -357,6 +363,7 @@ fn query_hype_count_cached(conn: &rusqlite::Connection, db_path: &str) -> i64 {
             let last = fmap.get(db_path).copied().unwrap_or(0);
             if epoch.saturating_sub(last) >= 60 {
                 fmap.insert(db_path.to_string(), epoch);
+                drop(fe);
                 eprintln!(
                     "[Memoria] WARN: hype_vector_index_size query failed (db {db_path}): {e}"
                 );

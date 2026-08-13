@@ -114,7 +114,8 @@ async fn embed(
 /// 抖动（连接 reset/限流）若落在某 rid 首次遭遇，fail-once 策略会把它永久排除在
 /// HyPE 覆盖外，小语料上覆盖率断言（≥80%）可能假红。一次 500ms 退避重试吞掉
 /// 绝大多数瞬时抖动。
-/// 瞬时错误（见 is_transient_embed_err）：send 失败 / 429 / 408 / 5xx；确定性错误
+/// 瞬时错误（见 is_transient_embed_err）：send 失败 / 429 / 408 / 500 / 502 / 503 /
+/// 504（501/505 属确定性，不重试）；确定性错误
 /// （其余 4xx、2xx 畸形 payload）不重试——系统性配置错误重试只多付 500ms + 必然
 /// 失败的重复请求。
 /// #R51 performance/low：**重试 attempt 用短超时（10s）**——挂死服务的最坏单 rid
@@ -324,7 +325,7 @@ async fn memory_eval_semantic_inner() {
         let Ok(v) = embed_with_retry(&client, content).await else {
             eprintln!(
                 "[eval_semantic] corpus embed failed for {:?}; skipping this item",
-                content.get(..min(content.len(), 80))
+                content.get(..content.floor_char_boundary(min(content.len(), 80)))
             );
             continue;
         };
