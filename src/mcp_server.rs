@@ -459,7 +459,10 @@ pub fn tools_list() -> Vec<serde_json::Value> {
     let mut tools = vec![
         tool(
             "memory_search",
-            "搜索记忆",
+            // #R63 bug/medium：**HyPE 索引是启动快照**——运行时写入（remember/
+            // observe/supersede）只更新 content 索引，启动后新建的记忆对问句路
+            // 不可见（不对称召回，重启后自愈）；工具描述如实声明限制。
+            "搜索记忆（HyPE 问句路仅覆盖启动时已建索引的记忆；重启后全量生效）",
             serde_json::json!({
                 "query": {"type": "string", "description": "搜索关键词（必填）"},
                 "namespace": {"type": "string", "description": "命名空间（必填）；缺省时由 agent-core 注入调用者主 ns"},
@@ -2065,6 +2068,13 @@ fn dispatch(
                 "hnsw_vectors".to_string(),
                 serde_json::Value::Number((state.hnsw.len() as i64).into()),
             );
+            // #R63 maintainability/medium：HyPE 索引规模镜像 lib.rs 双字段——hype
+            // 空/构建失败时 memory_search 静默退化为 content-only，MCP stats 无
+            // 感知（lib.rs db_stats 已有 store/live 对照）。
+            m.insert(
+                "hype_hnsw_vectors".to_string(),
+                serde_json::Value::Number((state.hype_hnsw.len() as i64).into()),
+            );
             serde_json::to_string(&serde_json::json!({"status":"ok","stats":m})).unwrap_or_default()
         }
         "a2a_send" => {
@@ -3231,14 +3241,22 @@ mod tests {
             (sem_cos - 1.0).abs() < 1e-3,
             "expected hype-road sem_cos ≈ 1.0, got {sem_cos}: {out}"
         );
-        // #R62 test/low：**归因断言补回**（注释声称的 attribution 覆盖要真实存在）——
-        // source 含 hype 作为辅助证据（顺序/分词依赖已在上方注释说明；归因回归
-        // 如恒标 content 路会在此红）。
-        let src = v["results"][0]["source"].as_str().unwrap_or("");
-        assert!(
-            src.contains("hype"),
-            "expected hype-road attribution, got source={src}: {out}"
-        );
+        // #R63 test/low：**放宽为"任一结果含 hype 归因"**——results[0].source 取
+        // RRF 首信号（keyword→semantic→temporal→importance 顺序 + unicode61 分词），
+        // jieba 落地/信号重排会让首结果假红；memory_id + sem_cos ≈ 1.0 已证明
+        // hype 路工作，归因存在性用 any 即可（归因回归如恒标 content 路仍会红）。
+        let any_hype = v["results"]
+            .as_array()
+            .map(|arr| {
+                arr.iter().any(|r| {
+                    r["source"]
+                        .as_str()
+                        .map(|s| s.contains("hype"))
+                        .unwrap_or(false)
+                })
+            })
+            .unwrap_or(false);
+        assert!(any_hype, "no result carries hype attribution: {out}");
     }
 
     fn build_test_state() -> Arc<AppState> {

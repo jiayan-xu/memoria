@@ -954,13 +954,37 @@ pub fn migrate_hype_vectors(pool: &SqlitePool) -> Result<(), String> {
                 .map_err(|e| format!("begin trigger tx: {}", e))?;
             tx.execute_batch("DROP TRIGGER IF EXISTS mem_ad_vec")
                 .map_err(|e| format!("drop mem_ad_vec trigger: {}", e))?;
-            tx.execute_batch(
-                "CREATE TRIGGER mem_ad_vec AFTER DELETE ON memories BEGIN
-                    DELETE FROM memory_vectors WHERE id = old.id;
-                    DELETE FROM memory_hype_vectors WHERE id = old.id;
-                END",
-            )
-            .map_err(|e| format!("create mem_ad_vec trigger: {}", e))?;
+            // #R63 bug/medium：**触发器 body 按 hype 表存在性分支**——SQLite 在
+            // 触发时（而非 CREATE 时）解析 body 的表名：memory_hype_vectors 的 DDL
+            // 是 ddl_soft（可能软降级缺表），无条件引用它会让之后**每次** DELETE
+            // FROM memories 报 `no such table: memory_hype_vectors`——核心级联清理
+            // 与可选表耦合。缺表时用单表 body（memory_vectors 清理不受影响）。
+            let hype_table_exists: i64 = tx
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='memory_hype_vectors'",
+                    [],
+                    |r| r.get(0),
+                )
+                .map_err(|e| format!("check memory_hype_vectors existence: {}", e))?;
+            if hype_table_exists > 0 {
+                tx.execute_batch(
+                    "CREATE TRIGGER mem_ad_vec AFTER DELETE ON memories BEGIN
+                        DELETE FROM memory_vectors WHERE id = old.id;
+                        DELETE FROM memory_hype_vectors WHERE id = old.id;
+                    END",
+                )
+                .map_err(|e| format!("create mem_ad_vec trigger: {}", e))?;
+            } else {
+                eprintln!(
+                    "[Memoria] WARN: memory_hype_vectors missing (DDL soft-degraded); trigger installed with memory_vectors-only body - hype orphans will be cleaned when table exists (next successful DDL)"
+                );
+                tx.execute_batch(
+                    "CREATE TRIGGER mem_ad_vec AFTER DELETE ON memories BEGIN
+                        DELETE FROM memory_vectors WHERE id = old.id;
+                    END",
+                )
+                .map_err(|e| format!("create mem_ad_vec trigger (content-only): {}", e))?;
+            }
             tx.execute(
                 "INSERT OR IGNORE INTO migration_flags (flag) VALUES (?1)",
                 rusqlite::params![TRIGGER_VERSION],
@@ -1142,7 +1166,7 @@ pub fn migrate_hype_vectors(pool: &SqlitePool) -> Result<(), String> {
                     if orphans_hype > 0 {
                         if !clean_vectors {
                             eprintln!(
-                                "[Memoria] WARN: {orphans_hype} orphan memory_hype_vectors rows (possible staged/external hype rows); NOT deleting - set MEMORIA_ORPHAN_CLEANUP_VECTORS=1 to enable (MEMORIA_FORCE_ORPHAN_CLEANUP=1 bypasses the {ORPHAN_REFUSE_THRESHOLD} threshold; once refused state is recorded, BOTH envs are required to re-enter)"
+                                "[Memoria] WARN: {orphans_hype} orphan memory_hype_vectors rows (possible staged/external hype rows); NOT deleting - MEMORIA_ORPHAN_CLEANUP_VECTORS=1 AND MEMORIA_FORCE_ORPHAN_CLEANUP=1 are BOTH required to clean (once refused state is recorded, both envs are required to re-enter; threshold {ORPHAN_REFUSE_THRESHOLD} bypassed by force)"
                             );
                             // #R57 bug/low：hype 段拒绝**不置 refused**——REFUSED_FLAG
                             // 语义 = memory_vectors 段拒绝（见下）；hype 拒绝态由
@@ -1235,7 +1259,7 @@ pub fn migrate_hype_vectors(pool: &SqlitePool) -> Result<(), String> {
                     if orphans_vec > 0 {
                         if !clean_vectors {
                             eprintln!(
-                                "[Memoria] WARN: {orphans_vec} orphan memory_vectors rows (possible legit external vectors via add_vectors); NOT deleting - set MEMORIA_ORPHAN_CLEANUP_VECTORS=1 to enable (MEMORIA_FORCE_ORPHAN_CLEANUP=1 bypasses the {ORPHAN_REFUSE_THRESHOLD} threshold; once refused state is recorded, BOTH envs are required to re-enter)"
+                                "[Memoria] WARN: {orphans_vec} orphan memory_vectors rows (possible legit external vectors via add_vectors); NOT deleting - MEMORIA_ORPHAN_CLEANUP_VECTORS=1 AND MEMORIA_FORCE_ORPHAN_CLEANUP=1 are BOTH required to clean (once refused state is recorded, both envs are required to re-enter; threshold {ORPHAN_REFUSE_THRESHOLD} bypassed by force)"
                             );
                             refused = true;
                         } else if orphans_vec > ORPHAN_REFUSE_THRESHOLD && !force_cleanup {

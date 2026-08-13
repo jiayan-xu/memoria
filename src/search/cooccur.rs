@@ -269,4 +269,121 @@ mod unit_tests {
             results.iter().map(|r| r.memory_id.as_str()).collect::<Vec<_>>()
         );
     }
+
+    // #R63 test/medium：**query-hit 路径独立验证**——m_d 仅被查询实体 e1 提及
+    // （无 pairwise 重叠），其 boost 只能来自 QUERY_HIT_BOOST；此前 m_a/m_b 共享
+    // 实体，PAIRWISE_BOOST 独立满足断言（query-hit 分支被删也不红）。
+    #[test]
+    fn query_hit_boost_alone() {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let db = format!(
+            "file:memoria_cooccur_qh_{}_{}?mode=memory&cache=shared",
+            std::process::id(),
+            seq
+        );
+        let pool = crate::storage::create_pool(&db, 4).expect("pool");
+        crate::storage::init_core_tables(&pool).expect("core tables");
+        let conn = pool.get().expect("conn");
+        conn.execute(
+            "INSERT INTO memories (id, namespace, content, importance)              VALUES ('m_d', 'agent/test', '丁记忆', 3), ('m_e', 'agent/test', '戊记忆', 3)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO entities(id, namespace, entity_type, name, aliases, summary)              VALUES ('e1', 'agent/test', 'person', '张三', '[]', NULL)",
+            [],
+        )
+        .unwrap();
+        // 仅 m_d 提及 e1（m_e 无任何提及）——m_d 的 boost 只可能来自 query-hit。
+        conn.execute(
+            "INSERT INTO entity_mentions(entity_id, memory_id, context, namespace)              VALUES ('e1', 'm_d', '提及张三', 'agent/test')",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        let mk = |id: &str, content: &str| FusedResult {
+            memory_id: id.into(),
+            content: content.into(),
+            rrf_score: 0.5,
+            source: "test".into(),
+            signal_scores: vec![],
+            sem_cos: None,
+            kw_bm25: None,
+            graph_signal: None,
+            evolved_at: None,
+            pending_evolution: false,
+            primary_channel: None,
+            channel_scores: std::collections::HashMap::new(),
+            access_count: 0,
+            last_recalled: None,
+            time_status: None,
+        };
+        let mut results: Vec<FusedResult> = vec![mk("m_d", "丁记忆"), mk("m_e", "戊记忆")];
+        rerank_by_cooccurrence(&pool, "agent/test", "张三", &mut results);
+        let d = results.iter().find(|r| r.memory_id == "m_d").expect("m_d");
+        let e = results.iter().find(|r| r.memory_id == "m_e").expect("m_e");
+        // m_d 有 query-hit boost（rrf_score > 0.5 且 source 带 cooccur）；m_e 无
+        // boost（0.5、无标记）。
+        assert!(d.rrf_score > 0.5 && d.source.contains("cooccur"), "query-hit boost missing: {:?}", (&d.memory_id, d.rrf_score, &d.source));
+        assert_eq!(e.rrf_score, 0.5, "m_e must stay unboosted");
+        assert!(!e.source.contains("cooccur"));
+    }
+
+    // #R63 test/low：**单结果分支**——len<2 且 query 非空时跳过早退、仍走查询
+    // 路径（guard 回归如改成 || 会静默失去 query-hit）。
+    #[test]
+    fn single_result_with_query_runs_query_path() {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let db = format!(
+            "file:memoria_cooccur_sr_{}_{}?mode=memory&cache=shared",
+            std::process::id(),
+            seq
+        );
+        let pool = crate::storage::create_pool(&db, 4).expect("pool");
+        crate::storage::init_core_tables(&pool).expect("core tables");
+        let conn = pool.get().expect("conn");
+        conn.execute(
+            "INSERT INTO memories (id, namespace, content, importance)              VALUES ('m_f', 'agent/test', '己记忆', 3)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO entities(id, namespace, entity_type, name, aliases, summary)              VALUES ('e1', 'agent/test', 'person', '李四', '[]', NULL)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO entity_mentions(entity_id, memory_id, context, namespace)              VALUES ('e1', 'm_f', '提及李四', 'agent/test')",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        let mut results: Vec<FusedResult> = vec![FusedResult {
+            memory_id: "m_f".into(),
+            content: "己记忆".into(),
+            rrf_score: 0.5,
+            source: "test".into(),
+            signal_scores: vec![],
+            sem_cos: None,
+            kw_bm25: None,
+            graph_signal: None,
+            evolved_at: None,
+            pending_evolution: false,
+            primary_channel: None,
+            channel_scores: std::collections::HashMap::new(),
+            access_count: 0,
+            last_recalled: None,
+            time_status: None,
+        }];
+        rerank_by_cooccurrence(&pool, "agent/test", "李四", &mut results);
+        // 单结果 + 匹配查询 → query-hit boost 生效（guard 未把单结果短路）。
+        let f = &results[0];
+        assert!(
+            f.rrf_score > 0.5 && f.source.contains("cooccur"),
+            "single-result query-hit boost missing: {:?}",
+            (&f.memory_id, f.rrf_score, &f.source)
+        );
+    }
 }

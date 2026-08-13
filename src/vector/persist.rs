@@ -383,15 +383,20 @@ fn rebuild_from_table(pool: &SqlitePool, hnsw: &HnswIndex, table: &str) -> Resul
     // "rebuild" 名字与 Ok(count) 暗示全量刷新（调用方拿到陈旧结果不自知）。doc
     // 警告只是软防线；非空索引直接 Err，误用响亮失败（refresh 路径用全新索引
     // 构造，不受影响）。
-    if hnsw.len() > 0 {
+    let td = lookup_table(table)
+        .ok_or_else(|| format!("rebuild_from_table: unknown rebuild table {table}"))?;
+    // #R61 maintainability/medium：**fresh-index 契约强制（按表）**——HnswIndex::add
+    // 按 id 去重：已填充索引上 rebuild 只追加新 id、已有 id 的向量更新被静默忽略。
+    // #R62 bug/high：仅 hype 表强制（require_fresh）——content 表公开契约支持
+    // ".bin 已加载增量补齐"（启动路径 load 快照后 rebuild 对齐权威表），无条件
+    // guard 会让正常重启每次 Err（快照缺行永不入索引）。
+    if td.require_fresh && hnsw.len() > 0 {
         return Err(format!(
             "rebuild_from_table({table}): index already populated ({} ids) - rebuild requires a fresh index; in-place rebuild silently ignores existing-id updates",
             hnsw.len()
         ));
     }
     let conn = pool.get().map_err(|e| format!("pool: {}", e))?;
-    let td = lookup_table(table)
-        .ok_or_else(|| format!("rebuild_from_table: unknown rebuild table {table}"))?;
     let label = td.label;
     let mut stmt = conn
         .prepare(td.select_sql)
