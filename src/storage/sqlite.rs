@@ -636,6 +636,11 @@ pub fn migrate_hype_vectors(pool: &SqlitePool) -> Result<(), String> {
     // 都做写锁 DDL（串行化启动），且滚动升级期间新旧版本进程交替启动会互相覆盖
     // 触发器（级联契约随版本振荡，新增向量表的清理在新版下次启动前丢失）。版本名即
     // body 标识：修改 body 时改版本名（v2→v3），存量库首次看到新名才 DROP+CREATE。
+    // #R47 maintainability/low 已知残余限制：版本 flag 只防**同版本**重跑，不防
+    // **版本回退**——旧二进制只查自己的 v2 flag：新二进制已装 v3 body 的库上，旧
+    // 进程看 v2 未置位会 DROP+CREATE 旧 body 覆盖 v3，契约回退到下次新版本重启。
+    // 仅在未来出现第二个 body 版本时才实质化；届时可加降级守卫（对比已安装的最大
+    // 触发器版本）或接受"回退 = 契约回退到旧版"的语义（与二进制回退一致）。
     const TRIGGER_VERSION: &str = "trigger_mem_ad_vec_v2";
     let trig_done: i64 = conn
         .query_row(
@@ -712,57 +717,47 @@ pub fn migrate_hype_vectors(pool: &SqlitePool) -> Result<(), String> {
             )
             .map_err(|e| format!("check cleanup flag (tx): {}", e))?;
         if already2 == 0 {
-            // 空表短路：向量表无行时无需扫描（避免持写锁的全表相关扫描）。
-            let v_count: i64 = tx
-                .query_row("SELECT COUNT(*) FROM memory_vectors", [], |r| r.get(0))
-                .map_err(|e| format!("count memory_vectors rows: {}", e))?;
-            if v_count > 0 {
-                let orphans_vec: i64 = tx
-                    .query_row(
-                        "SELECT COUNT(*) FROM memory_vectors \
-                         WHERE NOT EXISTS (SELECT 1 FROM memories m WHERE m.id = memory_vectors.id)",
-                        [],
-                        |r| r.get(0),
-                    )
-                    .map_err(|e| format!("count memory_vectors orphans: {}", e))?;
-                if orphans_vec > 0 {
-                    // #R42/#R44 performance/medium：**单条** DELETE（一次相关扫描）——
-                    // 分批 LIMIT 1000 在同一个 BEGIN IMMEDIATE 事务内**不降低**持锁时间：
-                    // NOT EXISTS 无索引可走，每批都是全表扫描，总工作量 O(批数 × 表大小)
-                    // 而非 O(孤儿数)；大库（孤儿恰在此累积）上启动被拖慢，并发首启的
-                    // 另一进程可能超 5000ms busy_timeout 而 SQLITE_BUSY 中止启动
-                    // （main.rs .expect 直接 panic）。真正释放锁需要每批独立事务，
-                    // 复杂度不值——单条 DELETE 一次扫描即最优。
-                    // #R43 maintainability/low：SQL 规范化（去掉填充空白）+ 错误消息
-                    // 内嵌 SQL 片段，便于真实库上失败时审计定位。
-                    const DEL_VEC: &str = "DELETE FROM memory_vectors \
-                        WHERE NOT EXISTS (SELECT 1 FROM memories m WHERE m.id = memory_vectors.id)";
-                    tx.execute(DEL_VEC, []).map_err(|e| {
-                        format!("clean memory_vectors orphans: {e} [SQL: {DEL_VEC}]")
-                    })?;
-                    eprintln!("[Memoria] Migration: removed {orphans_vec} orphan memory_vectors rows");
+            // #R47 performance/medium：持写锁期间**每张表只跑一趟**——DELETE 的返回
+            // 值即删除行数，可同时 gate 与喂日志（省掉独立的孤儿 COUNT 全表扫描）；
+            // 空表短路用 EXISTS(LIMIT 1)（全 COUNT 扫描换首行命中即停）。
+            // #R42/#R44 performance/medium：**单条** DELETE（一次相关扫描）——分批
+            // LIMIT 1000 在同一个 BEGIN IMMEDIATE 事务内**不降低**持锁时间：NOT EXISTS
+            // 无索引可走，每批都是全表扫描，总工作量 O(批数 × 表大小) 而非 O(孤儿数)；
+            // 大库（孤儿恰在此累积）上启动被拖慢，并发首启的另一进程可能超 5000ms
+            // busy_timeout 而 SQLITE_BUSY 中止启动（main.rs .expect 直接 panic）。
+            // #R43 maintainability/low：SQL 规范化 + 错误消息内嵌 SQL 片段便于审计。
+            let v_exists: i64 = tx
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM memory_vectors LIMIT 1)",
+                    [],
+                    |r| r.get(0),
+                )
+                .map_err(|e| format!("check memory_vectors exists: {}", e))?;
+            if v_exists > 0 {
+                const DEL_VEC: &str = "DELETE FROM memory_vectors \
+                    WHERE NOT EXISTS (SELECT 1 FROM memories m WHERE m.id = memory_vectors.id)";
+                let removed_vec = tx.execute(DEL_VEC, []).map_err(|e| {
+                    format!("clean memory_vectors orphans: {e} [SQL: {DEL_VEC}]")
+                })?;
+                if removed_vec > 0 {
+                    eprintln!("[Memoria] Migration: removed {removed_vec} orphan memory_vectors rows");
                 }
             }
-            let h_count: i64 = tx
-                .query_row("SELECT COUNT(*) FROM memory_hype_vectors", [], |r| r.get(0))
-                .map_err(|e| format!("count memory_hype_vectors rows: {}", e))?;
-            if h_count > 0 {
-                let orphans_hype: i64 = tx
-                    .query_row(
-                        "SELECT COUNT(*) FROM memory_hype_vectors \
-                         WHERE NOT EXISTS (SELECT 1 FROM memories m WHERE m.id = memory_hype_vectors.id)",
-                        [],
-                        |r| r.get(0),
-                    )
-                    .map_err(|e| format!("count memory_hype_vectors orphans: {}", e))?;
-                if orphans_hype > 0 {
-                    // #R44 performance/medium：单条 DELETE（同 DEL_VEC 理由，见上）。
-                    const DEL_HYPE: &str = "DELETE FROM memory_hype_vectors \
-                        WHERE NOT EXISTS (SELECT 1 FROM memories m WHERE m.id = memory_hype_vectors.id)";
-                    tx.execute(DEL_HYPE, []).map_err(|e| {
-                        format!("clean memory_hype_vectors orphans: {e} [SQL: {DEL_HYPE}]")
-                    })?;
-                    eprintln!("[Memoria] Migration: removed {orphans_hype} orphan memory_hype_vectors rows");
+            let h_exists: i64 = tx
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM memory_hype_vectors LIMIT 1)",
+                    [],
+                    |r| r.get(0),
+                )
+                .map_err(|e| format!("check memory_hype_vectors exists: {}", e))?;
+            if h_exists > 0 {
+                const DEL_HYPE: &str = "DELETE FROM memory_hype_vectors \
+                    WHERE NOT EXISTS (SELECT 1 FROM memories m WHERE m.id = memory_hype_vectors.id)";
+                let removed_hype = tx.execute(DEL_HYPE, []).map_err(|e| {
+                    format!("clean memory_hype_vectors orphans: {e} [SQL: {DEL_HYPE}]")
+                })?;
+                if removed_hype > 0 {
+                    eprintln!("[Memoria] Migration: removed {removed_hype} orphan memory_hype_vectors rows");
                 }
             }
             // 置位标记：插入 migration_flags 行（事务内，提交后对并发进程可见）。

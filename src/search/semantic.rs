@@ -99,10 +99,16 @@ pub fn semantic_search(
     // 升级会把每个此类查询误报为通道损坏、刷错误日志直到重启；且 hybrid.rs 对 Err
     // 与空结果同等处理（仅记录后丢弃），升级无新增诊断价值。search_and_merge 已逐次
     // eprintln 失败路——降级以日志呈现，返回值仍 Ok(vec![])。
+    // #R47 performance/low：该降级行**每查询都会命中**（失败路持续 + 多数查询无近邻），
+    // 无条件 eprintln 会刷爆 stderr——只记首次（状态转换语义：何时开始降级）。
     if roads_failed > 0 && best.is_empty() {
-        eprintln!(
-            "semantic_search: {roads_failed} road(s) failed and survivors returned no matches (degraded)"
-        );
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static DEGRADED_LOGGED: AtomicBool = AtomicBool::new(false);
+        if !DEGRADED_LOGGED.swap(true, Ordering::Relaxed) {
+            eprintln!(
+                "semantic_search: {roads_failed} road(s) failed and survivors returned no matches (degraded; logged once)"
+            );
+        }
     }
     if best.is_empty() {
         return Ok(vec![]);
@@ -228,8 +234,14 @@ fn search_and_merge(
 /// （web_api/mcp_server 只删 memories；mem_ad_vec 触发器清向量表，但内存索引到重启/
 /// 重建才更新），悬空 id 是预期数据滞后态；用户删光记忆或恢复不带向量的备份后，
 /// 全批 stale 是正常结果，升级 Err 会把良性状态误报为系统性故障、刷
-/// `[hybrid] semantic signal dropped` 日志。仅 prepare/query/行映射错误（列类型漂移
-/// 等系统性故障）且**全部批**都硬失败才 escalate。
+/// `[hybrid] semantic signal dropped` 日志。
+/// 硬失败 = prepare/query 错误（基础设施），或**所有请求行都返回且全部映射失败**
+/// （`row_errors == chunk.len()`：无 stale 掺水，可确认是系统性列漂移）（#R47 bug/low：
+/// 仅 `got==0 && row_errors>0` 会把"mostly stale + 单行异常"误判为系统性——一批 500
+/// 个请求只有 1 行存在且恰好不可映射时，整批升级会让 hybrid.rs 因单条异常行丢弃
+/// 整个语义通道）。**任一**批硬失败即 Err（#R47 bug/medium：部分失败返回 Ok(partial)
+/// 会让调用方把部分召回损失当完整结果，静默丢失最多 BATCH×N 个候选且不可观测；
+/// Err 使 hybrid.rs 记录 `semantic signal dropped`，降级可见可查）。
 fn fetch_memories_batch(
     pool: &SqlitePool,
     ids: &[&str],
@@ -280,17 +292,24 @@ fn fetch_memories_batch(
                             }
                         }
                     }
-                    // #R46 bug/medium：行映射失败**按行丢弃**（逐行已 eprintln），不
-                    // 整批硬失败——`got == 0 && row_errors > 0` 无法区分"系统性列漂移"
-                    // （所有返回行都失败）与"mostly stale + 单行异常"（一批 500 个请求
-                    // 只有 1 行存在且恰好不可映射，其余 499 是悬空 id）：后者整批升级
-                    // 会让 hybrid.rs 因**单条**异常行丢弃整个语义通道（小候选集时
-                    // fetch 直接 Err）。prepare/query 错误（基础设施）才升级。
+                    // #R46 bug/medium：行映射失败默认**按行丢弃**（逐行已 eprintln）。
+                    // #R47 bug/low：唯一例外——`row_errors == chunk.len()` 即所有请求
+                    // id 都返回了行且**全部**映射失败（无 stale 掺水）：这是确凿的
+                    // 系统性列漂移，硬失败升级。`got == 0 && row_errors > 0` 的混合
+                    // 场景（mostly stale + 单行异常）不升级。
                     if got == 0 && row_errors > 0 {
-                        eprintln!(
-                            "[semantic] fetch: batch of {} ids: {row_errors} row(s) failed mapping, 0 ok (row drops only)",
-                            chunk.len()
-                        );
+                        if row_errors == chunk.len() {
+                            eprintln!(
+                                "[semantic] fetch: all {} requested ids returned rows and ALL failed mapping (systematic column drift)",
+                                chunk.len()
+                            );
+                            hard_failed = true;
+                        } else {
+                            eprintln!(
+                                "[semantic] fetch: batch of {} ids: {row_errors} row(s) failed mapping, 0 ok (row drops only; rest stale)",
+                                chunk.len()
+                            );
+                        }
                     } else if got == 0 {
                         // 0 行无错误 = stale ids（并发删除/悬空 HNSW id）——预期数据
                         // 滞后态，仅记录不升级（#R45 bug/medium，见函数 doc）。
@@ -327,20 +346,14 @@ fn fetch_memories_batch(
             hard_failed_batches += 1;
         }
     }
-    // 全批升级只看**硬失败**（prepare/query 错误）：部分失败批已保留成功行（只损失
-    // 失败行召回），stale 批不计数——全部批都硬失败（系统性故障）才 escalate
-    // （#R41 bug/high 语义保留；#R46 bug/medium：行映射失败不再计入硬失败）。
-    // #R46 other/low：**部分**批硬失败时返回 Ok 部分 map，调用方（hybrid.rs）按完整
-    // 结果处理——失败批的召回损失不可见。在此汇总一行，使"部分损坏"与"干净空结果"
-    // 在日志层面可区分（逐批错误已有 eprintln，汇总便于一眼定位范围）。
-    if hard_failed_batches > 0 && hard_failed_batches == batches_total {
-        return Err("semantic_search: memories fetch hard-failed for all batches".into());
-    }
+    // #R47 bug/medium：**任一**批硬失败即 Err——部分失败返回 Ok(partial) 会让调用方
+    // 把召回损失当完整结果（静默丢候选、监控不可见）；Err 使 hybrid.rs 记录
+    // `semantic signal dropped`，降级可观测。瞬时 BUSY 重试成本低（下次查询恢复），
+    // 选择可观测性优先。
     if hard_failed_batches > 0 {
-        eprintln!(
-            "[semantic] fetch: {hard_failed_batches} of {batches_total} batches hard-failed (prepare/query), returning partial map of {} ids",
-            out.len()
-        );
+        return Err(format!(
+            "semantic_search: memories fetch hard-failed for {hard_failed_batches} of {batches_total} batches"
+        ));
     }
     Ok(out)
 }

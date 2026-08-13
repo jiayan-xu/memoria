@@ -29,6 +29,12 @@ async fn embed(client: &reqwest::Client, text: &str) -> Result<Vec<f32>, String>
         .send()
         .await
         .map_err(|e| format!("embed http: {}", e))?;
+    // #R47 other/low：非 2xx 显式带状态码返回——embed_with_retry 据此区分"服务明确
+    // 拒绝"（4xx，确定性，不重试）与"瞬时抖动"（网络/5xx，重试一次）。此前错误
+    // 只在 json 解析时以 parse 错误形式出现，无法分类。
+    if !resp.status().is_success() {
+        return Err(format!("embed http status {}", resp.status()));
+    }
     let data: Value = resp.json().await.map_err(|e| format!("embed parse: {}", e))?;
     let arr = data["embeddings"]
         .as_array()
@@ -52,10 +58,19 @@ impl<T> Pipe for T {}
 /// embed 带**一次有界重试**（#R45 test/low）：embed() 是单发 POST 无重试——瞬时服务
 /// 抖动（连接 reset/限流）若落在某 rid 首次遭遇，fail-once 策略会把它永久排除在
 /// HyPE 覆盖外，小语料上覆盖率断言（≥80%）可能假红。一次 500ms 退避重试吞掉
-/// 绝大多数瞬时抖动，同时不放大"系统性故障"（两次都失败照常记 skip）。
+/// 绝大多数瞬时抖动。
+/// #R47 other/low：重试须**分类**——embed 现返回结构化错误（`http status 4xx` 表示
+/// 服务明确拒绝，如维度校验失败/路径错误，属系统性），对 4xx 直接放弃不重试；
+/// 其余（网络/解析/5xx）视为瞬时抖动重试一次。此前对所有错误都重试，系统性拒绝
+/// 时每条语料多付 500ms + 一次必然失败的请求（22 条 → 10s+ 浪费）。
+fn is_transient_embed_err(e: &str) -> bool {
+    !e.starts_with("embed http status 4")
+}
+
 async fn embed_with_retry(client: &reqwest::Client, text: &str) -> Result<Vec<f32>, String> {
     match embed(client, text).await {
         Ok(v) => Ok(v),
+        Err(e) if !is_transient_embed_err(&e) => Err(e),
         Err(e) => {
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             match embed(client, text).await {
@@ -176,7 +191,6 @@ async fn memory_eval_semantic() {
 
     // 1) 语料嵌入 + 写入（向量入 QueryCache → HNSW）
     let mut ids: Vec<String> = Vec::with_capacity(corpus.len());
-    let mut hype_seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut hype_processed: std::collections::HashSet<String> = std::collections::HashSet::new();
     // #R43 bug/medium：total 独立计数（首次遇到即 +1，无论成败）——processed 失败时
     // 会 remove（允许重试），断言时只剩成功的，用它作分母是重言式。
@@ -241,7 +255,6 @@ async fn memory_eval_semantic() {
                 hype_total += 1;
                 match hype_upsert_one(&client, &engine, &pool, &rid, ns, content, &v).await {
                     HypeOutcome::Covered => {
-                        hype_seen.insert(rid.clone());
                         hype_covered += 1;
                     }
                     HypeOutcome::Skipped(reason) => {
@@ -273,21 +286,18 @@ async fn memory_eval_semantic() {
         engine.hype_hnsw.len() > 0,
         "hype index empty after corpus setup: question-embed likely failing"
     );
-    // #R40 maintainability/low：hype_seen（成功 add 的唯一 rid 集）与 covered 计数必须
-    // 一致——两者不同说明计数/去重逻辑漂移（各 rid 恰计一次）。
-    assert_eq!(
-        hype_seen.len(),
-        hype_covered,
-        "hype_seen ({}) != hype_covered ({}) — dedup/count drift",
-        hype_seen.len(),
-        hype_covered
-    );
+    // #R47 maintainability/low：hype_seen 已删除——它与 hype_covered 在同一 match 臂
+    // 同时写入、processed guard 保证每 rid 至多一次，`assert_eq!(hype_seen.len(),
+    // hype_covered)` 恒真（重言式，正是 #R43 批评的模式），保留只会误导。
     // #R46 test/low：hype_total 很小时（近义去重把唯一 rid 压到几条，如 2 条）单次瞬时
     // skip 会放大为假红（1/2=50% < 80%）——embed_with_retry 已吞掉绝大多数瞬时抖动，
-    // 剩余 skip 是小概率事件，按比例断言与"系统性故障"难以区分。设下限：覆盖 ≥3 条
-    // 或达到 80% 比例，兼顾小语料稳定与防假绿（系统性故障仍会大面积低于 80%）。
+    // 剩余 skip 是小概率事件，按比例断言与"系统性故障"难以区分。
+    // #R47 bug/medium：floor 必须**门控于小 total**——无条件 `hype_covered >= 3` 会让
+    // 22 条语料（~21 唯一 rid）只覆盖 3 条（~14%）就通过，重新打开 no-op 假绿。
+    // 公式：需求 = max(min(3, total), total*0.8)——total≤3 时要求全覆盖（小语料全部
+    // 成功才算数），total≥4 时 80% 比例权威（floor 不生效）。
     assert!(
-        hype_covered >= 3 || hype_covered as f64 >= hype_total as f64 * 0.8,
+        hype_covered as f64 >= (hype_total.min(3) as f64).max(hype_total as f64 * 0.8),
         "hype coverage too low: {hype_covered}/{hype_total} unique memories have HyPE vectors \
          (question-embed likely failing); skipped={hype_skipped}",
     );
