@@ -202,10 +202,16 @@ def main():
             # #R43 bug/low：补充 valid_to 过期过滤——过期记忆（valid_to < now）经
             # hybrid.rs 的 is_latest_now 在输出时被丢弃，为其生成问句+嵌入纯属
             # 付费浪费（sibling rebuild_vectors.py 与 eval 脚本均应用同款过滤）。
+            # #R44 bug/low：`datetime('now')` 返回空格分隔 "YYYY-MM-DD HH:MM:SS"，
+            # 而 memories.valid_to 存的是 'T' 分隔 ISO-8601（代码库约定补 T）——
+            # 字符串比较里 'T'(0x54) > ' '(0x20)，同日到期值会错序：今日早些时候
+            # 过期的记忆（"2026-08-12T08:00:00" vs now "2026-08-12 23:45:00"）仍
+            # 通过 `valid_to > now` 被嵌入，违背"避免过期记忆付费"意图。用
+            # strftime 生成 T 格式 now 与存储格式同构比较（eval_hyde_recall.py 同款）。
             rows = con.execute(
                 "SELECT id, content FROM memories WHERE namespace='agent/xujiayan' "
                 "AND superseded_by IS NULL "
-                "AND (valid_to IS NULL OR valid_to='' OR valid_to > datetime('now')) "
+                "AND (valid_to IS NULL OR valid_to='' OR valid_to > strftime('%Y-%m-%dT%H:%M:%S','now')) "
                 "AND length(content) BETWEEN 10 AND 500"
             ).fetchall()
         except sqlite3.OperationalError as e:
@@ -281,6 +287,18 @@ def main():
             print(f"错误: embed_server 维度 {pre_dim}≠Rust DIM {RUST_DIM}（模型不匹配，无法补嵌）")
             sys.exit(1)
         print(f"预检通过: embed_server dim={pre_dim} == RUST_DIM")
+        # #R44 bug/medium：chat 端点同样预检——generate_question 对确定性 4xx（401 无效
+        # key / 400 未知模型）立即 raise（见其 #R41 注释），但主循环的 catch-all except
+        # 会把该 RuntimeError 重新归类为"重试耗尽瞬时故障"、记入 fail_ids：坏 key/未知
+        # 模型会跑完全部目标、把每个 id 写进重跑清单、报告"失败 N"而非 fail-fast——
+        # 直接违反"fail_ids 只含可修复瞬时故障"的契约。探测一次（几厘付费）即可在
+        # 循环前暴露配置错误。
+        try:
+            _probe = generate_question("预检：请返回一句可检索的示例问题。")
+        except Exception as e:
+            print(f"错误: chat 端点预检失败（{e}）——请检查 SILICONFLOW_API_KEY/模型配置")
+            sys.exit(1)
+        print("预检通过: chat 端点可访问")
         # preflight 通过后才清理旧清单（见上方 #R42 说明）。
         try:
             if os.path.exists(failed_ids_path):
@@ -364,13 +382,19 @@ def main():
         print(f"提示: {len(skip_ids)} 条确定性跳过（LLM 判为不可检索，重跑不会成功），未写入失败列表")
     if fail_ids:
         # 追加式已实时落盘；此处去重重写（追加过程中同 id 可能多次失败产生重复行，
-        # 定点重跑清单须无重复）。#R40 bug/medium：中断时追加的清单仍完整保留。
+        # 定点重跑清单须无重复）。#R44 bug/low：先写临时文件再 os.replace **原子替换**——
+        # 直接 'w' 截断原文件后若写入中途失败（磁盘满/崩溃），record_fail 追加累积的
+        # 清单被毁，中断安全承诺恰在要保护的错误路径上失效。原子替换保证目标文件
+        # 要么是旧完整清单、要么是新完整清单，绝不半写。
+        dedup = list(dict.fromkeys(fail_ids))
         try:
-            with open(failed_ids_path, "w", encoding="utf-8") as f:
-                f.write("\n".join(dict.fromkeys(fail_ids)))
+            tmp = failed_ids_path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write("\n".join(dedup))
+            os.replace(tmp, failed_ids_path)
         except OSError as e:
             print(f"  [warn] 重写 {failed_ids_path} 失败（追加清单仍保留）: {e}")
-        print(f"失败 id 已写入 {failed_ids_path}（{len(set(fail_ids))} 条）")
+        print(f"失败 id 已写入 {failed_ids_path}（{len(dedup)} 条）")
 
 
 if __name__ == "__main__":

@@ -73,18 +73,32 @@ pub fn semantic_search(
     // （#R35 other/medium：为单路失败单开 escalate 会误伤"hype 空索引 + content 正常"
     // 的合法态；完整方案是 per-road 失败注入结果元数据，留待后续）。
     let mut roads_ok = 0usize;
+    let mut roads_failed = 0usize;
     if let Some(h) = hnsw {
         if search_and_merge(h, "content", &vector, limit, &mut best) {
             roads_ok += 1;
+        } else {
+            roads_failed += 1;
         }
     }
     if let Some(h) = hype_hnsw {
         if search_and_merge(h, "hype", &vector, limit, &mut best) {
             roads_ok += 1;
+        } else {
+            roads_failed += 1;
         }
     }
-    if roads_ok == 0 && (hnsw.is_some() || hype_hnsw.is_some()) {
+    if roads_ok == 0 && roads_failed > 0 {
         return Err("semantic_search: all HNSW roads failed (poisoned/corrupted index)".into());
+    }
+    // #R44 bug/medium：升级缺口——一路失败但幸存路**合法返回 0 结果**时（如 hype 空
+    // 索引 + content 索引损坏，或反之），`roads_ok==1` 且 best 空会走 Ok(vec![])，
+    // 掩盖坏路、语义通道静默降级（#R34 "区分索引空与索引坏"的目标在此组合下未达成，
+    // hybrid.rs 把损坏索引误当"该 ns 无匹配"）。任何失败路存在且幸存路无匹配 → Err。
+    if roads_failed > 0 && best.is_empty() {
+        return Err(format!(
+            "semantic_search: {roads_failed} road(s) failed and survivors returned no matches"
+        ));
     }
     if best.is_empty() {
         return Ok(vec![]);
@@ -98,7 +112,11 @@ pub fn semantic_search(
 
     // HNSW 是全局索引，无 namespace 维度。按调用者 ns 回查 memories 表，
     // 仅保留归属当前 ns 的记忆，杜绝跨租户泄露。无 pool 时无法过滤，保守返回空。
-    let ids: Vec<&str> = best.keys().map(|s| s.as_str()).collect();
+    // #R44 performance/low：ids 排序后再分批——HashMap 键遍历随机序下，部分批失败时
+    // 被剔除的 id 子集跨运行不确定（召回损失不可复现、日志难关联）；排序与最终输出
+    // 的 memory_id 决胜一致，使失败行为确定。
+    let mut ids: Vec<&str> = best.keys().map(|s| s.as_str()).collect();
+    ids.sort_unstable();
     let allowed: HashSet<String> = match pool {
         Some(p) => match lookup_namespaces(p, &ids) {
             Ok(map) => map
@@ -130,7 +148,10 @@ pub fn semantic_search(
     let mut failed_batch_ids: HashSet<String> = HashSet::new();
     if let Some(p) = pool {
         const BATCH: usize = 500;
-        let ids: Vec<&String> = allowed.iter().collect();
+        // #R44 performance/low：排序后再分批（与 lookup_namespaces 调用侧同款），
+        // 失败批剔除的 id 子集跨运行确定。
+        let mut ids: Vec<&String> = allowed.iter().collect();
+        ids.sort();
         // pool.get 提到循环外并**传播**失败（与 lookup_namespaces 一致）：连接级错误
         // 对每批都会失败，循环内 log-and-continue 会让所有批失败却仍返回 Ok + 空正文
         // 结果——P3-0 内容丢失 bug 的全量复发（#R36 bug/medium）。
@@ -151,7 +172,6 @@ pub fn semantic_search(
             // 候选跨多批时每条 NULL 都使 batches_ok=0，全批升级把整个语义通道打成 Err
             // （hybrid.rs 丢弃语义信号），与 #R40"只剔失败行保留成功行"的意图直接矛盾。
             let mut hard_failed = false;
-            let mut partial_failed = false;
             match conn.prepare(&sql) {
                 Ok(mut stmt) => match stmt.query_map(
                     rusqlite::params_from_iter(chunk.iter().map(|s| *s)),
@@ -208,13 +228,13 @@ pub fn semantic_search(
                         } else if row_errors > 0 || null_content > 0 {
                             // #R40/#R41 bug/medium：部分行失败（映射错误或 NULL content）
                             // 的 id 经 unwrap_or_default 会产出空正文、复现 P3-0 内容损坏。
-                            // 剔除范围见下方——只剔未成功插入的 id，成功行保留；本批仍
-                            // 算部分成功（不触发全批升级）。
+                            // 剔除由下方**无条件**剔除逻辑覆盖（contents 缺失即剔），
+                            // 此处仅记录诊断（#R44 maintainability/low：partial_failed
+                            // 变量曾是死代码——赋值后从未读取，已删除）。
                             eprintln!(
                                 "[semantic] content backfill: {row_errors} row errors + {null_content} NULL content of {} ids (dropping those ids)",
                                 chunk.len()
                             );
-                            partial_failed = true;
                         }
                     }
                     Err(e) => {
