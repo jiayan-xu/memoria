@@ -89,25 +89,13 @@ pub fn hybrid_search(
                 // #R37 maintainability/low：Err 也可能来自 DB/pool 故障（content backfill
                 // pool/get 失败等），日志前缀保持中立，不预设根因是索引损坏。
                 // #R49 performance/low：Err 是持久故障（RwLock poisoning/DB 持续故障）
-                // 时每查询刷一行 → 同款 60s 冷却（与 semantic.rs #R47/#R48 一致），
-                // 持续降级 ≤1 行/分钟，瞬时抖动只记一次。
+                // 时每查询刷一行 → 60s 冷却（共享 helper，#R51：按 key 隔离，不同故障
+                // 原因不互相抑制——单一全局 static 会让一种持续故障压住并发故障）。
                 Err(e) => {
-                    use std::sync::atomic::{AtomicU64, Ordering};
-                    use std::time::{SystemTime, UNIX_EPOCH};
-                    const COOLDOWN_SECS: u64 = 60;
-                    static LAST_DROP_LOG: AtomicU64 = AtomicU64::new(0);
-                    let now = SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .map(|d| d.as_secs())
-                        .unwrap_or(0);
-                    let last = LAST_DROP_LOG.load(Ordering::Relaxed);
-                    if now.saturating_sub(last) >= COOLDOWN_SECS
-                        && LAST_DROP_LOG
-                            .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
-                            .is_ok()
-                    {
-                        eprintln!("[hybrid] semantic signal dropped: {} (at most once per {COOLDOWN_SECS}s)", e);
-                    }
+                    crate::search::semantic::throttled_eprintln(
+                        "hybrid_semantic_drop",
+                        format!("[hybrid] semantic signal dropped: {e}"),
+                    );
                 }
             }
         }

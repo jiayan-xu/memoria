@@ -190,13 +190,23 @@ impl MemoriaEngine {
         );
         // V1（#R37 maintainability/low）：HyPE 索引规模也纳入公开统计——
         // 否则 Python/standalone 宿主只能从启动 eprintln 行观察，API 无感知。
-        // #R50 maintainability/low：报告**权威表行数**而非内存快照——hype_hnsw 是
+        // #R50 maintainability/medium：报告**权威表行数**而非内存快照——hype_hnsw 是
         // 构造时快照，运行时表更新（离线脚本重跑）后内存 len 静默偏离现实（如
-        // 索引 0 会隐藏脚本已写入的向量，误导运维）；字段名也暗示反映存储。查询
-        // 失败（表缺失/DB 故障）时回退内存快照并保留可观测性。
-        let hype_store: i64 = conn
-            .query_row("SELECT COUNT(*) FROM memory_hype_vectors", [], |r| r.get(0))
-            .unwrap_or(self.hype_hnsw.len() as i64);
+        // 索引 0 会隐藏脚本已写入的向量，误导运维）；字段名也暗示反映存储。
+        // #R51 maintainability/medium：查询失败**显式标记为 -1** 并 eprintln——此前
+        // unwrap_or(内存 len) 把任何查询失败（缺表/锁）伪装成合理数字，运维无法区分
+        // "HyPE 未启用（空表 0）"与"统计查询失败（-1）"，正是要 surface 的故障。
+        let hype_store: i64 = match conn.query_row(
+            "SELECT COUNT(*) FROM memory_hype_vectors",
+            [],
+            |r| r.get(0),
+        ) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("[Memoria] WARN: hype_vector_index_size query failed: {e}");
+                -1
+            }
+        };
         m.insert(
             "hype_vector_index_size".to_string(),
             serde_json::Value::Number(hype_store.into()),

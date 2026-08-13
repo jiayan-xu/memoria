@@ -578,14 +578,18 @@ pub fn migrate_evolution(pool: &SqlitePool) -> Result<(), String> {
     Ok(())
 }
 
-/// #R49 bug/medium：DDL 执行带 **SQLITE_BUSY 退避重试**——并发首启时另一进程持写锁
-/// （如大库孤儿 DELETE）超过 busy_timeout，本进程 DDL 立即 BUSY；main.rs/mcp_server.rs
-/// 用 .expect()，硬失败会让并发首启部署直接 panic 中止（清理分支已软降级，DDL 硬失败
-/// 是同类风险）。3 次退避（500ms/1s/2s），仍失败才传播。
+/// #R49 bug/medium：DDL 执行带 **SQLITE_BUSY/SQLITE_LOCKED 退避重试**——并发首启时
+/// 另一进程持写锁（如大库孤儿 DELETE）超过 busy_timeout，本进程 DDL 立即 BUSY；
+/// 同连接读锁升级写锁失败会报 LOCKED（#R51 bug/low：此前只匹配 DatabaseBusy，
+/// LOCKED 会立即终止重试并 .expect 硬失败启动）。main.rs/mcp_server.rs 用 .expect()，
+/// 硬失败会让并发首启部署直接 panic 中止（清理分支已软降级，DDL 硬失败是同类
+/// 风险）。3 次退避（500ms/1s/2s），仍失败才传播。
 fn is_busy(e: &rusqlite::Error) -> bool {
     matches!(
         e,
-        rusqlite::Error::SqliteFailure(se, _) if se.code == rusqlite::ErrorCode::DatabaseBusy
+        rusqlite::Error::SqliteFailure(se, _)
+            if se.code == rusqlite::ErrorCode::DatabaseBusy
+                || se.code == rusqlite::ErrorCode::DatabaseLocked
     )
 }
 
@@ -794,7 +798,12 @@ pub fn migrate_hype_vectors(pool: &SqlitePool) -> Result<(), String> {
                     |r| r.get(0),
                 )
                 .map_err(|e| format!("check cleanup flag (tx): {}", e))?;
-            if already2 != 0 {
+            // #R51 bug/high：force 时**不能短路**——force gate（force_cleanup &&
+            // clean_vectors）存在的唯一意义就是覆盖已置位的 CLEANUP/REFUSED 标记；
+            // 此处 `already2 != 0` 无条件 return 会让逃生通道永久 no-op（refused 态
+            // 一旦持久化，普通 gate 不再进入、force gate 进入又被短路——死局，只能
+            // 手删 migration_flags 行）。非 force 时保留短路（对端进程已完成）。
+            if already2 != 0 && !(force_cleanup && clean_vectors) {
                 tx.commit()
                     .map_err(|e| format!("commit cleanup tx (noop): {}", e))?;
                 return Ok(());
@@ -804,60 +813,12 @@ pub fn migrate_hype_vectors(pool: &SqlitePool) -> Result<(), String> {
             // #R42/#R44 performance/medium：**单条** DELETE（一次相关扫描）——分批
             // LIMIT 1000 在同一个 BEGIN IMMEDIATE 事务内不降低持锁时间（每批全表扫描）。
             // #R43 maintainability/low：SQL 规范化 + 错误消息内嵌 SQL 片段便于审计。
-            // #R48 bug/high（数据安全）：**孤儿 COUNT 必须有**——DELETE 无差别销毁
-            // 所有"无 memories 行的向量行"，但代码库并不强制该不变量：add_vectors
-            // （Python bindings，lib.rs:280）接受任意调用方 id、persist::lookup_namespace
-            // 对无 memories 行回退 'default'、vector_search 不 join memories——外部注册
-            // 向量/待重导入/合成 id 是合法数据态。
-            // #R49 bug/high：memory_vectors 孤儿删除改 **opt-in**——阈值只防大数，
-            // ≤5000 或 force 仍会静默销毁合法外部向量；默认**只报告不删除**，设
-            // MEMORIA_ORPHAN_CLEANUP_VECTORS=1 才删（仍受阈值与
-            // MEMORIA_FORCE_ORPHAN_CLEANUP=1 约束）。memory_hype_vectors 是内部派生表
-            // （无外部写入路径），保持自动清理。
-            const ORPHAN_REFUSE_THRESHOLD: i64 = 5000;
-            // force/opt-in env 在 gate 之前已读取（#R50 bug/medium，见函数上方）——
-            // 此处直接使用外层变量，不再重复读取。
-            // 阈值/opt-in 拒绝时**不置位 CLEANUP_FLAG**，改为持久化 REFUSED_FLAG——
-            // 避免每次启动重扫（#R49 performance/medium）；置位只发生在"无孤儿"或
-            // "清理已执行"之后。
-            let mut refused = false;
-            let v_exists: i64 = tx
-                .query_row(
-                    "SELECT EXISTS(SELECT 1 FROM memory_vectors LIMIT 1)",
-                    [],
-                    |r| r.get(0),
-                )
-                .map_err(|e| format!("check memory_vectors exists: {}", e))?;
-            if v_exists > 0 {
-                let orphans_vec: i64 = tx
-                    .query_row(
-                        "SELECT COUNT(*) FROM memory_vectors \
-                         WHERE NOT EXISTS (SELECT 1 FROM memories m WHERE m.id = memory_vectors.id)",
-                        [],
-                        |r| r.get(0),
-                    )
-                    .map_err(|e| format!("count memory_vectors orphans: {}", e))?;
-                if orphans_vec > 0 {
-                    if !clean_vectors {
-                        eprintln!(
-                            "[Memoria] WARN: {orphans_vec} orphan memory_vectors rows (possible legit external vectors via add_vectors); NOT deleting - set MEMORIA_ORPHAN_CLEANUP_VECTORS=1 to enable (MEMORIA_FORCE_ORPHAN_CLEANUP=1 bypasses the {ORPHAN_REFUSE_THRESHOLD} threshold)"
-                        );
-                        refused = true;
-                    } else if orphans_vec > ORPHAN_REFUSE_THRESHOLD && !force_cleanup {
-                        eprintln!(
-                            "[Memoria] WARN: {orphans_vec} orphan memory_vectors rows ABOVE safety threshold {ORPHAN_REFUSE_THRESHOLD}; refusing auto-delete (set MEMORIA_FORCE_ORPHAN_CLEANUP=1 to force)"
-                        );
-                        refused = true;
-                    } else {
-                        const DEL_VEC: &str = "DELETE FROM memory_vectors \
-                            WHERE NOT EXISTS (SELECT 1 FROM memories m WHERE m.id = memory_vectors.id)";
-                        tx.execute(DEL_VEC, []).map_err(|e| {
-                            format!("clean memory_vectors orphans: {e} [SQL: {DEL_VEC}]")
-                        })?;
-                        eprintln!("[Memoria] Migration: removed {orphans_vec} orphan memory_vectors rows");
-                    }
-                }
-            }
+            // #R51 maintainability/medium：**hype 段与 memory_vectors 段分离**——
+            // memory_hype_vectors 可由离线脚本重写（lib.rs/mcp_server.rs 文档），但
+            // 内容始终派生自 memories（问句向量），无 memories 行的 hype 行必为孤儿
+            // 垃圾、无合法态——不需要 opt-in/阈值；且 refused（仅由 memory_vectors
+            // 触发）不得禁用 hype 清理（此前共享 REFUSED_FLAG 让 memory_vectors 的
+            // 拒绝永久跳过两表清理）。
             let h_exists: i64 = tx
                 .query_row(
                     "SELECT EXISTS(SELECT 1 FROM memory_hype_vectors LIMIT 1)",
@@ -875,18 +836,70 @@ pub fn migrate_hype_vectors(pool: &SqlitePool) -> Result<(), String> {
                     )
                     .map_err(|e| format!("count memory_hype_vectors orphans: {}", e))?;
                 if orphans_hype > 0 {
-                    if orphans_hype > ORPHAN_REFUSE_THRESHOLD && !force_cleanup {
-                        eprintln!(
-                            "[Memoria] WARN: {orphans_hype} orphan memory_hype_vectors rows ABOVE safety threshold {ORPHAN_REFUSE_THRESHOLD}; refusing auto-delete (set MEMORIA_FORCE_ORPHAN_CLEANUP=1 to force)"
-                        );
-                        refused = true;
-                    } else {
-                        const DEL_HYPE: &str = "DELETE FROM memory_hype_vectors \
-                            WHERE NOT EXISTS (SELECT 1 FROM memories m WHERE m.id = memory_hype_vectors.id)";
-                        tx.execute(DEL_HYPE, []).map_err(|e| {
-                            format!("clean memory_hype_vectors orphans: {e} [SQL: {DEL_HYPE}]")
-                        })?;
-                        eprintln!("[Memoria] Migration: removed {orphans_hype} orphan memory_hype_vectors rows");
+                    const DEL_HYPE: &str = "DELETE FROM memory_hype_vectors \
+                        WHERE NOT EXISTS (SELECT 1 FROM memories m WHERE m.id = memory_hype_vectors.id)";
+                    tx.execute(DEL_HYPE, []).map_err(|e| {
+                        format!("clean memory_hype_vectors orphans: {e} [SQL: {DEL_HYPE}]")
+                    })?;
+                    eprintln!("[Memoria] Migration: removed {orphans_hype} orphan memory_hype_vectors rows");
+                }
+            }
+            // #R48 bug/high（数据安全）：memory_vectors 的**孤儿 COUNT 必须有**——
+            // DELETE 无差别销毁所有"无 memories 行的向量行"，但代码库并不强制该
+            // 不变量：add_vectors（Python bindings，lib.rs:280）接受任意调用方 id、
+            // persist::lookup_namespace 对无 memories 行回退 'default'、vector_search
+            // 不 join memories——外部注册向量/待重导入/合成 id 是合法数据态。
+            // #R49 bug/high：memory_vectors 孤儿删除 **opt-in**——默认只报告不删除，
+            // 设 MEMORIA_ORPHAN_CLEANUP_VECTORS=1 才删（仍受阈值与
+            // MEMORIA_FORCE_ORPHAN_CLEANUP=1 约束）。
+            // #R51 maintainability/medium：此前 refused（refused_done）→ 本段跳过——
+            // 非 force 时保持拒绝态（不再重扫评估）；force 时重新评估。
+            const ORPHAN_REFUSE_THRESHOLD: i64 = 5000;
+            // force/opt-in env 在 gate 之前已读取（#R50 bug/medium，见函数上方）。
+            let mut refused = false;
+            if refused_done && !(force_cleanup && clean_vectors) {
+                // #R51：WARN 文案明确**两个 env 都要**（此前只提示 FORCE，而 gate
+                // 还要求 OPT_IN——误导运维）。
+                eprintln!(
+                    "[Memoria] WARN: memory_vectors orphan cleanup previously refused; skipping (set MEMORIA_ORPHAN_CLEANUP_VECTORS=1 AND MEMORIA_FORCE_ORPHAN_CLEANUP=1 to force, or delete migration_flags row '{REFUSED_FLAG}')"
+                );
+                refused = true;
+            } else {
+                let v_exists: i64 = tx
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM memory_vectors LIMIT 1)",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .map_err(|e| format!("check memory_vectors exists: {}", e))?;
+                if v_exists > 0 {
+                    let orphans_vec: i64 = tx
+                        .query_row(
+                            "SELECT COUNT(*) FROM memory_vectors \
+                             WHERE NOT EXISTS (SELECT 1 FROM memories m WHERE m.id = memory_vectors.id)",
+                            [],
+                            |r| r.get(0),
+                        )
+                        .map_err(|e| format!("count memory_vectors orphans: {}", e))?;
+                    if orphans_vec > 0 {
+                        if !clean_vectors {
+                            eprintln!(
+                                "[Memoria] WARN: {orphans_vec} orphan memory_vectors rows (possible legit external vectors via add_vectors); NOT deleting - set MEMORIA_ORPHAN_CLEANUP_VECTORS=1 to enable (MEMORIA_FORCE_ORPHAN_CLEANUP=1 bypasses the {ORPHAN_REFUSE_THRESHOLD} threshold)"
+                            );
+                            refused = true;
+                        } else if orphans_vec > ORPHAN_REFUSE_THRESHOLD && !force_cleanup {
+                            eprintln!(
+                                "[Memoria] WARN: {orphans_vec} orphan memory_vectors rows ABOVE safety threshold {ORPHAN_REFUSE_THRESHOLD}; refusing auto-delete (set MEMORIA_FORCE_ORPHAN_CLEANUP=1 to force)"
+                            );
+                            refused = true;
+                        } else {
+                            const DEL_VEC: &str = "DELETE FROM memory_vectors \
+                                WHERE NOT EXISTS (SELECT 1 FROM memories m WHERE m.id = memory_vectors.id)";
+                            tx.execute(DEL_VEC, []).map_err(|e| {
+                                format!("clean memory_vectors orphans: {e} [SQL: {DEL_VEC}]")
+                            })?;
+                            eprintln!("[Memoria] Migration: removed {orphans_vec} orphan memory_vectors rows");
+                        }
                     }
                 }
             }

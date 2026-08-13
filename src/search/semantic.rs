@@ -7,6 +7,37 @@ use crate::storage::SqlitePool;
 use crate::vector::HnswIndex;
 use std::collections::HashMap;
 
+/// 60s 冷却的 eprintln（#R50/#R51 maintainability/low）：语义检索路径多处诊断日志
+/// （road fail / degraded / fetch 批级 / stale 汇总 / hybrid drop）此前各自实现
+/// static 冷却——复制到第 4 处时收敛为共享 helper，冷却语义一致；按 **key** 分开
+/// 计数（不同故障原因/路/调用点不互相抑制——单个全局 static 会让先失败的路径
+/// 永久压住后失败的路径）。
+pub(crate) fn throttled_eprintln(key: &'static str, msg: String) {
+    const COOLDOWN_SECS: u64 = 60;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+    static LAST_LOGS: [AtomicU64; 16] = [const { AtomicU64::new(0) }; 16];
+    // key → 固定槽位（fnv 风格简单散列；冲突只导致两 key 共享冷却槽，可接受）。
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in key.bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    let slot = &LAST_LOGS[(h as usize) % LAST_LOGS.len()];
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let last = slot.load(Ordering::Relaxed);
+    if now.saturating_sub(last) >= COOLDOWN_SECS
+        && slot
+            .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+    {
+        eprintln!("{msg} (at most once per {COOLDOWN_SECS}s)");
+    }
+}
+
 /// Semantic search via HNSW vector similarity.
 /// Python must call cache_query_vector() first to provide the query embedding.
 ///
@@ -37,22 +68,25 @@ pub fn semantic_search(
         None => return Ok(vec![]), // No cached embedding — skip semantic signal
     };
 
-    // P0 防御：查询向量退化（NaN / 全零）则无法产生有效语义信号，提前返回空集。
-    // 全零向量在 DistCosine 下与任意记忆 distance≈0 → score≈1.0，会灌入 limit 条垃圾；
-    // NaN 则 score 非有限。add() 已拦退化向量入索引，此处对「查询向量」做双保险。
-    let norm_sq: f32 = vector.iter().map(|&x| x * x).sum();
-    if !norm_sq.is_finite() || norm_sq <= 0.0 {
-        return Ok(vec![]);
-    }
-    // #R37 bug/low：维度校验——query 向量长度 ≠ DIM 时 HNSW 距离计算跑在错配维度上，
-    // 静默产生垃圾分数（最坏 panic 污染索引锁）。离线脚本已防服务器模型漂移（768d），
-    // 运行时路径同样显式拒绝，使配置漂移快速可见而非悄悄劣化。
+    // #R37 bug/low：维度校验**先于**退化检查（#R51 bug/low）——dim 检查是纯长度比较
+    // （廉价、不依赖向量值）；此前退化分支（NaN/全零 → Ok(vec![])）先返回，错维度的
+    // 全零/NaN 缓存向量静默产出空结果，配置漂移不发声（dim 检查的初衷就是大声暴露）。
+    // query 向量长度 ≠ DIM 时 HNSW 距离计算跑在错配维度上，静默产生垃圾分数（最坏
+    // panic 污染索引锁）。离线脚本已防服务器模型漂移（768d），运行时路径同样显式拒绝。
     if vector.len() != crate::vector::DIM {
         return Err(format!(
             "semantic_search: query vector dim {} != HNSW DIM {}",
             vector.len(),
             crate::vector::DIM
         ));
+    }
+
+    // P0 防御：查询向量退化（NaN / 全零）则无法产生有效语义信号，提前返回空集。
+    // 全零向量在 DistCosine 下与任意记忆 distance≈0 → score≈1.0，会灌入 limit 条垃圾；
+    // NaN 则 score 非有限。add() 已拦退化向量入索引，此处对「查询向量」做双保险。
+    let norm_sq: f32 = vector.iter().map(|&x| x * x).sum();
+    if !norm_sq.is_finite() || norm_sq <= 0.0 {
+        return Ok(vec![]);
     }
 
     // 收集两路候选：content 路（hnsw）+ hype 路（hype_hnsw），按 memory_id 合并取 max。
@@ -103,26 +137,14 @@ pub fn semantic_search(
     // 无条件 eprintln 会刷爆 stderr。
     // #R48 other/low：`once-only` 标志永不重武装——早期瞬时降级后，后续（可能持久的）
     // 降级期保持静默。用**时间戳冷却**（60s）重武装：持续故障每 ~60s 出一条信号，
-    // 瞬时抖动只出一条。
+    // 瞬时抖动只出一条。冷却经共享 helper（#R51，key 隔离）。
     if roads_failed > 0 && best.is_empty() {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        use std::time::{SystemTime, UNIX_EPOCH};
-        const COOLDOWN_SECS: u64 = 60;
-        static LAST_DEGRADED_LOG: AtomicU64 = AtomicU64::new(0);
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        let last = LAST_DEGRADED_LOG.load(Ordering::Relaxed);
-        if now.saturating_sub(last) >= COOLDOWN_SECS
-            && LAST_DEGRADED_LOG
-                .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
-                .is_ok()
-        {
-            eprintln!(
-                "semantic_search: {roads_failed} road(s) failed and survivors returned no matches (degraded; logged at most once per {COOLDOWN_SECS}s)"
-            );
-        }
+        throttled_eprintln(
+            "roads_degraded",
+            format!(
+                "semantic_search: {roads_failed} road(s) failed and survivors returned no matches (degraded)"
+            ),
+        );
     }
     if best.is_empty() {
         return Ok(vec![]);
@@ -235,32 +257,13 @@ fn search_and_merge(
             // #R49 performance/medium：search_with_ef 只在 RwLock poisoning（持久条件）
             // 时失败——每查询 eprintln 会刷爆 stderr（与 degraded 日志同款问题）。
             // 60s 冷却：持续故障 ≤1 行/分钟，瞬时抖动只记一次。
-            // #R50 maintainability/low：冷却状态**按路分离**——单个全局 static 在
-            // content/hype 双路 60s 内相继失败时只记首路，另一路被静默抑制到首路
-            // 停止失败 >60s；match label 让每路独立计数，两路故障都可见。
-            use std::sync::atomic::{AtomicU64, Ordering};
-            use std::time::{SystemTime, UNIX_EPOCH};
-            const COOLDOWN_SECS: u64 = 60;
-            static CONTENT_LAST_LOG: AtomicU64 = AtomicU64::new(0);
-            static HYPE_LAST_LOG: AtomicU64 = AtomicU64::new(0);
-            let counter: &AtomicU64 = match label {
-                "content" => &CONTENT_LAST_LOG,
-                _ => &HYPE_LAST_LOG,
-            };
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
-            let last = counter.load(Ordering::Relaxed);
-            if now.saturating_sub(last) >= COOLDOWN_SECS
-                && counter
-                    .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
-                    .is_ok()
-            {
-                eprintln!(
-                    "[semantic] {label} HNSW search failed: {e} (at most once per {COOLDOWN_SECS}s)"
-                );
-            }
+            // #R50/#R51 maintainability/low：冷却按**路**分离（key=label）——单个
+            // 全局 static 在 content/hype 双路 60s 内相继失败时只记首路；共享 helper
+            // 的 key 隔离天然满足，无需手写双 static。
+            throttled_eprintln(
+                label,
+                format!("[semantic] {label} HNSW search failed: {e}"),
+            );
             false
         }
     }
@@ -304,32 +307,12 @@ fn fetch_memories_batch(
     // #R48 performance/medium：stale id 日志**聚合**——内存 HNSW 不随删除修剪
     // （预期滞后），批量删除后每次查询大量 stale id，逐批 eprintln 每查询刷 ~9 行
     // stderr 淹没真实错误。批内只累计计数，函数末尾汇总一行。
-    // #R50 performance/medium：批级诊断日志（prepare/query 失败、混合批、stale 汇总）
-    // **60s 冷却**（与 search_and_merge/degraded 同款）——持久故障时每查询 ~9 批 ×
+    // #R50/#R51 performance/medium：批级诊断日志（prepare/query 失败、混合批、stale
+    // 汇总、行映射样本）统一走共享 60s 冷却 helper——持久故障时每查询 ~9 批 ×
     // 每批 1 行刷爆 stderr；硬失败场景由 Err 传播 + hybrid 的 60s 冷却兜底可观测。
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::{SystemTime, UNIX_EPOCH};
-    const LOG_COOLDOWN_SECS: u64 = 60;
-    static LAST_FETCH_LOG: AtomicU64 = AtomicU64::new(0);
-    let mut log_throttled = |msg: String| {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        let last = LAST_FETCH_LOG.load(Ordering::Relaxed);
-        if now.saturating_sub(last) >= LOG_COOLDOWN_SECS
-            && LAST_FETCH_LOG
-                .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
-                .is_ok()
-        {
-            eprintln!("[semantic] fetch: {msg} (at most once per {LOG_COOLDOWN_SECS}s)");
-        }
-    };
+    // 行映射样本（具体错误文本）经同一冷却，60s 窗口内保留最近一条（#R51
+    // performance/medium：无冷却时 cap-3 样本每查询刷 3 行）。
     let mut stale_ids_total = 0usize;
-    // 行级映射错误限流（前 3 条作原因样本，其余计数汇总）——错误内容本身是
-    // 诊断关键（列类型/值漂移的具体报错），保留未冷却的样本日志。
-    let mut row_err_logged = 0usize;
-    const ROW_ERR_LOG_CAP: usize = 3;
     for chunk in ids.chunks(BATCH) {
         batches_total += 1;
         let placeholders = vec!["?"; chunk.len()].join(",");
@@ -368,14 +351,17 @@ fn fetch_memories_batch(
                             }
                             Err(e) => {
                                 row_errors += 1;
-                                if row_err_logged < ROW_ERR_LOG_CAP {
-                                    row_err_logged += 1;
-                                    eprintln!(
+                                // #R51 performance/medium：样本行也走共享冷却——
+                                // 无冷却时 cap-3 样本在每查询刷 3 行（mostly stale +
+                                // 单行不可映射的常见混合态）。
+                                throttled_eprintln(
+                                    "fetch_row_mapping",
+                                    format!(
                                         "[semantic] fetch row mapping failed (batch {} ids): {}",
                                         chunk.len(),
                                         e
-                                    );
-                                }
+                                    ),
+                                );
                             }
                         }
                     }
@@ -388,39 +374,46 @@ fn fetch_memories_batch(
                     // 比较请求数；含 stale 的混合批不升级——漏判但安全（#R48 承认）。
                     if got == 0 && row_errors > 0 {
                         if row_errors == chunk.len() {
-                            log_throttled(format!(
-                                "all {} requested ids returned rows and ALL failed mapping (systematic column drift)",
-                                chunk.len()
-                            ));
+                            throttled_eprintln(
+                                "fetch_systemic",
+                                format!(
+                                    "all {} requested ids returned rows and ALL failed mapping (systematic column drift)",
+                                    chunk.len()
+                                ),
+                            );
                             hard_failed = true;
                         } else {
-                            log_throttled(format!(
-                                "batch of {} ids: {row_errors} row(s) failed mapping, 0 ok (row drops only; rest stale)",
-                                chunk.len()
-                            ));
+                            throttled_eprintln(
+                                "fetch_mixed",
+                                format!(
+                                    "batch of {} ids: {row_errors} row(s) failed mapping, 0 ok (row drops only; rest stale)",
+                                    chunk.len()
+                                ),
+                            );
                         }
                     } else if row_errors > 0 {
-                        log_throttled(format!(
-                            "{row_errors} of {} rows failed mapping (dropping those ids)",
-                            chunk.len()
-                        ));
+                        throttled_eprintln(
+                            "fetch_partial",
+                            format!(
+                                "{row_errors} of {} rows failed mapping (dropping those ids)",
+                                chunk.len()
+                            ),
+                        );
                     }
                 }
                 Err(e) => {
-                    log_throttled(format!(
-                        "query failed (batch {} ids): {}",
-                        chunk.len(),
-                        e
-                    ));
+                    throttled_eprintln(
+                        "fetch_query",
+                        format!("query failed (batch {} ids): {}", chunk.len(), e),
+                    );
                     hard_failed = true;
                 }
             },
             Err(e) => {
-                log_throttled(format!(
-                    "prepare failed (batch {} ids): {}",
-                    chunk.len(),
-                    e
-                ));
+                throttled_eprintln(
+                    "fetch_prepare",
+                    format!("prepare failed (batch {} ids): {}", chunk.len(), e),
+                );
                 hard_failed = true;
             }
         }
@@ -428,15 +421,23 @@ fn fetch_memories_batch(
         // 行数（saturating 防下溢），覆盖全部混合形态：全 stale（got==0,
         // row_errors==0 → 全计）、部分匹配（got>0 → 计缺口，此前漏计）、失败批
         // 混合（row_errors>0 → 计缺口）。聚合诊断与真实内存 HNSW 滞后一致。
-        stale_ids_total += chunk.len().saturating_sub(got + row_errors);
+        // #R51 bug/low：**硬失败批不计入 stale**——prepare/query 失败时 got==0 &&
+        // row_errors==0，全计会把这批缺失归因于"预期内存 HNSW 滞后"，而真实原因是
+        // 基础设施故障（且函数随即 Err）——良性态与硬失败混在一个诊断里误导运维。
+        if !hard_failed {
+            stale_ids_total += chunk.len().saturating_sub(got + row_errors);
+        }
         if hard_failed {
             hard_failed_batches += 1;
         }
     }
     if stale_ids_total > 0 {
-        log_throttled(format!(
-            "{stale_ids_total} candidate id(s) matched 0 rows (expected in-memory HNSW lag after deletions)"
-        ));
+        throttled_eprintln(
+            "fetch_stale",
+            format!(
+                "{stale_ids_total} candidate id(s) matched 0 rows (expected in-memory HNSW lag after deletions)"
+            ),
+        );
     }
     // #R47 bug/medium：**任一**批硬失败即 Err——部分失败返回 Ok(partial) 会让调用方
     // 把召回损失当完整结果（静默丢候选、监控不可见）；Err 使 hybrid.rs 记录
