@@ -52,6 +52,10 @@ pub fn put_stored_vector(
 
 /// V1（2026-08-12）：写入/覆盖某记忆的 HyPE 问句向量（与 `put_stored_vector` 对称，
 /// 落 `memory_hype_vectors` 表）。同款退化/维度防御；共享 `put_vector_into` 实现。
+/// #R57 maintainability/low：`src/` 内无调用者（生产 HyPE 写入走离线脚本
+/// build_hype_vectors.py 的原始 INSERT ... ON CONFLICT DO UPDATE，维护 question 列），
+/// 但 tests/eval_semantic.rs 的 HyPE upsert 路径实测调用——测试覆盖使其非死代码，
+/// 保留（生产侧脚本与库 API 双写路径的潜在分歧由 eval 测试的覆盖率断言兜底）。
 pub fn put_hype_stored_vector(
     pool: &SqlitePool,
     id: &str,
@@ -72,7 +76,9 @@ macro_rules! vector_table {
         VectorTable {
             table: $table,
             insert_sql: concat!(
-                "INSERT INTO ", $table, " (id, namespace, vector, updated_at) ",
+                "INSERT INTO ",
+                $table,
+                " (id, namespace, vector, updated_at) ",
                 "VALUES (?, ?, ?, datetime('now')) ",
                 "ON CONFLICT(id) DO UPDATE SET vector=excluded.vector, ",
                 "namespace=excluded.namespace, updated_at=excluded.updated_at"
@@ -105,7 +111,12 @@ struct VectorTable {
 fn vector_tables() -> &'static [VectorTable] {
     static TABLES: [VectorTable; 2] = [
         vector_table!("memory_vectors", "put_stored_vector", "content", false),
-        vector_table!("memory_hype_vectors", "put_hype_stored_vector", "hype", true),
+        vector_table!(
+            "memory_hype_vectors",
+            "put_hype_stored_vector",
+            "hype",
+            true
+        ),
     ];
     &TABLES
 }
@@ -118,18 +129,22 @@ fn lookup_table(table: &str) -> Option<&'static VectorTable> {
 /// 磁盘满/BUSY/schema 漂移）时调用方（add_vectors 等）循环 `let _ =` 丢弃 Result，
 /// 每写一条刷一行相同 WARN。前 3 条打印（含具体错误文本），其后静默计数，每满
 /// 1000 次打一条聚合行——读侧 READ_ERR_LOG_CAP 同款纪律，镜像对称。
-fn warn_throttled(fn_name: &str, msg: &str) {
-    // #R52 bug/medium：**按 fn_name 分槽**（16 槽 fnv）——此前两个全局 static 被
-    // put_stored_vector/put_hype_stored_vector 共享：先失败的路径消耗前 3 条详情预算
-    // （另一路径早期失败永不单独记录），且聚合行把全局计数归因到碰巧落在 1000 倍数
-    // 的 fn_name（恰在 `let _` 丢弃 Result 的事故中，WARN 是唯一信号）。
-    // AtomicU64 fetch_add 原子递增——check-then-act 竞态（并发全过 `logged < 3` 门槛
-    // 超发详情行）不存在。槽冲突只造成两 fn_name 共享预算，可接受（与
-    // throttled_eprintln 同款权衡）。
+/// #R57 other/medium：**按 (fn_name, reason) 分槽**——put_vector_into 的三类失败
+/// （degenerate / dim mismatch / execute error）此前共享 fn_name 槽：系统性事故
+/// （如嵌入模型产出零向量）会耗尽 3 条详情预算，压制更可操作的错误（BUSY/磁盘满/
+/// 约束冲突）；聚合行只含 fn_name + 计数、无错误文本，多因并发事故被掩盖。reason
+/// 入槽后每类独立预算，聚合行含 reason 使计数可归因。
+fn warn_throttled(fn_name: &str, reason: &str, msg: &str) {
+    // #R52 bug/medium：**按槽分**（32 槽 fnv，key=fn_name+reason）——此前两个全局
+    // static 被所有写路径共享：先失败的路径消耗前 3 条详情预算（另一路径早期失败
+    // 永不单独记录），且聚合行把全局计数归因到碰巧落在 1000 倍数的 fn_name（恰在
+    // `let _` 丢弃 Result 的事故中，WARN 是唯一信号）。AtomicU64 fetch_add 原子递增
+    // ——check-then-act 竞态（并发全过 `logged < 3` 门槛超发详情行）不存在。槽冲突
+    // 只造成两 key 共享预算，可接受（与 throttled_eprintln 同款权衡）。
     use std::sync::atomic::{AtomicU64, Ordering};
-    static SLOTS: [AtomicU64; 16] = [const { AtomicU64::new(0) }; 16];
+    static SLOTS: [AtomicU64; 32] = [const { AtomicU64::new(0) }; 32];
     let mut h: u64 = 0xcbf29ce484222325;
-    for b in fn_name.bytes() {
+    for b in format!("{fn_name}:{reason}").bytes() {
         h ^= b as u64;
         h = h.wrapping_mul(0x100000001b3);
     }
@@ -138,7 +153,9 @@ fn warn_throttled(fn_name: &str, msg: &str) {
     if n <= 3 {
         eprintln!("[persist] WARN: {msg}");
     } else if n % 1000 == 0 {
-        eprintln!("[persist] WARN: {fn_name}: {n} failures so far (sample above; suppressing repeats)");
+        eprintln!(
+            "[persist] WARN: {fn_name}:{reason}: {n} failures so far (sample above; suppressing repeats)"
+        );
     }
 }
 
@@ -156,7 +173,8 @@ fn put_vector_into(
     table: &str,
 ) -> Result<(), String> {
     let conn = pool.get().map_err(|e| format!("pool: {}", e))?;
-    let td = lookup_table(table).ok_or_else(|| format!("put_vector_into: unknown table {table}"))?;
+    let td =
+        lookup_table(table).ok_or_else(|| format!("put_vector_into: unknown table {table}"))?;
     let fn_name = td.fn_name;
     // P0 防御：拒绝退化（零 / 非有限）向量落库。历史嵌入失败的写入会在 memory_vectors
     // 留下全 0 向量，污染 HNSW 语义召回（零向量被 DistCosine 误判为完美匹配）。
@@ -166,7 +184,7 @@ fn put_vector_into(
         // #R41 maintainability/low：与维度分支一致地记录——调用方均 `let _ =` 忽略
         // Result，零/NaN 写入若不 eprintln 与错长写入的可见性不对称。
         let msg = format!("{fn_name}: degenerate (zero/NaN) vector rejected");
-        warn_throttled(fn_name, &msg);
+        warn_throttled(fn_name, "degenerate", &msg);
         return Err(msg);
     }
     // 写入时校验维度：错误长度的向量落库后会被 rebuild 静默跳过（仅 stderr 告警），
@@ -182,23 +200,23 @@ fn put_vector_into(
             DIM,
             vector.len()
         );
-        warn_throttled(fn_name, &msg);
+        warn_throttled(fn_name, "dim_mismatch", &msg);
         return Err(msg);
     }
     conn.execute(
         td.insert_sql,
         rusqlite::params![id, namespace, encode_vector(vector)],
     )
-        .map(|_| ())
-        .map_err(|e| {
-            // #R44 bug/medium：execute 失败必须 eprintln——所有生产调用方 `let _ =`
-            // 丢弃 Result（lib.rs:197、remember.rs 多处），schema 漂移/磁盘满/BUSY/
-            // 约束冲突完全不可见；与上方 degenerate/dim 两个 fail-fast 分支的可观测性
-            // 对齐（此前仅该分支静默，索引缺口只能从 HNSW 长度差异推断）。
-            let msg = format!("{fn_name}: {}", e);
-            warn_throttled(fn_name, &msg);
-            msg
-        })?;
+    .map(|_| ())
+    .map_err(|e| {
+        // #R44 bug/medium：execute 失败必须 eprintln——所有生产调用方 `let _ =`
+        // 丢弃 Result（lib.rs:197、remember.rs 多处），schema 漂移/磁盘满/BUSY/
+        // 约束冲突完全不可见；与上方 degenerate/dim 两个 fail-fast 分支的可观测性
+        // 对齐（此前仅该分支静默，索引缺口只能从 HNSW 长度差异推断）。
+        let msg = format!("{fn_name}: {}", e);
+        warn_throttled(fn_name, "execute", &msg);
+        msg
+    })?;
     Ok(())
 }
 
@@ -322,11 +340,7 @@ pub fn build_hype_hnsw_or_default(pool: &SqlitePool, ef_search: usize) -> (HnswI
 /// 调用方传第二份字符串，避免与 descriptor 漂移（#R38 maintainability/low）。
 /// 统计并告警被跳过的行（解码失败 / 维度 ≠ DIM），使索引健康度可观测——
 /// 数据损坏不再被静默吞掉。表名**白名单 dispatch**（descriptor 查找，非字符串插值）。
-fn rebuild_from_table(
-    pool: &SqlitePool,
-    hnsw: &HnswIndex,
-    table: &str,
-) -> Result<usize, String> {
+fn rebuild_from_table(pool: &SqlitePool, hnsw: &HnswIndex, table: &str) -> Result<usize, String> {
     let conn = pool.get().map_err(|e| format!("pool: {}", e))?;
     let td = lookup_table(table)
         .ok_or_else(|| format!("rebuild_from_table: unknown rebuild table {table}"))?;
@@ -436,9 +450,7 @@ fn rebuild_from_table(
         let cause = if skipped == 0 {
             format!("all {rows_seen} row(s) failed read/iteration")
         } else {
-            format!(
-                "{rows_seen} row(s) unusable ({skipped} skipped, {read_errors} read errors)"
-            )
+            format!("{rows_seen} row(s) unusable ({skipped} skipped, {read_errors} read errors)")
         };
         if td.error_on_all_skipped {
             // #R55 bug/low：skip-cause 括号**仅当确有 skip 行时追加**——skipped==0

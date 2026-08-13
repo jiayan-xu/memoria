@@ -107,7 +107,12 @@ fn hyde_enabled() -> bool {
     }
 }
 
-async fn embed_query(client: &reqwest::Client, url: &str, query: &str, hyde: bool) -> Option<Vec<f32>> {
+async fn embed_query(
+    client: &reqwest::Client,
+    url: &str,
+    query: &str,
+    hyde: bool,
+) -> Option<Vec<f32>> {
     let body = if hyde {
         serde_json::json!({ "texts": [query], "hyde": true })
     } else {
@@ -167,7 +172,10 @@ async fn embed_query(client: &reqwest::Client, url: &str, query: &str, hyde: boo
             }
         }
     }
-    eprintln!("[embed_query] FAILED after retries for q={:?}: {:?}", query, last_err);
+    eprintln!(
+        "[embed_query] FAILED after retries for q={:?}: {:?}",
+        query, last_err
+    );
     None
 }
 
@@ -695,10 +703,7 @@ pub fn tools_list() -> Vec<serde_json::Value> {
                     "namespace": {"type": "string", "description": "可选；调用者主 ns，缺省由引擎注入"}
                 }),
             ),
-            "system_status" => (
-                "检查各Agent连接状态",
-                serde_json::json!({}),
-            ),
+            "system_status" => ("检查各Agent连接状态", serde_json::json!({})),
             "reasonix_dispatch" => (
                 "派发编码任务给Reasonix",
                 serde_json::json!({
@@ -1030,12 +1035,18 @@ async fn handle_tool_call(
     let ns_policy = crate::permissions::matrix_lookup(tool).map(|e| e.ns_policy.clone());
     let ns: &str = match ns_policy {
         // 无命名空间概念的工具：用调用者主命名空间占位，跳过校验
-        Some(crate::permissions::NsPolicy::None) => {
-            auth.allowed_ns.first().map(|s| s.as_str()).unwrap_or("default")
-        }
+        Some(crate::permissions::NsPolicy::None) => auth
+            .allowed_ns
+            .first()
+            .map(|s| s.as_str())
+            .unwrap_or("default"),
         // NamespaceArg 及其它需按 namespace 门控的变体：要求调用方显式传 namespace；
         // 若缺省则回退到调用者主授权 ns（禁止静默落到 "default" 造成跨租户串写）。
-        Some(_) => match safe_args.get("namespace").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+        Some(_) => match safe_args
+            .get("namespace")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+        {
             Some(n) => n,
             None => {
                 match auth
@@ -1103,7 +1114,9 @@ async fn handle_tool_call(
     {
         if let Some(q) = safe_args.get("query").and_then(|v| v.as_str()) {
             if !q.is_empty() {
-                if let Some(qvec) = embed_query(&state.http_client, &state.embedding_url, q, hyde_enabled()).await {
+                if let Some(qvec) =
+                    embed_query(&state.http_client, &state.embedding_url, q, hyde_enabled()).await
+                {
                     state.query_cache.put(q, qvec);
                 }
             }
@@ -1125,7 +1138,9 @@ async fn handle_tool_call(
         };
         if let Some(c) = text {
             if !c.is_empty() {
-                if let Some(cvec) = embed_query(&state.http_client, &state.embedding_url, c, false).await {
+                if let Some(cvec) =
+                    embed_query(&state.http_client, &state.embedding_url, c, false).await
+                {
                     state.query_cache.put(c, cvec);
                 }
             }
@@ -1351,7 +1366,9 @@ fn dispatch(
             // 仅改变相对序，不增删候选；失败则保留 hybrid 原序（优雅降级）。
             if rerank_on && fused.len() > 1 {
                 let docs: Vec<String> = fused.iter().map(|r| r.content.clone()).collect();
-                if let Some(scored) = block_on_rerank(&state.http_client, &rerank_url(), query, &docs) {
+                if let Some(scored) =
+                    block_on_rerank(&state.http_client, &rerank_url(), query, &docs)
+                {
                     let mut order_score: Vec<f64> = vec![0.0; fused.len()];
                     for (i, s) in scored {
                         if i < order_score.len() {
@@ -1545,7 +1562,10 @@ fn dispatch(
                         },
                         None => (400u16, e.clone()),
                     };
-                    format!(r#"{{"status":"error","code":{},"message":"{}"}}"#, code, msg)
+                    format!(
+                        r#"{{"status":"error","code":{},"message":"{}"}}"#,
+                        code, msg
+                    )
                 }
             };
             body
@@ -1581,9 +1601,7 @@ fn dispatch(
                     "manifest_id": out.manifest_id,
                     "chunk_ids": out.chunk_ids,
                 }))
-                .unwrap_or_else(|_| {
-                    r#"{"status":"error","message":"serialize"}"#.to_string()
-                }),
+                .unwrap_or_else(|_| r#"{"status":"error","message":"serialize"}"#.to_string()),
                 Err(e) => format!(
                     r#"{{"status":"error","code":422,"message":"{}"}}"#,
                     e.replace('"', "'")
@@ -1612,8 +1630,9 @@ fn dispatch(
                 dynamic_limit,
                 as_of,
             ) {
-                Ok(v) => serde_json::to_string(&v)
-                    .unwrap_or_else(|_| "{\"status\":\"error\",\"message\":\"serialize\"}".to_string()),
+                Ok(v) => serde_json::to_string(&v).unwrap_or_else(|_| {
+                    "{\"status\":\"error\",\"message\":\"serialize\"}".to_string()
+                }),
                 Err(e) => format!(r#"{{"status":"error","message":"{}"}}"#, e),
             }
         }
@@ -1651,8 +1670,9 @@ fn dispatch(
                 dynamic_limit,
                 as_of,
             ) {
-                Ok(v) => serde_json::to_string(&v)
-                    .unwrap_or_else(|_| "{\"status\":\"error\",\"message\":\"serialize\"}".to_string()),
+                Ok(v) => serde_json::to_string(&v).unwrap_or_else(|_| {
+                    "{\"status\":\"error\",\"message\":\"serialize\"}".to_string()
+                }),
                 Err(e) => format!(r#"{{"status":"error","message":"{}"}}"#, e),
             }
         }
@@ -2191,7 +2211,9 @@ fn dispatch(
                         );
                         format!(r#"{{"status":"ok","deleted":{}}}"#, deleted)
                     } else {
-                        format!(r#"{{"status":"ok","deleted":0,"message":"not found or not owned"}}"#)
+                        format!(
+                            r#"{{"status":"ok","deleted":0,"message":"not found or not owned"}}"#
+                        )
                     }
                 }
                 Err(e) => format!(r#"{{"status":"error","message":"{}"}}"#, e),
@@ -2635,7 +2657,7 @@ fn dispatch(
                 "embed": report.soft_checks.iter().find(|c| c.name == "embedding"),
                 "report": report
             }))
-                .unwrap_or_default()
+            .unwrap_or_default()
         }
         "memory_dedup_chain" => {
             let memory_id = args.get("memory_id").and_then(|v| v.as_str()).unwrap_or("");
@@ -2686,16 +2708,14 @@ fn dispatch(
         "memory_evolve" => {
             // 演化写回：ns 门控（与写入同权），不强制 admin（agent-core consolidate 用 dashboard badge 调）
             let target_id = args.get("target_id").and_then(|v| v.as_str()).unwrap_or("");
-            let ev_ns = args
-                .get("namespace")
-                .and_then(|v| v.as_str())
-                .unwrap_or(ns);
+            let ev_ns = args.get("namespace").and_then(|v| v.as_str()).unwrap_or(ns);
             let evolved_context = args
                 .get("evolved_context")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
             if target_id.is_empty() || evolved_context.is_empty() {
-                return r#"{"status":"error","message":"missing target_id or evolved_context"}"#.to_string();
+                return r#"{"status":"error","message":"missing target_id or evolved_context"}"#
+                    .to_string();
             }
             let link_count = args.get("link_count").and_then(|v| v.as_i64());
             let model = args.get("model").and_then(|v| v.as_str()).unwrap_or("");
@@ -2715,7 +2735,8 @@ fn dispatch(
                 model,
                 change_type,
             ) {
-                Ok(v) => serde_json::to_string(&v).unwrap_or_else(|_| r#"{"status":"evolved"}"#.to_string()),
+                Ok(v) => serde_json::to_string(&v)
+                    .unwrap_or_else(|_| r#"{"status":"evolved"}"#.to_string()),
                 Err(e) => format!(r#"{{"status":"error","message":"{}"}}"#, e),
             }
         }
@@ -2729,7 +2750,8 @@ fn dispatch(
                 return r#"{"status":"error","message":"missing log_id"}"#.to_string();
             }
             match tools::evolve::evolution_rollback(&state.pool, log_id) {
-                Ok(v) => serde_json::to_string(&v).unwrap_or_else(|_| r#"{"status":"rolled_back"}"#.to_string()),
+                Ok(v) => serde_json::to_string(&v)
+                    .unwrap_or_else(|_| r#"{"status":"rolled_back"}"#.to_string()),
                 Err(e) => format!(r#"{{"status":"error","message":"{}"}}"#, e),
             }
         }
@@ -2738,7 +2760,11 @@ fn dispatch(
             let change_types: Vec<String> = args
                 .get("change_types")
                 .and_then(|v| v.as_array())
-                .map(|a| a.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                        .collect()
+                })
                 .unwrap_or_default();
             let since = args
                 .get("since")
@@ -3158,7 +3184,8 @@ mod tests {
         memoria_core::storage::migrate_temporal(&pool).expect("migrate temporal");
         memoria_core::storage::migrate_extract_fields(&pool).expect("migrate extract fields");
         memoria_core::storage::migrate_evolution(&pool).expect("migrate evolution");
-        memoria_core::storage::migrate_memory_relation_types(&pool).expect("migrate relation types");
+        memoria_core::storage::migrate_memory_relation_types(&pool)
+            .expect("migrate relation types");
         memoria_core::quota::init_quota_table(&pool).expect("quota table");
         let auth_pool = memoria_core::storage::create_pool(":memory:", 4).expect("auth pool");
         memoria_core::storage::init_schema(&auth_pool).expect("auth schema");
@@ -3324,7 +3351,10 @@ mod tests {
         let text = dispatch(&state, "memory_context", &args, &auth);
         let v: serde_json::Value = serde_json::from_str(&text).expect("valid json");
         assert_eq!(v["status"], "ok", "memory_context response: {}", text);
-        assert!(v["prompt_block"].is_string(), "memory_context 应产出 prompt_block");
+        assert!(
+            v["prompt_block"].is_string(),
+            "memory_context 应产出 prompt_block"
+        );
         assert!(v["profile"].is_object(), "memory_context 应含 profile 块");
     }
 }
