@@ -91,14 +91,26 @@ fn select_sql(table: &str) -> String {
 
 /// 写入 SQL（ON CONFLICT upsert 而非 INSERT OR REPLACE——REPLACE 会整行删除重建，
 /// 把 `memory_hype_vectors.question`（离线脚本写入的假设问句）静默抹成 NULL）。
+/// #R51 bug/medium：**按表区分列集**——memory_vectors 的旧库可能没有 updated_at 列
+/// （CREATE TABLE 只在 sqlite.rs 建表时生效，存量库无 ALTER 迁移补列）；共享四列
+/// SQL 会让存量部署的每次 put_stored_vector 报 "no column named updated_at" 且
+/// 生产调用方 let _ 丢弃 Result（向量持久化静默停止，仅 WARN 可见）。memory_vectors
+/// 保持原三列；updated_at 只写给 migration 显式创建该列的 memory_hype_vectors。
 fn insert_sql(table: &str) -> String {
-    format!(
-        "INSERT INTO {table} (id, namespace, vector, updated_at) \
-         VALUES (?, ?, ?, datetime('now')) \
-         ON CONFLICT(id) DO UPDATE SET vector=excluded.vector, \
-                                        namespace=excluded.namespace, \
-                                        updated_at=excluded.updated_at"
-    )
+    match table {
+        "memory_vectors" => format!(
+            "INSERT INTO {table} (id, namespace, vector) VALUES (?, ?, ?) \
+             ON CONFLICT(id) DO UPDATE SET vector=excluded.vector, \
+                                            namespace=excluded.namespace"
+        ),
+        _ => format!(
+            "INSERT INTO {table} (id, namespace, vector, updated_at) \
+             VALUES (?, ?, ?, datetime('now')) \
+             ON CONFLICT(id) DO UPDATE SET vector=excluded.vector, \
+                                            namespace=excluded.namespace, \
+                                            updated_at=excluded.updated_at"
+        ),
+    }
 }
 
 fn vector_tables() -> &'static [VectorTable] {
@@ -123,7 +135,26 @@ fn lookup_table(table: &str) -> Option<&'static VectorTable> {
     vector_tables().iter().find(|t| t.table == table)
 }
 
-/// 共享实现：校验后写入 `table`（须含 id/namespace/vector/updated_at 列）。
+/// #R51 maintainability/low：写路径 WARN **限流**——系统性故障（模型 dim 漂移/
+/// 磁盘满/BUSY/schema 漂移）时调用方（add_vectors 等）循环 `let _ =` 丢弃 Result，
+/// 每写一条刷一行相同 WARN。前 3 条打印（含具体错误文本），其后静默计数，每满
+/// 1000 次打一条聚合行——读侧 READ_ERR_LOG_CAP 同款纪律，镜像对称。
+fn warn_throttled(fn_name: &str, msg: &str) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static WARN_COUNT: AtomicUsize = AtomicUsize::new(0);
+    static WARN_LOGGED: AtomicUsize = AtomicUsize::new(0);
+    let n = WARN_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    let logged = WARN_LOGGED.load(Ordering::Relaxed);
+    if logged < 3 {
+        WARN_LOGGED.store(logged + 1, Ordering::Relaxed);
+        eprintln!("[persist] WARN: {msg}");
+    } else if n % 1000 == 0 {
+        eprintln!("[persist] WARN: {fn_name}: {n} failures so far (sample above; suppressing repeats)");
+    }
+}
+
+/// 共享实现：校验后写入 `table`（须含 id/namespace/vector 列；updated_at 见
+/// `insert_sql` 的表级列集区分）。
 ///
 /// `table` 仅接受 descriptor 白名单（杜绝字符串插值注入面）；
 /// 用 `ON CONFLICT(id) DO UPDATE` 而非 INSERT OR REPLACE——REPLACE 会整行删除重建，
@@ -146,7 +177,7 @@ fn put_vector_into(
         // #R41 maintainability/low：与维度分支一致地记录——调用方均 `let _ =` 忽略
         // Result，零/NaN 写入若不 eprintln 与错长写入的可见性不对称。
         let msg = format!("{fn_name}: degenerate (zero/NaN) vector rejected");
-        eprintln!("[persist] WARN: {msg}");
+        warn_throttled(fn_name, &msg);
         return Err(msg);
     }
     // 写入时校验维度：错误长度的向量落库后会被 rebuild 静默跳过（仅 stderr 告警），
@@ -162,7 +193,7 @@ fn put_vector_into(
             DIM,
             vector.len()
         );
-        eprintln!("[persist] WARN: {msg}");
+        warn_throttled(fn_name, &msg);
         return Err(msg);
     }
     conn.execute(
@@ -176,7 +207,7 @@ fn put_vector_into(
             // 约束冲突完全不可见；与上方 degenerate/dim 两个 fail-fast 分支的可观测性
             // 对齐（此前仅该分支静默，索引缺口只能从 HNSW 长度差异推断）。
             let msg = format!("{fn_name}: {}", e);
-            eprintln!("[persist] WARN: {msg}");
+            warn_throttled(fn_name, &msg);
             msg
         })?;
     Ok(())

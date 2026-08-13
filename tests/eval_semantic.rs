@@ -20,28 +20,66 @@ use std::time::Instant;
 const RECALL_FLOOR: f64 = 0.85;
 const EMBED_URL: &str = "http://127.0.0.1:8777/embed";
 
-async fn embed(client: &reqwest::Client, text: &str) -> Result<Vec<f32>, String> {
+/// #R51 maintainability/low：结构化错误——此前 String 前缀匹配分类脆弱（改错误
+/// 文案会静默改变重试行为；501 之类确定性 5xx 被误判瞬时白付重试；组合消息
+/// `{e}; retry also failed: {e2}` 不可分类）。错误类型在源头区分，重试决策 robust。
+#[derive(Debug)]
+enum EmbedError {
+    /// send 失败（网络抖动/连接 reset）——瞬时。
+    Transport(String),
+    /// 非 2xx 状态码（含原因短语）。
+    Status(u16, String),
+    /// 2xx 但畸形 payload（缺字段/非向量/非数值）——确定性。
+    Malformed(String),
+}
+
+impl std::fmt::Display for EmbedError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EmbedError::Transport(e) => write!(f, "embed http: {e}"),
+            EmbedError::Status(c, r) => write!(f, "embed http status {c} {r}"),
+            EmbedError::Malformed(m) => write!(f, "embed: {m}"),
+        }
+    }
+}
+
+fn is_transient_embed_err(e: &EmbedError) -> bool {
+    match e {
+        EmbedError::Transport(_) => true,
+        EmbedError::Status(c, _) => *c == 429 || *c == 408 || (500..=599).contains(c),
+        EmbedError::Malformed(_) => false,
+    }
+}
+
+async fn embed(
+    client: &reqwest::Client,
+    text: &str,
+    timeout: std::time::Duration,
+) -> Result<Vec<f32>, EmbedError> {
     let body = serde_json::json!({"texts": [text], "normalize": false});
     let resp = client
         .post(EMBED_URL)
-        .timeout(std::time::Duration::from_secs(60))
+        .timeout(timeout)
         .json(&body)
         .send()
         .await
-        .map_err(|e| format!("embed http: {}", e))?;
-    // #R47 other/low：非 2xx 显式带状态码返回——embed_with_retry 据此区分"服务明确
-    // 拒绝"（4xx，确定性，不重试）与"瞬时抖动"（网络/5xx，重试一次）。此前错误
-    // 只在 json 解析时以 parse 错误形式出现，无法分类。
+        .map_err(|e| EmbedError::Transport(e.to_string()))?;
     if !resp.status().is_success() {
-        return Err(format!("embed http status {}", resp.status()));
+        return Err(EmbedError::Status(
+            resp.status().as_u16(),
+            resp.status().to_string(),
+        ));
     }
-    let data: Value = resp.json().await.map_err(|e| format!("embed parse: {}", e))?;
+    let data: Value = resp
+        .json()
+        .await
+        .map_err(|e| EmbedError::Malformed(format!("parse: {e}")))?;
     let arr = data["embeddings"]
         .as_array()
-        .ok_or_else(|| "embed: missing embeddings".to_string())?;
+        .ok_or_else(|| EmbedError::Malformed("missing embeddings".to_string()))?;
     arr[0]
         .as_array()
-        .ok_or_else(|| "embed: bad vector".to_string())?
+        .ok_or_else(|| EmbedError::Malformed("bad vector".to_string()))?
         .iter()
         .filter_map(|x| x.as_f64().map(|f| f as f32))
         .collect::<Vec<f32>>()
@@ -62,28 +100,18 @@ impl<T> Pipe for T {}
 /// 瞬时错误（见 is_transient_embed_err）：send 失败 / 429 / 408 / 5xx；确定性错误
 /// （其余 4xx、2xx 畸形 payload）不重试——系统性配置错误重试只多付 500ms + 必然
 /// 失败的重复请求。
-/// #R50 bug/medium：重试策略与文档对齐——**瞬时 = send 失败（网络抖动）+ 429/408
-/// （限流/超时）+ 5xx（服务过载/OOM 重载）**；确定性 = 其余 4xx（维度校验/路径错误）
-/// 与 2xx 畸形 payload（parse/missing/bad vector——同形状响应每次必现）。
-/// 5xx 若不重试，embed_server 瞬时过载会让该 rid 永久排除在 HyPE 覆盖外、触发
-/// 覆盖率断言假红（正是有界重试要防的故障模式）。字符串前缀分类脆弱（错误格式
-/// 改动会静默改变重试行为），结构化错误留待后续。
-fn is_transient_embed_err(e: &str) -> bool {
-    (e.starts_with("embed http:") && !e.starts_with("embed http status"))
-        || e.starts_with("embed http status 429")
-        || e.starts_with("embed http status 408")
-        || e.starts_with("embed http status 5")
-}
-
-async fn embed_with_retry(client: &reqwest::Client, text: &str) -> Result<Vec<f32>, String> {
-    match embed(client, text).await {
+/// #R51 performance/low：**重试 attempt 用短超时（10s）**——复用主超时 60s 时，
+/// 挂死服务的最坏耗时 ≈ (60 + 0.5 + 60) × 21 rid ≈ 42 分钟测试时长；10s 上限把
+/// 单 rid 最坏降到 ~20.5s（挂死仍会重试一次，符合"瞬时抖动"判定）。
+async fn embed_with_retry(client: &reqwest::Client, text: &str) -> Result<Vec<f32>, EmbedError> {
+    match embed(client, text, std::time::Duration::from_secs(60)).await {
         Ok(v) => Ok(v),
         Err(e) if !is_transient_embed_err(&e) => Err(e),
         Err(e) => {
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-            match embed(client, text).await {
+            match embed(client, text, std::time::Duration::from_secs(10)).await {
                 Ok(v) => Ok(v),
-                Err(e2) => Err(format!("{e}; retry also failed: {e2}")),
+                Err(e2) => Err(EmbedError::Transport(format!("{e}; retry also failed: {e2}"))),
             }
         }
     }
@@ -126,6 +154,17 @@ async fn hype_upsert_one(
             // hype_hnsw.len()>0 与 80% 覆盖断言全部照过（恰好是本块要防的 no-op 假
             // 覆盖）。cosine ≥ 0.99 视为恒等 → Skipped：恒等 stub 会触发大量 skip →
             // 覆盖率断言失败 → 测试红，把假覆盖变成显式失败。
+            // #R51 bug/low：guard 前置**长度与有限性检查**——zip 静默截断到较短切片
+            // （嵌入模型中途换维度时 cosine 算在错配上）；NaN 分量使 cos=NaN，
+            // `NaN >= 0.99` 恒 false → 恒等检查被静默绕过。下游 put/add 会拒
+            // NaN/错维（无损坏），但本 guard 驱动的 skip/covered 判定必须可预测。
+            if hv.len() != content_vec.len() {
+                return HypeOutcome::Skipped(format!(
+                    "question vector dim {} != content vector dim {} (embed model drifted mid-run?)",
+                    hv.len(),
+                    content_vec.len()
+                ));
+            }
             let dot: f64 = hv
                 .iter()
                 .zip(content_vec.iter())
@@ -134,6 +173,11 @@ async fn hype_upsert_one(
             let n1: f64 = hv.iter().map(|x| (*x as f64) * (*x as f64)).sum();
             let n2: f64 = content_vec.iter().map(|x| (*x as f64) * (*x as f64)).sum();
             let cos = dot / (n1.sqrt() * n2.sqrt()).max(1e-12);
+            if !cos.is_finite() {
+                return HypeOutcome::Skipped(format!(
+                    "cosine not finite (n1={n1:.4}, n2={n2:.4}); degenerate vector?"
+                ));
+            }
             if cos >= 0.99 {
                 return HypeOutcome::Skipped(format!(
                     "question vector identical to content vector (cos={cos:.4}); embed prefix ignored?"
@@ -212,7 +256,9 @@ async fn memory_eval_semantic() {
         let ns = item["ns"].as_str().unwrap_or("agent/default");
         let tags = item["tags"].as_str().unwrap_or("[]");
 
-        let v = embed(&client, content).await.expect("corpus embed");
+        let v = embed(&client, content, std::time::Duration::from_secs(60))
+            .await
+            .expect("corpus embed");
         // v 用于内容路（cache_query_vector）；HyPE 块需内容向量副本校验「问句向量与内容
         // 向量确实不同」核心不变量（#R46 test/medium）——clone 一次（1024 维，廉价）。
         engine.cache_query_vector(content, v.clone());
@@ -334,7 +380,7 @@ async fn memory_eval_semantic() {
             .unwrap_or_default();
 
         // query 嵌入
-        if let Ok(v) = embed(&client, q).await {
+        if let Ok(v) = embed(&client, q, std::time::Duration::from_secs(60)).await {
             engine.cache_query_vector(q, v);
         }
 
@@ -401,7 +447,7 @@ async fn memory_eval_semantic() {
     for (pq, idx) in &paraphrase_cases {
         let ns = "agent/default";
         let k = 5;
-        if let Ok(v) = embed(&client, pq).await {
+        if let Ok(v) = embed(&client, pq, std::time::Duration::from_secs(60)).await {
             engine.cache_query_vector(pq, v);
         }
         let results = hybrid_search(
