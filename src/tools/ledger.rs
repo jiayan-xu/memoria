@@ -89,8 +89,18 @@ pub(crate) fn legacy_occurred(legacy_et: &str) -> Option<String> {
     // #R61 maintainability/low：**'-' 分隔符校验**（与 parse_occurred_tag 一致）——
     // ≥10 字节的非日期 ASCII（如 "hello-world"）此前会作为 occurred 流入
     // extract_text_signals 日期解析（doc 声称"畸形值不进 ledger"但未实现）。
+    // #R64 maintainability/low：**完整数字校验**（对齐 text_signals::is_iso_date_at）——
+    // 分隔符正确的非日期串（"abcd-ef-gh"/"2024-13-99"）此前仍会通过。
     let d = legacy_et.get(..10)?;
-    if d.as_bytes().get(4) == Some(&b'-') && d.as_bytes().get(7) == Some(&b'-') {
+    let b = d.as_bytes();
+    if b[0..4].iter().all(|c| c.is_ascii_digit())
+        && b[4] == b'-'
+        && b[5].is_ascii_digit()
+        && b[6].is_ascii_digit()
+        && b[7] == b'-'
+        && b[8].is_ascii_digit()
+        && b[9].is_ascii_digit()
+    {
         Some(d.to_string())
     } else {
         None
@@ -290,7 +300,10 @@ pub fn enrich_ledger(
             let text_signals = crate::search::text_signals::extract_text_signals(
                 &f.content,
                 tags_json,
-                Some(occurred.as_str()),
+                // #R64 maintainability/low：空 occurred 传 **None**（显式契约——
+                // extract_text_signals 的 !tag_date.is_empty() 守卫只是隐性容忍；
+                // 守卫被移除时保持健壮）。
+                (!occurred.is_empty()).then_some(occurred.as_str()),
             );
 
             json!({

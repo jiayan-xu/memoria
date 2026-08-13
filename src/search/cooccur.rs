@@ -323,11 +323,16 @@ mod unit_tests {
         rerank_by_cooccurrence(&pool, "agent/test", "张三", &mut results);
         let d = results.iter().find(|r| r.memory_id == "m_d").expect("m_d");
         let e = results.iter().find(|r| r.memory_id == "m_e").expect("m_e");
-        // m_d 有 query-hit boost（rrf_score > 0.5 且 source 带 cooccur）；m_e 无
-        // boost（0.5、无标记）。
+        // m_d 有 query-hit boost（rrf_score 抬升且 source 带 cooccur）；m_e 无
+        // boost（无标记）。
+        // #R64 test/low：**排序断言**替代精确浮点相等——boosted 必须排 unboosted
+        // 前（直接表达契约；无浮点运算的 no-boost 分支被未来算术改动触碰时
+        // assert_eq! 会假红）。
         assert!(d.rrf_score > 0.5 && d.source.contains("cooccur"), "query-hit boost missing: {:?}", (&d.memory_id, d.rrf_score, &d.source));
-        assert_eq!(e.rrf_score, 0.5, "m_e must stay unboosted");
-        assert!(!e.source.contains("cooccur"));
+        assert!(!e.source.contains("cooccur"), "m_e must stay unboosted");
+        let d_pos = results.iter().position(|r| r.memory_id == "m_d").unwrap();
+        let e_pos = results.iter().position(|r| r.memory_id == "m_e").unwrap();
+        assert!(d_pos < e_pos, "boosted m_d must outrank unboosted m_e (d@{d_pos}, e@{e_pos})");
     }
 
     // #R63 test/low：**单结果分支**——len<2 且 query 非空时跳过早退、仍走查询
@@ -360,7 +365,7 @@ mod unit_tests {
         )
         .unwrap();
         drop(conn);
-        let mut results: Vec<FusedResult> = vec![FusedResult {
+        let mk_f = || FusedResult {
             memory_id: "m_f".into(),
             content: "己记忆".into(),
             rrf_score: 0.5,
@@ -376,7 +381,8 @@ mod unit_tests {
             access_count: 0,
             last_recalled: None,
             time_status: None,
-        }];
+        };
+        let mut results: Vec<FusedResult> = vec![mk_f()];
         rerank_by_cooccurrence(&pool, "agent/test", "李四", &mut results);
         // 单结果 + 匹配查询 → query-hit boost 生效（guard 未把单结果短路）。
         let f = &results[0];
@@ -385,5 +391,12 @@ mod unit_tests {
             "single-result query-hit boost missing: {:?}",
             (&f.memory_id, f.rrf_score, &f.source)
         );
+        // #R64 test/low：**空查询 + 单结果 → guard 真分支**（len<2 && query 空 →
+        // 早退，无 boost）——此前该 guard 分支无测试覆盖。
+        let mut empty_q: Vec<FusedResult> = vec![mk_f()];
+        rerank_by_cooccurrence(&pool, "agent/test", "  ", &mut empty_q);
+        let f0 = &empty_q[0];
+        assert_eq!(f0.rrf_score, 0.5, "empty query must not boost");
+        assert!(!f0.source.contains("cooccur"), "empty query must not add marker");
     }
 }

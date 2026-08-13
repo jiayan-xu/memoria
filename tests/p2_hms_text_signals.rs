@@ -27,7 +27,7 @@ fn ledger_includes_text_signals() {
     // text_signals_rerank_enabled() 读取 MEMORIA_TEXT_SIGNALS_RERANK；并行下与
     // env 变异测试的 set_var/remove_var 窗口重叠 = 数据竞争（set_var 在 edition
     // 2024 为 unsafe 正是为此）。
-    let _env_guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _env_guard = ENV_LOCK.read().unwrap_or_else(|p| p.into_inner());
     let (engine, ns) = fresh_engine("ledger");
     let _ = remember_with_dedup(
         &engine.pool,
@@ -93,15 +93,18 @@ fn ledger_includes_text_signals() {
 // #R60：变异 MEMORIA_TEXT_SIGNALS_RERANK 的测试与读取它的测试共享串行锁
 // （R33 曾移除 3 个"不依赖"测试的锁，#R63 加回——它们经 memory_context→
 // hybrid_search 每次搜索都读该 env，并行下与 set_var 窗口重叠是数据竞争 UB）。
-static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+// #R64 performance/medium：**RwLock**——只读测试拿 read 锁可并发，仅变异测试
+// （search_boosts / env_off）拿 write 锁串行（全 Mutex 让 5 个测试完全序列化）。
+static ENV_LOCK: std::sync::RwLock<()> = std::sync::RwLock::new(());
 
 /// #R63 maintainability/low：共享 env 恢复 guard——Option<OsString> 无损快照 +
-/// Drop 恢复原值（含 unwind）；search_boosts（pin enabled）与 env_off 共用，
-/// 防两份恢复语义静默分歧。
-struct EnvRestore(Option<std::ffi::OsString>);
-impl Drop for EnvRestore {
+/// Drop 恢复原值（含 unwind）；search_boosts（pin enabled）与 env_off 共用。
+/// #R64 maintainability/low：**生命周期编码锁不变量**——`'a` 绑定 write guard，
+/// 构造必须在锁作用域内（类型层面杜绝 drop 时无锁的 UB，此前只靠注释约定）。
+struct EnvRestore<'a>(Option<std::ffi::OsString>, &'a std::sync::RwLockWriteGuard<'a, ()>);
+impl Drop for EnvRestore<'_> {
     fn drop(&mut self) {
-        // SAFETY: 恢复在 ENV_LOCK 串行区内（所有变异/读取测试共享该锁）。
+        // SAFETY: 锁（write）在 drop 时仍持有——guard 生命周期保证（self.1 存活）。
         unsafe {
             match &self.0 {
                 Some(v) => std::env::set_var("MEMORIA_TEXT_SIGNALS_RERANK", v),
@@ -116,7 +119,7 @@ fn search_boosts_on_numeric_query_overlap() {
     // #R62 test/medium：**显式 pin enabled**——强化断言依赖 rerank 默认开启；环境
     // 预设 MEMORIA_TEXT_SIGNALS_RERANK=0（dev shell/CI）会让正确代码假红。
     // ENV_LOCK 只串行化本二进制内的变异，管不到环境预设。
-    let _env_guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _env_guard = ENV_LOCK.write().unwrap_or_else(|p| p.into_inner());
     // #R63 maintainability/low：共享 guard（EnvRestore 同款，见下——防两份恢复
     // 语义静默分歧）。
     let prev = std::env::var_os("MEMORIA_TEXT_SIGNALS_RERANK");
@@ -125,7 +128,7 @@ fn search_boosts_on_numeric_query_overlap() {
     unsafe {
         std::env::set_var("MEMORIA_TEXT_SIGNALS_RERANK", "1");
     }
-    let _pin = EnvRestore(prev);
+    let _pin = EnvRestore(prev, &_env_guard);
     let (engine, ns) = fresh_engine("rerank");
     let a = remember_with_dedup(
         &engine.pool,
@@ -196,7 +199,7 @@ fn search_boosts_on_numeric_query_overlap() {
 
 #[test]
 fn relative_date_in_ledger_signals() {
-    let _env_guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _env_guard = ENV_LOCK.read().unwrap_or_else(|p| p.into_inner());
     let (engine, ns) = fresh_engine("reldate");
     let _ = remember_with_dedup(
         &engine.pool,
@@ -278,7 +281,7 @@ fn text_signals_rerank_env_off() {
     // 观察到瞬时的 "0"（flaky，依赖默认值的 search_boosts 会静默跳过 rerank），
     // 断言 panic 时 remove_var 不执行则变量泄漏污染后续测试。guard 的 Drop 在
     // unwind 路径也恢复；ENV_LOCK 为文件级（与 search_boosts 共享，见上）。
-    let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _guard = ENV_LOCK.write().unwrap_or_else(|p| p.into_inner());
     // #R61 bug/medium：**恢复原值而非无条件 remove**——进程启动时若 env 已带预设
     // 值（CI 配置/harness），无条件 remove 会永久抹除、改变后续依赖预设值的行为。
 
@@ -288,7 +291,7 @@ fn text_signals_rerank_env_off() {
     unsafe {
         std::env::set_var("MEMORIA_TEXT_SIGNALS_RERANK", "0");
     }
-    let _restore = EnvRestore(prev);
+    let _restore = EnvRestore(prev, &_guard);
     let fused =
         hybrid_search(&engine.pool, "999", &ns, 5, None, None, None, None, false).expect("s");
     assert!(!fused.is_empty(), "rerank-off search for '999' should return the memory");
@@ -300,7 +303,7 @@ fn text_signals_rerank_env_off() {
 
 #[test]
 fn signal_tags_persisted_on_remember() {
-    let _env_guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _env_guard = ENV_LOCK.read().unwrap_or_else(|p| p.into_inner());
     let (engine, ns) = fresh_engine("sigtags");
     let result = remember_with_dedup(
         &engine.pool,
