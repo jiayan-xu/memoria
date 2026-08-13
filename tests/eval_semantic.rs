@@ -233,8 +233,25 @@ async fn hype_upsert_one(
     }
 }
 
+// #R55 test/low：**测试级超时**——retry 路径最坏 ~70.5s/rid（~21 rid ≈ 25 分钟）
+// 仅当 embed_server 挂死（accept 不响应）时出现；#[tokio::test] 默认无全局超时，
+// CI 里挂死服务会拖垮整个 suite 数十分钟才暴露首个失败。600s 上限远高于正常
+// 运行（~1-2 分钟）但能快速 fail 挂死场景，与逐 attempt 超时互补。
+// 注：tokio-macros 2.x 的 #[tokio::test] 已移除 timeout 属性（Unknown attribute），
+// 用 tokio::time::timeout 手动包装等价实现。
 #[tokio::test]
 async fn memory_eval_semantic() {
+    let inner = memory_eval_semantic_inner();
+    tokio::pin!(inner);
+    if tokio::time::timeout(std::time::Duration::from_secs(600), inner)
+        .await
+        .is_err()
+    {
+        panic!("memory_eval_semantic timed out after 600s (embed server hung?)");
+    }
+}
+
+async fn memory_eval_semantic_inner() {
     // CI/无本地嵌入服务时跳过（本测试属手动语义评测范畴，依赖 127.0.0.1:8777；
     // GitHub Actions runner 无该服务 → 此前 CI 恒红、本地全绿）
     {
@@ -333,8 +350,9 @@ async fn memory_eval_semantic() {
             // 内，每个 rid 至多处理一次）——曾有的 hype_failed_once 恒为 processed 子集
             // （insert 先于一切簿记执行），guard 冗余、conditional 计数死代码，已删除；
             // 瞬时失败由 embed_with_retry 覆盖，无需跨重复条目的重试。
-            if !hype_processed.contains(&rid) {
-                hype_processed.insert(rid.clone());
+            // #R55 style/low：HashSet::insert 返回 bool（true=新插入）——contains+
+            // insert 两次哈希换成单次，避免 check-then-act 形态。
+            if hype_processed.insert(rid.clone()) {
                 hype_total += 1;
                 match hype_upsert_one(&client, &engine, &pool, &rid, ns, content, &v).await {
                     HypeOutcome::Covered => {

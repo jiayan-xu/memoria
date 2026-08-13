@@ -100,7 +100,7 @@ pub fn hybrid_search(
                     let msg = format!("[hybrid] semantic signal dropped: {e}");
                     let key: &'static str = if e.starts_with("semantic_search: query vector dim") {
                         "hybrid_drop_dim"
-                    } else if e.contains("road(s) failed") {
+                    } else if e.contains("all HNSW roads failed") {
                         "hybrid_drop_roads"
                     } else if e.contains("fetch") || e.contains("pool") || e.contains("backfill")
                     {
