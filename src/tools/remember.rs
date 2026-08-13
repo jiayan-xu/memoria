@@ -497,17 +497,40 @@ pub fn remember_with_dedup(
     tx.commit().map_err(|e| format!("commit: {}", e))?;
 
     // 向量持久化在事务外（非 tip 权威）；失败不回滚记忆写入
+    // #R64 maintainability/medium：创建路径与 exact/superseded 路径同款失败处理
+    // （put 失败短路 add；edge upsert 仅 put+add 成功时跑——无向量的记忆不该有
+    // 图边，且失败可见）。
     if near_dup_enabled() {
         if let (Some(hnsw_idx), Some(qv)) = (hnsw, candidate_vector.as_ref()) {
-            let _ = crate::vector::persist::put_stored_vector(pool, &mem_id, namespace, qv);
-            let _ = hnsw_idx.add(&[VectorEntry {
-                id: mem_id.clone(),
-                vector: qv.clone(),
-            }]);
-            // 增量补 semantic_related 边（闭环 Phase 1b）
-            let _ = crate::search::semantic_edges::upsert_semantic_edges_for(
-                pool, hnsw_idx, &mem_id, namespace, qv,
-            );
+            let put_ok = match crate::vector::persist::put_stored_vector(pool, &mem_id, namespace, qv) {
+                Ok(()) => true,
+                Err(e) => {
+                    eprintln!("[remember] put_stored_vector failed for {mem_id}: {e}");
+                    false
+                }
+            };
+            let add_ok = put_ok
+                && match hnsw_idx.add(&[VectorEntry {
+                    id: mem_id.clone(),
+                    vector: qv.clone(),
+                }]) {
+                    Ok(_) => true,
+                    Err(e) => {
+                        // put 成功 add 失败：向量已持久化但内存索引缺失；外层
+                        // get_stored_vector 守卫会让后续 remember 跳过 add（发散
+                        // 到重启）；下次启动 rebuild 对齐权威表自愈。
+                        eprintln!("[remember] hnsw add failed for {mem_id}: {e} (index rebuild at next start reconciles)");
+                        false
+                    }
+                };
+            if add_ok {
+                // 增量补 semantic_related 边（闭环 Phase 1b）——仅 put+add 都成功。
+                if let Err(e) = crate::search::semantic_edges::upsert_semantic_edges_for(
+                    pool, hnsw_idx, &mem_id, namespace, qv,
+                ) {
+                    eprintln!("[remember] upsert_semantic_edges failed for {mem_id}: {e}");
+                }
+            }
         }
     }
 

@@ -565,6 +565,9 @@ mod unit_tests {
         ];
         rerank_by_text_signals("120 吨", &mut results);
         assert_eq!(results[0].memory_id, "a");
-        assert!(results[0].source.contains(SOURCE_MARKER));
+        // #R64 test/low：**字面量断言**（wire format）——SOURCE_MARKER 是生产
+        // 常量，测试引用常量是自证重言式；source 直接序列化进 API 响应，
+        // 常量值被改/typo 时此断言红。
+        assert!(results[0].source.contains("text_signals"));
     }
 }

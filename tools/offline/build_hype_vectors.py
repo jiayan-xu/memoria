@@ -251,8 +251,8 @@ def main():
         "--ids",
         default=None,
         help=f"定点重跑：读取 id 清单文件（默认清单位置: {os.path.join(HERE, 'hype_failed_ids.txt')}，"
-        "或任意逗号分隔 id 列表文件）仅处理这些 id "
-        "（与 --all 的 fail_ids 清单闭环，#R53：此前清单只写不读，唯一重跑路径是全量 --all）",
+        "或任意逗号分隔 id 列表文件）仅处理这些 id。**必须与 --all 组合**（fail_ids "
+        "清单只由全量运行产生；独立 --ids 会对 golden 集过滤、报'已删除/失效'后空目标退出）",
     )
     ap.add_argument("--all", action="store_true", help="全库补嵌（验证通过后）")
     ap.add_argument("--db", default=DB)
@@ -358,8 +358,11 @@ def main():
     # #R62 bug/high：con 在此初始化（preflight 后段另有赋值）——atexit 注册段对
     # 非 --all 模式（golden/--ids）引用 con 时未定义 → UnboundLocalError 崩溃
     # 脚本主用法；--all 模式则避免误用旧连接对象。
+    # #R64 bug/high：guard **不能检查 con**（刚置 None 恒 False → atexit 永不
+    # 注册、中断保护死代码）；handler 只引用 args/pending_batch/failed_ids_path，
+    # 条件只需 `not args.dry_run`（dry-run 不写库无 pending）。
     con = None
-    if not args.dry_run and con is not None:
+    if not args.dry_run:
         # #R61 bug/low：**中断安全**——Ctrl+C/SIGINT 时最后未提交批（最多 49 条
         # 已付费行）被解释器回滚且不进 fail_ids（record_fail 的"中断不丢清单"
         # 承诺只覆盖已 append 的 id）；atexit 在退出路径（含 KeyboardInterrupt

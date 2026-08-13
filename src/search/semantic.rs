@@ -454,17 +454,20 @@ fn fetch_memories_batch(
                 },
             ) {
                 Ok(rows) => {
+                    let mut iterator_error: Option<String> = None;
                     for r in rows {
                         match r {
                             Ok((id, content)) => {
                                 out.insert(id, content);
                                 got += 1;
                             }
-                            Err(e) => {
+                            // #R64 bug/medium：**区分映射错误与迭代错误**——rusqlite
+                            // MappedRows 的 Err 项可能来自行映射闭包（列类型漂移，
+                            // 按行丢弃）或底层 step()（SQLITE_BUSY/IOERR，连接级
+                            // 故障）。迭代级错误 = 批硬失败（#R47 契约），且中止后
+                            // 未读行不混入 stale 计数。
+                            Err(e @ rusqlite::Error::FromSqlConversionFailure(..)) => {
                                 row_errors += 1;
-                                // #R51 performance/medium：样本行也走共享冷却——
-                                // 无冷却时 cap-3 样本在每查询刷 3 行（mostly stale +
-                                // 单行不可映射的常见混合态）。
                                 throttled_eprintln("fetch_row_mapping", || {
                                     format!(
                                         "[semantic] fetch row mapping failed (batch {} ids): {}",
@@ -473,6 +476,25 @@ fn fetch_memories_batch(
                                     )
                                 });
                             }
+                            Err(e) => {
+                                if iterator_error.is_none() {
+                                    iterator_error = Some(format!("step: {e}"));
+                                }
+                                throttled_eprintln("fetch_iterator", || {
+                                    format!(
+                                        "[semantic] fetch row iteration failed (batch {} ids): {}",
+                                        chunk.len(),
+                                        e
+                                    )
+                                });
+                                hard_failed = true;
+                                break;
+                            }
+                        }
+                    }
+                    if let Some(msg) = iterator_error {
+                        if first_hard_err.is_none() {
+                            first_hard_err = Some(msg);
                         }
                     }
                     // #R46 bug/medium：行映射失败默认**按行丢弃**。

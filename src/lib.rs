@@ -258,8 +258,10 @@ impl MemoriaEngine {
         // #R62 maintainability/low：**语义信号丢弃累计计数**——hybrid drop 语义
         // 通道时递增（semantic::bump_semantic_drops）；持续降级（索引损坏/DB
         // 故障）不再只对 tail stderr 的人可见，健康检查可据此告警。
+        // #R64 other/low：字段名披露**进程级全局**作用域——多引擎进程（多 PyEngine）
+        // 中此计数合并所有引擎，per-engine 健康监控按名可辨。
         m.insert(
-            "semantic_signal_drops".to_string(),
+            "semantic_signal_drops_global".to_string(),
             serde_json::Value::Number(
                 (search::semantic::semantic_drop_count() as i64).into(),
             ),
@@ -338,6 +340,23 @@ fn query_hype_count_cached(conn: &rusqlite::Connection, db_path: &str) -> i64 {
     use std::collections::HashMap;
     use std::sync::Mutex;
     use std::time::Instant;
+    // #R64 bug/medium：**:memory: 跳过缓存**——db_path 对内存引擎不是唯一身份
+    // （进程内多个 :memory: 引擎各自独立库却共享键 "…memory…"）：A 填充的 count
+    // 会被 B 读到（降级检测启发 store>0 && live==0 被污染）。文件路径删除重建
+    // 同路径 30s 内的陈旧也一并规避（直接查成本可接受）。
+    if db_path.starts_with(":memory:") || db_path.starts_with("file:") && db_path.contains("mode=memory") {
+        return match conn.query_row("SELECT COUNT(*) FROM memory_hype_vectors", [], |r| {
+            r.get::<_, i64>(0)
+        }) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!(
+                    "[Memoria] WARN: hype_vector_index_size query failed (db {db_path}): {e}"
+                );
+                -1
+            }
+        };
+    }
     static CACHE: Mutex<Option<HashMap<String, (Instant, i64)>>> = Mutex::new(None);
     static FAIL_EPOCHS: Mutex<Option<HashMap<String, Instant>>> = Mutex::new(None);
     {
@@ -543,7 +562,10 @@ mod python {
             }
             let (fresh, count, _) = slot.take().unwrap();
             self.inner.swap_hype_index(fresh, count);
-            Ok(count)
+            // #R64 bug/low：返回**实际应用长度**——引擎内部对 count 不匹配做了
+            // 修正（取 fresh.len()）；返回 pending 槽的原始 count 会让调用方拿到
+            // 与 hype_vector_index_live 不一致的统计。
+            Ok(self.inner.hype_hnsw.len())
         }
         fn add_vectors(&self, ids: Vec<String>, vectors: Vec<Vec<f32>>) -> PyResult<usize> {
             self.inner

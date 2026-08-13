@@ -787,11 +787,16 @@ pub fn migrate_hype_vectors(pool: &SqlitePool) -> Result<(), String> {
                             );
                         }
                     }
-                    // #R58 maintainability/low：共享 commit_tx（Drop 自动回滚，
-                    // 见 helper doc）。元组形态保留：commit 失败不重试（与 BEGIN
-                    // 的锁竞争语义无关）。
-                    commit_tx(tx, "commit updated_at tx")
-                        .map_err(|m| (m, None))?;
+                    // #R58 maintainability/low：共享 commit_tx 的 Drop 回滚语义
+                    // （commit 失败后事务仍活跃，Drop 自动回滚）。
+                    // #R64 bug/medium：**手写 commit 携带原始错误（Some(e)）**——
+                    // commit_tx 已把错误字符串化无法还原 rusqlite::Error；WAL 下
+                    // COMMIT 可 BUSY（auto-checkpoint 与并发读者竞态），此前归 None
+                    // 立即终止（列验证失败 → .expect 中止部署，并发首启场景唯一
+                    // 未保护的写路径）；busy COMMIT 走重试循环。
+                    if let Err(e) = tx.commit() {
+                        return Err((format!("commit updated_at tx: {e}"), Some(e)));
+                    }
                     Ok(())
                 })();
                 match r {
@@ -887,24 +892,41 @@ pub fn migrate_hype_vectors(pool: &SqlitePool) -> Result<(), String> {
         // （build_hype_vectors.py 插入 id/namespace/question/vector/updated_at）依赖
         // 它；此前漏检会让未来 schema 变更静默破坏离线写入路径。
         let expect: [&str; 5] = ["id", "namespace", "question", "vector", "updated_at"];
-        let have: Vec<String> = match conn
-            .prepare("SELECT name FROM pragma_table_info('memory_hype_vectors')")
-        {
-            Ok(mut stmt) => stmt
-                .query_map([], |r| r.get::<_, String>(0))
-                .map(|rows| rows.filter_map(|r| r.ok()).collect())
-                .unwrap_or_default(),
-            Err(_) => vec![],
-        };
-        let missing: Vec<&str> = expect
-            .iter()
-            .copied()
-            .filter(|c| !have.iter().any(|h| h.as_str() == *c))
-            .collect();
-        if !missing.is_empty() {
+        // #R64 maintainability/low：**先查表存在**——DDL 软降级（ddl_soft 失败）时
+        // pragma_table_info 对不存在的表返回 0 行，把"DDL 失败"误报为"5 列全部
+        // schema 漂移"（运维查无此 schema 变更）；缺表与列漂移是不同根因，
+        // 诊断必须区分（缺表 = 瞬时 DDL 失败，下次启动自愈）。
+        let table_exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='memory_hype_vectors'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        if table_exists == 0 {
             eprintln!(
-                "[Memoria] WARN: memory_hype_vectors schema drift - missing columns {missing:?} (HyPE feature degraded until next successful migration)"
+                "[Memoria] WARN: memory_hype_vectors table absent (DDL soft-degraded; will retry next start) - HyPE feature degraded"
             );
+        } else {
+            let have: Vec<String> = match conn
+                .prepare("SELECT name FROM pragma_table_info('memory_hype_vectors')")
+            {
+                Ok(mut stmt) => stmt
+                    .query_map([], |r| r.get::<_, String>(0))
+                    .map(|rows| rows.filter_map(|r| r.ok()).collect())
+                    .unwrap_or_default(),
+                Err(_) => vec![],
+            };
+            let missing: Vec<&str> = expect
+                .iter()
+                .copied()
+                .filter(|c| !have.iter().any(|h| h.as_str() == *c))
+                .collect();
+            if !missing.is_empty() {
+                eprintln!(
+                    "[Memoria] WARN: memory_hype_vectors schema drift - missing columns {missing:?} (HyPE feature degraded until next successful migration)"
+                );
+            }
         }
     }
 
@@ -928,6 +950,10 @@ pub fn migrate_hype_vectors(pool: &SqlitePool) -> Result<(), String> {
     // 仅在未来出现第二个 body 版本时才实质化；届时可加降级守卫（对比已安装的最大
     // 触发器版本）或接受"回退 = 契约回退到旧版"的语义（与二进制回退一致）。
     const TRIGGER_VERSION: &str = "trigger_mem_ad_vec_v2";
+    // #R64 bug/medium：fallback body 的**独立版本标记**——置位表示"曾安装过
+    // content-only body"；gate 检查它 → 下次启动（hype 表可能已恢复）重新评估
+    // 并升级 full body。升级成功后清除（同 refused flag 模式）。
+    const TRIGGER_FALLBACK_VERSION: &str = "trigger_mem_ad_vec_fallback_v1";
     // #R52 bug/medium：trig_done 读取**软处理**（WARN + 视为未置位）——并发首启时
     // 对端进程提交中可能让本进程此读 SQLITE_BUSY（busy_timeout 后）；硬失败会让
     // .expect 中止部署（与触发器重建本身软降级、flag_set 软读取的意图一致）。
@@ -943,7 +969,17 @@ pub fn migrate_hype_vectors(pool: &SqlitePool) -> Result<(), String> {
             eprintln!("[Memoria] WARN: check trigger version flag failed (treated as unset): {e}");
             false
         });
-    if !trig_done {
+    let trig_fallback_done = conn
+        .query_row(
+            "SELECT COUNT(*) FROM migration_flags WHERE flag = ?1",
+            rusqlite::params![TRIGGER_FALLBACK_VERSION],
+            |r| r.get::<_, i64>(0),
+        )
+        .map(|c| c > 0)
+        .unwrap_or(false);
+    // #R64 bug/medium：fallback 置位 → 重新评估（hype 表可能已恢复，需升级 full
+    // body）；升级成功路径清除 fallback flag。
+    if !trig_done || trig_fallback_done {
         // #R49 bug/medium：触发器重建**软降级**——BEGIN IMMEDIATE 在并发首启大库
         // 清理持锁时可能 BUSY（busy_timeout 超时）；触发器缺失只影响未来 memories
         // 删除的联动清理（孤儿可下次启动补，或孤儿清理段兜底），不阻断启动。
@@ -974,9 +1010,18 @@ pub fn migrate_hype_vectors(pool: &SqlitePool) -> Result<(), String> {
                     END",
                 )
                 .map_err(|e| format!("create mem_ad_vec trigger: {}", e))?;
+                // full body 升级成功：清除 fallback 标记（下次启动 gate 不再进入）。
+                tx.execute(
+                    "DELETE FROM migration_flags WHERE flag = ?1",
+                    rusqlite::params![TRIGGER_FALLBACK_VERSION],
+                )
+                .map_err(|e| format!("clear trigger fallback flag: {}", e))?;
             } else {
+                // #R64 bug/medium：fallback body 置**独立 flag**——同 TRIGGER_VERSION
+                // 会让后续启动（hype 表已恢复）跳过触发器段、full body 永不安装
+                // （WARN 承诺的自愈落空，DELETE 静默漏清 hype 孤儿）。
                 eprintln!(
-                    "[Memoria] WARN: memory_hype_vectors missing (DDL soft-degraded); trigger installed with memory_vectors-only body - hype orphans will be cleaned when table exists (next successful DDL)"
+                    "[Memoria] WARN: memory_hype_vectors missing (DDL soft-degraded); trigger installed with memory_vectors-only body - full body will be installed next start when table exists"
                 );
                 tx.execute_batch(
                     "CREATE TRIGGER mem_ad_vec AFTER DELETE ON memories BEGIN
@@ -984,6 +1029,11 @@ pub fn migrate_hype_vectors(pool: &SqlitePool) -> Result<(), String> {
                     END",
                 )
                 .map_err(|e| format!("create mem_ad_vec trigger (content-only): {}", e))?;
+                tx.execute(
+                    "INSERT OR IGNORE INTO migration_flags (flag) VALUES (?1)",
+                    rusqlite::params![TRIGGER_FALLBACK_VERSION],
+                )
+                .map_err(|e| format!("set trigger fallback version flag: {}", e))?;
             }
             tx.execute(
                 "INSERT OR IGNORE INTO migration_flags (flag) VALUES (?1)",

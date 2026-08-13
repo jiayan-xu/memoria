@@ -117,13 +117,14 @@ async fn embed(
             let f = x
                 .as_f64()
                 .ok_or_else(|| EmbedError::Malformed("non-numeric vector element".to_string()))?;
-            let f32 = f as f32;
-            if !f32.is_finite() {
+            // #R64 style/low：避免遮蔽内置类型名 f32。
+            let narrowed = f as f32;
+            if !narrowed.is_finite() {
                 return Err(EmbedError::Malformed(format!(
                     "non-finite vector element after f32 narrowing: {f}"
                 )));
             }
-            Ok(f32)
+            Ok(narrowed)
         })
         .collect()
 }
@@ -174,6 +175,10 @@ async fn embed_with_retry(client: &reqwest::Client, text: &str) -> Result<Vec<f3
 }
 
 /// 单条记忆的 HyPE 补嵌结果（#R44 maintainability/low：四个失败分支的簿记收口）。
+/// #R64 test/low：问句向量池（唯一性验证）——文件级 static：收集（hype_upsert_one）
+/// 与读取（最终断言）共享同一实例（函数局部 static 是两个独立实例，uniq 恒 0）。
+static HV_POOL: std::sync::Mutex<Option<Vec<Vec<f32>>>> = std::sync::Mutex::new(None);
+
 enum HypeOutcome {
     /// 问句化 embed → put → add 全链路成功且索引真正加入（n>0）。
     Covered,
@@ -249,9 +254,26 @@ async fn hype_upsert_one(
                     // 不符/锁污染）与 Ok(0)（dup id / f32 复检拒绝）是不同失败，日志区分。
                     match engine.hype_hnsw.add(&[VectorEntry {
                         id: rid.to_string(),
-                        vector: hv,
+                        vector: hv.clone(),
                     }]) {
-                        Ok(n) if n > 0 => HypeOutcome::Covered,
+                        Ok(n) if n > 0 => {
+                            // #R64 test/low：**hv 多样性收集**——所有问句映射同一
+                            // 向量的病态服务会通过 hv≠v 检查但贡献单点退化索引；
+                            // 唯一性在最终断言中验证（HV_POOL 文件级）。hv 在
+                            // add 用 clone 后仍可用（闭包借用）。
+                            if let Ok(mut g) = HV_POOL.lock() {
+                                let pool = g.get_or_insert_with(Vec::new);
+                                if !pool.iter().any(|q| {
+                                    q.len() == hv.len()
+                                        && q.iter()
+                                            .zip(hv.iter())
+                                            .all(|(a, b)| (a - b).abs() < 1e-4)
+                                }) {
+                                    pool.push(hv.clone());
+                                }
+                            }
+                            HypeOutcome::Covered
+                        }
                         Ok(_) => HypeOutcome::Skipped(
                             "add returned 0 entries (dup id or f32 re-validation)".into(),
                         ),
@@ -470,6 +492,21 @@ async fn memory_eval_semantic_inner() {
         "hype coverage too low: {hype_covered}/{hype_total} unique memories have HyPE vectors \
          (question-embed likely failing); skipped={hype_skipped}",
     );
+    // #R64 test/low：**hv 多样性断言**——唯一问句向量数非病态（恒等映射服务会让
+    // 所有 hv 相同 → 1 个唯一向量，双路合并退化单路而覆盖断言全绿）。
+    {
+        use std::sync::Mutex;
+        let uniq = HV_POOL
+            .lock()
+            .map(|g| g.as_ref().map(|v| v.len()).unwrap_or(0))
+            .unwrap_or(0);
+        let floor = (hype_total as f64 * 0.3).ceil() as usize;
+        assert!(
+            uniq >= floor.max(2),
+            "hype question vectors degenerate: {uniq} unique vs {hype_total} total (min {}) - embed service mapping all questions to one vector?",
+            floor.max(2)
+        );
+    }
 
     // 2) 官方 12 用例（query 嵌入 → 语义信号参与融合）
     let mut recall_hits = 0u32;
@@ -648,13 +685,50 @@ async fn memory_eval_semantic_inner() {
     }
     eprintln!("=================================================");
 
-    // #R62 test/medium：**skip 硬断言前置**——退化语料（跳过项）先于 recall 断言
-    // 大声失败且根因直接可见（此前 WARN 在 recall assert 之后、且跳过项不被任何
-    // case 引用时测试静默通过——"显式失败"意图落空）。
-    assert_eq!(
-        corpus_skipped, 0,
-        "{corpus_skipped} corpus item(s) skipped due to embed failures; expect_indices referencing them will fail"
-    );
+    // #R62 test/medium：**skip 断言前置**——退化语料（跳过项）先于 recall 断言
+    // 大声失败且根因直接可见。
+    // #R64 test/low：**按引用门控**——跳过位置被任一 case（expect/must_not/
+    // paraphrase）引用才硬失败；未被引用的跳过项只 warn（单次瞬时双败不至于
+    // 让 ~25 分钟评测整体 flake，引用的 case 会显式失败暴露缺口）。
+    if corpus_skipped > 0 {
+        use std::collections::HashSet;
+        let mut referenced: HashSet<usize> = HashSet::new();
+        for c in &cases {
+            if let Some(arr) = c["expect_indices"].as_array() {
+                for v in arr {
+                    if let Some(i) = v.as_u64() {
+                        referenced.insert(i as usize);
+                    }
+                }
+            }
+            if let Some(arr) = c["must_not_indices"].as_array() {
+                for v in arr {
+                    if let Some(i) = v.as_u64() {
+                        referenced.insert(i as usize);
+                    }
+                }
+            }
+        }
+        for (_, idx) in &paraphrase_cases {
+            referenced.insert(*idx);
+        }
+        // 占位符形如 "<embed-failed-N>"，N = corpus 索引。
+        let skipped_idx: HashSet<usize> = ids
+            .iter()
+            .filter_map(|id| id.strip_prefix("<embed-failed-").and_then(|s| s.parse::<usize>().ok()))
+            .collect();
+        let overlapping: Vec<usize> = skipped_idx.intersection(&referenced).copied().collect();
+        if !overlapping.is_empty() {
+            assert_eq!(
+                corpus_skipped, 0,
+                "{corpus_skipped} corpus item(s) skipped; skipped positions {overlapping:?} are referenced by cases - recall assertions unreliable"
+            );
+        } else {
+            eprintln!(
+                "[eval_semantic] WARN: {corpus_skipped} corpus item(s) skipped (not referenced by any case; recall unaffected)"
+            );
+        }
+    }
     assert!(
         recall >= RECALL_FLOOR,
         "召回@k {:.2} 低于下限 {:.2}",

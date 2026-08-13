@@ -34,9 +34,9 @@ Memoria 本地嵌入服务（语义检索后端）
 接口：
     POST /embed
         body:  {"texts": ["..."], "normalize": false}
-        return: {"embeddings": [[...]], "dim": 768, "model": "..."}
+        return: {"embeddings": [[...]], "dim": <EMBED_DIM 默认 1024>, "model": "..."}
     GET  /health
-        return: {"status": "ok", "model": "...", "dim": 768}
+        return: {"status": "ok", "model": "...", "dim": <EMBED_DIM 默认 1024>}
 """
 
 import os
