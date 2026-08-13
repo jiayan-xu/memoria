@@ -16,20 +16,21 @@ use std::collections::HashMap;
 /// （16/64 槽）总有确定性碰撞（DefaultHasher 固定 key，11 个键 64 槽碰撞概率
 /// ~58%；碰撞是永久性的，正是 16 槽 FNV 的跨抑制问题）。60s 冷却下锁竞争无关
 /// 紧要，per-key 精确隔离。
+/// #R54 other/low：**单调时钟（Instant）**——SystemTime 是墙钟，回拨时
+/// now < last 使 saturating_sub 恒 < 60s，所有冷却日志被静默压制到时钟追平；
+/// 恰在需要可观测性的故障场景失效。Instant 对墙钟调整免疫。
 pub(crate) fn throttled_eprintln(key: &'static str, msg: String) {
     const COOLDOWN_SECS: u64 = 60;
     use std::collections::HashMap;
     use std::sync::Mutex;
-    use std::time::{SystemTime, UNIX_EPOCH};
-    static LAST_LOGS: Mutex<Option<HashMap<&'static str, u64>>> = Mutex::new(None);
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+    use std::time::Instant;
+    static LAST_LOGS: Mutex<Option<HashMap<&'static str, Instant>>> = Mutex::new(None);
+    let now = Instant::now();
     let mut guard = LAST_LOGS.lock().unwrap_or_else(|p| p.into_inner());
     let m = guard.get_or_insert_with(HashMap::new);
-    let last = m.get(key).copied().unwrap_or(0);
-    if now.saturating_sub(last) >= COOLDOWN_SECS {
+    let last = m.get(key).copied();
+    let due = last.map_or(true, |t| now.duration_since(t).as_secs() >= COOLDOWN_SECS);
+    if due {
         m.insert(key, now);
         eprintln!("{msg} (at most once per {COOLDOWN_SECS}s)");
     }
@@ -98,7 +99,17 @@ pub fn semantic_search(
     // #R53 performance/low：容量提示——best 上界 ~2×overfetch（默认 recall_depth=50
     // 时 ~4096 条/查询），HashMap::new() 每查询多次 rehash/growth；rows 上界
     // ids.len()（排序后已知）。热路径一致优化的自然补全。
-    let best_cap = (limit as usize).saturating_mul(40).max(4096);
+    // #R54 bug/high：**容量 clamp 到实际索引规模**——limit 来自 hybrid.rs
+    // primary_limit = recall_depth.max(max_results*3)，max_results 是 MCP
+    // memory_search 用户可控参数（无上界钳制）；40×limit 在
+    // max_results=1e9 时 ≈120e9：with_capacity 要么 32 位容量溢出 panic、
+    // 要么 64 位多 TB 分配 OOM 中止进程——热请求路径。overfetch 本身恒被
+    // h.len() 钳制，真实合并集 ≤ 双索引容量；容量提示随索引规模走即可。
+    let cap_total = hnsw.map_or(0, |h| h.len()) + hype_hnsw.map_or(0, |h| h.len());
+    let best_cap = (limit as usize)
+        .saturating_mul(40)
+        .min(cap_total.saturating_add(2))
+        .max(4096);
     let mut best: HashMap<String, (f64, &'static str)> = HashMap::with_capacity(best_cap);
     // 两路分别搜索；`roads_ok` 统计成功路数——若**所有存在的路**都失败（如 RwLock
     // poisoned），返回 Err 而非空集，使调用方能区分"索引空"与"索引坏了"（#R34 other/low：
@@ -437,8 +448,12 @@ fn fetch_memories_batch(
     if stale_ids_total > 0 {
         throttled_eprintln(
             "fetch_stale",
+            // #R54 other/low：0 行有两类原因——跨 ns 候选（查询 SQL 已按 ns 过滤，
+            // 全局 HNSW 过取窗口在多租户下大部分是外 ns 向量，属**设计的过滤行为**）
+            // 与删除滞后（悬空 id）。文案并列两因，避免把正常跨租户过取误归因为
+            // 删除滞后、驱动错误的召回排查。
             format!(
-                "{stale_ids_total} candidate id(s) matched 0 rows (expected in-memory HNSW lag after deletions)"
+                "{stale_ids_total} candidate id(s) matched 0 rows in this ns (cross-tenant overfetch or deletion lag)"
             ),
         );
     }

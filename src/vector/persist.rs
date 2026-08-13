@@ -370,9 +370,17 @@ fn rebuild_from_table(
                 rows_seen += 1;
                 // #R53 performance/low：**blob 字节长度在 decode 前判定**——损坏/超长
                 // blob 先全量解码分配再被拒（恰是要防的损坏场景）；chunks_exact(4)
-                // 语义下分类完全由 blob.len() 决定：短于 DIM*4 → 维度漂移（dim 桶，
-                // 与 #R48"dim 先于 blob"一致）；长于 DIM*4 → 尾部垃圾/超长（blob 桶）。
-                // 仅恰好 DIM*4 才需要解码（此时 v.len() 恒为 DIM，dim 检查冗余）。
+                // 语义下分类主要由 blob.len() 决定。
+                // #R54 maintainability/low：**4 字节对齐先查**——非 4 的倍数 = 截断/
+                // 对齐损坏（写入端 encode_vector 恒产出 4 倍数长度，非倍数必是损坏）：
+                // 与"维度漂移"（短但 4 对齐，如 768d 模型）区分开，否则 DIM*4-2 这类
+                // 截断 blob 被误读成 1024→768 模型漂移、DIM*4+2 被归"超长"（而
+                // chunks_exact 恰好解出 DIM 个有效 f32 本可入索引）。all-skipped 的
+                // Err 现在门控 hype 启动路径，归因错误会把运维引向错误根因。
+                if blob.len() % 4 != 0 {
+                    skipped_blob += 1;
+                    continue;
+                }
                 if blob.len() < DIM * 4 {
                     skipped_dim += 1;
                     continue;
@@ -444,7 +452,7 @@ fn rebuild_from_table(
         };
         if td.error_on_all_skipped {
             return Err(format!(
-                "{label}: {cause} (dim mismatch, corrupt blob, or read error)"
+                "{label}: {cause} (dim mismatch, corrupt/degenerate blob, or read error)"
             ));
         }
         eprintln!("[persist] {label}: {cause}; returning 0 (historical behavior)");

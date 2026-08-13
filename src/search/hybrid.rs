@@ -91,11 +91,24 @@ pub fn hybrid_search(
                 // #R49 performance/low：Err 是持久故障（RwLock poisoning/DB 持续故障）
                 // 时每查询刷一行 → 60s 冷却（共享 helper，#R51：按 key 隔离，不同故障
                 // 原因不互相抑制——单一全局 static 会让一种持续故障压住并发故障）。
+                // #R54 maintainability/low：key 按**错误类别**派生——此 Err 分支汇合
+                // 多种原因（query 向量 dim 不符 / 全路 poisoned / fetch DB 故障），
+                // 单一字面 key 只按调用点隔离：一种持续故障（如 DB 中断）会重置
+                // 时间戳、把并发出现的另一种原因压制满 60s（恰是注释声称避免的
+                // 跨抑制）。按消息前缀分类到独立 key。
                 Err(e) => {
-                    crate::search::semantic::throttled_eprintln(
-                        "hybrid_semantic_drop",
-                        format!("[hybrid] semantic signal dropped: {e}"),
-                    );
+                    let msg = format!("[hybrid] semantic signal dropped: {e}");
+                    let key: &'static str = if e.starts_with("semantic_search: query vector dim") {
+                        "hybrid_drop_dim"
+                    } else if e.contains("road(s) failed") {
+                        "hybrid_drop_roads"
+                    } else if e.contains("fetch") || e.contains("pool") || e.contains("backfill")
+                    {
+                        "hybrid_drop_db"
+                    } else {
+                        "hybrid_drop_other"
+                    };
+                    crate::search::semantic::throttled_eprintln(key, msg);
                 }
             }
         }

@@ -409,7 +409,10 @@ async fn memory_eval_semantic() {
             .unwrap_or_default();
 
         // query 嵌入
-        if let Ok(v) = embed(&client, q, std::time::Duration::from_secs(60)).await {
+        // #R54 test/medium：query 嵌入也走 embed_with_retry——单发 embed 的瞬时
+                // Transport/429/5xx 会静默丢 query 向量（if let Ok 吞错），hybrid
+                // 召回低于 RECALL_FLOOR(0.85) 假红；与 corpus/HyPE 路径统一重试策略。
+                if let Ok(v) = embed_with_retry(&client, q).await {
             engine.cache_query_vector(q, v);
         }
 
@@ -476,7 +479,7 @@ async fn memory_eval_semantic() {
     for (pq, idx) in &paraphrase_cases {
         let ns = "agent/default";
         let k = 5;
-        if let Ok(v) = embed(&client, pq, std::time::Duration::from_secs(60)).await {
+        if let Ok(v) = embed_with_retry(&client, pq).await {
             engine.cache_query_vector(pq, v);
         }
         let results = hybrid_search(
