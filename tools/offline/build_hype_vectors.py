@@ -128,9 +128,13 @@ def generate_question(content: str) -> str:
             if not isinstance(content_val, dict):
                 return ""
             content_val = content_val.get("content")
-            if content_val is None:
+            # #R48 bug/low：content 可能是**非字符串结构**（content-parts 数组/
+            # 结构化 refusal）——无条件 str() 会把 list 转成 `[{'type': 'text', ...}]`
+            # 这类 repr，长度 ≥6 通过校验后被当作伪问句嵌入持久化，污染 HyPE 召回。
+            # 非 str 按确定性 skip 返回 ""（与 null/缺失/空 choices 同语义）。
+            if not isinstance(content_val, str):
                 return ""
-            return str(content_val).strip().strip('"').strip("'")
+            return content_val.strip().strip('"').strip("'")
         except urllib.error.HTTPError as e:
             # #R41 bug/medium：4xx（除 429 限流）是确定性配置错误（401 无效 key、400
             # 未知模型/超长内容）——重试/重跑永远同样失败，直接 raise 免白付 3 次付费
@@ -360,7 +364,7 @@ def main():
         # 运行静默抹掉上次全量运行累积的失败清单（"定点重跑"工件），运维先 --limit
         # 调试再定点重跑时清单已丢，被迫全量 --all 再付几千次付费调用。dry-run 与
         # preflight 失败已有守卫，部分运行此前漏网。
-        if args.limit is None:
+        if args.all and args.limit is None:
             try:
                 if os.path.exists(failed_ids_path):
                     os.remove(failed_ids_path)
@@ -374,7 +378,7 @@ def main():
         #R46 bug/medium：仅**全量**运行（--limit is None）落盘——--limit 调试/抽样
         运行的失败既不写盘也不清理，旧清单保持完整（不被部分运行污染/覆盖）。"""
         fail_ids.append(mid)
-        if not args.dry_run and args.limit is None:
+        if not args.dry_run and args.all and args.limit is None:
             try:
                 with open(failed_ids_path, "a", encoding="utf-8") as f:
                     f.write(mid + "\n")
@@ -462,10 +466,12 @@ def main():
         # 直接 'w' 截断原文件后若写入中途失败（磁盘满/崩溃），record_fail 追加累积的
         # 清单被毁，中断安全承诺恰在要保护的错误路径上失效。原子替换保证目标文件
         # 要么是旧完整清单、要么是新完整清单，绝不半写。
-        # #R46 bug/medium：仅全量运行重写文件——--limit 调试运行的失败集是子集，
-        # 覆盖旧清单会破坏"定点重跑"工件。
+        # #R46/#R48 bug/medium：仅**全量 --all**（不带 --limit）运行重写文件——--limit
+        # 调试运行与默认 golden 运行的失败集都是子集，覆盖/清理旧清单会破坏
+        # "--all 全量累积的定点重跑工件"（#R48：golden 默认运行此前也满足
+        # `limit is None` 门控，会静默销毁全量清单）。
         dedup = list(dict.fromkeys(fail_ids))
-        if args.limit is None:
+        if args.all and args.limit is None:
             try:
                 tmp = failed_ids_path + ".tmp"
                 with open(tmp, "w", encoding="utf-8") as f:
@@ -473,9 +479,13 @@ def main():
                 os.replace(tmp, failed_ids_path)
             except OSError as e:
                 print(f"  [warn] 重写 {failed_ids_path} 失败（追加清单仍保留）: {e}")
-            print(f"失败 id 已写入 {failed_ids_path}（{len(dedup)} 条）")
+            else:
+                # #R48 bug/low：成功提示只在 os.replace 成功后打印——替换失败时目标
+                # 文件仍是带重复的原始追加清单，与"已写入去重清单"表述矛盾、误导运维
+                # 误信文件已原子替换。
+                print(f"失败 id 已写入 {failed_ids_path}（{len(dedup)} 条）")
         else:
-            print(f"（--limit 调试运行，未写 fail_ids 文件）本次失败 {len(dedup)} 条")
+            print(f"（非全量 --all 运行，未写 fail_ids 文件）本次失败 {len(dedup)} 条")
 
 
 if __name__ == "__main__":

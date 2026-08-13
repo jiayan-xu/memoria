@@ -63,8 +63,13 @@ impl<T> Pipe for T {}
 /// 服务明确拒绝，如维度校验失败/路径错误，属系统性），对 4xx 直接放弃不重试；
 /// 其余（网络/解析/5xx）视为瞬时抖动重试一次。此前对所有错误都重试，系统性拒绝
 /// 时每条语料多付 500ms + 一次必然失败的请求（22 条 → 10s+ 浪费）。
+/// #R48 bug/medium：4xx 中 **429（限流）/408（请求超时）是瞬时**——本地 embed_server
+/// 限流时按永久跳过会静默丢语料、触发覆盖率假红（正是有界重试要防的故障模式）。
+/// 字符串前缀分类脆弱（错误格式改动会静默改变重试行为），结构化错误留待后续。
 fn is_transient_embed_err(e: &str) -> bool {
     !e.starts_with("embed http status 4")
+        || e.starts_with("embed http status 429")
+        || e.starts_with("embed http status 408")
 }
 
 async fn embed_with_retry(client: &reqwest::Client, text: &str) -> Result<Vec<f32>, String> {
@@ -294,8 +299,10 @@ async fn memory_eval_semantic() {
     // 剩余 skip 是小概率事件，按比例断言与"系统性故障"难以区分。
     // #R47 bug/medium：floor 必须**门控于小 total**——无条件 `hype_covered >= 3` 会让
     // 22 条语料（~21 唯一 rid）只覆盖 3 条（~14%）就通过，重新打开 no-op 假绿。
-    // 公式：需求 = max(min(3, total), total*0.8)——total≤3 时要求全覆盖（小语料全部
-    // 成功才算数），total≥4 时 80% 比例权威（floor 不生效）。
+    // 阈值 = max(min(3, total), 0.8×total)：total≤3 要求全覆盖；total≥4 时比例权威。
+    // #R48 documentation/low：hype_covered 是整数、与 f64 阈值比较——实际需求是
+    // ceil(0.8×total)（total=4 时 3.2 → 须 4，即 100%；total=6..9 时 83%~88%），
+    // 仅 total 为 5 的倍数时恰好 80%。注释以 ceil 语义表述以免误导调参。
     assert!(
         hype_covered as f64 >= (hype_total.min(3) as f64).max(hype_total as f64 * 0.8),
         "hype coverage too low: {hype_covered}/{hype_total} unique memories have HyPE vectors \

@@ -100,13 +100,27 @@ pub fn semantic_search(
     // 与空结果同等处理（仅记录后丢弃），升级无新增诊断价值。search_and_merge 已逐次
     // eprintln 失败路——降级以日志呈现，返回值仍 Ok(vec![])。
     // #R47 performance/low：该降级行**每查询都会命中**（失败路持续 + 多数查询无近邻），
-    // 无条件 eprintln 会刷爆 stderr——只记首次（状态转换语义：何时开始降级）。
+    // 无条件 eprintln 会刷爆 stderr。
+    // #R48 other/low：`once-only` 标志永不重武装——早期瞬时降级后，后续（可能持久的）
+    // 降级期保持静默。用**时间戳冷却**（60s）重武装：持续故障每 ~60s 出一条信号，
+    // 瞬时抖动只出一条。
     if roads_failed > 0 && best.is_empty() {
-        use std::sync::atomic::{AtomicBool, Ordering};
-        static DEGRADED_LOGGED: AtomicBool = AtomicBool::new(false);
-        if !DEGRADED_LOGGED.swap(true, Ordering::Relaxed) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::time::{SystemTime, UNIX_EPOCH};
+        const COOLDOWN_SECS: u64 = 60;
+        static LAST_DEGRADED_LOG: AtomicU64 = AtomicU64::new(0);
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let last = LAST_DEGRADED_LOG.load(Ordering::Relaxed);
+        if now.saturating_sub(last) >= COOLDOWN_SECS
+            && LAST_DEGRADED_LOG
+                .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+        {
             eprintln!(
-                "semantic_search: {roads_failed} road(s) failed and survivors returned no matches (degraded; logged once)"
+                "semantic_search: {roads_failed} road(s) failed and survivors returned no matches (degraded; logged at most once per {COOLDOWN_SECS}s)"
             );
         }
     }
@@ -130,8 +144,10 @@ pub fn semantic_search(
     // content 回填前被并发删除时，原实现静默丢正文）。
     let mut ids: Vec<&str> = best.keys().map(|s| s.as_str()).collect();
     ids.sort_unstable();
+    // #R48 performance/medium：ns 过滤推入 SQL（见 fetch_memories_batch doc）——
+    // 返回行已属当前 ns，输出循环无需再判 ns。
     let rows: HashMap<String, (String, Option<String>)> = match pool {
-        Some(p) => fetch_memories_batch(p, &ids)?,
+        Some(p) => fetch_memories_batch(p, &ids, namespace)?,
         None => return Ok(vec![]),
     };
 
@@ -141,12 +157,9 @@ pub fn semantic_search(
         // 删除/失败行）在此直接跳过——正文缺失的命中若进入融合会被 rrf_merge 以空
         // 正文锁定（P3-0），不返回候选只损失召回、不污染正文。此前 `unwrap_or_default`
         // 兜底在此**不可达**（死默认掩盖了 P3-0 不变量），已删除。
-        let Some((ns, content)) = rows.get(*memory_id) else {
+        let Some((_ns, content)) = rows.get(*memory_id) else {
             continue;
         };
-        if ns != namespace {
-            continue;
-        }
         // NULL content = 合法数据态，召回损失（剔 id）——与映射失败区分（#R42）。
         let Some(content) = content else {
             continue;
@@ -239,29 +252,48 @@ fn search_and_merge(
 /// （`row_errors == chunk.len()`：无 stale 掺水，可确认是系统性列漂移）（#R47 bug/low：
 /// 仅 `got==0 && row_errors>0` 会把"mostly stale + 单行异常"误判为系统性——一批 500
 /// 个请求只有 1 行存在且恰好不可映射时，整批升级会让 hybrid.rs 因单条异常行丢弃
-/// 整个语义通道）。**任一**批硬失败即 Err（#R47 bug/medium：部分失败返回 Ok(partial)
-/// 会让调用方把部分召回损失当完整结果，静默丢失最多 BATCH×N 个候选且不可观测；
-/// Err 使 hybrid.rs 记录 `semantic signal dropped`，降级可见可查）。
+/// 整个语义通道；判定用**实际返回行数**（returned = got + row_errors）而非请求数：
+/// 无 stale 掺水（所有请求 id 都返回了行且全部失败）才是确凿的列漂移。**任一**批
+/// 硬失败即 Err（#R47 bug/medium：部分失败返回 Ok(partial) 会让调用方把部分召回
+/// 损失当完整结果，静默丢失最多 BATCH×N 个候选且不可观测；Err 使 hybrid.rs 记录
+/// `semantic signal dropped`，降级可见可查）。
+///
+/// ns 过滤**推入 SQL**（#R48 performance/medium）：多租户部署下全局候选大部分属
+/// 其他 ns，Rust 侧过滤意味着读取/分配大量立即丢弃的 content 全文（MB 级 I/O 与
+/// 堆抖动），且跨租户正文被拉过 fetch 边界（虽不返回）。`AND namespace = ?` 保持
+/// 单趟往返/TOCTOU 收益且从不读外 ns 行。
 fn fetch_memories_batch(
     pool: &SqlitePool,
     ids: &[&str],
+    namespace: &str,
 ) -> Result<HashMap<String, (String, Option<String>)>, String> {
     const BATCH: usize = 500;
-    let conn = pool.get().map_err(|e| format!("semantic fetch pool: {}", e))?;
     let mut out = HashMap::new();
     let mut batches_total = 0usize;
     let mut hard_failed_batches = 0usize;
+    // #R48 performance/medium：stale id 日志**聚合**——内存 HNSW 不随删除修剪
+    // （预期滞后），批量删除后每次查询大量 stale id，逐批 eprintln 每查询刷 ~9 行
+    // stderr 淹没真实错误。批内只累计计数，函数末尾汇总一行。
+    let mut stale_ids_total = 0usize;
+    // 行级映射错误同样限流（前 3 条作原因样本，其余计数汇总）。
+    let mut row_err_logged = 0usize;
+    const ROW_ERR_LOG_CAP: usize = 3;
     for chunk in ids.chunks(BATCH) {
         batches_total += 1;
         let placeholders = vec!["?"; chunk.len()].join(",");
         let sql = format!(
-            "SELECT id, namespace, content FROM memories WHERE id IN ({})",
+            "SELECT id, namespace, content FROM memories WHERE id IN ({}) AND namespace = ?",
             placeholders
         );
         let mut hard_failed = false;
+        // #R48 performance/low：连接**每批重新获取**——跨整循环持有会在并发搜索时
+        // 把连接钉住 ~9 次往返时长，小池场景加剧耗尽（耗尽即整通道 Err）。
+        let conn = pool.get().map_err(|e| format!("semantic fetch pool: {}", e))?;
         match conn.prepare(&sql) {
             Ok(mut stmt) => match stmt.query_map(
-                rusqlite::params_from_iter(chunk.iter().map(|s| *s)),
+                rusqlite::params_from_iter(
+                    chunk.iter().map(|s| *s).chain(std::iter::once(namespace)),
+                ),
                 // content 可空（schema `content TEXT` 无 NOT NULL）：Option 读取，
                 // NULL 是合法数据态（单独计数），不当作行映射错误（#R42 bug/high：
                 // 否则全 NULL 批被误判为列漂移硬失败，触发全批升级）。
@@ -284,24 +316,29 @@ fn fetch_memories_batch(
                             }
                             Err(e) => {
                                 row_errors += 1;
-                                eprintln!(
-                                    "[semantic] fetch row mapping failed (batch {} ids): {}",
-                                    chunk.len(),
-                                    e
-                                );
+                                if row_err_logged < ROW_ERR_LOG_CAP {
+                                    row_err_logged += 1;
+                                    eprintln!(
+                                        "[semantic] fetch row mapping failed (batch {} ids): {}",
+                                        chunk.len(),
+                                        e
+                                    );
+                                }
                             }
                         }
                     }
-                    // #R46 bug/medium：行映射失败默认**按行丢弃**（逐行已 eprintln）。
-                    // #R47 bug/low：唯一例外——`row_errors == chunk.len()` 即所有请求
-                    // id 都返回了行且**全部**映射失败（无 stale 掺水）：这是确凿的
-                    // 系统性列漂移，硬失败升级。`got == 0 && row_errors > 0` 的混合
-                    // 场景（mostly stale + 单行异常）不升级。
+                    // #R46 bug/medium：行映射失败默认**按行丢弃**。
+                    // #R48 bug/medium：系统性判定用**实际返回行数** returned——
+                    // `row_errors == chunk.len()` 要求批内无 stale（任何 stale id 都
+                    // 让 row_errors < chunk.len()，真实列漂移被降级为逐行 eprintln，
+                    // 安全网永不触发）。returned 计数后 `row_errors == returned` 即
+                    // "所有返回行都失败"且无 stale 掺水 → 确凿列漂移，硬失败升级。
+                    let returned = got + row_errors;
                     if got == 0 && row_errors > 0 {
-                        if row_errors == chunk.len() {
+                        if row_errors == returned {
                             eprintln!(
-                                "[semantic] fetch: all {} requested ids returned rows and ALL failed mapping (systematic column drift)",
-                                chunk.len()
+                                "[semantic] fetch: all {} returned rows failed mapping (systematic column drift)",
+                                returned
                             );
                             hard_failed = true;
                         } else {
@@ -312,11 +349,8 @@ fn fetch_memories_batch(
                         }
                     } else if got == 0 {
                         // 0 行无错误 = stale ids（并发删除/悬空 HNSW id）——预期数据
-                        // 滞后态，仅记录不升级（#R45 bug/medium，见函数 doc）。
-                        eprintln!(
-                            "[semantic] fetch: batch of {} ids matched 0 rows (stale ids)",
-                            chunk.len()
-                        );
+                        // 滞后态，仅计数不升级（#R45 bug/medium，见函数 doc）。
+                        stale_ids_total += chunk.len();
                     } else if row_errors > 0 {
                         eprintln!(
                             "[semantic] fetch: {row_errors} of {} rows failed mapping (dropping those ids)",
@@ -345,6 +379,11 @@ fn fetch_memories_batch(
         if hard_failed {
             hard_failed_batches += 1;
         }
+    }
+    if stale_ids_total > 0 {
+        eprintln!(
+            "[semantic] fetch: {stale_ids_total} candidate id(s) matched 0 rows (expected in-memory HNSW lag after deletions)"
+        );
     }
     // #R47 bug/medium：**任一**批硬失败即 Err——部分失败返回 Ok(partial) 会让调用方
     // 把召回损失当完整结果（静默丢候选、监控不可见）；Err 使 hybrid.rs 记录

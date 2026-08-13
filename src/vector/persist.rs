@@ -335,10 +335,16 @@ fn rebuild_from_table(
                 // 把截断向量静默装入索引。显式校验 blob 字节长度 = DIM*4 彻底关闭
                 // 小尾部损坏缝隙（"损坏行被跳过"的保证对尾部损坏同样成立）。
                 let norm_sq: f64 = v.iter().map(|x| (*x as f64) * (*x as f64)).sum();
-                if blob.len() != DIM * 4 {
-                    skipped_blob += 1;
-                } else if v.len() != DIM {
+                // #R48 maintainability/low：**dim 检查先于 blob 长度**——decode_vector 用
+                // chunks_exact(4)：blob 恰为 DIM*4 字节时必解出 DIM 个 float（此前
+                // `else if v.len() != DIM` 分支不可达、skipped_dim 恒 0，真实维度漂移
+                // （如嵌入模型 1024→768，短 blob）被误报为 corrupt blob）。先查 dim：
+                // 短 blob/维度漂移 → dim 桶；恰 DIM 个 float 但字节超 DIM*4（尾部垃圾）
+                // → blob 桶；退化（零/NaN）→ degenerate 桶。
+                if v.len() != DIM {
                     skipped_dim += 1;
+                } else if blob.len() != DIM * 4 {
+                    skipped_blob += 1;
                 } else if !norm_sq.is_finite() || norm_sq <= 0.0 {
                     skipped_degenerate += 1;
                 } else {
