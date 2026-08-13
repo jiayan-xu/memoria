@@ -101,6 +101,7 @@ static ENV_LOCK: std::sync::RwLock<()> = std::sync::RwLock::new(());
 /// Drop 恢复原值（含 unwind）；search_boosts（pin enabled）与 env_off 共用。
 /// #R64 maintainability/low：**生命周期编码锁不变量**——`'a` 绑定 write guard，
 /// 构造必须在锁作用域内（类型层面杜绝 drop 时无锁的 UB，此前只靠注释约定）。
+#[must_use = "EnvRestore::drop 负责恢复 env，丢弃即失去恢复（避免在语句末尾提前 drop）"]
 struct EnvRestore<'a>(Option<std::ffi::OsString>, &'a std::sync::RwLockWriteGuard<'a, ()>);
 impl Drop for EnvRestore<'_> {
     fn drop(&mut self) {
@@ -288,6 +289,8 @@ fn text_signals_rerank_env_off() {
     // #R62 bug/low：var_os 无损快照——var().ok() 把非 Unicode 预设值归 None，
     // Drop 时误执行 remove_var（违反"恢复原值"契约）。
     let prev = std::env::var_os("MEMORIA_TEXT_SIGNALS_RERANK");
+    // SAFETY: 本 unsafe 块处于 ENV_LOCK 写锁串行区内（_guard 持有），本二进制内
+    // 所有 env 读/写（含 EnvRestore::drop）均经同一把锁，无并发访问。
     unsafe {
         std::env::set_var("MEMORIA_TEXT_SIGNALS_RERANK", "0");
     }

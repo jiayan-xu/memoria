@@ -741,7 +741,14 @@ pub fn migrate_hype_vectors(pool: &SqlitePool) -> Result<(), String> {
                 [],
                 |r| r.get(0),
             )
-            .unwrap_or(0);
+            // #R66 maintainability/low：读失败**可见**（BUSY/坏连接被误判为列缺失
+            // 触发无谓写事务——事务路径安全，但诊断应点名真实错误）。
+            .unwrap_or_else(|e| {
+                eprintln!(
+                    "[Memoria] WARN: check memory_vectors.updated_at (fast path) failed, treating as missing: {e}"
+                );
+                0
+            });
         if fast_has_upd == 0 {
             let mut attempt = 0;
             loop {
@@ -764,7 +771,18 @@ pub fn migrate_hype_vectors(pool: &SqlitePool) -> Result<(), String> {
                         ) {
                             // #R53 bug/high：`duplicate column name` = 对端进程刚提交了
                             // 同一 ALTER（并发首启窗口）——按"已应用"处理，不中止启动。
-                            if is_duplicate_column(&e) {
+                            // #R66 maintainability/low：**重查列存在**（消息/错误码
+                            // 无关幂等）——is_duplicate_column 依赖 libsqlite3-sys
+                            // 版本映射 + 英文消息，升级/变体可能静默失效；列现在
+                            // 存在即视为已应用。
+                            let col_now: i64 = tx
+                                .query_row(
+                                    "SELECT COUNT(*) FROM pragma_table_info('memory_vectors') WHERE name='updated_at'",
+                                    [],
+                                    |r| r.get(0),
+                                )
+                                .unwrap_or(0);
+                            if col_now > 0 || is_duplicate_column(&e) {
                                 eprintln!(
                                     "[Memoria] Migration: memory_vectors.updated_at added by peer process"
                                 );
@@ -979,7 +997,25 @@ pub fn migrate_hype_vectors(pool: &SqlitePool) -> Result<(), String> {
         .unwrap_or(false);
     // #R64 bug/medium：fallback 置位 → 重新评估（hype 表可能已恢复，需升级 full
     // body）；升级成功路径清除 fallback flag。
+    // #R66 bug/medium：**版本已置位也重查表存在**——full body 触发器在表缺失时
+    // （手动 DROP/部分恢复/损坏）让每次 DELETE memories 报 no such table（核心
+    // 删除路径被可选表硬前置）；缺表 → 降级 content-only body + fallback flag。
     if !trig_done || trig_fallback_done {
+        // 版本已置位时的降级检查：表缺失 → 强制重装 content-only body。
+        if trig_done && !trig_fallback_done {
+            let hype_present: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='memory_hype_vectors'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0);
+            if hype_present == 0 {
+                eprintln!(
+                    "[Memoria] WARN: memory_hype_vectors absent though trigger v2 installed - downgrading trigger to content-only body"
+                );
+            }
+        }
         // #R49 bug/medium：触发器重建**软降级**——BEGIN IMMEDIATE 在并发首启大库
         // 清理持锁时可能 BUSY（busy_timeout 超时）；触发器缺失只影响未来 memories
         // 删除的联动清理（孤儿可下次启动补，或孤儿清理段兜底），不阻断启动。
@@ -1002,6 +1038,8 @@ pub fn migrate_hype_vectors(pool: &SqlitePool) -> Result<(), String> {
                     |r| r.get(0),
                 )
                 .map_err(|e| format!("check memory_hype_vectors existence: {}", e))?;
+            // #R66：降级路径（版本已置位 + 表缺失）——hype_table_exists==0 时走
+            // fallback body + fallback flag（下段分支已按表存在分流）。
             if hype_table_exists > 0 {
                 tx.execute_batch(
                     "CREATE TRIGGER mem_ad_vec AFTER DELETE ON memories BEGIN

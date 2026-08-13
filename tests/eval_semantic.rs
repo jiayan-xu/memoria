@@ -392,17 +392,23 @@ async fn memory_eval_semantic_inner() {
         // 后续 expect_indices/must_not_indices/paraphrase 用 `ids.get(i)` 定位；
         // 裸 continue 会让后续索引整体漂移（ids.get(5) 解析到错误记忆，断言错指
         // 或错对）。占位符使跳过项在 case 断言中**显式失败**（而非静默错位）。
-        let Ok(v) = embed_with_retry(&client, content).await else {
-            eprintln!(
-                "[eval_semantic] corpus embed failed for {:?}; skipping this item (placeholder keeps id alignment)",
-                content.get(..content.floor_char_boundary(min(content.len(), 80)))
-            );
-            // #R61 bug/medium：**corpus_skipped 计数**——占位符使引用该位置的
-            // expect_indices 必败且后续近义去重漂移（错位假红）；计数在最终
-            // 断言前显式报告，根因直指 embed skip 而非索引错位的召回失败。
-            corpus_skipped += 1;
-            ids.push(format!("<embed-failed-{}>", ids.len()));
-            continue;
+        // #R66 test/medium：**绑定 Err**（else 不绑定让失败原因丢失——timeout/500/
+        // malformed payload 无法区分瞬时双败与系统性拒绝，正是 #R58 要解决的
+        // 低诊断缺口；query/paraphrase/hype 路径均打印 {e}）。
+        let v = match embed_with_retry(&client, content).await {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!(
+                    "[eval_semantic] corpus embed failed: {e} for {:?}; skipping this item (placeholder keeps id alignment)",
+                    content.get(..content.floor_char_boundary(min(content.len(), 80)))
+                );
+                // #R61 bug/medium：**corpus_skipped 计数**——占位符使引用该位置的
+                // expect_indices 必败且后续近义去重漂移（错位假红）；计数在最终
+                // 断言前显式报告，根因直指 embed skip 而非索引错位的召回失败。
+                corpus_skipped += 1;
+                ids.push(format!("<embed-failed-{}>", ids.len()));
+                continue;
+            }
         };
         // v 用于内容路（cache_query_vector）；HyPE 块需内容向量副本校验「问句向量与内容
         // 向量确实不同」核心不变量（#R46 test/medium）——clone 一次（1024 维，廉价）。
@@ -514,7 +520,11 @@ async fn memory_eval_semantic_inner() {
             .as_ref()
             .map(|v| v.len())
             .unwrap_or(0);
-        let floor = (hype_total as f64 * 0.3).ceil() as usize;
+        // #R66 test/low：**下限钳制 hype_total**——近义去重把唯一 rid 压到 1 时
+        // floor.max(2) 恒不成立（正常服务也假红）；与覆盖断言的 min(3) 门控一致。
+        let floor = ((hype_total as f64 * 0.3).ceil() as usize)
+            .max(2)
+            .min(hype_total.max(1));
         assert!(
             uniq >= floor.max(2),
             "hype question vectors degenerate: {uniq} unique vs {hype_total} total (min {}) - embed service mapping all questions to one vector?",
@@ -743,8 +753,9 @@ async fn memory_eval_semantic_inner() {
         let overlapping_must_not: Vec<usize> =
             skipped_idx.intersection(&must_not_ref).copied().collect();
         if !overlapping_expect.is_empty() {
-            assert_eq!(
-                corpus_skipped, 0,
+            // #R66 style/low：panic! 直接表达失败原因（assert_eq 在 if 内恒假，
+            // 渲染成误导性的相等性不匹配）。
+            panic!(
                 "{corpus_skipped} corpus item(s) skipped; expect/paraphrase positions {overlapping_expect:?} referenced - recall assertions unreliable"
             );
         } else if !overlapping_must_not.is_empty() {

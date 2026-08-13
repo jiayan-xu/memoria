@@ -118,12 +118,13 @@ def generate_question(content: str) -> str:
             )
             with urllib.request.urlopen(req, timeout=30) as r:
                 try:
-                    resp = json.loads(r.read().decode())
-                except json.JSONDecodeError as e:
+                    # #R66 bug/low：json.loads 直接吃 bytes（免 UTF-8 解码——非
+                    # UTF-8 体抛 UnicodeDecodeError 落 catch-all 重试 3 次白付）。
+                    resp = json.loads(r.read())
+                except (json.JSONDecodeError, UnicodeDecodeError) as e:
                     # #R55 bug/medium：2xx 非 JSON 体是确定性畸形响应（同形状每次必现）——
-                    # 直接确定性跳过，不重试（此前 JSONDecodeError 落 catch-all 重试 3 次
-                    # 白付 3 次付费调用后进 fail_ids，清单永不收敛；与 embed() 的
-                    # #R53 同款分类）。
+                    # 直接确定性跳过，不重试（此前落 catch-all 重试 3 次白付 3 次
+                    # 付费调用后进 fail_ids，清单永不收敛；与 embed() 的 #R53 同款）。
                     raise DeterministicSkipError(f"chat 响应非 JSON: {e}")
                 if not isinstance(resp, dict):
                     # 2xx 非 dict 体（如 list）→ resp.get 会 AttributeError——确定性畸形。
@@ -200,11 +201,13 @@ def embed(texts):
             )
             with urllib.request.urlopen(req, timeout=60) as r:
                 try:
-                    resp = json.loads(r.read().decode())
-                except json.JSONDecodeError as e:
+                    # #R66 bug/low：json.loads 直接吃 bytes（与 chat 同款——非
+                    # UTF-8 体抛 UnicodeDecodeError 落 catch-all 重试白付）。
+                    resp = json.loads(r.read())
+                except (json.JSONDecodeError, UnicodeDecodeError) as e:
                     # #R53 bug/low：非 JSON 的 2xx 体是确定性畸形响应（同形状每次必现）——
-                    # 直接抛确定性异常，不重试（此前 JSONDecodeError 经 3 次重试后
-                    # 以 RuntimeError 被归为瞬时失败进 fail_ids，清单永不收敛）。
+                    # 直接抛确定性异常，不重试（此前落 catch-all 重试 3 次后以
+                    # RuntimeError 被归为瞬时失败进 fail_ids，清单永不收敛）。
                     raise DeterministicSkipError(f"embed 响应非 JSON: {e}")
                 if not isinstance(resp, dict):
                     # 2xx 但体不是 dict（如 list）——确定性畸形，同样不重试。
@@ -328,14 +331,18 @@ def main():
             print(f"错误: id 清单文件不存在 {ids_file}")
             sys.exit(1)
         with open(ids_file, encoding="utf-8") as f:
-            # #R54 maintainability/low：支持逗号分隔（帮助文本承诺）——每行按逗号
-            # split 后再收进集合（此前整行作一个 id，逗号文件全被当作不存在的 id）。
-            wanted = set()
+            # #R54 maintainability/low：支持逗号分隔（帮助文本承诺）。
+            # #R66 maintainability/low：**保持文件出现顺序**（list + seen 去重）——
+            # set 迭代顺序受 PYTHONHASHSEED 影响，--ids 定点重跑 + --limit N 时
+            # "前 N 条"跨运行不确定。
+            wanted: list = []
+            seen = set()
             for ln in f:
                 for part in ln.strip().split(","):
                     part = part.strip()
-                    if part:
-                        wanted.add(part)
+                    if part and part not in seen:
+                        seen.add(part)
+                        wanted.append(part)
         by_id = {mid: c for mid, c in targets}
         targets = [(m, by_id[m]) for m in wanted if m in by_id]
         missing = wanted - set(by_id)

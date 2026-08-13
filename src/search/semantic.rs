@@ -469,7 +469,16 @@ fn fetch_memories_batch(
                             // 按行丢弃）或底层 step()（SQLITE_BUSY/IOERR，连接级
                             // 故障）。迭代级错误 = 批硬失败（#R47 契约），且中止后
                             // 未读行不混入 stale 计数。
-                            Err(e @ rusqlite::Error::FromSqlConversionFailure(..)) => {
+                            // #R66 bug/medium：**行级转换错误全集**——row.get() 在映射
+                            // 闭包内除 FromSqlConversionFailure 外还有
+                            // InvalidColumnType/UnexpectedNullType/IntegralValueOutOfRange
+                            // （如 INTEGER 存 TEXT 亲和列）——漏列会落 catch-all 被误判
+                            // 为连接级硬失败、整批 Err 丢通道（fetch_systemic 永不触发）。
+                            Err(
+                                e @ (rusqlite::Error::FromSqlConversionFailure(..)
+                                    | rusqlite::Error::InvalidColumnType(..)
+                                    | rusqlite::Error::IntegralValueOutOfRange(..)),
+                            ) => {
                                 row_errors += 1;
                                 throttled_eprintln("fetch_row_mapping", || {
                                     format!(

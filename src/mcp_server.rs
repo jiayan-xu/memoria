@@ -2075,6 +2075,20 @@ fn dispatch(
                 "hype_hnsw_vectors".to_string(),
                 serde_json::Value::Number((state.hype_hnsw.len() as i64).into()),
             );
+            // #R66 maintainability/low：**store count 对照**——build_hype_hnsw_or_
+            // default 失败时软降级为空索引（仅 stderr WARN），live==0 无法区分
+            // "未启用/空表"与"构建失败"；store>0 && live==0 揭示降级（镜像
+            // lib.rs db_stats 双字段）。
+            let hype_store: i64 = match state.pool.get() {
+                Ok(c) => c
+                    .query_row("SELECT COUNT(*) FROM memory_hype_vectors", [], |r| r.get(0))
+                    .unwrap_or(-1),
+                Err(_) => -1,
+            };
+            m.insert(
+                "hype_hnsw_store".to_string(),
+                serde_json::Value::Number(hype_store.into()),
+            );
             serde_json::to_string(&serde_json::json!({"status":"ok","stats":m})).unwrap_or_default()
         }
         "a2a_send" => {
@@ -3241,22 +3255,20 @@ mod tests {
             (sem_cos - 1.0).abs() < 1e-3,
             "expected hype-road sem_cos ≈ 1.0, got {sem_cos}: {out}"
         );
-        // #R63 test/low：**放宽为"任一结果含 hype 归因"**——results[0].source 取
-        // RRF 首信号（keyword→semantic→temporal→importance 顺序 + unicode61 分词），
-        // jieba 落地/信号重排会让首结果假红；memory_id + sem_cos ≈ 1.0 已证明
-        // hype 路工作，归因存在性用 any 即可（归因回归如恒标 content 路仍会红）。
-        let any_hype = v["results"]
+        // #R66 test/low：**channel_scores/primary_channel 断言**（替代顺序依赖的
+        // source）——semantic 通道幅度 > 0 即 hype 路贡献真实可证（归因回归如
+        // 恒标 content 路时 semantic 通道缺失会红）。
+        let sem_channel = v["results"]
             .as_array()
-            .map(|arr| {
-                arr.iter().any(|r| {
-                    r["source"]
-                        .as_str()
-                        .map(|s| s.contains("hype"))
-                        .unwrap_or(false)
-                })
-            })
-            .unwrap_or(false);
-        assert!(any_hype, "no result carries hype attribution: {out}");
+            .and_then(|arr| arr.first())
+            .and_then(|r| r["channel_scores"].as_object())
+            .and_then(|m| m.get("semantic"))
+            .and_then(|s| s.as_f64())
+            .unwrap_or(0.0);
+        assert!(
+            sem_channel > 0.0,
+            "semantic channel missing from results[0]: {out}"
+        );
     }
 
     fn build_test_state() -> Arc<AppState> {
