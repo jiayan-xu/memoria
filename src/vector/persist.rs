@@ -308,9 +308,19 @@ fn rebuild_from_table(
         .map_err(|e| format!("query {}: {}", label, e))?;
 
     let mut entries: Vec<VectorEntry> = Vec::new();
-    let mut skipped = 0usize;
+    // #R47 maintainability/low：skip 分因计数——degenerate（零/NaN）、dim 不符、blob
+    // 字节长度损坏是三种可区分原因（此前单计数在 all-skipped 时无法一眼判断是维度
+    // 漂移还是整体损坏；read_errors 已单独）。
+    let mut skipped_degenerate = 0usize;
+    let mut skipped_dim = 0usize;
+    let mut skipped_blob = 0usize;
     let mut read_errors = 0usize;
     let mut rows_seen = 0usize;
+    // #R47 maintainability/low：行级读取失败只记前 3 条——系统性漂移时每行一条会
+    // 刷爆 stderr（hype 表可达数千行），聚合 read_errors 计数已存在；保留前几条
+    // 作原因样本即可。
+    let mut read_err_logged = 0usize;
+    const READ_ERR_LOG_CAP: usize = 3;
     for row in rows {
         match row {
             Ok((id, blob)) => {
@@ -325,14 +335,14 @@ fn rebuild_from_table(
                 // 把截断向量静默装入索引。显式校验 blob 字节长度 = DIM*4 彻底关闭
                 // 小尾部损坏缝隙（"损坏行被跳过"的保证对尾部损坏同样成立）。
                 let norm_sq: f64 = v.iter().map(|x| (*x as f64) * (*x as f64)).sum();
-                if blob.len() == DIM * 4
-                    && v.len() == DIM
-                    && norm_sq.is_finite()
-                    && norm_sq > 0.0
-                {
-                    entries.push(VectorEntry { id, vector: v });
+                if blob.len() != DIM * 4 {
+                    skipped_blob += 1;
+                } else if v.len() != DIM {
+                    skipped_dim += 1;
+                } else if !norm_sq.is_finite() || norm_sq <= 0.0 {
+                    skipped_degenerate += 1;
                 } else {
-                    skipped += 1;
+                    entries.push(VectorEntry { id, vector: v });
                 }
             }
             Err(e) => {
@@ -340,22 +350,30 @@ fn rebuild_from_table(
                 read_errors += 1;
                 // 注意：decode_vector 本身不可失败（长度不符走 Ok 分支的跳过路径），
                 // 此 Err 分支捕获的是 query_map 的行读取/列转换/SQLite 迭代错误。
-                eprintln!("[persist] {label} row read/iteration failed: {e}");
+                if read_err_logged < READ_ERR_LOG_CAP {
+                    read_err_logged += 1;
+                    eprintln!("[persist] {label} row read/iteration failed: {e}");
+                }
             }
         }
     }
+    let skipped = skipped_degenerate + skipped_dim + skipped_blob;
     if skipped > 0 {
-        // #R43/#R44 other/low：decode_vector 不可失败（chunks_exact 丢尾部字节 → 长度
-        // 不符走 dim 分支）——真实行级失败只有 Err 臂（已单独 eprintln）。
-        // #R45 other/low：行读取错误（read_errors）**单独计数**、不混入聚合摘要——
-        // 否则 schema 漂移场景（每行都转换失败）摘要会错误归因为 degenerate/dim，
-        // 与"只列实际原因"的注释矛盾。
+        // #R47 maintainability/low：摘要按原因分解——运维一眼判断维度漂移 vs 整体
+        // blob 损坏 vs 退化行（read_errors 单独汇总，不混入）。
         eprintln!(
-            "[persist] {label}: {skipped} row(s) skipped (degenerate zero/NaN, dim != {DIM}, or corrupt blob length)"
+            "[persist] {label}: {skipped} row(s) skipped (degenerate {skipped_degenerate}, dim != {DIM} {skipped_dim}, corrupt blob length {skipped_blob})"
         );
     }
     if read_errors > 0 {
-        eprintln!("[persist] {label}: {read_errors} row(s) failed read/iteration (see per-row logs above)");
+        eprintln!(
+            "[persist] {label}: {read_errors} row(s) failed read/iteration{}",
+            if read_err_logged < read_errors {
+                format!(" (first {read_err_logged} logged above)")
+            } else {
+                String::new()
+            }
+        );
     }
 
     // #R37 bug/medium：区分"空表"（无行，count=0 = 功能未启用）与"表有数据但全部损坏"。

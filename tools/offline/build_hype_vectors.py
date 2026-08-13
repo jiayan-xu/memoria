@@ -138,10 +138,15 @@ def generate_question(content: str) -> str:
             # #R45 bug/medium：抛 DeterministicSkipError——主循环据此按 skip 计数而非
             # 记入 fail_ids（catch-all except Exception 会把 RuntimeError 重新归类为
             # 瞬时失败，让 400 之类的每轮重跑同样失败、清单永不收敛）。
-            if e.code != 429:
+            # #R47 bug/medium：确定性分支**只限 4xx**（除 429）——5xx（500/502/503/504）
+            # 是瞬时过载/服务故障（sibling eval_hyde_recall.py 明确重试 429/503/504，
+            # SiliconFlow chat 高负载常见 5xx）：按确定性跳过会静默丢记忆且无法经
+            # fail_ids 定点重跑，违反"fail_ids 只含可修复瞬时失败"契约。5xx 走下方
+            # 重试/瞬时失败路径。
+            if 400 <= e.code < 500 and e.code != 429:
                 raise DeterministicSkipError(f"chat HTTP {e.code}: {e}") from e
             if attempt == 2:
-                raise RuntimeError(f"chat 429 限流重试耗尽: {e}") from e
+                raise RuntimeError(f"chat HTTP {e.code} 重试耗尽: {e}") from e
             time.sleep(min(2 ** attempt, 10))
         except Exception as e:
             if attempt == 2:
@@ -172,13 +177,16 @@ def embed(texts):
         except urllib.error.HTTPError as e:
             # 4xx（除 429）为确定性配置错误：直接 raise（与 generate_question 同款纪律，
             # #R45：抛 DeterministicSkipError 供主循环按 skip 计数）。
-            if e.code != 429:
+            # #R47 bug/medium：确定性分支**只限 4xx**——embed_server 把上游/编码失败
+            # 映射为 500（embed_server.py:338），属瞬时；按确定性跳过会静默丢记忆且
+            # 无定点重跑记录（skip_ids 不进 fail_ids）。
+            if 400 <= e.code < 500 and e.code != 429:
                 raise DeterministicSkipError(f"embed HTTP {e.code}: {e}") from e
             if attempt == 2:
                 # #R41 maintainability/low：最终 attempt 内 raise 保留原始 traceback
                 # （urlopen/JSON 解析/取字段的失败点）——循环后 raise last_err 会把
                 # 栈指向 raise 行而非真实失败处，--all 5000+ 行时诊断困难。
-                raise RuntimeError(f"embed 429 限流重试耗尽: {e}") from e
+                raise RuntimeError(f"embed HTTP {e.code} 重试耗尽: {e}") from e
             time.sleep(min(2 ** attempt, 10))
         except Exception as e:
             if attempt == 2:
