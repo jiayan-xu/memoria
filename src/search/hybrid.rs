@@ -99,14 +99,15 @@ pub fn hybrid_search(
                 // 互相压制）。枚举 match 对消息改写免疫；Fetch 内部各因仍共享
                 // 60s 冷却（DB 故障恢复前持续压制同类噪音可接受）。
                 Err(e) => {
-                    let msg = format!("[hybrid] semantic signal dropped: {e}");
+                    // #R57 maintainability/low：RoadsFailed 现为 unit variant。
                     let key: &'static str = match &e {
                         SemanticError::QueryDim(_) => "hybrid_drop_dim",
-                        SemanticError::RoadsFailed(_) => "hybrid_drop_roads",
+                        SemanticError::RoadsFailed => "hybrid_drop_roads",
                         SemanticError::Fetch(_) => "hybrid_drop_db",
                         SemanticError::Other(_) => "hybrid_drop_other",
                     };
-                    throttled_eprintln(key, msg);
+                    // 闭包求值：冷却期间零分配（#R57）。
+                    throttled_eprintln(key, || format!("[hybrid] semantic signal dropped: {e}"));
                 }
             }
         }
@@ -266,7 +267,10 @@ pub fn hybrid_search(
                     .query_map(rusqlite::params_from_iter(ids.iter()), |row| {
                         Ok((
                             row.get::<_, String>(0)?,
-                            (row.get::<_, i64>(1).unwrap_or(0), row.get::<_, Option<String>>(2)?),
+                            (
+                                row.get::<_, i64>(1).unwrap_or(0),
+                                row.get::<_, Option<String>>(2)?,
+                            ),
                         ))
                     })
                     .map(|rows| rows.flatten().collect())
@@ -416,7 +420,11 @@ fn two_stage_rerank(results: &mut Vec<FusedResult>, w_rrf: f64, w_sem: f64, w_kw
     let lambda = env_f64("MEMORIA_RECENCY_LAMBDA", 0.01).max(0.0);
     let now_secs = chrono::Utc::now().timestamp();
     for r in results.iter_mut() {
-        let rrf_n = if rrf_max > 0.0 { r.rrf_score / rrf_max } else { 0.0 };
+        let rrf_n = if rrf_max > 0.0 {
+            r.rrf_score / rrf_max
+        } else {
+            0.0
+        };
         let sem_n = if sem_max > 0.0 {
             r.sem_cos.unwrap_or(0.0) / sem_max
         } else {
@@ -445,9 +453,12 @@ fn two_stage_rerank(results: &mut Vec<FusedResult>, w_rrf: f64, w_sem: f64, w_kw
             }
             None => 0.5,
         };
-        r.rrf_score = w_rrf * rrf_n + w_sem * sem_n + w_kw * kw_n
+        r.rrf_score = w_rrf * rrf_n
+            + w_sem * sem_n
+            + w_kw * kw_n
             + w_graph * graph_n
-            + w_freq * freq_n + w_rec * recency_n;
+            + w_freq * freq_n
+            + w_rec * recency_n;
         if !r.source.contains("rerank2") {
             r.source = format!("{};rerank2", r.source);
         }

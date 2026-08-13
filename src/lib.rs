@@ -92,8 +92,7 @@ impl MemoriaEngine {
         hnsw.set_ef_search(ef_search);
         // 与 main.rs 共用 build_hype_hnsw_or_default（build + 软降级 + WARN 单一实现）：
         // 库路径不因 HyPE 故障 panic（Python bindings 宿主健壮性）。
-        let (hype_hnsw, hype_count) =
-            vector::persist::build_hype_hnsw_or_default(&pool, ef_search);
+        let (hype_hnsw, hype_count) = vector::persist::build_hype_hnsw_or_default(&pool, ef_search);
         // 库代码（Python bindings 等宿主）不污染 stdout——用 eprintln；且无条件打印
         // （0 也打），与 main.rs 一致：空表（未启用）与 rebuild 静默降级可区分。
         eprintln!("[Memoria] HYPE HNSW vectors: {}", hype_count);
@@ -283,8 +282,7 @@ impl MemoriaEngine {
 /// #R55 performance/low：hype 表行数的**缓存查询**（30s TTL）——db_stats 每调用
 /// 一次 O(n) COUNT 全表扫描，监控轮询高频调用时成本逐次放大；表由离线脚本在
 /// 服务外写入，30s 陈旧可接受（live 索引 len 在 stats 中仍实时）。查询失败
-/// WARN 60s 冷却（throttled_eprintln）——持续故障（缺表/锁）下每调用刷一行
-/// 会把 stderr 淹没在同一行。
+/// WARN 60s 冷却——持续故障（缺表/锁）下每调用刷一行会把 stderr 淹没在同一行。
 /// #R56 bug/medium：**缓存按 db 身份键控**——进程级 static 若不区分 db，同进程
 /// 内多引擎实例（多 PyEngine / 测试 recreate 模式）会让先填缓存的那个实例把
 /// 自己的行数供给所有其他实例最多 30s；`hype_vector_index_size` 恰是检测 HyPE
@@ -293,19 +291,28 @@ impl MemoriaEngine {
 /// saturating_duration_since——锁外捕获存在竞态：对端线程可先写入更新的时间戳，
 /// 本线程 `now.duration_since(*at)` 在 now < at 时 panic（与 semantic.rs #R55
 /// 同款竞态，db_stats 是库路径，panic 不可接受）。
+/// #R57 细节：
+/// - **失败也缓存（-1，同 30s TTL）**——此前 Err 分支不写缓存，`*v != -1` 守卫是
+///   死代码：持续失败（软降级 DDL 后缺表/锁）时每次 db_stats 都重跑失败的 COUNT，
+///   监控轮询对已降级库叠加负载。缓存 -1 后恢复可见性延迟 ≤30s（TTL 语义一致）。
+/// - **失败冷却按 db_path 键控**——进程级单冷却会让一库失败压制所有库的 WARN
+///   60s；WARN 消息含 db_path，故障定位直接。
+/// - **缓存条目随读写淘汰**——>30s TTL 的条目在下次访问时清除，多 db 路径
+///   进程（per-test 临时库）不累积。
 fn query_hype_count_cached(conn: &rusqlite::Connection, db_path: &str) -> i64 {
     use std::collections::HashMap;
-    use std::sync::atomic::{AtomicI64, Ordering};
     use std::sync::Mutex;
     use std::time::Instant;
     static CACHE: Mutex<Option<HashMap<String, (Instant, i64)>>> = Mutex::new(None);
-    // 失败冷却（秒级时间戳；跨线程近似即可，精确隔离非目标）
-    static LAST_FAIL_EPOCH: AtomicI64 = AtomicI64::new(0);
+    static FAIL_EPOCHS: Mutex<Option<HashMap<String, i64>>> = Mutex::new(None);
     {
-        let cache = CACHE.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some((at, v)) = cache.as_ref().and_then(|m| m.get(db_path)) {
+        let mut cache = CACHE.lock().unwrap_or_else(|p| p.into_inner());
+        let m = cache.get_or_insert_with(HashMap::new);
+        // 淘汰过期条目（写入路径顺带维护，避免无界累积）。
+        m.retain(|_, (at, _)| at.elapsed().as_secs() < 30);
+        if let Some((at, v)) = m.get(db_path) {
             let now = Instant::now();
-            if now.saturating_duration_since(*at).as_secs() < 30 && *v != -1 {
+            if now.saturating_duration_since(*at).as_secs() < 30 {
                 return *v;
             }
         }
@@ -321,17 +328,22 @@ fn query_hype_count_cached(conn: &rusqlite::Connection, db_path: &str) -> i64 {
             c
         }
         Err(e) => {
+            // 失败也缓存（-1，同 TTL）——见函数 doc #R57。
+            let mut cache = CACHE.lock().unwrap_or_else(|p| p.into_inner());
+            let m = cache.get_or_insert_with(HashMap::new);
+            m.insert(db_path.to_string(), (Instant::now(), -1));
             let epoch = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs() as i64)
                 .unwrap_or(0);
-            let last = LAST_FAIL_EPOCH.load(Ordering::Relaxed);
-            if epoch.saturating_sub(last) >= 60
-                && LAST_FAIL_EPOCH
-                    .compare_exchange(last, epoch, Ordering::Relaxed, Ordering::Relaxed)
-                    .is_ok()
-            {
-                eprintln!("[Memoria] WARN: hype_vector_index_size query failed: {e}");
+            let mut fe = FAIL_EPOCHS.lock().unwrap_or_else(|p| p.into_inner());
+            let fmap = fe.get_or_insert_with(HashMap::new);
+            let last = fmap.get(db_path).copied().unwrap_or(0);
+            if epoch.saturating_sub(last) >= 60 {
+                fmap.insert(db_path.to_string(), epoch);
+                eprintln!(
+                    "[Memoria] WARN: hype_vector_index_size query failed (db {db_path}): {e}"
+                );
             }
             -1
         }
@@ -381,7 +393,14 @@ mod python {
             include_superseded: bool,
         ) -> PyResult<String> {
             self.inner
-                .hybrid_search(query, max_results, intent, namespace, tier, include_superseded)
+                .hybrid_search(
+                    query,
+                    max_results,
+                    intent,
+                    namespace,
+                    tier,
+                    include_superseded,
+                )
                 .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))
         }
         fn db_stats(&self) -> PyResult<String> {

@@ -7,11 +7,11 @@
 //! 运行：`cargo test --test eval_semantic -- --nocapture`
 //! 前置：embed_server.py 运行于 127.0.0.1:8777（MEMORIA_EMBEDDING_URL）。
 
+use memoria_core::MemoriaEngine;
 use memoria_core::search::hybrid::hybrid_search;
-use memoria_core::storage::{create_pool, init_core_tables, init_schema, SqlitePool};
+use memoria_core::storage::{SqlitePool, create_pool, init_core_tables, init_schema};
 use memoria_core::tools::remember::remember_with_dedup;
 use memoria_core::vector::{VectorEntry, persist};
-use memoria_core::MemoriaEngine;
 use serde_json::Value;
 use std::path::Path;
 use std::time::Instant;
@@ -133,13 +133,12 @@ async fn embed_with_retry(client: &reqwest::Client, text: &str) -> Result<Vec<f3
                 // 501）展平成瞬时类，未来任何消费该错误的 is_transient 判定会错误
                 // 重试；首次错误信息并入 e2 文本保留诊断。
                 Err(e2) => match e2 {
-                    EmbedError::Status(c, r) => Err(EmbedError::Status(
-                        c,
-                        format!("{r} (first attempt: {e})"),
-                    )),
-                    EmbedError::Malformed(m) => Err(EmbedError::Malformed(format!(
-                        "{m} (first attempt: {e})"
-                    ))),
+                    EmbedError::Status(c, r) => {
+                        Err(EmbedError::Status(c, format!("{r} (first attempt: {e})")))
+                    }
+                    EmbedError::Malformed(m) => {
+                        Err(EmbedError::Malformed(format!("{m} (first attempt: {e})")))
+                    }
                     EmbedError::Transport(t) => {
                         // #R56 maintainability/low：用**内部消息** t 而非首次错误的
                         // Display `{e}`——Transport 的 Display 已渲染 `embed http: <err>`
@@ -282,7 +281,10 @@ async fn memory_eval_semantic_inner() {
     let cases_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/cases");
     let corpus: Vec<Value> = read_json_array(&cases_dir.join("corpus.json"));
     let cases: Vec<Value> = read_json_array(&cases_dir.join("cases.json"));
-    assert!(!corpus.is_empty() && !cases.is_empty(), "eval cases 不能为空");
+    assert!(
+        !corpus.is_empty() && !cases.is_empty(),
+        "eval cases 不能为空"
+    );
 
     // fixture DB
     let db = std::env::temp_dir().join(format!("memoria_eval_sem_{}.db", std::process::id()));
@@ -430,11 +432,19 @@ async fn memory_eval_semantic_inner() {
         let ctype = c["type"].as_str().unwrap_or("");
         let expect: Vec<usize> = c["expect_indices"]
             .as_array()
-            .map(|a| a.iter().filter_map(|v| v.as_u64().map(|x| x as usize)).collect())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_u64().map(|x| x as usize))
+                    .collect()
+            })
             .unwrap_or_default();
         let must_not: Vec<usize> = c["must_not_indices"]
             .as_array()
-            .map(|a| a.iter().filter_map(|v| v.as_u64().map(|x| x as usize)).collect())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_u64().map(|x| x as usize))
+                    .collect()
+            })
             .unwrap_or_default();
 
         // query 嵌入
@@ -452,8 +462,15 @@ async fn memory_eval_semantic_inner() {
 
         let start = Instant::now();
         let results = hybrid_search(
-            &pool, q, ns, k,
-            Some(&engine.hnsw), Some(&engine.hype_hnsw), Some(&engine.query_cache), None, false,
+            &pool,
+            q,
+            ns,
+            k,
+            Some(&engine.hnsw),
+            Some(&engine.hype_hnsw),
+            Some(&engine.query_cache),
+            None,
+            false,
         )
         .unwrap_or_default();
         latencies.push(start.elapsed().as_secs_f64() * 1000.0);
@@ -504,7 +521,7 @@ async fn memory_eval_semantic_inner() {
     // 3) 追加「同义改写」用例：验证语义召回（不共享关键词）
     let paraphrase_cases: Vec<(String, usize)> = vec![
         // 官方 corpus 中的记忆，用完全不同的说法查询
-        ("代码托管平台开源仓库".to_string(), 5),      // corpus 中 GitHub 相关
+        ("代码托管平台开源仓库".to_string(), 5), // corpus 中 GitHub 相关
         ("在线的开发项目托管服务".to_string(), 5),
         ("技术文档的版本管理".to_string(), 3),
     ];
@@ -522,12 +539,22 @@ async fn memory_eval_semantic_inner() {
             }
         }
         let results = hybrid_search(
-            &pool, pq, ns, k,
-            Some(&engine.hnsw), Some(&engine.hype_hnsw), Some(&engine.query_cache), None, false,
+            &pool,
+            pq,
+            ns,
+            k,
+            Some(&engine.hnsw),
+            Some(&engine.hype_hnsw),
+            Some(&engine.query_cache),
+            None,
+            false,
         )
         .unwrap_or_default();
         let result_ids: Vec<&str> = results.iter().map(|r| r.memory_id.as_str()).collect();
-        let ok = ids.get(*idx).map(|id| result_ids.contains(&id.as_str())).unwrap_or(false);
+        let ok = ids
+            .get(*idx)
+            .map(|id| result_ids.contains(&id.as_str()))
+            .unwrap_or(false);
         if ok {
             sem_hits += 1;
         } else {
@@ -542,8 +569,16 @@ async fn memory_eval_semantic_inner() {
     latencies.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let p50 = percentile(&latencies, 0.50);
     let p95 = percentile(&latencies, 0.95);
-    let recall = if recall_total > 0 { recall_hits as f64 / recall_total as f64 } else { 1.0 };
-    let zero_rate = if !cases.is_empty() { zero_results as f64 / cases.len() as f64 } else { 0.0 };
+    let recall = if recall_total > 0 {
+        recall_hits as f64 / recall_total as f64
+    } else {
+        1.0
+    };
+    let zero_rate = if !cases.is_empty() {
+        zero_results as f64 / cases.len() as f64
+    } else {
+        0.0
+    };
 
     eprintln!("===== Memoria Semantic Eval（含 S2 语义通道）=====");
     eprintln!(
@@ -560,7 +595,12 @@ async fn memory_eval_semantic_inner() {
     }
     eprintln!("=================================================");
 
-    assert!(recall >= RECALL_FLOOR, "召回@k {:.2} 低于下限 {:.2}", recall, RECALL_FLOOR);
+    assert!(
+        recall >= RECALL_FLOOR,
+        "召回@k {:.2} 低于下限 {:.2}",
+        recall,
+        RECALL_FLOOR
+    );
     assert_eq!(zero_rate, 0.0, "存在零结果用例");
     assert!(failures.is_empty(), "共 {} 个评测失败", failures.len());
 

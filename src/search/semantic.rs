@@ -18,7 +18,11 @@ pub enum SemanticError {
     /// 查询向量维度 ≠ HNSW DIM（嵌入模型/配置漂移）
     QueryDim(usize),
     /// 全部存在的路都失败（RwLock poisoned / 索引损坏）
-    RoadsFailed(String),
+    /// #R57 maintainability/low：**无 payload**——此前 String 字段恒为
+    /// String::new()（死字段）；各路失败详情已由 search_and_merge 的 throttled
+    /// eprintln 逐次记录，传播的错误只需分类标识。unit variant 同时消除 Display
+    /// 拼接歧义（`{m}` 无分隔符粘贴）。
+    RoadsFailed,
     /// memories 回查硬失败（pool/prepare/query/整批硬失败）
     Fetch(String),
     /// 其他未分类故障
@@ -33,15 +37,22 @@ impl std::fmt::Display for SemanticError {
                 "semantic_search: query vector dim {d} != HNSW DIM {}",
                 crate::vector::DIM
             ),
-            SemanticError::RoadsFailed(m) => write!(
-                f,
-                "semantic_search: all HNSW roads failed (poisoned/corrupted index){m}"
-            ),
+            SemanticError::RoadsFailed => {
+                write!(
+                    f,
+                    "semantic_search: all HNSW roads failed (poisoned/corrupted index)"
+                )
+            }
             SemanticError::Fetch(m) => write!(f, "semantic_search: memories fetch failed: {m}"),
             SemanticError::Other(m) => write!(f, "semantic_search: {m}"),
         }
     }
 }
+
+// #R57 maintainability/low：标准 Error trait——pub 错误类型经 crate 公开模块可达，
+// 空 impl（无 source 链）使其可用于 Box<dyn Error>/anyhow/thiserror 等泛型错误
+// 处理代码。
+impl std::error::Error for SemanticError {}
 
 /// 60s 冷却的 eprintln（#R50/#R51 maintainability/low）：语义检索路径多处诊断日志
 /// （road fail / degraded / fetch 批级 / stale 汇总 / hybrid drop）此前各自实现
@@ -55,7 +66,11 @@ impl std::fmt::Display for SemanticError {
 /// #R54 other/low：**单调时钟（Instant）**——SystemTime 是墙钟，回拨时
 /// now < last 使 saturating_sub 恒 < 60s，所有冷却日志被静默压制到时钟追平；
 /// 恰在需要可观测性的故障场景失效。Instant 对墙钟调整免疫。
-pub(crate) fn throttled_eprintln(key: &'static str, msg: String) {
+/// #R57 performance/low：**消息闭包化（FnOnce -> String）**——此前调用方总是先
+/// format! 分配再传入；hot-path 诊断（roads_degraded 每查询、fetch_stale 多租户
+/// 每查询）在冷却期间白付每次查询的堆分配，60s 抑制只限输出不限开销。冷却
+/// 通过后才求值闭包，被抑制的调用零分配。
+pub(crate) fn throttled_eprintln(key: &'static str, msg: impl FnOnce() -> String) {
     const COOLDOWN_SECS: u64 = 60;
     use std::collections::HashMap;
     use std::sync::Mutex;
@@ -76,7 +91,7 @@ pub(crate) fn throttled_eprintln(key: &'static str, msg: String) {
     if due {
         m.insert(key, now);
         drop(guard);
-        eprintln!("{msg} (at most once per {COOLDOWN_SECS}s)");
+        eprintln!("{} (at most once per {COOLDOWN_SECS}s)", msg());
     }
 }
 
@@ -180,7 +195,7 @@ pub fn semantic_search(
     }
     if roads_ok == 0 && roads_failed > 0 {
         // #R56 maintainability/medium：结构化错误（RoadsFailed 变体）。
-        return Err(SemanticError::RoadsFailed(String::new()));
+        return Err(SemanticError::RoadsFailed);
     }
     // #R44 bug/medium：升级缺口——一路失败但幸存路**合法返回 0 结果**时（如 hype 空
     // 索引 + content 索引损坏，或反之），`roads_ok==1` 且 best 空会走 Ok(vec![])，
@@ -196,12 +211,11 @@ pub fn semantic_search(
     // 降级期保持静默。用**时间戳冷却**（60s）重武装：持续故障每 ~60s 出一条信号，
     // 瞬时抖动只出一条。冷却经共享 helper（#R51，key 隔离）。
     if roads_failed > 0 && best.is_empty() {
-        throttled_eprintln(
-            "roads_degraded",
+        throttled_eprintln("roads_degraded", || {
             format!(
                 "semantic_search: {roads_failed} road(s) failed and survivors returned no matches (degraded)"
-            ),
-        );
+            )
+        });
     }
     if best.is_empty() {
         return Ok(vec![]);
@@ -318,10 +332,9 @@ fn search_and_merge(
             // #R50/#R51 maintainability/low：冷却按**路**分离（key=label）——单个
             // 全局 static 在 content/hype 双路 60s 内相继失败时只记首路；共享 helper
             // 的 key 隔离天然满足，无需手写双 static。
-            throttled_eprintln(
-                label,
-                format!("[semantic] {label} HNSW search failed: {e}"),
-            );
+            throttled_eprintln(label, || {
+                format!("[semantic] {label} HNSW search failed: {e}")
+            });
             false
         }
     }
@@ -384,7 +397,9 @@ fn fetch_memories_batch(
         let mut got = 0usize;
         // #R48 performance/low：连接**每批重新获取**——跨整循环持有会在并发搜索时
         // 把连接钉住 ~9 次往返时长，小池场景加剧耗尽（耗尽即整通道 Err）。
-        let conn = pool.get().map_err(|e| format!("semantic fetch pool: {}", e))?;
+        let conn = pool
+            .get()
+            .map_err(|e| format!("semantic fetch pool: {}", e))?;
         match conn.prepare(&sql) {
             Ok(mut stmt) => match stmt.query_map(
                 rusqlite::params_from_iter(
@@ -413,14 +428,13 @@ fn fetch_memories_batch(
                                 // #R51 performance/medium：样本行也走共享冷却——
                                 // 无冷却时 cap-3 样本在每查询刷 3 行（mostly stale +
                                 // 单行不可映射的常见混合态）。
-                                throttled_eprintln(
-                                    "fetch_row_mapping",
+                                throttled_eprintln("fetch_row_mapping", || {
                                     format!(
                                         "[semantic] fetch row mapping failed (batch {} ids): {}",
                                         chunk.len(),
                                         e
-                                    ),
-                                );
+                                    )
+                                });
                             }
                         }
                     }
@@ -433,46 +447,41 @@ fn fetch_memories_batch(
                     // 比较请求数；含 stale 的混合批不升级——漏判但安全（#R48 承认）。
                     if got == 0 && row_errors > 0 {
                         if row_errors == chunk.len() {
-                            throttled_eprintln(
-                                "fetch_systemic",
+                            throttled_eprintln("fetch_systemic", || {
                                 format!(
                                     "all {} requested ids returned rows and ALL failed mapping (systematic column drift)",
                                     chunk.len()
-                                ),
-                            );
+                                )
+                            });
                             hard_failed = true;
                         } else {
-                            throttled_eprintln(
-                                "fetch_mixed",
+                            throttled_eprintln("fetch_mixed", || {
                                 format!(
                                     "batch of {} ids: {row_errors} row(s) failed mapping, 0 ok (row drops only; rest stale)",
                                     chunk.len()
-                                ),
-                            );
+                                )
+                            });
                         }
                     } else if row_errors > 0 {
-                        throttled_eprintln(
-                            "fetch_partial",
+                        throttled_eprintln("fetch_partial", || {
                             format!(
                                 "{row_errors} of {} rows failed mapping (dropping those ids)",
                                 chunk.len()
-                            ),
-                        );
+                            )
+                        });
                     }
                 }
                 Err(e) => {
-                    throttled_eprintln(
-                        "fetch_query",
-                        format!("query failed (batch {} ids): {}", chunk.len(), e),
-                    );
+                    throttled_eprintln("fetch_query", || {
+                        format!("query failed (batch {} ids): {}", chunk.len(), e)
+                    });
                     hard_failed = true;
                 }
             },
             Err(e) => {
-                throttled_eprintln(
-                    "fetch_prepare",
-                    format!("prepare failed (batch {} ids): {}", chunk.len(), e),
-                );
+                throttled_eprintln("fetch_prepare", || {
+                    format!("prepare failed (batch {} ids): {}", chunk.len(), e)
+                });
                 hard_failed = true;
             }
         }
@@ -491,16 +500,15 @@ fn fetch_memories_batch(
         }
     }
     if stale_ids_total > 0 {
-        throttled_eprintln(
-            "fetch_stale",
+        throttled_eprintln("fetch_stale", || {
             // #R54 other/low：0 行有两类原因——跨 ns 候选（查询 SQL 已按 ns 过滤，
             // 全局 HNSW 过取窗口在多租户下大部分是外 ns 向量，属**设计的过滤行为**）
             // 与删除滞后（悬空 id）。文案并列两因，避免把正常跨租户过取误归因为
             // 删除滞后、驱动错误的召回排查。
             format!(
                 "{stale_ids_total} candidate id(s) matched 0 rows in this ns (cross-tenant overfetch or deletion lag)"
-            ),
-        );
+            )
+        });
     }
     // #R47 bug/medium：**任一**批硬失败即 Err——部分失败返回 Ok(partial) 会让调用方
     // 把召回损失当完整结果（静默丢候选、监控不可见）；Err 使 hybrid.rs 记录

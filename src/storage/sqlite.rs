@@ -541,8 +541,11 @@ pub fn migrate_evolution(pool: &SqlitePool) -> Result<(), String> {
             )
             .unwrap_or(0);
         if has == 0 {
-            conn.execute_batch(&format!("ALTER TABLE memories ADD COLUMN {} {};", col, ctype))
-                .map_err(|e| format!("add memories.{}: {}", col, e))?;
+            conn.execute_batch(&format!(
+                "ALTER TABLE memories ADD COLUMN {} {};",
+                col, ctype
+            ))
+            .map_err(|e| format!("add memories.{}: {}", col, e))?;
             println!("[Memoria] Migration: added memories.{} column", col);
         }
     }
@@ -576,6 +579,19 @@ pub fn migrate_evolution(pool: &SqlitePool) -> Result<(), String> {
         .map_err(|e| format!("add evolution_log.namespace: {}", e))?;
     }
     Ok(())
+}
+
+/// #R57 maintainability/low：**共享 commit helper**——四处 commit（updated_at/trigger/
+/// cleanup-noop/cleanup）此前各自重复"commit 失败 + 显式 ROLLBACK"模式。
+/// #R57 实证修正（推翻 R25 评论 10 的"drop-guard 已清除"说法）：rusqlite 0.32.1 的
+/// `Transaction` Drop 语义（transaction.rs:242-247 finish_）用 **is_autocommit()** 判定
+/// 而非 committed 标志——commit 失败时事务仍活跃（is_autocommit=false），Drop 按
+/// 默认 `DropBehavior::Rollback` **自动执行回滚**；"commit 失败会带写锁还池"不成立，
+/// R25 加的显式 ROLLBACK 是画蛇添足（且与 `&mut conn` 借用冲突，helper 无法取
+/// conn 引用）。commit 成功则 is_autocommit=true，Drop no-op。helper 只收口错误
+/// 消息格式，防四处文案漂移。
+fn commit_or_rollback(tx: rusqlite::Transaction, label: &str) -> Result<(), String> {
+    tx.commit().map_err(|e| format!("{label}: {e}"))
 }
 
 /// #R49 bug/medium：DDL 执行带 **SQLITE_BUSY/SQLITE_LOCKED 退避重试**——并发首启时
@@ -620,11 +636,7 @@ fn is_duplicate_column(e: &rusqlite::Error) -> bool {
     }
 }
 
-fn execute_batch_retry(
-    conn: &rusqlite::Connection,
-    sql: &str,
-    label: &str,
-) -> Result<(), String> {
+fn execute_batch_retry(conn: &rusqlite::Connection, sql: &str, label: &str) -> Result<(), String> {
     let mut attempt = 0;
     loop {
         match conn.execute_batch(sql) {
@@ -651,9 +663,7 @@ fn execute_batch_retry(
 /// 而这三张附加表缺失时核心功能不受影响（见调用处注释），下次启动重试即可。
 fn ddl_soft(conn: &rusqlite::Connection, sql: &str, label: &str) {
     if let Err(e) = execute_batch_retry(conn, sql, label) {
-        eprintln!(
-            "[Memoria] WARN: {label} failed (soft-degraded, will retry next start): {e}"
-        );
+        eprintln!("[Memoria] WARN: {label} failed (soft-degraded, will retry next start): {e}");
     }
 }
 
@@ -743,28 +753,26 @@ pub fn migrate_hype_vectors(pool: &SqlitePool) -> Result<(), String> {
                             // #R53 bug/high：`duplicate column name` = 对端进程刚提交了
                             // 同一 ALTER（并发首启窗口）——按"已应用"处理，不中止启动。
                             if is_duplicate_column(&e) {
-                                eprintln!("[Memoria] Migration: memory_vectors.updated_at added by peer process");
+                                eprintln!(
+                                    "[Memoria] Migration: memory_vectors.updated_at added by peer process"
+                                );
                             } else {
-                                return Err((format!("add memory_vectors.updated_at: {}", e), None));
+                                return Err((
+                                    format!("add memory_vectors.updated_at: {}", e),
+                                    None,
+                                ));
                             }
                         } else {
-                            eprintln!("[Memoria] Migration: added memory_vectors.updated_at column");
+                            eprintln!(
+                                "[Memoria] Migration: added memory_vectors.updated_at column"
+                            );
                         }
                     }
-                    if let Err(e) = tx.commit() {
-                        // #R55 bug/high：drop-guard 已消费，显式回滚防"带写锁还池"。
-                        // #R56 bug/medium：**ROLLBACK 结果检查**——回滚也失败（同一
-                        // 磁盘压力下可能 IOERR）时连接仍带写锁还池（r2d2 无
-                        // test_on_check_out），后续查询静默跑在未提交事务内；把
-                        // 回滚失败并入错误消息升级传播，让"带锁还池"显式可见。
-                        if let Err(rb) = conn.execute_batch("ROLLBACK") {
-                            return Err((
-                                format!("commit updated_at tx: {e}; rollback also failed: {rb}"),
-                                None,
-                            ));
-                        }
-                        return Err((format!("commit updated_at tx: {}", e), None));
-                    }
+                    // #R57 maintainability/low：共享 commit_or_rollback（commit 失败
+                    // drop-guard 已消费 + ROLLBACK 结果检查，见 helper doc）。元组
+                    // 形态保留：commit 失败不重试（与 BEGIN 的锁竞争语义无关）。
+                    commit_or_rollback(tx, "commit updated_at tx")
+                        .map_err(|m| (m, None))?;
                     Ok(())
                 })();
                 match r {
@@ -779,7 +787,20 @@ pub fn migrate_hype_vectors(pool: &SqlitePool) -> Result<(), String> {
                         );
                         std::thread::sleep(std::time::Duration::from_millis(500 * attempt as u64));
                     }
-                    Err((msg, _)) => return Err(msg),
+                    Err((msg, _)) => {
+                        // #R57 bug/medium：**软降级**——本块是 migrate_hype_vectors 内
+                        // 唯一的重试耗尽后硬失败路径（BEGIN 每次尝试可等满 5s
+                        // busy_timeout，3 次 ≈15-18s）：对端进程持写锁超预算（如它自己
+                        // 的大库孤儿 COUNT/DELETE）时 Err 经 init_core_tables 传播到
+                        // .expect() 中止启动——与本函数其余分支（ddl_soft 三表/触发器
+                        // 重建/孤儿清理均软降级 + 下次重试）的并发首启存活目标相悖。
+                        // 缺列后果（4 列 upsert 报 no such column）只在存量旧库出现且
+                        // 下次启动重试，可接受。
+                        eprintln!(
+                            "[Memoria] WARN: updated_at migration failed after retries (soft-degraded, will retry next start): {msg}"
+                        );
+                        break;
+                    }
                 }
             }
         }
@@ -880,18 +901,8 @@ pub fn migrate_hype_vectors(pool: &SqlitePool) -> Result<(), String> {
                 rusqlite::params![TRIGGER_VERSION],
             )
             .map_err(|e| format!("set trigger version flag: {}", e))?;
-            if let Err(e) = tx.commit() {
-                // #R55 bug/high：commit 失败时 drop-guard 已消费、不会自动回滚——
-                // 显式 ROLLBACK 防"带写锁还池"（r2d2 无 test_on_check_out，后续查询
-                // 静默跑在未提交事务内、写锁不释放）。三处 commit
-                // （updated_at/trigger/cleanup）同款处理。
-                if let Err(rb) = conn.execute_batch("ROLLBACK") {
-                    return Err(format!(
-                        "commit trigger tx: {e}; rollback also failed: {rb} (connection may hold write lock)"
-                    ));
-                }
-                return Err(format!("commit trigger tx: {}", e));
-            }
+            // #R57 maintainability/low：共享 commit_or_rollback（见 helper doc）。
+            commit_or_rollback(tx, "commit trigger tx")?;
             Ok(())
         })();
         if let Err(e) = trig {
@@ -1004,16 +1015,8 @@ pub fn migrate_hype_vectors(pool: &SqlitePool) -> Result<(), String> {
                 )
                 .map_err(|e| format!("check cleanup flags (tx): {}", e))?;
             if done2 == 2 && !(force_cleanup && clean_vectors) {
-                if let Err(e) = tx.commit() {
-                    // #R55 bug/high：commit 失败 drop-guard 已消费——显式回滚防带
-                    // 写锁还池（同 updated_at/trigger 段）。
-                    if let Err(rb) = conn.execute_batch("ROLLBACK") {
-                        return Err(format!(
-                            "commit cleanup tx (noop): {e}; rollback also failed: {rb}"
-                        ));
-                    }
-                    return Err(format!("commit cleanup tx (noop): {}", e));
-                }
+                // #R57 maintainability/low：共享 commit_or_rollback（见 helper doc）。
+                commit_or_rollback(tx, "commit cleanup tx (noop)")?;
                 return Ok(());
             }
             // #R54 bug/low：refused 态**事务内重读**（与完成 flag 一致）——对端进程
@@ -1076,25 +1079,45 @@ pub fn migrate_hype_vectors(pool: &SqlitePool) -> Result<(), String> {
                             eprintln!(
                                 "[Memoria] WARN: {orphans_hype} orphan memory_hype_vectors rows (possible staged/external hype rows); NOT deleting - set MEMORIA_ORPHAN_CLEANUP_VECTORS=1 to enable (MEMORIA_FORCE_ORPHAN_CLEANUP=1 bypasses the {ORPHAN_REFUSE_THRESHOLD} threshold)"
                             );
-                            refused = true;
+                            // #R57 bug/low：hype 段拒绝**不置 refused**——REFUSED_FLAG
+                            // 语义 = memory_vectors 段拒绝（见下）；hype 拒绝态由
+                            // HYPE_FLAG 记录（段完成=删除或拒绝）。混用会让 vec 段
+                            // 干净完成也被标记 refused、下次启动 WARN 误导归因。
                         } else if orphans_hype > ORPHAN_REFUSE_THRESHOLD && !force_cleanup {
                             eprintln!(
                                 "[Memoria] WARN: {orphans_hype} orphan memory_hype_vectors rows ABOVE safety threshold {ORPHAN_REFUSE_THRESHOLD}; refusing auto-delete (set MEMORIA_FORCE_ORPHAN_CLEANUP=1 to force)"
                             );
-                            refused = true;
                         } else {
+                            // #R57 bug/medium：**删除前打印样本**——opt-in 时 DELETE
+                            // 永久销毁所有无 memories 行的向量行，但 add_vectors/
+                            // put_stored_vector 接受任意 id、lookup_namespace 回退
+                            // default、vector_search 不 join memories：外部注册向量是
+                            // 合法数据态，阈值只限数量不限分类正确性。删除前列出前
+                            // 5 个 id 使"删了什么"可审计（组内 concat 至多 5 个）。
+                            let samples: String = tx
+                                .query_row(
+                                    "SELECT COALESCE(group_concat(id, ', '), '') FROM (SELECT id FROM memory_hype_vectors \
+                                     WHERE NOT EXISTS (SELECT 1 FROM memories m WHERE m.id = memory_hype_vectors.id) LIMIT 5)",
+                                    [],
+                                    |r| r.get(0),
+                                )
+                                .map_err(|e| format!("sample hype orphans: {e}"))?;
+                            eprintln!(
+                                "[Memoria] Migration: deleting {orphans_hype} orphan memory_hype_vectors rows (samples: {samples})"
+                            );
                             const DEL_HYPE: &str = "DELETE FROM memory_hype_vectors \
                                 WHERE NOT EXISTS (SELECT 1 FROM memories m WHERE m.id = memory_hype_vectors.id)";
                             tx.execute(DEL_HYPE, []).map_err(|e| {
                                 format!("clean memory_hype_vectors orphans: {e} [SQL: {DEL_HYPE}]")
                             })?;
-                            eprintln!("[Memoria] Migration: removed {orphans_hype} orphan memory_hype_vectors rows");
                         }
                     }
                 }
                 // #R54 performance/medium：段完成（删除或拒绝）都置 HYPE_FLAG——
-                // 拒绝态由 REFUSED_FLAG 记录（语义与 memory_vectors 段一致：
-                // 评估过即跳过后续启动的持锁重扫，force 覆盖重新评估）。
+                // 评估过即跳过后续启动的持锁重扫，force 覆盖重新评估。
+                // #R57 bug/low：hype 拒绝态**只由 HYPE_FLAG 记录**（不再写
+                // REFUSED_FLAG——该 flag 语义 = memory_vectors 段拒绝，混用会让
+                // vec 段干净完成也被标记拒绝、下次启动 WARN 误导归因）。
                 tx.execute(
                     "INSERT OR IGNORE INTO migration_flags (flag) VALUES (?1)",
                     rusqlite::params![HYPE_FLAG],
@@ -1148,12 +1171,25 @@ pub fn migrate_hype_vectors(pool: &SqlitePool) -> Result<(), String> {
                             );
                             refused = true;
                         } else {
+                            // #R57 bug/medium：删除前打印样本（同 hype 段理由——
+                            // opt-in 时 ≤5000 的合法外部向量也会被永久销毁，
+                            // 样本使操作可审计）。
+                            let samples: String = tx
+                                .query_row(
+                                    "SELECT COALESCE(group_concat(id, ', '), '') FROM (SELECT id FROM memory_vectors \
+                                     WHERE NOT EXISTS (SELECT 1 FROM memories m WHERE m.id = memory_vectors.id) LIMIT 5)",
+                                    [],
+                                    |r| r.get(0),
+                                )
+                                .map_err(|e| format!("sample vec orphans: {e}"))?;
+                            eprintln!(
+                                "[Memoria] Migration: deleting {orphans_vec} orphan memory_vectors rows (samples: {samples})"
+                            );
                             const DEL_VEC: &str = "DELETE FROM memory_vectors \
                                 WHERE NOT EXISTS (SELECT 1 FROM memories m WHERE m.id = memory_vectors.id)";
                             tx.execute(DEL_VEC, []).map_err(|e| {
                                 format!("clean memory_vectors orphans: {e} [SQL: {DEL_VEC}]")
                             })?;
-                            eprintln!("[Memoria] Migration: removed {orphans_vec} orphan memory_vectors rows");
                         }
                     }
                 }
@@ -1184,17 +1220,9 @@ pub fn migrate_hype_vectors(pool: &SqlitePool) -> Result<(), String> {
                 )
                 .map_err(|e| format!("set cleanup flag: {}", e))?;
             }
-            // #R55 bug/high：commit 失败时 Transaction 的 Drop 自动回滚的说法只对
-            // **事务内语句失败**成立（`?` 提前返回）；commit 本身失败时 drop-guard
-            // 已消费——显式 ROLLBACK 防"带写锁还池"（同 updated_at/trigger 段）。
-            if let Err(e) = tx.commit() {
-                if let Err(rb) = conn.execute_batch("ROLLBACK") {
-                    return Err(format!(
-                        "commit cleanup tx: {e}; rollback also failed: {rb} (connection may hold write lock)"
-                    ));
-                }
-                return Err(format!("commit cleanup tx: {}", e));
-            }
+            // #R57 maintainability/low：共享 commit_or_rollback（commit 失败时
+            // drop-guard 已消费、显式 ROLLBACK 防"带写锁还池"，见 helper doc）。
+            commit_or_rollback(tx, "commit cleanup tx")?;
             Ok(())
         })();
         if let Err(e) = cleanup {
