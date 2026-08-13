@@ -78,9 +78,9 @@ SF_CHAT_API = os.environ.get(
     "SILICONFLOW_CHAT_URL", "https://api.siliconflow.cn/v1/chat/completions"
 )
 HYDE_MODEL = os.environ.get("MEMORIA_HYDE_MODEL", "Qwen/Qwen2.5-7B-Instruct")
-# 输出维度：默认 768（与现有 hnsw.rs:DIM 对齐，零 Rust 改动）；
-# 可选 1024/4096（需同步改 hnsw.rs:DIM 并重编）。MRL 截断，精度损失极小。
-EMBED_DIM = int(os.environ.get("MEMORIA_EMBED_DIM", "768"))
+# 输出维度：默认 1024（与 hnsw.rs:DIM=1024 对齐，零 Rust 改动）；
+# 可选 768/4096（改维度须同步改 hnsw.rs:DIM 并重编 + 全量重嵌）。MRL 截断，精度损失极小。
+EMBED_DIM = int(os.environ.get("MEMORIA_EMBED_DIM", "1024"))
 
 HOST = os.environ.get("MEMORIA_EMBED_HOST", "127.0.0.1")
 PORT = int(os.environ.get("MEMORIA_EMBED_PORT", "8777"))

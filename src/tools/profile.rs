@@ -9,7 +9,7 @@
 use crate::search;
 use crate::storage::SqlitePool;
 use crate::vector::{HnswIndex, QueryCache};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// 由 `category` + `tags` 派生 `kind`（响应投影字段，无库列，禁止 ALTER 加 kind）。
 fn derive_kind(category: &str, tags: &str) -> String {

@@ -65,9 +65,7 @@ fn days_ago(date_str: &Option<String>) -> Option<f64> {
     let days = if s.len() >= 10 {
         chrono::Utc::now()
             .date_naive()
-            .signed_duration_since(
-                chrono::NaiveDate::parse_from_str(&s[..10], "%Y-%m-%d").ok()?,
-            )
+            .signed_duration_since(chrono::NaiveDate::parse_from_str(&s[..10], "%Y-%m-%d").ok()?)
             .num_days()
     } else {
         30

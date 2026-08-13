@@ -33,7 +33,9 @@ pub fn keyword_search(
     // 加权，前置可确保目标进入高权重位置）。仅对纯英文/代码查询（无 CJK）跳过，避免噪音。
     // 注意：须在 tokens.is_empty() 早退之前执行——单 CJK 字查询（如「钱」）会被
     // tokenize_for_fts 的 all_cjk && len<2 过滤导致 tokens 为空，此时 LIKE 兜底是唯一通道。
-    let has_cjk = query.chars().any(|c| (0x4E00..=0x9FFF).contains(&(c as u32)));
+    let has_cjk = query
+        .chars()
+        .any(|c| (0x4E00..=0x9FFF).contains(&(c as u32)));
     if has_cjk && !query.trim().is_empty() {
         let mut like_q = query.trim();
         // 去掉 [pattern] 前缀标记（非内容词）
@@ -52,9 +54,8 @@ pub fn keyword_search(
                         WHERE content LIKE ? ESCAPE '\\' AND namespace = ? \
                         ORDER BY rowid LIMIT ?";
         if let Ok(mut stmt) = conn.prepare(like_sql) {
-            if let Ok(rows) = stmt.query_map(
-                rusqlite::params![like_pattern, namespace, limit],
-                |row| {
+            if let Ok(rows) =
+                stmt.query_map(rusqlite::params![like_pattern, namespace, limit], |row| {
                     Ok(SignalResult {
                         memory_id: row.get::<_, String>(1)?,
                         content: row.get::<_, String>(2)?,
@@ -66,8 +67,8 @@ pub fn keyword_search(
                         score: -20.0,
                         source: "like_fallback".to_string(),
                     })
-                },
-            ) {
+                })
+            {
                 for row in rows.flatten() {
                     if seen_ids.insert(row.memory_id.clone()) {
                         results.push(row);

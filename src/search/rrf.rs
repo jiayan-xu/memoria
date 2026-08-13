@@ -79,14 +79,16 @@ pub fn rrf_merge(signals: &[Vec<SignalResult>], weights: &[f64], k: f64) -> Vec<
         for (rank, result) in results.iter().enumerate() {
             let rrf = weight / (k + rank as f64 + 1.0);
             let ch = channel_of(&result.source);
-            let entry = score_map.entry(result.memory_id.clone()).or_insert_with(|| Agg {
-                rrf: 0.0,
-                content: result.content.clone(),
-                source: result.source.clone(),
-                sigs: Vec::new(),
-                sem: None,
-                kw: None,
-            });
+            let entry = score_map
+                .entry(result.memory_id.clone())
+                .or_insert_with(|| Agg {
+                    rrf: 0.0,
+                    content: result.content.clone(),
+                    source: result.source.clone(),
+                    sigs: Vec::new(),
+                    sem: None,
+                    kw: None,
+                });
             entry.rrf += rrf;
             // 记录贡献通道（粗粒度），供评测的通道贡献度量使用
             if let Some(existing) = entry.sigs.iter_mut().find(|(n, _)| n == &ch) {
@@ -237,7 +239,8 @@ pub fn graph_expand(
         let mut next_frontier: Vec<(String, f64, f64)> = Vec::new();
         let hop_factor = decay.powi(hop as i32);
         for (fid, _fscore, fedge) in &frontier {
-            let mut type_count: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+            let mut type_count: std::collections::HashMap<String, usize> =
+                std::collections::HashMap::new();
             let pickup = (fanout * 3).max(20);
             let hop_sql = format!(
                 "SELECT r.neighbor_id, r.weight, r.relation_type, m.content
@@ -261,16 +264,15 @@ pub fn graph_expand(
                 pickup
             );
             if let Ok(mut stmt) = conn.prepare(&hop_sql) {
-                if let Ok(rows) = stmt.query_map(
-                    rusqlite::params![fid, namespace, fid, namespace],
-                    |row| {
+                if let Ok(rows) =
+                    stmt.query_map(rusqlite::params![fid, namespace, fid, namespace], |row| {
                         let target_id: String = row.get(0)?;
                         let weight: f64 = row.get(1)?;
                         let rel_type: String = row.get(2)?;
                         let content: String = row.get::<_, Option<String>>(3)?.unwrap_or_default();
                         Ok((target_id, weight, rel_type, content))
-                    },
-                ) {
+                    })
+                {
                     for row in rows.flatten() {
                         let (target_id, weight, rel_type, content) = row;
                         if seen_ids.insert(target_id.clone()) {

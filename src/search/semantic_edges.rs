@@ -71,10 +71,9 @@ pub fn upsert_semantic_edges_for(
             .prepare(&sql)
             .map_err(|e| format!("prepare ns: {}", e))?;
         let rows = stmt
-            .query_map(
-                params_from_iter(ids.iter().map(|s| *s)),
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-            )
+            .query_map(params_from_iter(ids.iter().map(|s| *s)), |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
             .map_err(|e| format!("query ns: {}", e))?;
         rows.flatten().collect()
     };

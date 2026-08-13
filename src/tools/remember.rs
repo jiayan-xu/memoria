@@ -168,23 +168,8 @@ pub fn remember(
     valid_to: Option<&str>,
 ) -> Result<String, String> {
     let result = remember_with_dedup(
-        pool,
-        content,
-        category,
-        importance,
-        source,
-        namespace,
-        tags,
-        None,
-        None,
-        valid_from,
-        valid_to,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
+        pool, content, category, importance, source, namespace, tags, None, None, valid_from,
+        valid_to, None, None, None, None, None, None,
     )?;
     Ok(result.id)
 }
@@ -192,11 +177,7 @@ pub fn remember(
 /// **Deprecated (O2)**：不再作为 P0 写入主路径。保留函数以免外部调用方编译断裂；
 /// 调用方应改用 tags `occurred:YYYY-MM-DD`。本函数仍写旧列（只读兼容遗留数据），
 /// 但 MCP `memory_remember` 已不再调用。
-pub fn set_event_time(
-    pool: &SqlitePool,
-    memory_id: &str,
-    event_time: &str,
-) -> Result<(), String> {
+pub fn set_event_time(pool: &SqlitePool, memory_id: &str, event_time: &str) -> Result<(), String> {
     eprintln!(
         "[Memoria] WARN: set_event_time deprecated (O2); prefer tags occurred:YYYY-MM-DD (id={})",
         memory_id
@@ -303,7 +284,8 @@ pub fn remember_with_dedup(
             if near_dup_enabled() {
                 if let (Some(hnsw_idx), Some(qv)) = (hnsw, &candidate_vector) {
                     if crate::vector::persist::get_stored_vector(pool, &mem_id).is_none() {
-                        let _ = crate::vector::persist::put_stored_vector(pool, &mem_id, namespace, qv);
+                        let _ =
+                            crate::vector::persist::put_stored_vector(pool, &mem_id, namespace, qv);
                         let _ = hnsw_idx.add(&[VectorEntry {
                             id: mem_id.clone(),
                             vector: qv.clone(),
@@ -337,25 +319,25 @@ pub fn remember_with_dedup(
                 rusqlite::params![tags_safe, mem_id],
             );
         }
-            if near_dup_enabled() {
-                if let (Some(hnsw_idx), Some(qv)) = (hnsw, &candidate_vector) {
-                    if crate::vector::persist::get_stored_vector(pool, &mem_id).is_none() {
-                        let _ = crate::vector::persist::put_stored_vector(pool, &mem_id, namespace, qv);
-                        let _ = hnsw_idx.add(&[VectorEntry {
-                            id: mem_id.clone(),
-                            vector: qv.clone(),
-                        }]);
-                    }
-                    // 增量补 semantic_related 边（闭环 Phase 1b）
-                    let _ = crate::search::semantic_edges::upsert_semantic_edges_for(
-                        pool, hnsw_idx, &mem_id, namespace, qv,
-                    );
+        if near_dup_enabled() {
+            if let (Some(hnsw_idx), Some(qv)) = (hnsw, &candidate_vector) {
+                if crate::vector::persist::get_stored_vector(pool, &mem_id).is_none() {
+                    let _ = crate::vector::persist::put_stored_vector(pool, &mem_id, namespace, qv);
+                    let _ = hnsw_idx.add(&[VectorEntry {
+                        id: mem_id.clone(),
+                        vector: qv.clone(),
+                    }]);
                 }
+                // 增量补 semantic_related 边（闭环 Phase 1b）
+                let _ = crate::search::semantic_edges::upsert_semantic_edges_for(
+                    pool, hnsw_idx, &mem_id, namespace, qv,
+                );
             }
+        }
 
-            return Ok(RememberResult {
-                id: mem_id,
-                action: "updated_exact".to_string(),
+        return Ok(RememberResult {
+            id: mem_id,
+            action: "updated_exact".to_string(),
             ..Default::default()
         });
     }
@@ -438,8 +420,11 @@ pub fn remember_with_dedup(
                                             |r| r.get(0),
                                         )
                                         .unwrap_or(None);
-                                    let stamp_to =
-                                        compute_stamp_to_boundary(old_vt.as_deref(), &now, Some(valid_from_val));
+                                    let stamp_to = compute_stamp_to_boundary(
+                                        old_vt.as_deref(),
+                                        &now,
+                                        Some(valid_from_val),
+                                    );
                                     tx.execute(
                                         "UPDATE memories SET superseded_by = ?, tier = 'cold', valid_to = ?
                                          WHERE id = ?",
