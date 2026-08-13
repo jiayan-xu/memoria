@@ -191,11 +191,12 @@ pub fn set_event_time(pool: &SqlitePool, memory_id: &str, event_time: &str) -> R
 }
 
 /// #R65 maintainability/medium：**三路统一的向量持久化+索引 helper**——put 失败
-/// 短路 add（防 memory-only 向量）；semantic_related 边仅 put+add 都成功才建
-/// （无向量的记忆不该有图边）；add 失败记录并注明重启 rebuild 自愈。返回
-/// put+add 是否都成功（edge 门控）。此前三路复制粘贴的 if/else-if 链让门控
-/// 语义漂移（更新/superseded 路 edge 无条件），抽单点防未来只改一路。
-/// （#R65 插入位置修正：原插在 pub 与 fn 之间。）
+/// 短路 add（防 memory-only 向量）；add 失败记录并注明重启 rebuild 自愈。
+/// 此前三路复制粘贴的 if/else-if 链让失败语义漂移，抽单点防未来只改一路。
+/// #R66 bug/medium：**semantic_related 边移出本函数**——edge 刷新是幂等维护
+/// （已存在向量的记忆也应重算邻接），不能与 put+add 成功条件耦合；由调用方
+/// 在 is_none 守卫**之外**统一调用 edge_refresh。本函数只管 put+add，返回 ()
+/// （bool 返回值无消费者，是误导性 API）。
 /// 短路 add（防 memory-only 向量）；semantic_related 边仅 put+add 都成功才建
 /// （无向量的记忆不该有图边）；add 失败记录并注明重启 rebuild 自愈。返回
 /// put+add 是否都成功（edge 门控）。此前三路复制粘贴的 if/else-if 链让门控
@@ -206,7 +207,7 @@ fn persist_and_index(
     id: &str,
     ns: &str,
     qv: &[f32],
-) -> bool {
+) {
     let put_ok = match crate::vector::persist::put_stored_vector(pool, id, ns, qv) {
         Ok(()) => true,
         Err(e) => {
@@ -214,28 +215,32 @@ fn persist_and_index(
             false
         }
     };
-    let add_ok = put_ok
-        && match hnsw.add(&[VectorEntry {
+    if put_ok
+        && let Err(e) = hnsw.add(&[VectorEntry {
             id: id.to_string(),
             vector: qv.to_vec(),
-        }]) {
-            Ok(_) => true,
-            Err(e) => {
-                // put 成功 add 失败：向量已持久化但内存索引缺失；外层
-                // get_stored_vector 守卫会让后续 remember 跳过 add（发散到重启，
-                // #R65：长期运行服务可能持续缺失——重启 rebuild 对齐权威表自愈）。
-                eprintln!("[remember] hnsw add failed for {id}: {e} (index rebuild at next start reconciles)");
-                false
-            }
-        };
-    if add_ok {
-        if let Err(e) = crate::search::semantic_edges::upsert_semantic_edges_for(
-            pool, hnsw, id, ns, qv,
-        ) {
-            eprintln!("[remember] upsert_semantic_edges failed for {id}: {e}");
-        }
+        }])
+    {
+        // put 成功 add 失败：向量已持久化但内存索引缺失；外层
+        // get_stored_vector 守卫会让后续 remember 跳过 add（发散到重启，
+        // #R65：长期运行服务可能持续缺失——重启 rebuild 对齐权威表自愈）。
+        eprintln!("[remember] hnsw add failed for {id}: {e} (index rebuild at next start reconciles)");
     }
-    add_ok
+}
+
+/// #R66：semantic_related 边的**幂等刷新**——is_none 守卫之外统一调用（已存在
+/// 向量的记忆也应重算邻接，删除旧出边 + 按当前 HNSW 邻域重算）；失败可见。
+fn edge_refresh(
+    pool: &SqlitePool,
+    hnsw: &HnswIndex,
+    id: &str,
+    ns: &str,
+    qv: &[f32],
+) {
+    if let Err(e) = crate::search::semantic_edges::upsert_semantic_edges_for(pool, hnsw, id, ns, qv)
+    {
+        eprintln!("[remember] upsert_semantic_edges failed for {id}: {e}");
+    }
 }
 
 /// 带近义重复检测的 remember
@@ -335,10 +340,13 @@ pub fn remember_with_dedup(
                         // #R63 maintainability/medium：**与 updated 路径同款失败
                         // 处理**——put 失败短路 add（瞬态 BUSY 留 memory-only 向量、
                         // 重启后消失）；失败可见（低频异常直接 eprintln）。
-                        // #R65：共享 helper（put 失败短路 / edge 门控统一，
-                        // 见 persist_and_index doc）。
-                        let _ = persist_and_index(pool, hnsw_idx, &mem_id, namespace, qv);
+                        // #R65：共享 helper（put 失败短路 add）。
+                        persist_and_index(pool, hnsw_idx, &mem_id, namespace, qv);
                     }
+                    // #R66 bug/medium：edge 刷新在 is_none 守卫**之外**——已存在
+                    // 向量的记忆也需重算邻接（幂等维护）；移入 helper 且只在
+                    // is_none 内调用会让存量记忆的边永不刷新。
+                    edge_refresh(pool, hnsw_idx, &mem_id, namespace, qv);
                 }
             }
 
@@ -366,14 +374,12 @@ pub fn remember_with_dedup(
         if near_dup_enabled() {
             if let (Some(hnsw_idx), Some(qv)) = (hnsw, &candidate_vector) {
                 if crate::vector::persist::get_stored_vector(pool, &mem_id).is_none() {
-                    // #R61 maintainability/medium：**失败可见**——向量持久化/HNSW
-                    // add 失败时记忆行照常提交、语义召回静默降级（此前的 let _
-                    // 丢弃让 I/O 错误/BUSY 无痕）；失败属低频异常，直接 eprintln。
-                    // #R62 maintainability/low：**失败短路**——put 失败后不再 add
-                    // （否则向量只存内存、重启重建后消失——内存/持久态发散）。
-                    // #R65：共享 helper（put 失败短路 / edge 门控统一）。
-                    let _ = persist_and_index(pool, hnsw_idx, &mem_id, namespace, qv);
+                    // #R61 maintainability/medium：**失败可见**（put 失败短路 add，
+                    // 见 persist_and_index doc）；#R65：共享 helper。
+                    persist_and_index(pool, hnsw_idx, &mem_id, namespace, qv);
                 }
+                // #R66：edge 刷新在 is_none 之外（幂等维护，同 superseded 路）。
+                edge_refresh(pool, hnsw_idx, &mem_id, namespace, qv);
             }
         }
 
@@ -519,8 +525,10 @@ pub fn remember_with_dedup(
     // 图边，且失败可见）。
     if near_dup_enabled() {
         if let (Some(hnsw_idx), Some(qv)) = (hnsw, candidate_vector.as_ref()) {
-            // #R65：共享 helper（put 失败短路 / edge 门控统一）。
-            let _ = persist_and_index(pool, hnsw_idx, &mem_id, namespace, qv);
+            // #R65：共享 helper（put 失败短路 add）。
+            persist_and_index(pool, hnsw_idx, &mem_id, namespace, qv);
+            // #R66：edge 刷新（创建路径无存量向量——helper 后直接刷新，三路统一）。
+            edge_refresh(pool, hnsw_idx, &mem_id, namespace, qv);
         }
     }
 

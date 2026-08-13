@@ -32,11 +32,22 @@ pub fn parse_occurred_tag(tags_json: &str) -> Option<String> {
             // （如 occurred:💥💥💥，12 字节）时 `&date[..10]` 会在 UTF-8 字符中间
             // 切片 panic（remember 路径传调用方标签，可达）。`get(..10)` 对越界与
             // 非字符边界都返回 None，天然安全。
+            // #R66 maintainability/low：**与 legacy_occurred 的数字校验对齐**——
+            // 同一 occurred 字段此前两种规则（tags 路只查分隔符、legacy 路全数字），
+            // "abcd-ef-gh" 会从 tags 路漏进 extract_text_signals。
             if date.len() >= 10 {
                 let Some(d) = date.get(..10) else {
                     continue;
                 };
-                if d.as_bytes().get(4) == Some(&b'-') && d.as_bytes().get(7) == Some(&b'-') {
+                let b = d.as_bytes();
+                if b[0..4].iter().all(|c| c.is_ascii_digit())
+                    && b[4] == b'-'
+                    && b[5].is_ascii_digit()
+                    && b[6].is_ascii_digit()
+                    && b[7] == b'-'
+                    && b[8].is_ascii_digit()
+                    && b[9].is_ascii_digit()
+                {
                     return Some(d.to_string());
                 }
             }

@@ -502,7 +502,9 @@ fn rebuild_from_table(pool: &SqlitePool, hnsw: &HnswIndex, table: &str) -> Resul
                 // 此 Err 分支捕获的是 query_map 的行读取/列转换/SQLite 迭代错误。
                 if read_err_logged < READ_ERR_LOG_CAP {
                     read_err_logged += 1;
-                    eprintln!("[persist] {label} row read/iteration failed: {e}");
+                    // #R66 other/low：统一 [persist] WARN 前缀（写路径 let _ 丢弃 Result 时这些
+        // 样本行是主要失败信号，ops grep [persist] WARN 会漏掉引用了错误文本的行）。
+        eprintln!("[persist] WARN: {label} row read/iteration failed: {e}");
                 }
             }
         }

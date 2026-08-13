@@ -178,6 +178,44 @@ fn occurred_falls_back_to_valid_from_without_tag() {
     );
 }
 
+// #R66 test/low：**malformed-legacy 组合路径**——tags 无 occurred + 旧列
+// event_time_legacy 是畸形值（≥10 字节非日期 ASCII）+ valid_from 有效：
+// legacy_occurred 返回 None → occurred 回退 valid_from（此前 raw pass-through
+// 会把 "hello-worl" 写进 occurred）。
+#[test]
+fn occurred_malformed_legacy_falls_back_to_valid_from() {
+    let (engine, ns) = fresh_engine("malformed");
+    let conn = engine.pool.get().expect("conn");
+    conn.execute(
+        "INSERT INTO memories (id, namespace, content, importance, event_time, valid_from)          VALUES ('mm1', ?1, '带畸形旧列的记忆', 3, 'hello-world', '2026-07-10T00:00:00')",
+        rusqlite::params![&ns],
+    )
+    .unwrap();
+    drop(conn);
+    let ctx: Value = memory_context(
+        &engine.pool,
+        None,
+        None,
+        None,
+        &ns,
+        Some("畸形旧列"),
+        3,
+        true,
+        12,
+        15,
+        None,
+    )
+    .expect("context");
+    let row = &ctx["recall"].as_array().expect("recall")[0];
+    let occurred = row["occurred"].as_str().unwrap_or("");
+    let mentioned = row["mentioned"].as_str().unwrap_or("");
+    assert!(
+        occurred.starts_with("2026-07-10"),
+        "malformed legacy must fall back to valid_from, got occurred={occurred}"
+    );
+    assert_eq!(occurred, mentioned);
+}
+
 #[test]
 fn parse_occurred_tag_unit() {
     assert_eq!(

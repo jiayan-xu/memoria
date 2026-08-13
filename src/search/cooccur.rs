@@ -155,6 +155,41 @@ fn match_query_entities(pool: &SqlitePool, namespace: &str, query: &str) -> Hash
 mod unit_tests {
     use super::*;
 
+    // #R66 maintainability/low：**共享测试夹具**（三测试复制漂移源）——共享缓存
+    // 内存库 + 15 字段 FusedResult 构造收敛为两 helper。
+    fn test_pool(tag: &str) -> SqlitePool {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let db = format!(
+            "file:memoria_cooccur_{tag}_{}_{}?mode=memory&cache=shared",
+            std::process::id(),
+            seq
+        );
+        let pool = crate::storage::create_pool(&db, 4).expect("pool");
+        crate::storage::init_core_tables(&pool).expect("core tables");
+        pool
+    }
+
+    fn mk_result(id: &str, content: &str) -> FusedResult {
+        FusedResult {
+            memory_id: id.into(),
+            content: content.into(),
+            rrf_score: 0.5,
+            source: "test".into(),
+            signal_scores: vec![],
+            sem_cos: None,
+            kw_bm25: None,
+            graph_signal: None,
+            evolved_at: None,
+            pending_evolution: false,
+            primary_channel: None,
+            channel_scores: std::collections::HashMap::new(),
+            access_count: 0,
+            last_recalled: None,
+            time_status: None,
+        }
+    }
+
     // #R58 test/low：**真实调用** rerank_by_cooccurrence——此前只断言新空 Vec 为空
     // （函数被删也会通过，假覆盖）。
     // #R59 test/medium：**no-op 契约测试**——空结果集空进空出、不 panic。
@@ -175,17 +210,7 @@ mod unit_tests {
     // （let Ok else 兜底吞错），测试在查询逻辑完全损坏时也会通过。
     #[test]
     fn rerank_with_data() {
-        // :memory: 经 SqliteConnectionManager::file 每连接独立空库且预热超时——
-        // 用共享缓存内存库（多连接同库，同 mcp_server::build_test_state 模式）。
-        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let db = format!(
-            "file:memoria_cooccur_{}_{}?mode=memory&cache=shared",
-            std::process::id(),
-            seq
-        );
-        let pool = crate::storage::create_pool(&db, 4).expect("pool");
-        crate::storage::init_core_tables(&pool).expect("core tables");
+        let pool = test_pool("data");
         let conn = pool.get().expect("conn");
         // entity_mentions.memory_id 有外键引用 memories——先插 memories 再插引用。
         conn.execute(
@@ -213,31 +238,14 @@ mod unit_tests {
         )
         .unwrap();
         drop(conn);
-        let mk = |id: &str, content: &str| FusedResult {
-            memory_id: id.into(),
-            content: content.into(),
-            rrf_score: 0.5,
-            source: "test".into(),
-            signal_scores: vec![],
-            sem_cos: None,
-            kw_bm25: None,
-            graph_signal: None,
-            evolved_at: None,
-            pending_evolution: false,
-            primary_channel: None,
-            channel_scores: std::collections::HashMap::new(),
-            access_count: 0,
-            last_recalled: None,
-            time_status: None,
-        };
         // #R61 test/medium：**负控制**——m_c 无任何实体提及（与 m_a/m_b 相同初始
         // rrf_score 0.5）：boosting 记忆应排在它前面（排序契约真正被检验；此前
         // m_a/m_b boost 相同、sort_by 不改变相对序，断言在 sort_by 被删/反向时
         // 也通过）。
         let mut results: Vec<FusedResult> = vec![
-            mk("m_a", "甲记忆"),
-            mk("m_b", "乙记忆"),
-            mk("m_c", "丙记忆（无实体）"),
+            mk_result("m_a", "甲记忆"),
+            mk_result("m_b", "乙记忆"),
+            mk_result("m_c", "丙记忆（无实体）"),
         ];
         rerank_by_cooccurrence(&pool, "agent/test", "张三", &mut results);
         // #R60 test/medium：断言**可观察效果**——提及实体的记忆 boost 应用后
@@ -275,18 +283,11 @@ mod unit_tests {
     // 实体，PAIRWISE_BOOST 独立满足断言（query-hit 分支被删也不红）。
     #[test]
     fn query_hit_boost_alone() {
-        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let db = format!(
-            "file:memoria_cooccur_qh_{}_{}?mode=memory&cache=shared",
-            std::process::id(),
-            seq
-        );
-        let pool = crate::storage::create_pool(&db, 4).expect("pool");
-        crate::storage::init_core_tables(&pool).expect("core tables");
+        let pool = test_pool("qh");
         let conn = pool.get().expect("conn");
         conn.execute(
-            "INSERT INTO memories (id, namespace, content, importance)              VALUES ('m_d', 'agent/test', '丁记忆', 3), ('m_e', 'agent/test', '戊记忆', 3)",
+            "INSERT INTO memories (id, namespace, content, importance)              VALUES ('m_d', 'agent/test', '丁记忆', 3),
+                    ('m_e', 'agent/test', '戊记忆', 3)",
             [],
         )
         .unwrap();
@@ -302,24 +303,7 @@ mod unit_tests {
         )
         .unwrap();
         drop(conn);
-        let mk = |id: &str, content: &str| FusedResult {
-            memory_id: id.into(),
-            content: content.into(),
-            rrf_score: 0.5,
-            source: "test".into(),
-            signal_scores: vec![],
-            sem_cos: None,
-            kw_bm25: None,
-            graph_signal: None,
-            evolved_at: None,
-            pending_evolution: false,
-            primary_channel: None,
-            channel_scores: std::collections::HashMap::new(),
-            access_count: 0,
-            last_recalled: None,
-            time_status: None,
-        };
-        let mut results: Vec<FusedResult> = vec![mk("m_d", "丁记忆"), mk("m_e", "戊记忆")];
+        let mut results: Vec<FusedResult> = vec![mk_result("m_d", "丁记忆"), mk_result("m_e", "戊记忆")];
         rerank_by_cooccurrence(&pool, "agent/test", "张三", &mut results);
         let d = results.iter().find(|r| r.memory_id == "m_d").expect("m_d");
         let e = results.iter().find(|r| r.memory_id == "m_e").expect("m_e");
@@ -339,15 +323,7 @@ mod unit_tests {
     // 路径（guard 回归如改成 || 会静默失去 query-hit）。
     #[test]
     fn single_result_with_query_runs_query_path() {
-        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let db = format!(
-            "file:memoria_cooccur_sr_{}_{}?mode=memory&cache=shared",
-            std::process::id(),
-            seq
-        );
-        let pool = crate::storage::create_pool(&db, 4).expect("pool");
-        crate::storage::init_core_tables(&pool).expect("core tables");
+        let pool = test_pool("sr");
         let conn = pool.get().expect("conn");
         conn.execute(
             "INSERT INTO memories (id, namespace, content, importance)              VALUES ('m_f', 'agent/test', '己记忆', 3)",
@@ -365,23 +341,7 @@ mod unit_tests {
         )
         .unwrap();
         drop(conn);
-        let mk_f = || FusedResult {
-            memory_id: "m_f".into(),
-            content: "己记忆".into(),
-            rrf_score: 0.5,
-            source: "test".into(),
-            signal_scores: vec![],
-            sem_cos: None,
-            kw_bm25: None,
-            graph_signal: None,
-            evolved_at: None,
-            pending_evolution: false,
-            primary_channel: None,
-            channel_scores: std::collections::HashMap::new(),
-            access_count: 0,
-            last_recalled: None,
-            time_status: None,
-        };
+        let mk_f = || mk_result("m_f", "己记忆");
         let mut results: Vec<FusedResult> = vec![mk_f()];
         rerank_by_cooccurrence(&pool, "agent/test", "李四", &mut results);
         // 单结果 + 匹配查询 → query-hit boost 生效（guard 未把单结果短路）。
@@ -391,8 +351,9 @@ mod unit_tests {
             "single-result query-hit boost missing: {:?}",
             (&f.memory_id, f.rrf_score, &f.source)
         );
-        // #R64 test/low：**空查询 + 单结果 → guard 真分支**（len<2 && query 空 →
-        // 早退，无 boost）——此前该 guard 分支无测试覆盖。
+        // #R66 test/low 注释修正：空查询 + 单结果下**任何路径都无法 boost**
+        // （match_query_entities 空 + 单记忆 peer_overlap 恒 0），断言只文档化
+        // no-boost 契约、不判别 guard 分支本身（guard 删除也通过）。
         let mut empty_q: Vec<FusedResult> = vec![mk_f()];
         rerank_by_cooccurrence(&pool, "agent/test", "  ", &mut empty_q);
         let f0 = &empty_q[0];

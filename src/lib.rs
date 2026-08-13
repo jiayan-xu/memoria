@@ -169,8 +169,11 @@ impl MemoriaEngine {
         // 仅构建成功才替换；失败保留旧快照，检索不中断。
         // #R65 bug/medium：pending 槽的失效由 PyEngine::refresh_hype_index 处理
         // （字段属 PyEngine——两阶段 build/swap 与一步 refresh 不得混用，见其 doc）。
+        // #R66 bug/low：返回**实际应用长度**（swap 内部对 count 不匹配做了修正——
+        // 返回原始 count 会与 hype_vector_index_live 不一致）。
+        let applied = fresh.len();
         self.swap_hype_index(fresh, count);
-        Ok(count)
+        Ok(applied)
     }
 
     pub fn hybrid_search(
@@ -352,6 +355,9 @@ fn query_hype_count_cached(conn: &rusqlite::Connection, db_path: &str) -> i64 {
     // 同路径 30s 内的陈旧也一并规避（直接查成本可接受）。
     // #R65 style/low：显式括号（A || (B && C) 依赖 Rust 优先级易误读）；注释不夸大
     // （文件路径删除重建的 30s 陈旧仍由缓存路径承担——此分支只覆盖内存标识）。
+    // #R66 bug/low：**FAIL_EPOCHS 冷却以 ":memory:" 为共享键**——多内存引擎一库
+    // 失败会静默其他引擎 WARN 60s（缓存已按引擎跳过、冷却无 per-engine 身份可
+    // 用）；接受为已知限制（内存引擎通常单例/低频），注释留痕。
     if db_path.starts_with(":memory:")
         || (db_path.starts_with("file:") && db_path.contains("mode=memory"))
     {
@@ -386,8 +392,10 @@ fn query_hype_count_cached(conn: &rusqlite::Connection, db_path: &str) -> i64 {
     // #R65 performance/medium：**FAIL_EPOCHS 每次调用修剪**（此前只错误路径——大量
     // db_path 各失败一次的长期进程条目永积，违背 #R57 不累积意图）。
     {
-        let now = Instant::now();
         if let Ok(mut fe) = FAIL_EPOCHS.lock() {
+            // #R66 bug/low：now 在**锁内**取（#R56 纪律——锁外采样在交错窗口
+            // 给出偏移 TTL 判定；未来换 duration_since 会重演 panic 风险）。
+            let now = Instant::now();
             if let Some(fmap) = fe.as_mut() {
                 fmap.retain(|_, at| now.saturating_duration_since(*at).as_secs() < 60);
             }
@@ -608,6 +616,10 @@ mod python {
                 _ => {}
             }
             let (fresh, count, _) = slot.take().unwrap();
+            // #R66 performance/low：**guard 提前释放**——token/pending 已消费，
+            // swap 内 eprintln（count 不匹配 WARN）在慢 stderr 管道上阻塞时不再
+            // 卡住其他线程的 build/swap（#R59 同款纪律）。
+            drop(slot);
             self.inner.swap_hype_index(fresh, count);
             // #R64 bug/low：返回**实际应用长度**——引擎内部对 count 不匹配做了
             // 修正（取 fresh.len()）；返回 pending 槽的原始 count 会让调用方拿到
