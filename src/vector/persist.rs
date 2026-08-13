@@ -93,9 +93,10 @@ macro_rules! vector_table {
 
 struct VectorTable {
     table: &'static str,
-    /// #R53 performance/low：**预构建 SQL**（concat! 编译期拼接）——此前 insert_sql/
-    /// select_sql 每次写入/重建都 format! 分配。字段字面量消除每调用分配与未来
-    /// typo/注入面。
+    /// #R53 performance/low：**预构建 SQL**（concat! 编译期拼接）——字段字面量
+    /// 消除未来 typo/注入面。 #R60 documentation/low 纠正：旧实现是**字符串字面量**
+    /// （无每调用分配，R53 的"每次 format! 分配"表述失实）；本字段的真实动机是
+    /// 宏单源构建 SQL（#R49/#R56），分配/注入论述是附带收益。
     insert_sql: &'static str,
     select_sql: &'static str,
     fn_name: &'static str,
@@ -258,7 +259,8 @@ pub fn rebuild_hnsw_from_store(pool: &SqlitePool, hnsw: &HnswIndex) -> Result<us
 ///
 /// #R44 bug/medium 已知限制：HnswIndex::add 按 id 去重（已存在 id 静默跳过），本函数
 /// 在**已填充**的索引上调用时只**追加新 id**——已存在 id 的表内向量更新（离线脚本
-/// `INSERT OR REPLACE` 重跑）不会反映到运行中索引。生产路径（main.rs/lib.rs）启动时
+/// `INSERT ... ON CONFLICT(id) DO UPDATE` 重跑，#R60：脚本自 R25 起已与 Rust 写契约
+/// 对齐，REPLACE 语义早已不用）不会反映到运行中索引。生产路径（main.rs/lib.rs）启动时
 /// 均新建空索引再 rebuild，无此问题；仅"运行中对已填充索引调用"的场景受限。需要
 /// 拾取更新向量时须**全新索引**重建：`let fresh = HnswIndex::new(); fresh.set_ef_search(..);
 /// rebuild_hype_hnsw_from_store(pool, &fresh)?;` 后整体替换。
@@ -396,7 +398,13 @@ fn rebuild_from_table(pool: &SqlitePool, hnsw: &HnswIndex, table: &str) -> Resul
                 // 漂移）会误导运维往"换模型"方向查（而 0/4 字节更可能是截断/损坏）；
                 // 这些计数器喂给 hype 启动路径的 all-skipped 归因（error_on_all_
                 // skipped）。空 blob 在此单独短路。
-                if blob.is_empty() {
+                // #R60 bug/low：`<= 4` 而非仅 `is_empty()`——R58 的意图是"0 字节或
+                // 单个 float 归 corrupt（skipped_blob）而非模型漂移（skipped_dim）"，
+                // 但 4 字节 blob 通过 is_empty + 4 对齐后仍落 `len < DIM*4` → dim 桶。
+                // encode_vector 恒产出 4 倍数，单 float blob 更可能是截断/损坏；
+                // hype 启动门（error_on_all_skipped）的 all-skipped 归因会因此把
+                // 损坏表误指为维度漂移。
+                if blob.len() <= 4 {
                     skipped_blob += 1;
                     continue;
                 }

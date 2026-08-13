@@ -129,9 +129,23 @@ impl MemoriaEngine {
     /// #R54 maintainability/low：刷新时复用 **content 索引当前的 ef**（self.hnsw
     /// 构造时解析并应用）——重新解析 env 会在长驻进程里 env 变更后让双路 ef 分裂
     /// （content 保持构造时值、hype 用新值），违背 ef 对齐目标。
-    pub fn refresh_hype_index(&mut self) -> Result<usize, String> {
+    /// #R60 maintainability/medium：**两阶段 API**——`build_hype_index_fresh`（&self，
+    /// 锁外/无独占借用下构建新索引）与 `swap_hype_index`（&mut self，O(1) 赋值）分离：
+    /// Arc<Mutex> 宿主与多线程 Python 宿主可在**构建期间保持并发检索**，锁内窗口从
+    /// "秒级构建"缩到"一次赋值"。refresh_hype_index 保留为简单宿主的一步封装。
+    pub fn build_hype_index_fresh(&self) -> Result<(HnswIndex, usize), String> {
+        // 复用 content 索引当前的 ef（#R54：避免 env 重解析导致双路 ef 分裂）。
         let ef_search = self.hnsw.ef_search();
-        let (fresh, count) = match vector::persist::build_hype_hnsw(&self.pool, ef_search) {
+        vector::persist::build_hype_hnsw(&self.pool, ef_search)
+    }
+
+    pub fn swap_hype_index(&mut self, fresh: HnswIndex, count: usize) {
+        self.hype_hnsw = fresh;
+        eprintln!("[Memoria] HYPE HNSW refreshed: {} vectors", count);
+    }
+
+    pub fn refresh_hype_index(&mut self) -> Result<usize, String> {
+        let (fresh, count) = match self.build_hype_index_fresh() {
             Ok(x) => x,
             Err(e) => {
                 eprintln!("[Memoria] HYPE HNSW refresh failed, keeping existing index: {e}");
@@ -139,8 +153,7 @@ impl MemoriaEngine {
             }
         };
         // 仅构建成功才替换；失败保留旧快照，检索不中断。
-        self.hype_hnsw = fresh;
-        eprintln!("[Memoria] HYPE HNSW refreshed: {} vectors", count);
+        self.swap_hype_index(fresh, count);
         Ok(count)
     }
 
@@ -312,7 +325,8 @@ fn query_hype_count_cached(conn: &rusqlite::Connection, db_path: &str) -> i64 {
         let mut cache = CACHE.lock().unwrap_or_else(|p| p.into_inner());
         let m = cache.get_or_insert_with(HashMap::new);
         // 淘汰过期条目（写入路径顺带维护，避免无界累积）。
-        m.retain(|_, (at, _)| at.elapsed().as_secs() < 30);
+        let now = Instant::now();
+        m.retain(|_, (at, _)| now.saturating_duration_since(*at).as_secs() < 30);
         if let Some((at, v)) = m.get(db_path) {
             let now = Instant::now();
             if now.saturating_duration_since(*at).as_secs() < 30 {
@@ -344,7 +358,10 @@ fn query_hype_count_cached(conn: &rusqlite::Connection, db_path: &str) -> i64 {
                 let mut cache = CACHE.lock().unwrap_or_else(|p| p.into_inner());
                 let m = cache.get_or_insert_with(HashMap::new);
                 let preserve_success = match m.get(db_path) {
-                    Some((at, v)) if *v != -1 && at.elapsed().as_secs() < 30 => true,
+                    Some((at, v)) if *v != -1 && {
+                        let now = Instant::now();
+                        now.saturating_duration_since(*at).as_secs() < 30
+                    } => true,
                     _ => false,
                 };
                 if !preserve_success {
@@ -394,6 +411,10 @@ mod python {
     #[pyclass(name = "MemoriaEngine")]
     pub struct PyEngine {
         inner: MemoriaEngine,
+        /// #R60：两阶段 refresh 的**暂存槽**——HnswIndex 不能过 PyO3 边界，构建
+        /// 结果（&self 方法，detach 期间其他线程可并发检索）先存此处，随后
+        /// swap_hype_index（&mut self，O(1) 窗口）落地到引擎。
+        pending_hype: std::sync::Mutex<Option<(HnswIndex, usize)>>,
     }
 
     #[pymethods]
@@ -402,7 +423,10 @@ mod python {
         #[pyo3(signature = (db_path, _embedding = "shibing624/text2vec-base-chinese"))]
         fn new(db_path: &str, _embedding: &str) -> PyResult<Self> {
             MemoriaEngine::new(db_path)
-                .map(|e| PyEngine { inner: e })
+                .map(|e| PyEngine {
+                    inner: e,
+                    pending_hype: std::sync::Mutex::new(None),
+                })
                 .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))
         }
         #[pyo3(signature = (query, max_results=5, intent="", namespace="default", tier="", include_superseded=false))]
@@ -436,17 +460,50 @@ mod python {
         // Arc<Mutex> 宿主在刷新期间持锁，秒级构建会阻塞并发检索——当前取舍：
         // 正确性优先，宿主可错峰刷新）。此前该方法无任何调用点（doc 声称给
         // Python bindings 用但未绑定），refresh 不可达。
-        // #R55 performance/medium：**释放 GIL**——`py.allow_threads` 让构建期间
+        // #R55 performance/medium：**释放 GIL**——`py.detach`（pyo3 0.23+ 从 allow_threads 改名） 让构建期间
         // 其他 Python 线程继续运行（此前整段重建冻结整个解释器；PyEngine.inner 是
         // 实例独占非 Mutex 共享，allow_threads 无锁竞争语义）。
         // #R56 bug/medium 已知取舍：`&mut self` 的 PyRefMut 借用在 allow_threads 期间
         // 仍持有——其他线程若在刷新中调用**同一实例**的任何方法，PyO3 运行时借用
         // 检查会抛 PyBorrowError（"Already borrowed"）。benefit 只对"从不触碰该实例
-        // 的线程"成立；跨实例（多 PyEngine）完全安全。文档明示该限制，完整方案
-        // （interior-mutex 字段使其他线程刷新期间仍可搜索）留待后续。
+        // 的线程"成立；跨实例（多 PyEngine）完全安全。
+        // #R60 maintainability/medium：**两阶段 API 消除该取舍**——`build_hype_index`
+        // 只取 &self（detach 期间其他线程可自由调用**任意 &self 方法**，
+        // 包括 hybrid_search），构建完成后 `swap_hype_index` 的 &mut self 窗口只剩
+        // O(1) 赋值（微秒级，PyBorrowError 窗口可忽略）。多线程宿主推荐此组合。
         fn refresh_hype_index(&mut self, py: Python<'_>) -> PyResult<usize> {
-            let r: Result<usize, String> = py.allow_threads(|| self.inner.refresh_hype_index());
+            let r: Result<usize, String> = py.detach(|| self.inner.refresh_hype_index());
             r.map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))
+        }
+        /// #R60：两阶段 refresh 的构建阶段（&self——detach 下其他线程可并发
+        /// 检索）；HnswIndex 不能过 PyO3 边界，结果暂存 pending_hype，
+        /// 返回 count；swap_hype_index 以 O(1) 窗口落地。
+        fn build_hype_index(&self, py: Python<'_>) -> PyResult<usize> {
+            let r: Result<(HnswIndex, usize), String> =
+                py.detach(|| self.inner.build_hype_index_fresh());
+            let (fresh, count) =
+                r.map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
+            *self
+                .pending_hype
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()) = Some((fresh, count));
+            Ok(count)
+        }
+        fn swap_hype_index(&mut self) -> PyResult<usize> {
+            let taken = self
+                .pending_hype
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .take();
+            match taken {
+                Some((fresh, count)) => {
+                    self.inner.swap_hype_index(fresh, count);
+                    Ok(count)
+                }
+                None => Err(pyo3::exceptions::PyRuntimeError::new_err(
+                    "no pending hype index; call build_hype_index first",
+                )),
+            }
         }
         fn add_vectors(&self, ids: Vec<String>, vectors: Vec<Vec<f32>>) -> PyResult<usize> {
             self.inner

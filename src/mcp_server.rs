@@ -3221,6 +3221,15 @@ mod tests {
         let v: serde_json::Value =
             serde_json::from_str(&out).expect("memory_search returns valid JSON");
         assert_eq!(v["status"], "ok", "memory_search response: {out}");
+        // #R60 test/low：核心断言 = 正确记忆被命中（与 corpus 位置无关的稳定标识）；
+        // source 含 "hype" 作为语义通道证据保留——但注意它依赖 fused source 取
+        // RRF 合并首信号（temporal/importance 路对新建记忆也有贡献；keyword 路
+        // 目前因 unicode61 单 token 不匹配，切 jieba 后可能改变），若未来信号顺序
+        // 或分词变化导致 source 非 hype，应先确认 HyPE 路仍工作而非直接判失败。
+        assert_eq!(
+            v["results"][0]["memory_id"], "mem_hype_1",
+            "wrong memory hit through dispatch: {out}"
+        );
         let src = v["results"][0]["source"].as_str().unwrap_or("");
         assert!(
             src.contains("hype"),

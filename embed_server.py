@@ -15,10 +15,12 @@ Memoria 本地嵌入服务（语义检索后端）
         memory_search → POST /embed → 向量 → 注入 QueryCache → HNSW 参与融合。
 
 支持两种后端（env 切换，互不影响）：
-  - provider=local（默认）：sentence_transformers 离线 CPU 跑 text2vec（768d）。
-    注意：本服务输出维度默认 1024（MEMORIA_EMBED_DIM，见下）——local 后端的 768d
-    输出会与 hnsw.rs:DIM=1024 不匹配（QueryDim 错误），local 后端需显式设
-    MEMORIA_EMBED_DIM=768 或改用 siliconflow。
+  - provider=local（默认）：sentence_transformers 离线 CPU 跑 text2vec，**固定输出
+    768d**（_embed_local 不读 MEMORIA_EMBED_DIM；模型原生维度 768）。
+    注意：Rust 侧 hnsw.rs:DIM=1024 是硬编码（semantic_search 按 len!=DIM 拒绝查询
+    向量，不读 env），local 后端的 768d 与 1024d 索引**不兼容**（QueryDim(768) 错误）；
+    设 MEMORIA_EMBED_DIM=768 对 local 无效。local 场景须改用 siliconflow，或换原生
+    1024d 的本地模型并全量重嵌 + 重建索引。
   - provider=siliconflow：调用 SiliconFlow 云端 /v1/embeddings（OpenAI-compatible），
     支持 MRL `dimensions` 参数，可输出 64~4096 任意维度。无需本地 GPU。
     模型默认 Qwen/Qwen3-VL-Embedding-8B（纯文本+多模态）。
