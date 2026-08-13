@@ -117,7 +117,17 @@ def generate_question(content: str) -> str:
                 CHAT_URL, data=json.dumps(body).encode(), headers=headers, method="POST"
             )
             with urllib.request.urlopen(req, timeout=30) as r:
-                resp = json.loads(r.read().decode())
+                try:
+                    resp = json.loads(r.read().decode())
+                except json.JSONDecodeError as e:
+                    # #R55 bug/medium：2xx 非 JSON 体是确定性畸形响应（同形状每次必现）——
+                    # 直接确定性跳过，不重试（此前 JSONDecodeError 落 catch-all 重试 3 次
+                    # 白付 3 次付费调用后进 fail_ids，清单永不收敛；与 embed() 的
+                    # #R53 同款分类）。
+                    raise DeterministicSkipError(f"chat 响应非 JSON: {e}")
+                if not isinstance(resp, dict):
+                    # 2xx 非 dict 体（如 list）→ resp.get 会 AttributeError——确定性畸形。
+                    raise DeterministicSkipError(f"chat 响应非 dict: {type(resp).__name__}")
             # #R40 bug/medium：OpenAI 兼容端点的 content 可为 null/missing（refusal/空回复）——
             # 无条件 .strip() 会 AttributeError/KeyError，3 次重试后被误判为"瞬时失败"
             # 进 fail_ids（永不收敛且每轮白付 3 次付费调用）。null/缺失是**确定性**结果，
@@ -288,9 +298,13 @@ def main():
         if not os.path.exists(GOLDEN):
             print(f"错误: golden 文件不存在 {GOLDEN}（请先用 eval/eval_hyde_recall.py --build 生成）")
             sys.exit(1)
-        with open(GOLDEN, encoding="utf-8") as f:
-            d = json.load(f)
-        targets = [(it["id"], it["content"]) for it in d["items"]]
+        try:
+            with open(GOLDEN, encoding="utf-8") as f:
+                d = json.load(f)
+            targets = [(it["id"], it["content"]) for it in d["items"]]
+        except (json.JSONDecodeError, KeyError, TypeError) as e:
+            print(f"错误: golden 文件格式损坏/结构不符 {GOLDEN}: {e}")
+            sys.exit(1)
         if args.all and args.dry_run:
             print(f"--all --dry-run: 使用 golden 目标 {len(targets)} 条（不读库）")
         else:
@@ -358,6 +372,12 @@ def main():
             _probe = generate_question("预检：请返回一句可检索的示例问题。")
         except Exception as e:
             print(f"错误: chat 端点预检失败（{e}）——请检查 SILICONFLOW_API_KEY/模型配置")
+            sys.exit(1)
+        # #R55 bug/low：探针必须返回非空内容——模型系统性拒答/恒空（错模型名/
+        # 内容过滤常开）不抛异常，预检"通过"后 --all 每记忆付一次调用、全行确定性
+        # skip（写入 0 / 跳过 N），fail-fast-before-spending 目标落空。
+        if not _probe or len(_probe) < 6:
+            print("错误: chat 端点预检返回空/过短内容（模型拒绝或配置错误）——请检查 MEMORIA_HYDE_MODEL")
             sys.exit(1)
         print("预检通过: chat 端点可访问")
         # preflight 通过后才清理旧清单（见上方 #R42 说明）。
@@ -493,7 +513,7 @@ def main():
             try:
                 v = vecs[0]
                 blob = struct.pack(f"<{len(v)}f", *v)
-            except (IndexError, struct.error, TypeError, ValueError) as e:
+            except (IndexError, KeyError, struct.error, TypeError, ValueError) as e:
                 raise DeterministicSkipError(f"embed 响应向量畸形（{type(e).__name__}: {e}）") from e
             # 维度校验也在 try 内：畸形响应（非序列/非数值）抛异常 →
             # 按失败计数跳过而非中断整个 --all 批（否则 5339 条白跑且无 fail_ids）。
@@ -520,8 +540,10 @@ def main():
             # 单行写失败若抛到外层会中断整批且 fail_ids 永不落盘——违背
             # "不中断、可定点重跑"承诺。写失败按失败计数跳过并记录 id。
             con.execute(
-                "INSERT OR REPLACE INTO memory_hype_vectors (id, namespace, question, vector, updated_at) "
-                "VALUES (?, 'agent/xujiayan', ?, ?, datetime('now'))",
+                "INSERT INTO memory_hype_vectors (id, namespace, question, vector, updated_at) "
+                "VALUES (?, 'agent/xujiayan', ?, ?, datetime('now')) "
+                "ON CONFLICT(id) DO UPDATE SET question=excluded.question, vector=excluded.vector, "
+                "namespace=excluded.namespace, updated_at=excluded.updated_at",
                 (mid, q, blob),
             )
             # #R54 performance/low：批量 commit（每 50 行 + 循环后最终一次）——--all

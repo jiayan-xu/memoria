@@ -451,9 +451,15 @@ fn rebuild_from_table(
             )
         };
         if td.error_on_all_skipped {
-            return Err(format!(
-                "{label}: {cause} (dim mismatch, corrupt/degenerate blob, or read error)"
-            ));
+            // #R55 bug/low：skip-cause 括号**仅当确有 skip 行时追加**——skipped==0
+            // （全行读取失败，如列漂移）时列出 dim/corrupt 归因是误导（#R46 声称已修
+            // 的归因错误在启动门控路径重现）；cause 此时已含真实原因。
+            let detail = if skipped > 0 {
+                " (dim mismatch, corrupt/degenerate blob, or read error)"
+            } else {
+                ""
+            };
+            return Err(format!("{label}: {cause}{detail}"));
         }
         eprintln!("[persist] {label}: {cause}; returning 0 (historical behavior)");
     }

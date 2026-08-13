@@ -213,17 +213,11 @@ impl MemoriaEngine {
         // 返回正值、看起来健康（API-only 宿主不解析启动 WARN 就无从发现单路退化）。
         // 双字段对照：store > 0 且 live == 0 = 构建降级，一眼可见。
         // 查询失败显式标记为 -1（#R51：缺表/锁不被伪装成合理数字）。
-        let hype_store: i64 = match conn.query_row(
-            "SELECT COUNT(*) FROM memory_hype_vectors",
-            [],
-            |r| r.get(0),
-        ) {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("[Memoria] WARN: hype_vector_index_size query failed: {e}");
-                -1
-            }
-        };
+        // #R55 performance/low：**COUNT 结果 30s 缓存**——db_stats 每调用一次
+        // O(n) 全表扫描（在 8 个既有 COUNT 之上），监控循环高频轮询时逐次放大；
+        // 缓存由内存 HNSW 滞后语义兜底（live len 仍实时）。失败 WARN 走 60s 冷却
+        // ——持续故障下每调用刷一行会把 stderr 淹没在同一行里。
+        let hype_store = query_hype_count_cached(&conn);
         m.insert(
             "hype_vector_index_size".to_string(),
             serde_json::Value::Number(hype_store.into()),
@@ -286,6 +280,53 @@ impl MemoriaEngine {
     }
 }
 
+/// #R55 performance/low：hype 表行数的**缓存查询**（30s TTL）——db_stats 每调用
+/// 一次 O(n) COUNT 全表扫描，监控轮询高频调用时成本逐次放大；表由离线脚本在
+/// 服务外写入，30s 陈旧可接受（live 索引 len 在 stats 中仍实时）。查询失败
+/// WARN 60s 冷却（throttled_eprintln）——持续故障（缺表/锁）下每调用刷一行
+/// 会把 stderr 淹没在同一行。
+fn query_hype_count_cached(conn: &rusqlite::Connection) -> i64 {
+    use std::sync::atomic::{AtomicI64, Ordering};
+    use std::sync::Mutex;
+    use std::time::Instant;
+    static CACHE: Mutex<Option<(Instant, i64)>> = Mutex::new(None);
+    // 失败冷却（秒级时间戳；跨线程近似即可，精确隔离非目标）
+    static LAST_FAIL_EPOCH: AtomicI64 = AtomicI64::new(0);
+    let now = Instant::now();
+    {
+        let cache = CACHE.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some((at, v)) = cache.as_ref() {
+            if now.duration_since(*at).as_secs() < 30 && *v != -1 {
+                return *v;
+            }
+        }
+    }
+    let r = conn.query_row("SELECT COUNT(*) FROM memory_hype_vectors", [], |r| {
+        r.get::<_, i64>(0)
+    });
+    match r {
+        Ok(c) => {
+            *CACHE.lock().unwrap_or_else(|p| p.into_inner()) = Some((Instant::now(), c));
+            c
+        }
+        Err(e) => {
+            let epoch = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            let last = LAST_FAIL_EPOCH.load(Ordering::Relaxed);
+            if epoch.saturating_sub(last) >= 60
+                && LAST_FAIL_EPOCH
+                    .compare_exchange(last, epoch, Ordering::Relaxed, Ordering::Relaxed)
+                    .is_ok()
+            {
+                eprintln!("[Memoria] WARN: hype_vector_index_size query failed: {e}");
+            }
+            -1
+        }
+    }
+}
+
 // Utility
 pub fn truncate(s: &str, max_len: usize) -> String {
     if s.len() <= max_len {
@@ -342,10 +383,13 @@ mod python {
         // Arc<Mutex> 宿主在刷新期间持锁，秒级构建会阻塞并发检索——当前取舍：
         // 正确性优先，宿主可错峰刷新）。此前该方法无任何调用点（doc 声称给
         // Python bindings 用但未绑定），refresh 不可达。
-        fn refresh_hype_index(&mut self) -> PyResult<usize> {
-            self.inner
-                .refresh_hype_index()
-                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))
+        // #R55 performance/medium：**释放 GIL**——`py.allow_threads` 让构建期间
+        // 其他 Python 线程继续运行（此前整段重建冻结整个解释器，与 Arc<Mutex>
+        // 宿主阻塞并发检索同款问题；PyEngine.inner 是实例独占非 Mutex 共享，
+        // allow_threads 无锁竞争语义）。
+        fn refresh_hype_index(&mut self, py: Python<'_>) -> PyResult<usize> {
+            let r: Result<usize, String> = py.allow_threads(|| self.inner.refresh_hype_index());
+            r.map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))
         }
         fn add_vectors(&self, ids: Vec<String>, vectors: Vec<Vec<f32>>) -> PyResult<usize> {
             self.inner

@@ -25,13 +25,21 @@ pub(crate) fn throttled_eprintln(key: &'static str, msg: String) {
     use std::sync::Mutex;
     use std::time::Instant;
     static LAST_LOGS: Mutex<Option<HashMap<&'static str, Instant>>> = Mutex::new(None);
-    let now = Instant::now();
     let mut guard = LAST_LOGS.lock().unwrap_or_else(|p| p.into_inner());
     let m = guard.get_or_insert_with(HashMap::new);
-    let last = m.get(key).copied();
-    let due = last.map_or(true, |t| now.duration_since(t).as_secs() >= COOLDOWN_SECS);
+    // #R55 bug/medium：`Instant::now()` 在**锁内**取——锁外捕获存在竞态：另一线程
+    // 可在本线程取 now 后为同一 key 插入更新的时间戳并释放锁，本线程随后
+    // `now.duration_since(t)` 在 now < t 时 **panic**（Instant 要求 self >= earlier），
+    // panic 沿降级检索路径（并发下恰常触发）传播到请求处理。saturating_
+    // duration_since 兜底同型边界。判定后先解锁再打印，锁窗口只覆盖 HashMap 操作。
+    let now = Instant::now();
+    let due = match m.get(key).copied() {
+        Some(t) => now.saturating_duration_since(t).as_secs() >= COOLDOWN_SECS,
+        None => true,
+    };
     if due {
         m.insert(key, now);
+        drop(guard);
         eprintln!("{msg} (at most once per {COOLDOWN_SECS}s)");
     }
 }
@@ -105,11 +113,14 @@ pub fn semantic_search(
     // max_results=1e9 时 ≈120e9：with_capacity 要么 32 位容量溢出 panic、
     // 要么 64 位多 TB 分配 OOM 中止进程——热请求路径。overfetch 本身恒被
     // h.len() 钳制，真实合并集 ≤ 双索引容量；容量提示随索引规模走即可。
+    // #R55 performance/low：**去掉 .max(4096) 地板**——默认 primary_limit=50 时
+    // 40*50=2000 恒 < 4096，地板总是胜出、min(cap_total+2) 对小索引的钳制被架空；
+    // 空/小索引每查询仍分配 ~4096 槽（数十 KB）热路径开销。with_capacity 只是提示，
+    // 真实合并集恒被索引容量钳制，随 (limit*40).min(cap_total+2) 走即可。
     let cap_total = hnsw.map_or(0, |h| h.len()) + hype_hnsw.map_or(0, |h| h.len());
     let best_cap = (limit as usize)
         .saturating_mul(40)
-        .min(cap_total.saturating_add(2))
-        .max(4096);
+        .min(cap_total.saturating_add(2));
     let mut best: HashMap<String, (f64, &'static str)> = HashMap::with_capacity(best_cap);
     // 两路分别搜索；`roads_ok` 统计成功路数——若**所有存在的路**都失败（如 RwLock
     // poisoned），返回 Err 而非空集，使调用方能区分"索引空"与"索引坏了"（#R34 other/low：

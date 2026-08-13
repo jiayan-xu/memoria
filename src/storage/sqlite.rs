@@ -625,6 +625,13 @@ fn execute_batch_retry(
             Ok(()) => return Ok(()),
             Err(e) if is_busy(&e) && attempt < 3 => {
                 attempt += 1;
+                // #R55 maintainability/low：重试前 WARN——静默重试在并发首启锁竞争
+                // 下表现为数秒启动停滞零诊断，部署死锁难排查（与 updated_at BEGIN
+                // 循环同款）。
+                eprintln!(
+                    "[Memoria] WARN: {label} busy/locked (attempt {attempt}/3), retrying in {}ms: {e}",
+                    500 * attempt
+                );
                 std::thread::sleep(std::time::Duration::from_millis(500 * attempt as u64));
             }
             Err(e) => return Err(format!("{label}: {}", e)),
@@ -660,6 +667,11 @@ pub fn migrate_hype_vectors(pool: &SqlitePool) -> Result<(), String> {
     // #R52 bug/low：存量库的 memory_vectors 可能缺 updated_at 列（旧 schema 无此列、
     // 无历史 ALTER 迁移）——补齐后所有写入统一 4 列 upsert（当前 schema 部署的时间戳
     // 不再因 3 列 upsert 陈旧；imp_exp 导出该列，陈旧时间戳会出现在导出数据里）。
+    // #R55 performance/low：**只读快速路径**——新库的基表 schema 已声明该列，先在
+    // 无事务下查列存在（pragma_table_info 只读、busy_timeout 已设），存在即跳过整个
+    // BEGIN IMMEDIATE 块（多进程首启/滚动重启下避免每次启动一次写锁获取与跨进程
+    // 串行化，与本迁移的 flag 门控设计目标一致）。缺列才进事务路径；check-then-act
+    // 竞态由 `duplicate column name` 幂等判定兜底（对端先提交同一 ALTER 的窗口）。
     // #R53 bug/high：**check + ALTER 包进 BEGIN IMMEDIATE 事务**——pragma_table_info
     // 读与 ALTER 分开执行存在 check-then-act 竞态：两进程同时见列缺失，第一个提交
     // ALTER 后第二个报 `duplicate column name`（SQLITE_ERROR，is_busy 不重试）→
@@ -671,48 +683,77 @@ pub fn migrate_hype_vectors(pool: &SqlitePool) -> Result<(), String> {
     // 孤儿 DELETE 可超 5s busy_timeout，或对端自身的 ALTER）会让本进程 BEGIN 直接
     // DatabaseBusy 并 ? 传播到 .expect 中止启动（本函数唯一既无 execute_batch_retry
     // 也无软降级的 DDL 路径）。退避与 execute_batch_retry 同款（3 次 500/1000/1500ms）。
+    // #R55 bug/high：ALTER 默认值用**常量 `''`**——SQLite 的 ALTER TABLE ADD COLUMN
+    // 禁止非常量默认表达式（`datetime('now')` 是函数调用，报 "Cannot add a column with
+    // non-constant default" SQLITE_ERROR），恰在此迁移要服务的存量库上每次必现且
+    // 不是 duplicate-column 分支 → 传播到 .expect 中止启动。常量默认即可：4 列
+    // upsert 每次写入都会 SET updated_at=datetime('now')，存量行的 '' 只占位。
+    // #R55 bug/high：`tx.commit()` 失败时 Transaction 的 drop-guard **已清除**
+    // （rusqlite 在发 COMMIT 前消费 drop 保护），drop 不会执行 ROLLBACK——连接带着
+    // 未提交写事务还池（r2d2 无 test_on_check_out），后续查询静默跑在事务内、写锁
+    // 不释放。commit 失败路径显式 `ROLLBACK` 再传播。事务内语句失败（`?` 提前返回）
+    // 仍由 Transaction::drop 正常回滚。
     {
-        let mut attempt = 0;
-        loop {
-            // BEGIN 失败携带原始 rusqlite 错误供 busy 判定；其余错误只带消息
-            // （重试只对 BEGIN 的锁竞争有意义——事务内语句失败是真实 DB 问题）。
-            let r: Result<(), (String, Option<rusqlite::Error>)> = (|| {
-                let tx = conn
-                    .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-                    .map_err(|e| (format!("begin updated_at tx: {}", e), Some(e)))?;
-                let has_upd: i64 = tx
-                    .query_row(
-                        "SELECT COUNT(*) FROM pragma_table_info('memory_vectors') WHERE name='updated_at'",
-                        [],
-                        |r| r.get(0),
-                    )
-                    .map_err(|e| (format!("check memory_vectors.updated_at: {}", e), None))?;
-                if has_upd == 0 {
-                    if let Err(e) = tx.execute_batch(
-                        "ALTER TABLE memory_vectors ADD COLUMN updated_at TEXT DEFAULT (datetime('now'))",
-                    ) {
-                        // #R53 bug/high：`duplicate column name` = 对端进程刚提交了
-                        // 同一 ALTER（并发首启窗口）——按"已应用"处理，不中止启动。
-                        if is_duplicate_column(&e) {
-                            eprintln!("[Memoria] Migration: memory_vectors.updated_at added by peer process");
+        // 只读快速路径：新库基表已含该列（常见情形）→ 零写锁。
+        let fast_has_upd: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('memory_vectors') WHERE name='updated_at'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        if fast_has_upd == 0 {
+            let mut attempt = 0;
+            loop {
+                // BEGIN 失败携带原始 rusqlite 错误供 busy 判定；其余错误只带消息
+                // （重试只对 BEGIN 的锁竞争有意义——事务内语句失败是真实 DB 问题）。
+                let r: Result<(), (String, Option<rusqlite::Error>)> = (|| {
+                    let tx = conn
+                        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                        .map_err(|e| (format!("begin updated_at tx: {}", e), Some(e)))?;
+                    let has_upd: i64 = tx
+                        .query_row(
+                            "SELECT COUNT(*) FROM pragma_table_info('memory_vectors') WHERE name='updated_at'",
+                            [],
+                            |r| r.get(0),
+                        )
+                        .map_err(|e| (format!("check memory_vectors.updated_at: {}", e), None))?;
+                    if has_upd == 0 {
+                        if let Err(e) = tx.execute_batch(
+                            "ALTER TABLE memory_vectors ADD COLUMN updated_at TEXT DEFAULT ''",
+                        ) {
+                            // #R53 bug/high：`duplicate column name` = 对端进程刚提交了
+                            // 同一 ALTER（并发首启窗口）——按"已应用"处理，不中止启动。
+                            if is_duplicate_column(&e) {
+                                eprintln!("[Memoria] Migration: memory_vectors.updated_at added by peer process");
+                            } else {
+                                return Err((format!("add memory_vectors.updated_at: {}", e), None));
+                            }
                         } else {
-                            return Err((format!("add memory_vectors.updated_at: {}", e), None));
+                            eprintln!("[Memoria] Migration: added memory_vectors.updated_at column");
                         }
-                    } else {
-                        eprintln!("[Memoria] Migration: added memory_vectors.updated_at column");
                     }
+                    if let Err(e) = tx.commit() {
+                        // #R55 bug/high：drop-guard 已消费，显式回滚防"带写锁还池"。
+                        let _ = conn.execute_batch("ROLLBACK");
+                        return Err((format!("commit updated_at tx: {}", e), None));
+                    }
+                    Ok(())
+                })();
+                match r {
+                    Ok(()) => break,
+                    Err((_msg, Some(e))) if is_busy(&e) && attempt < 3 => {
+                        attempt += 1;
+                        // #R55 maintainability/low：重试前 WARN——静默重试在并发首启
+                        // 锁竞争下表现为数秒启动停滞零诊断，部署死锁难排查。
+                        eprintln!(
+                            "[Memoria] WARN: updated_at migration busy/locked (attempt {attempt}/3), retrying in {}ms: {e}",
+                            500 * attempt
+                        );
+                        std::thread::sleep(std::time::Duration::from_millis(500 * attempt as u64));
+                    }
+                    Err((msg, _)) => return Err(msg),
                 }
-                tx.commit()
-                    .map_err(|e| (format!("commit updated_at tx: {}", e), None))?;
-                Ok(())
-            })();
-            match r {
-                Ok(()) => break,
-                Err((_msg, Some(e))) if is_busy(&e) && attempt < 3 => {
-                    attempt += 1;
-                    std::thread::sleep(std::time::Duration::from_millis(500 * attempt as u64));
-                }
-                Err((msg, _)) => return Err(msg),
             }
         }
     }
@@ -805,8 +846,14 @@ pub fn migrate_hype_vectors(pool: &SqlitePool) -> Result<(), String> {
                 rusqlite::params![TRIGGER_VERSION],
             )
             .map_err(|e| format!("set trigger version flag: {}", e))?;
-            tx.commit()
-                .map_err(|e| format!("commit trigger tx: {}", e))?;
+            if let Err(e) = tx.commit() {
+                // #R55 bug/high：commit 失败时 drop-guard 已消费、不会自动回滚——
+                // 显式 ROLLBACK 防"带写锁还池"（r2d2 无 test_on_check_out，后续查询
+                // 静默跑在未提交事务内、写锁不释放）。三处 commit
+                // （updated_at/trigger/cleanup）同款处理。
+                let _ = conn.execute_batch("ROLLBACK");
+                return Err(format!("commit trigger tx: {}", e));
+            }
             Ok(())
         })();
         if let Err(e) = trig {
@@ -875,10 +922,19 @@ pub fn migrate_hype_vectors(pool: &SqlitePool) -> Result<(), String> {
     // 避免这个）。HYPE_FLAG = "hype 段已评估（删除或拒绝）"；force 时仍重新评估。
     const HYPE_FLAG: &str = "hype_orphan_cleanup_v1";
     let hype_done = flag_set(&conn, HYPE_FLAG);
-    // #R52 bug/medium：外层 gate 由两个完成 flag 门控（任一未完成即进）——refused 态
+    // #R52 bug/medium：外层 gate 由完成 flag 门控（任一未完成即进）——refused 态
     // 只跳过 memory_vectors 段的评估（事务内判定），不再跳过整个清理。
     // force gate 保留（覆盖已置位标记的逃生通道，#R50/#R51）。
-    if !already || !hype_done || (force_cleanup && clean_vectors) {
+    // #R55 performance/medium：**refused 态外层 gate 跳过**——refused 后 CLEANUP_FLAG
+    // 故意不置位（#R49 语义：拒绝态需重新评估的机会），但每次启动都重新
+    // BEGIN IMMEDIATE + flag 检查 + no-op commit 是在多进程部署里每次启动获取一次
+    // 写锁（可阻塞到 busy_timeout），正是 #R49 声称避免的。refused 且两段完成
+    // （hype 段独立 HYPE_FLAG 已置位）时整分支跳过；refused 但 hype 段未评估时仍需
+    // 进入（hype 段有独立 flag，refused 不跳过它）。force 时一律进入。
+    // 逻辑：`(!already && !refused_done) || !hype_done`——refused_done 只压掉
+    // `!already`（vec 段拒绝态），hype 未完成仍进。
+    let refused_done = flag_set(&conn, REFUSED_FLAG);
+    if (!already && !refused_done) || !hype_done || (force_cleanup && clean_vectors) {
         // 清理**软降级**（#R48 bug/medium）：BEGIN IMMEDIATE 阻塞超 busy_timeout（并发
         // 首启大库 DELETE 可超 5s）、或清理中任何 DB 错误，**不阻断启动**——main.rs/
         // mcp_server.rs 用 .expect()，硬失败会让并发首启部署直接 panic 中止。失败仅
@@ -904,8 +960,12 @@ pub fn migrate_hype_vectors(pool: &SqlitePool) -> Result<(), String> {
                 )
                 .map_err(|e| format!("check cleanup flags (tx): {}", e))?;
             if done2 > 0 && !(force_cleanup && clean_vectors) {
-                tx.commit()
-                    .map_err(|e| format!("commit cleanup tx (noop): {}", e))?;
+                if let Err(e) = tx.commit() {
+                    // #R55 bug/high：commit 失败 drop-guard 已消费——显式回滚防带
+                    // 写锁还池（同 updated_at/trigger 段）。
+                    let _ = conn.execute_batch("ROLLBACK");
+                    return Err(format!("commit cleanup tx (noop): {}", e));
+                }
                 return Ok(());
             }
             // #R54 bug/low：refused 态**事务内重读**（与完成 flag 一致）——对端进程
@@ -933,7 +993,12 @@ pub fn migrate_hype_vectors(pool: &SqlitePool) -> Result<(), String> {
             const ORPHAN_REFUSE_THRESHOLD: i64 = 5000;
             // force/opt-in env 在 gate 之前已读取（#R50 bug/medium，见函数上方）。
             let mut refused = false;
-            // ── hype 段（HYPE_FLAG 未评估时）──
+            // ── hype 段（HYPE_FLAG 未评估，或 force 覆盖）──
+            // #R55 bug/medium：force 时**重新评估**——HYPE_FLAG 置位后（含 refused
+            // 路径）`hype_done2 == 0` 恒假，hype 段对 force env 组合（FORCE+OPT_IN）
+            // 静默 no-op，与 memory_vectors 段（refused2 > 0 && !force 才跳过）语义
+            // 不一致，文档承诺的"force 覆盖重新评估"对 hype 表失效；孤儿 hype 行
+            // 持续存在并在每次 rebuild 重入 HNSW。
             let hype_done2: i64 = tx
                 .query_row(
                     "SELECT COUNT(*) FROM migration_flags WHERE flag = ?1",
@@ -941,7 +1006,7 @@ pub fn migrate_hype_vectors(pool: &SqlitePool) -> Result<(), String> {
                     |r| r.get(0),
                 )
                 .map_err(|e| format!("check hype flag (tx): {}", e))?;
-            if hype_done2 == 0 {
+            if hype_done2 == 0 || (force_cleanup && clean_vectors) {
                 let h_exists: i64 = tx
                     .query_row(
                         "SELECT EXISTS(SELECT 1 FROM memory_hype_vectors LIMIT 1)",
@@ -1071,10 +1136,13 @@ pub fn migrate_hype_vectors(pool: &SqlitePool) -> Result<(), String> {
                 )
                 .map_err(|e| format!("set cleanup flag: {}", e))?;
             }
-            // #R43 bug/medium：commit 失败时 Transaction 的 Drop 自动回滚——连接不会
-            // 带着未提交事务还池。
-            tx.commit()
-                .map_err(|e| format!("commit cleanup tx: {}", e))?;
+            // #R55 bug/high：commit 失败时 Transaction 的 Drop 自动回滚的说法只对
+            // **事务内语句失败**成立（`?` 提前返回）；commit 本身失败时 drop-guard
+            // 已消费——显式 ROLLBACK 防"带写锁还池"（同 updated_at/trigger 段）。
+            if let Err(e) = tx.commit() {
+                let _ = conn.execute_batch("ROLLBACK");
+                return Err(format!("commit cleanup tx: {}", e));
+            }
             Ok(())
         })();
         if let Err(e) = cleanup {
