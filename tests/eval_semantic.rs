@@ -8,8 +8,9 @@
 //! 前置：embed_server.py 运行于 127.0.0.1:8777（MEMORIA_EMBEDDING_URL）。
 
 use memoria_core::search::hybrid::hybrid_search;
-use memoria_core::storage::{create_pool, init_core_tables, init_schema};
+use memoria_core::storage::{create_pool, init_core_tables, init_schema, SqlitePool};
 use memoria_core::tools::remember::remember_with_dedup;
+use memoria_core::vector::{VectorEntry, persist};
 use memoria_core::MemoriaEngine;
 use serde_json::Value;
 use std::path::Path;
@@ -47,6 +48,61 @@ trait Pipe: Sized {
     }
 }
 impl<T> Pipe for T {}
+
+/// 单条记忆的 HyPE 补嵌结果（#R44 maintainability/low：四个失败分支的簿记收口）。
+enum HypeOutcome {
+    /// 问句化 embed → put → add 全链路成功且索引真正加入（n>0）。
+    Covered,
+    /// 任一环节失败/被拒，附原因（已去重计数由调用方处理）。
+    Skipped(String),
+}
+
+/// 问句化改写嵌入 → 落库 → 入 hype 索引，一次调用完成（#R44 maintainability/low：
+/// 此前整个 embed/put/add 金字塔嵌套在语料循环体内，四个失败分支重复
+/// `hype_failed_once.insert / hype_skipped += 1 / hype_processed.remove` 簿记，
+/// 深嵌套让策略矛盾难以发现。抽出后成败簿记集中在调用方一处）。
+///
+/// #R44 bug/medium 策略（与 #R43 注释对齐）：**失败一次即永久跳过，不重试**——
+/// 近义重复条目对同一 rid 重试 = 重复付费 embed；系统性故障（服务拒绝前缀 prompt）
+/// 重试同样失败，仅瞬时抖动受益，而覆盖率断言（≥80%）已把持续性失败暴露为测试
+/// 失败。故调用方对 Skipped 结果入 `hype_failed_once` 后不再处理该 rid。
+async fn hype_upsert_one(
+    client: &reqwest::Client,
+    engine: &MemoriaEngine,
+    pool: &SqlitePool,
+    rid: &str,
+    ns: &str,
+    content: &str,
+) -> HypeOutcome {
+    // 问句化改写：与内容向量不同（否则双路合并无意义）。嵌入失败则跳过（不 put/add）
+    // ——fallback 到内容向量会让两路恒等、退化为内容通道，且把内容向量写进 question
+    // 列与离线脚本的问句向量不一致，rebuild 后会混入两种形态。
+    match embed(client, &format!("用户提问：{content}")).await {
+        Err(e) => HypeOutcome::Skipped(format!("question embed failed: {e}")),
+        Ok(hv) => {
+            // put 可能因退化向量（零/NaN）/维度/DB 失败返回 Err——内容路容忍静默跳过，
+            // 此处按 skip 计数（局部 embed 服务异常不应打挂整个评测；覆盖率断言兜底）。
+            match persist::put_hype_stored_vector(pool, rid, ns, &hv) {
+                Err(e) => HypeOutcome::Skipped(format!("put rejected (degenerate/dim/db): {e}")),
+                Ok(()) => {
+                    // add 失败/0 条按 skip 而非 panic：put 用 f64 校验、add 用 f32 复检
+                    // （重复 id 返回 0 属正常），put 通过仍可能 n==0。add 的 Err（维度
+                    // 不符/锁污染）与 Ok(0)（dup id / f32 复检拒绝）是不同失败，日志区分。
+                    match engine.hype_hnsw.add(&[VectorEntry {
+                        id: rid.to_string(),
+                        vector: hv,
+                    }]) {
+                        Ok(n) if n > 0 => HypeOutcome::Covered,
+                        Ok(_) => HypeOutcome::Skipped(
+                            "add returned 0 entries (dup id or f32 re-validation)".into(),
+                        ),
+                        Err(e) => HypeOutcome::Skipped(format!("add failed: {e}")),
+                    }
+                }
+            }
+        }
+    }
+}
 
 #[tokio::test]
 async fn memory_eval_semantic() {
@@ -136,92 +192,30 @@ async fn memory_eval_semantic() {
         // 双路分数各异，合并取 max 才有意义）。
         // 结果必须断言：put/add 静默失败会让 hype_hnsw 恒空、测试假绿。注意：
         // remember_with_dedup 近义去重命中时返回**已有记忆 id**，其 hype 向量可能已 add 过
-        // （HnswIndex 按 id 去重，重复 add 返回 0 属正常），故仅首次遇到该 rid 才断言 n>0。
+        // （HnswIndex 按 id 去重，重复 add 返回 0 属正常），故仅首次遇到该 rid 才处理。
         {
-            use memoria_core::vector::{VectorEntry, persist};
-            // 唯一处理集：每个 rid 只计数一次（近义去重会让同一 rid 出现多次——重复
-            // 计数会虚增分母、拉低覆盖率造成假红，#R39 bug/medium）。
-            // #R42 bug/medium：`insert` 在操作**之后**才提交最终结果——若首次遭遇
-            // 失败（瞬时 embed 错误/退化向量/add 返回 0），该 rid 从 processed 移除
-            // 允许后续近义重复条目重试，避免"一次失败永久无 HyPE 向量"且覆盖断言
-            // 在小的唯一集上因几次瞬时失败假红。
-            // #R43 bug/medium：`hype_total` 独立计数（首次遇到即 +1，无论成败）——
-            // processed 在失败时被 remove 以便重试，断言时只剩成功的，`hype_covered >=
-            // processed.len()*0.8` 恒真（重言式），无法防 no-op 假绿。用 total 作分母：
-            // 若问句化 embed 对多数记忆持续失败，覆盖断言真实失败。
+            // #R39 bug/medium：唯一处理集——每个 rid 只计数一次（近义去重会让同一 rid
+            // 出现多次，重复计数虚增分母拉低覆盖率造成假红）。
+            // #R43 bug/medium：`hype_total` 独立计数（首次遇到即 +1，无论成败）——此前
+            // 失败时把 rid 从 processed 移除以便重试，断言时 processed 只剩成功的，
+            // `hype_covered >= processed.len()*0.8` 恒真（重言式），无法防 no-op 假绿。
+            // 用 total 作分母：若问句化 embed 对多数记忆持续失败，覆盖断言真实失败。
+            // #R44 bug/medium：策略统一为**失败一次即永久跳过**（hype_failed_once）——
+            // 移除死代码 `hype_processed.remove(&rid)`（失败后 failed_once 已拦后续
+            // 重复，remove 无效果）；processed 仅作"已处理（成功或失败）"去重集。
             if !hype_processed.contains(&rid) && !hype_failed_once.contains(&rid) {
                 hype_processed.insert(rid.clone());
                 hype_total += 1;
-                // 问句化改写：与内容向量不同（否则双路合并无意义）。嵌入失败则**跳过**
-                // 该条（不 put/add）——fallback 到内容向量会让两路恒等、退化为内容通道，
-                // 正是本块要防的 no-op 假覆盖（且把内容向量写进 question 列与离线脚本
-                // 的问句向量不一致，rebuild 后会混入两种形态）。
-                // #R42 maintainability/low：绑定并记录 embed 实际错误（HTTP/解析/字段
-                // 缺失）——否则系统性拒绝带前缀 prompt 时只有 rid 无根因。
-                match embed(&client, &format!("用户提问：{content}")).await {
-                    Ok(hv) => {
-                        // #R38 test/low：put 可能因退化向量（零/NaN）返回 Err——内容路
-                        // 容忍静默跳过，此处同样按 skip 计数而非 panic（局部 embed 服务
-                        // 异常不应打挂整个评测；最终覆盖率断言会反映真实填充情况）。
-                        // #R43 maintainability/low：put 的 Err 不限于退化（维度不符/DB
-                        // 失败）——日志不预设原因。
-                        match persist::put_hype_stored_vector(&pool, &rid, ns, &hv) {
-                            Ok(()) => {
-                                // #R40 bug/medium：add 失败/0 条按 skip 计数而非 panic——
-                                // put 用 f64 校验、HnswIndex::add 用 f32 复检（且重复 id
-                                // 返回 0 属正常），put 通过仍可能 n==0；expect/assert 会
-                                // 打挂整个评测丢失全部召回诊断。覆盖率断言（≥80%）已兜住
-                                // "索引恒空"假绿。
-                                // #R42 maintainability/low：add 的 Err（维度不符/锁污染）
-                                // 与重复 id 的 Ok(0) 是不同失败，日志须区分。
-                                match engine.hype_hnsw.add(&[VectorEntry {
-                                    id: rid.clone(),
-                                    vector: hv,
-                                }]) {
-                                    Ok(n) if n > 0 => {
-                                        hype_seen.insert(rid.clone());
-                                        hype_covered += 1;
-                                    }
-                                    Ok(_) => {
-                                        eprintln!(
-                                            "[eval_semantic] hype add skipped (0 entries: dup id or f32 re-validation)"
-                                        );
-                                        if hype_failed_once.insert(rid.clone()) {
-                                            hype_skipped += 1;
-                                        }
-                                        hype_processed.remove(&rid);
-                                    }
-                                    Err(e) => {
-                                        eprintln!(
-                                            "[eval_semantic] hype add failed (skip): {e}"
-                                        );
-                                        if hype_failed_once.insert(rid.clone()) {
-                                            hype_skipped += 1;
-                                        }
-                                        hype_processed.remove(&rid);
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                eprintln!(
-                                    "[eval_semantic] hype put rejected (degenerate/dim/db): {e}"
-                                );
-                                if hype_failed_once.insert(rid.clone()) {
-                                    hype_skipped += 1;
-                                }
-                                hype_processed.remove(&rid);
-                            }
-                        }
+                match hype_upsert_one(&client, &engine, &pool, &rid, ns, content).await {
+                    HypeOutcome::Covered => {
+                        hype_seen.insert(rid.clone());
+                        hype_covered += 1;
                     }
-                    Err(e) => {
-                        // #R42 maintainability/low：记录实际 embed 错误。
-                        eprintln!(
-                            "[eval_semantic] question embed failed for {rid:?}: {e} (skipping hype put/add)"
-                        );
+                    HypeOutcome::Skipped(reason) => {
+                        eprintln!("[eval_semantic] hype skipped for {rid:?}: {reason}");
                         if hype_failed_once.insert(rid.clone()) {
                             hype_skipped += 1;
                         }
-                        hype_processed.remove(&rid);
                     }
                 }
             }

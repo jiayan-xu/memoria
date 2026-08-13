@@ -611,10 +611,17 @@ pub fn migrate_hype_vectors(pool: &SqlitePool) -> Result<(), String> {
         "CREATE INDEX IF NOT EXISTS idx_hype_ns ON memory_hype_vectors(namespace)",
     )
     .map_err(|e| format!("create idx_hype_ns: {}", e))?;
-    // 删除联动：memories 行删除时清理两个向量表（幂等，触发器已存在则跳过）。
-    // 注意：memory_vectors 同样存在孤儿问题（历史行为），一并覆盖。
+    // 删除联动：memories 行删除时清理两个向量表。注意：memory_vectors 同样存在孤儿
+    // 问题（历史行为），一并覆盖。
+    // #R44 maintainability/low：`DROP TRIGGER IF EXISTS` + `CREATE TRIGGER` 而非仅
+    // `IF NOT EXISTS`——固定名 + IF NOT EXISTS 会让存量库永远保留**旧 body**：未来
+    // 修改联动体（新增第三张向量表/修 bug）对新库生效、对已部署库静默失效（CREATE
+    // 被跳过），孤儿预防契约无法演进。DROP+CREATE 每次启动重放（DDL 微秒级，幂等），
+    // 保证 body 恒为当前代码定义；并发首启各进程执行同一 body，最终一致。
+    conn.execute_batch("DROP TRIGGER IF EXISTS mem_ad_vec")
+        .map_err(|e| format!("drop mem_ad_vec trigger: {}", e))?;
     conn.execute_batch(
-        "CREATE TRIGGER IF NOT EXISTS mem_ad_vec AFTER DELETE ON memories BEGIN
+        "CREATE TRIGGER mem_ad_vec AFTER DELETE ON memories BEGIN
             DELETE FROM memory_vectors WHERE id = old.id;
             DELETE FROM memory_hype_vectors WHERE id = old.id;
         END",
@@ -690,24 +697,20 @@ pub fn migrate_hype_vectors(pool: &SqlitePool) -> Result<(), String> {
                     )
                     .map_err(|e| format!("count memory_vectors orphans: {}", e))?;
                 if orphans_vec > 0 {
-                    // #R42 performance/medium：分批删除（每批 1000）限定单次持锁时间——
-                    // 大向量表全量 DELETE 的相关扫描可能超 busy_timeout。
+                    // #R42/#R44 performance/medium：**单条** DELETE（一次相关扫描）——
+                    // 分批 LIMIT 1000 在同一个 BEGIN IMMEDIATE 事务内**不降低**持锁时间：
+                    // NOT EXISTS 无索引可走，每批都是全表扫描，总工作量 O(批数 × 表大小)
+                    // 而非 O(孤儿数)；大库（孤儿恰在此累积）上启动被拖慢，并发首启的
+                    // 另一进程可能超 5000ms busy_timeout 而 SQLITE_BUSY 中止启动
+                    // （main.rs .expect 直接 panic）。真正释放锁需要每批独立事务，
+                    // 复杂度不值——单条 DELETE 一次扫描即最优。
                     // #R43 maintainability/low：SQL 规范化（去掉填充空白）+ 错误消息
                     // 内嵌 SQL 片段，便于真实库上失败时审计定位。
-                    const DEL_VEC: &str = "DELETE FROM memory_vectors WHERE rowid IN ( \
-                        SELECT rowid FROM memory_vectors \
-                        WHERE NOT EXISTS (SELECT 1 FROM memories m WHERE m.id = memory_vectors.id) \
-                        LIMIT 1000)";
-                    let mut remaining = orphans_vec;
-                    while remaining > 0 {
-                        let n = tx.execute(DEL_VEC, []).map_err(|e| {
-                            format!("clean memory_vectors orphans (batch): {e} [SQL: {DEL_VEC}]")
-                        })?;
-                        if n == 0 {
-                            break;
-                        }
-                        remaining -= n as i64;
-                    }
+                    const DEL_VEC: &str = "DELETE FROM memory_vectors \
+                        WHERE NOT EXISTS (SELECT 1 FROM memories m WHERE m.id = memory_vectors.id)";
+                    tx.execute(DEL_VEC, []).map_err(|e| {
+                        format!("clean memory_vectors orphans: {e} [SQL: {DEL_VEC}]")
+                    })?;
                     eprintln!("[Memoria] Migration: removed {orphans_vec} orphan memory_vectors rows");
                 }
             }
@@ -724,20 +727,12 @@ pub fn migrate_hype_vectors(pool: &SqlitePool) -> Result<(), String> {
                     )
                     .map_err(|e| format!("count memory_hype_vectors orphans: {}", e))?;
                 if orphans_hype > 0 {
-                    const DEL_HYPE: &str = "DELETE FROM memory_hype_vectors WHERE rowid IN ( \
-                        SELECT rowid FROM memory_hype_vectors \
-                        WHERE NOT EXISTS (SELECT 1 FROM memories m WHERE m.id = memory_hype_vectors.id) \
-                        LIMIT 1000)";
-                    let mut remaining = orphans_hype;
-                    while remaining > 0 {
-                        let n = tx.execute(DEL_HYPE, []).map_err(|e| {
-                            format!("clean memory_hype_vectors orphans (batch): {e} [SQL: {DEL_HYPE}]")
-                        })?;
-                        if n == 0 {
-                            break;
-                        }
-                        remaining -= n as i64;
-                    }
+                    // #R44 performance/medium：单条 DELETE（同 DEL_VEC 理由，见上）。
+                    const DEL_HYPE: &str = "DELETE FROM memory_hype_vectors \
+                        WHERE NOT EXISTS (SELECT 1 FROM memories m WHERE m.id = memory_hype_vectors.id)";
+                    tx.execute(DEL_HYPE, []).map_err(|e| {
+                        format!("clean memory_hype_vectors orphans: {e} [SQL: {DEL_HYPE}]")
+                    })?;
                     eprintln!("[Memoria] Migration: removed {orphans_hype} orphan memory_hype_vectors rows");
                 }
             }

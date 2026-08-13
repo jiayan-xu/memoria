@@ -71,6 +71,12 @@ struct VectorTable {
     insert_sql: &'static str,
     fn_name: &'static str,
     label: &'static str,
+    /// #R44 maintainability/medium：全 skip 时的错误语义（Err vs Ok(0)+WARN）作为**显式
+    /// 字段**而非 `label == "hype"` 字符串比较——label 只服务于日志前缀，用它门控
+    /// 行为会让"改 label 名"或"新增第三张表"静默改变错误契约（见 rebuild_from_table）。
+    /// content 表保持 Ok(0)（历史兼容：遗留全坏行不该让启动 Err）；hype 表 Err
+    /// （区分"功能未启用"与"表数据全损坏"）。
+    error_on_all_skipped: bool,
 }
 
 fn vector_tables() -> &'static [VectorTable] {
@@ -85,6 +91,7 @@ fn vector_tables() -> &'static [VectorTable] {
                                                         updated_at=excluded.updated_at",
             fn_name: "put_stored_vector",
             label: "content",
+            error_on_all_skipped: false,
         },
         VectorTable {
             table: "memory_hype_vectors",
@@ -96,6 +103,7 @@ fn vector_tables() -> &'static [VectorTable] {
                                                         updated_at=excluded.updated_at",
             fn_name: "put_hype_stored_vector",
             label: "hype",
+            error_on_all_skipped: true,
         },
     ];
     &TABLES
@@ -149,7 +157,15 @@ fn put_vector_into(
     }
     conn.execute(td.insert_sql, rusqlite::params![id, namespace, encode_vector(vector)])
         .map(|_| ())
-        .map_err(|e| format!("{fn_name}: {}", e))?;
+        .map_err(|e| {
+            // #R44 bug/medium：execute 失败必须 eprintln——所有生产调用方 `let _ =`
+            // 丢弃 Result（lib.rs:197、remember.rs 多处），schema 漂移/磁盘满/BUSY/
+            // 约束冲突完全不可见；与上方 degenerate/dim 两个 fail-fast 分支的可观测性
+            // 对齐（此前仅该分支静默，索引缺口只能从 HNSW 长度差异推断）。
+            let msg = format!("{fn_name}: {}", e);
+            eprintln!("[persist] WARN: {msg}");
+            msg
+        })?;
     Ok(())
 }
 
@@ -178,6 +194,13 @@ pub fn rebuild_hnsw_from_store(pool: &SqlitePool, hnsw: &HnswIndex) -> Result<us
 /// HNSW 实例**（内容索引与问句索引分离，因 HnswIndex 按 id 去重、同一 memory_id 只能有
 /// 一条向量）。调用方（main.rs/lib.rs）在启动时对两个索引分别 rebuild；`semantic_search`
 /// 双路搜索后按 memory_id 取 max 合并。
+///
+/// #R44 bug/medium 已知限制：HnswIndex::add 按 id 去重（已存在 id 静默跳过），本函数
+/// 在**已填充**的索引上调用时只**追加新 id**——已存在 id 的表内向量更新（离线脚本
+/// `INSERT OR REPLACE` 重跑）不会反映到运行中索引。生产路径（main.rs/lib.rs）启动时
+/// 均新建空索引再 rebuild，无此问题；仅"运行中对已填充索引调用"的场景受限。需要
+/// 拾取更新向量时须**全新索引**重建：`let fresh = HnswIndex::new(); fresh.set_ef_search(..);
+/// rebuild_hype_hnsw_from_store(pool, &fresh)?;` 后整体替换。
 pub fn rebuild_hype_hnsw_from_store(pool: &SqlitePool, hnsw: &HnswIndex) -> Result<usize, String> {
     rebuild_from_table(pool, hnsw, "memory_hype_vectors")
 }
@@ -310,10 +333,12 @@ fn rebuild_from_table(
         }
     }
     if skipped > 0 {
-        // #R43 other/low：decode_vector 不可失败（chunks_exact 丢尾部字节 → 长度不符走
-        // dim 分支）——真实行级失败只有 Err 臂（已单独记录）。摘要只列真实原因。
+        // #R43/#R44 other/low：decode_vector 不可失败（chunks_exact 丢尾部字节 → 长度
+        // 不符走 dim 分支）——真实行级失败只有 Err 臂（已单独 eprintln）。聚合摘要
+        // 只列实际原因（行读取错误已单列，不混入聚合消息，避免"哪条原因真的发生了"
+        // 无法从报告判断）。
         eprintln!(
-            "[persist] {label}: {skipped} row(s) skipped (row read/iteration error, degenerate zero/NaN, or dim != {DIM})"
+            "[persist] {label}: {skipped} row(s) skipped (degenerate zero/NaN or dim != {DIM})"
         );
     }
 
@@ -321,8 +346,11 @@ fn rebuild_from_table(
     // #R43 bug/medium：仅 **hype** 路径全 skip 时 Err（区分"功能未启用"与"数据损坏"）；
     // **content** 路径保持 Ok(0) + WARN——历史全退化行部署此前就是 Ok(0)，改 Err 是
     // 对现有公共函数 rebuild_hnsw_from_store 的契约变更（startup 路径，下游可能 `?`）。
+    // #R44 maintainability/medium：Err/Ok 语义由 descriptor 显式字段
+    // `error_on_all_skipped` 决定——不用 `label == "hype"` 字符串门控（改 label 名或
+    // 新增第三张表会静默改变错误契约）。
     if entries.is_empty() && rows_seen > 0 {
-        if label == "hype" {
+        if td.error_on_all_skipped {
             return Err(format!(
                 "{label}: table has {rows_seen} row(s) but ALL were skipped (dim mismatch or corrupt)"
             ));
