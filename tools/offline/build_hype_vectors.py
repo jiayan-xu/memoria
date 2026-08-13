@@ -288,16 +288,24 @@ def main():
     if not args.dry_run and not args.all:
         gids = [mid for mid, _ in targets]
         valid_ids = set()
-        for i in range(0, len(gids), 500):
-            chunk = gids[i : i + 500]
-            ph = ",".join("?" * len(chunk))
-            rows = con.execute(
-                "SELECT id FROM memories WHERE id IN (" + ph + ") "
-                "AND namespace='agent/xujiayan' AND superseded_by IS NULL "
-                "AND (valid_to IS NULL OR valid_to='' OR valid_to > strftime('%Y-%m-%dT%H:%M:%S','now'))",
-                chunk,
-            ).fetchall()
-            valid_ids.update(r[0] for r in rows)
+        # #R46 bug/medium：DB 文件存在但**未初始化**（无 memories 表）时裸抛
+        # OperationalError traceback——且此时 memory_hype_vectors 已作为副作用创建，
+        # 违背"友好诊断 / 失败无副作用"纪律。镜像 --all 分支的 try/except。
+        try:
+            for i in range(0, len(gids), 500):
+                chunk = gids[i : i + 500]
+                ph = ",".join("?" * len(chunk))
+                rows = con.execute(
+                    "SELECT id FROM memories WHERE id IN (" + ph + ") "
+                    "AND namespace='agent/xujiayan' AND superseded_by IS NULL "
+                    "AND (valid_to IS NULL OR valid_to='' OR valid_to > strftime('%Y-%m-%dT%H:%M:%S','now'))",
+                    chunk,
+                ).fetchall()
+                valid_ids.update(r[0] for r in rows)
+        except sqlite3.OperationalError as e:
+            con.close()
+            print(f"错误: 读取 {args.db} 的 memories 表失败（库未初始化/路径错误）: {e}")
+            sys.exit(1)
         before = len(targets)
         targets = [(m, c) for m, c in targets if m in valid_ids]
         stale = before - len(targets)
@@ -339,18 +347,26 @@ def main():
             sys.exit(1)
         print("预检通过: chat 端点可访问")
         # preflight 通过后才清理旧清单（见上方 #R42 说明）。
-        try:
-            if os.path.exists(failed_ids_path):
-                os.remove(failed_ids_path)
-        except OSError as e:
-            print(f"  [warn] 清理旧 hype_failed_ids.txt 失败: {e}")
+        # #R46 bug/medium：清理仅限**全量**运行（--limit 为 None）——`--limit N` 是
+        # 调试/抽样运行（argparse help 注明），只处理目标子集；无条件清理会让部分
+        # 运行静默抹掉上次全量运行累积的失败清单（"定点重跑"工件），运维先 --limit
+        # 调试再定点重跑时清单已丢，被迫全量 --all 再付几千次付费调用。dry-run 与
+        # preflight 失败已有守卫，部分运行此前漏网。
+        if args.limit is None:
+            try:
+                if os.path.exists(failed_ids_path):
+                    os.remove(failed_ids_path)
+            except OSError as e:
+                print(f"  [warn] 清理旧 hype_failed_ids.txt 失败: {e}")
 
     def record_fail(mid):
         """失败 id **立即追加**落盘（#R40 bug/medium）：脚本中断（Ctrl+C/崩溃）时
         已累计的失败清单不丢——"可定点重跑"承诺依赖该文件，删除旧清单后若只在循环
-        结束时写一次，中断即全丢。"""
+        结束时写一次，中断即全丢。
+        #R46 bug/medium：仅**全量**运行（--limit is None）落盘——--limit 调试/抽样
+        运行的失败既不写盘也不清理，旧清单保持完整（不被部分运行污染/覆盖）。"""
         fail_ids.append(mid)
-        if not args.dry_run:
+        if not args.dry_run and args.limit is None:
             try:
                 with open(failed_ids_path, "a", encoding="utf-8") as f:
                     f.write(mid + "\n")
@@ -438,15 +454,20 @@ def main():
         # 直接 'w' 截断原文件后若写入中途失败（磁盘满/崩溃），record_fail 追加累积的
         # 清单被毁，中断安全承诺恰在要保护的错误路径上失效。原子替换保证目标文件
         # 要么是旧完整清单、要么是新完整清单，绝不半写。
+        # #R46 bug/medium：仅全量运行重写文件——--limit 调试运行的失败集是子集，
+        # 覆盖旧清单会破坏"定点重跑"工件。
         dedup = list(dict.fromkeys(fail_ids))
-        try:
-            tmp = failed_ids_path + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as f:
-                f.write("\n".join(dedup))
-            os.replace(tmp, failed_ids_path)
-        except OSError as e:
-            print(f"  [warn] 重写 {failed_ids_path} 失败（追加清单仍保留）: {e}")
-        print(f"失败 id 已写入 {failed_ids_path}（{len(dedup)} 条）")
+        if args.limit is None:
+            try:
+                tmp = failed_ids_path + ".tmp"
+                with open(tmp, "w", encoding="utf-8") as f:
+                    f.write("\n".join(dedup))
+                os.replace(tmp, failed_ids_path)
+            except OSError as e:
+                print(f"  [warn] 重写 {failed_ids_path} 失败（追加清单仍保留）: {e}")
+            print(f"失败 id 已写入 {failed_ids_path}（{len(dedup)} 条）")
+        else:
+            print(f"（--limit 调试运行，未写 fail_ids 文件）本次失败 {len(dedup)} 条")
 
 
 if __name__ == "__main__":

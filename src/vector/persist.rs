@@ -365,15 +365,23 @@ fn rebuild_from_table(
     // #R44 maintainability/medium：Err/Ok 语义由 descriptor 显式字段
     // `error_on_all_skipped` 决定——不用 `label == "hype"` 字符串门控（改 label 名或
     // 新增第三张表会静默改变错误契约）。
+    // #R46 bug/low：全损归因须区分 read_errors 与 skipped——全行读取失败（列类型漂移）
+    // 时 skipped=0，原消息统一报"dim mismatch/corrupt"会误导运维（#R45 已把 read_errors
+    // 从 skip 摘要分离，此处条件/消息一并纳入）。
     if entries.is_empty() && rows_seen > 0 {
+        let cause = if skipped == 0 {
+            format!("all {rows_seen} row(s) failed read/iteration")
+        } else {
+            format!(
+                "{rows_seen} row(s) unusable ({skipped} skipped, {read_errors} read errors)"
+            )
+        };
         if td.error_on_all_skipped {
             return Err(format!(
-                "{label}: table has {rows_seen} row(s) but ALL were skipped (dim mismatch or corrupt)"
+                "{label}: {cause} (dim mismatch, corrupt blob, or read error)"
             ));
         }
-        eprintln!(
-            "[persist] {label}: {rows_seen} row(s) all skipped (legacy degenerate rows); returning 0 (historical behavior)"
-        );
+        eprintln!("[persist] {label}: {cause}; returning 0 (historical behavior)");
     }
     if entries.is_empty() {
         return Ok(0);

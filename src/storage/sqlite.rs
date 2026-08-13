@@ -611,17 +611,40 @@ pub fn migrate_hype_vectors(pool: &SqlitePool) -> Result<(), String> {
         "CREATE INDEX IF NOT EXISTS idx_hype_ns ON memory_hype_vectors(namespace)",
     )
     .map_err(|e| format!("create idx_hype_ns: {}", e))?;
+    // migration_flags 表（先建——触发器版本门控与下方孤儿清理共用；key-value 语义
+    // 隔离，不复用 health.rs 的 user_version 位（#R40 maintainability/low：位复用会
+    // 在"按版本号写 user_version"的未来路径上被静默清除或碰撞）。
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS migration_flags (
+            flag TEXT PRIMARY KEY,
+            applied_at TEXT DEFAULT (datetime('now'))
+        )",
+    )
+    .map_err(|e| format!("create migration_flags: {}", e))?;
+
     // 删除联动：memories 行删除时清理两个向量表。注意：memory_vectors 同样存在孤儿
     // 问题（历史行为），一并覆盖。
     // #R44 maintainability/low：`DROP TRIGGER IF EXISTS` + `CREATE TRIGGER` 而非仅
     // `IF NOT EXISTS`——固定名 + IF NOT EXISTS 会让存量库永远保留**旧 body**：未来
     // 修改联动体（新增第三张向量表/修 bug）对新库生效、对已部署库静默失效（CREATE
-    // 被跳过），孤儿预防契约无法演进。DROP+CREATE 每次启动重放（DDL 微秒级，幂等），
-    // 保证 body 恒为当前代码定义；并发首启各进程执行同一 body，最终一致。
+    // 被跳过），孤儿预防契约无法演进。
     // #R45 other/low：DROP+CREATE 包进 BEGIN IMMEDIATE 事务——避免并发进程在
     // DROP 与 CREATE 之间读到"触发器不存在"的中间态（DELETE 瞬间漏清向量表）。
     // busy_timeout 已在函数入口设置，事务竞争按 busy 等待而非失败。
-    {
+    // #R46 maintainability/medium：重建按 **body 版本**门控（migration_flags 记录
+    // 已应用的 body 版本）——无条件每次启动重建会在多进程部署中让每个进程每次启动
+    // 都做写锁 DDL（串行化启动），且滚动升级期间新旧版本进程交替启动会互相覆盖
+    // 触发器（级联契约随版本振荡，新增向量表的清理在新版下次启动前丢失）。版本名即
+    // body 标识：修改 body 时改版本名（v2→v3），存量库首次看到新名才 DROP+CREATE。
+    const TRIGGER_VERSION: &str = "trigger_mem_ad_vec_v2";
+    let trig_done: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM migration_flags WHERE flag = ?1",
+            rusqlite::params![TRIGGER_VERSION],
+            |r| r.get(0),
+        )
+        .map_err(|e| format!("check trigger version flag: {}", e))?;
+    if trig_done == 0 {
         let tx = conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(|e| format!("begin trigger tx: {}", e))?;
@@ -634,6 +657,11 @@ pub fn migrate_hype_vectors(pool: &SqlitePool) -> Result<(), String> {
             END",
         )
         .map_err(|e| format!("create mem_ad_vec trigger: {}", e))?;
+        tx.execute(
+            "INSERT OR IGNORE INTO migration_flags (flag) VALUES (?1)",
+            rusqlite::params![TRIGGER_VERSION],
+        )
+        .map_err(|e| format!("set trigger version flag: {}", e))?;
         tx.commit()
             .map_err(|e| format!("commit trigger tx: {}", e))?;
     }
@@ -643,30 +671,21 @@ pub fn migrate_hype_vectors(pool: &SqlitePool) -> Result<(), String> {
     // #R37 bug/medium：两表在此刻**必然存在**（刚 CREATE），query_row 失败即真实 DB
     // 问题（BUSY/schema 异常）——unwrap_or(0) 会静默跳过清理、迁移假成功、孤儿
     // 每启动重入 HNSW。必须传播。
-    // #R37 performance/medium：清理用 `PRAGMA user_version` 位标记门控——`COUNT(*) NOT IN`
+    // #R37 performance/medium：清理用 migration_flags 门控——`COUNT(*) NOT EXISTS`
     // 是全表相关扫描 + 可能的大 DELETE，若每次启动都跑会拖慢启动并持写锁。
-    // user_version 已有值只增不减；用位 0x1000 标记"孤儿清理已执行"。
     // #R38 other/low：门控 + 清理 + 置位必须在单个 BEGIN IMMEDIATE 事务内——
     // init_core_tables 可能被 CLI/server/库引擎三进程并发首次启动调用，check-then-act
     // 会让多个进程同时跑全表扫描/DELETE（写锁争用），且 DELETE 后崩溃会留下未置位
     // 标记导致下次重复清理。BEGIN IMMEDIATE 使第二进程阻塞到首个提交后看到已置位。
     // #R38 maintainability/low：库代码（Python bindings 宿主可达）用 eprintln 不污染 stdout。
-    // #R39 bug/high：事务体内所有错误路径必须 ROLLBACK——raw execute_batch 开启的事务
-    // 池不知情，`?` 提前返回会把"仍持有写锁的事务"还给连接池：后续查询静默跑在事务内、
-    // 写锁不释放（其他写者 SQLITE_BUSY）。闭包返回 Result，错误统一 rollback 后传播。
-    // #R39 performance/medium：持写锁做全表 COUNT+DELETE 相关扫描可能超 busy_timeout——
+    // #R43 bug/high：事务用 rusqlite 的 transaction_with_behavior(Immediate)——Transaction
+    // 在 Drop 时自动回滚，任何 `?` 提前返回或 panic 都不会把"仍持有写锁的连接"还给池
+    // （r2d2 无 test_on_check_out，归还后后续查询会静默跑在未提交事务内、写锁不释放）。
+    // #R43 performance/medium：持写锁做全表 COUNT+DELETE 相关扫描可能超 busy_timeout——
     // 空表直接短路（最常见的首次启动场景），减少持锁时间。
-    // #R40 maintainability/low：门控用**独立 migration_flags 表**而非 user_version 位复用——
-    // health.rs 把 user_version 当纯 schema 版本号写（EXPECTED_SCHEMA_VERSION=2），位
-    // 复用会在任何"按版本号写 user_version"的未来路径上被静默清除（重跑昂贵清理）或
-    // 与升高的期望版本碰撞。key-value 表语义隔离、无耦合。
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS migration_flags (
-            flag TEXT PRIMARY KEY,
-            applied_at TEXT DEFAULT (datetime('now'))
-        )",
-    )
-    .map_err(|e| format!("create migration_flags: {}", e))?;
+    // #R46 maintainability/low：flag 按**清理集**版本化——`orphan_vector_cleanup_v1`
+    // 置位后清理分支永久跳过；未来新增第三张向量表并扩展本清理时，必须用新 flag 名
+    // （如 v2）注册，否则已迁移部署的清理扩展被静默禁用（新表孤儿每启动重入 HNSW）。
     const CLEANUP_FLAG: &str = "orphan_vector_cleanup_v1";
     let already: i64 = conn
         .query_row(
