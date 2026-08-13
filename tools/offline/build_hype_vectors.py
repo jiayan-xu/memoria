@@ -253,9 +253,9 @@ def main():
                 "AND (valid_to IS NULL OR valid_to='' OR valid_to > strftime('%Y-%m-%dT%H:%M:%S','now')) "
                 "AND length(content) BETWEEN 10 AND 500"
             ).fetchall()
-        except sqlite3.OperationalError as e:
+        except sqlite3.Error as e:
             con.close()
-            print(f"错误: 读取 {args.db} 的 memories 表失败（库未初始化/路径错误）: {e}")
+            print(f"错误: 读取 {args.db} 的 memories 表失败（库未初始化/路径错误/损坏）: {e}")
             sys.exit(1)
         con.close()
         targets = [(mid, c) for mid, c in rows]
@@ -384,9 +384,9 @@ def main():
                     chunk,
                 ).fetchall()
                 valid_ids.update(r[0] for r in rows)
-        except sqlite3.OperationalError as e:
+        except sqlite3.Error as e:
             con.close()
-            print(f"错误: 读取 {args.db} 的 memories 表失败（库未初始化/路径错误）: {e}")
+            print(f"错误: 读取 {args.db} 的 memories 表失败（库未初始化/路径错误/损坏）: {e}")
             sys.exit(1)
         before = len(targets)
         targets = [(m, c) for m, c in targets if m in valid_ids]
@@ -462,6 +462,15 @@ def main():
                 raise DeterministicSkipError(f"服务维度 {dim}≠Rust DIM {RUST_DIM}（模型不匹配）")
             if len(v) != dim:
                 raise DeterministicSkipError(f"维度异常 {len(v)}≠{dim}")
+            # #R52 bug/medium：写前镜像 Rust 写侧退化防御（persist.rs put_vector_into
+            # 拒绝 !finite || ==0 的向量）——脚本直写 SQL 绕过该防御：embed_server 对
+            # 未返回项有零向量 fallback（[0.0]*EMBED_DIM），NaN 可经 Python json 的
+            # NaN 扩展泄漏；此类向量过 len==dim 与 struct.pack 落库、报"写入 N /
+            # 失败 0"假成功，但 rebuild_from_table 静默丢弃（skipped_degenerate），
+            # 行永远不进 HyPE HNSW——付费 no-op 报成功。此处显式拒绝计确定性 skip。
+            norm = sum(x * x for x in v)
+            if norm != norm or norm == float("inf") or norm == 0.0:
+                raise DeterministicSkipError("嵌入向量退化（零/NaN/Inf），跳过")
             # 写入也在此 try 内（#R35 bug/medium）：服务运行中 DB 可能被锁/磁盘满，
             # 单行写失败若抛到外层会中断整批且 fail_ids 永不落盘——违背
             # "不中断、可定点重跑"承诺。写失败按失败计数跳过并记录 id。

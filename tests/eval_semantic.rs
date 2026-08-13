@@ -20,9 +20,10 @@ use std::time::Instant;
 const RECALL_FLOOR: f64 = 0.85;
 const EMBED_URL: &str = "http://127.0.0.1:8777/embed";
 
-/// #R51 maintainability/low：结构化错误——此前 String 前缀匹配分类脆弱（改错误
-/// 文案会静默改变重试行为；501 之类确定性 5xx 被误判瞬时白付重试；组合消息
-/// `{e}; retry also failed: {e2}` 不可分类）。错误类型在源头区分，重试决策 robust。
+/// #R51/#R52 maintainability/low：结构化错误——此前 String 前缀匹配分类脆弱（改错误
+/// 文案会静默改变重试行为；组合消息 `{e}; retry also failed: {e2}` 不可分类；且
+/// 所有 5xx 一律瞬时导致 501/505 之类确定性错误白付重试——现瞬时 5xx 收窄为
+/// 500/502/503/504，见 is_transient_embed_err）。错误类型在源头区分，重试决策 robust。
 #[derive(Debug)]
 enum EmbedError {
     /// send 失败（网络抖动/连接 reset）——瞬时。
@@ -46,7 +47,10 @@ impl std::fmt::Display for EmbedError {
 fn is_transient_embed_err(e: &EmbedError) -> bool {
     match e {
         EmbedError::Transport(_) => true,
-        EmbedError::Status(c, _) => *c == 429 || *c == 408 || (500..=599).contains(c),
+        // #R52 maintainability/low：瞬时 5xx **收窄为 500/502/503/504**——501/505
+        // 之类"未实现/版本不支持"是确定性（配置错误，重试同样失败）；此前所有 5xx
+        // 归瞬时让确定性 501 白付 500ms + 重复请求（doc 注释与实现对齐）。
+        EmbedError::Status(c, _) => matches!(c, 429 | 408 | 500 | 502 | 503 | 504),
         EmbedError::Malformed(_) => false,
     }
 }
@@ -77,21 +81,24 @@ async fn embed(
     let arr = data["embeddings"]
         .as_array()
         .ok_or_else(|| EmbedError::Malformed("missing embeddings".to_string()))?;
-    arr[0]
+    // #R52 bug/medium：空数组用 first() 守卫——`arr[0]` 在 `{"embeddings": []}` 时
+    // 越界 panic 整个测试进程，直接违背结构化错误"畸形 payload 确定性分类不 panic"
+    // 的设计目的。filter_map 静默丢非数值会产出截断向量——显式转换失败走
+    // Malformed（同形状响应每次必现，确定性）。
+    let first = arr
+        .first()
+        .ok_or_else(|| EmbedError::Malformed("empty embeddings".to_string()))?;
+    first
         .as_array()
         .ok_or_else(|| EmbedError::Malformed("bad vector".to_string()))?
         .iter()
-        .filter_map(|x| x.as_f64().map(|f| f as f32))
-        .collect::<Vec<f32>>()
-        .pipe(Ok)
+        .map(|x| {
+            x.as_f64()
+                .map(|f| f as f32)
+                .ok_or_else(|| EmbedError::Malformed("non-numeric vector element".to_string()))
+        })
+        .collect()
 }
-
-trait Pipe: Sized {
-    fn pipe<T>(self, f: impl FnOnce(Self) -> T) -> T {
-        f(self)
-    }
-}
-impl<T> Pipe for T {}
 
 /// embed 带**一次有界重试**（#R45 test/low）：embed() 是单发 POST 无重试——瞬时服务
 /// 抖动（连接 reset/限流）若落在某 rid 首次遭遇，fail-once 策略会把它永久排除在
@@ -100,9 +107,10 @@ impl<T> Pipe for T {}
 /// 瞬时错误（见 is_transient_embed_err）：send 失败 / 429 / 408 / 5xx；确定性错误
 /// （其余 4xx、2xx 畸形 payload）不重试——系统性配置错误重试只多付 500ms + 必然
 /// 失败的重复请求。
-/// #R51 performance/low：**重试 attempt 用短超时（10s）**——复用主超时 60s 时，
-/// 挂死服务的最坏耗时 ≈ (60 + 0.5 + 60) × 21 rid ≈ 42 分钟测试时长；10s 上限把
-/// 单 rid 最坏降到 ~20.5s（挂死仍会重试一次，符合"瞬时抖动"判定）。
+/// #R51 performance/low：**重试 attempt 用短超时（10s）**——挂死服务的最坏单 rid
+/// 耗时 = 60s（首次）+ 0.5s（退避）+ 10s（重试）≈ **70.5s**（#R52 documentation/
+/// low：此前注释误写 ~20.5s）；× 21 唯一 rid ≈ **24.7 分钟**——10s 上限已把 42
+/// 分钟（复用 60s）压到 ~25 分钟，评估/调参时按此数。
 async fn embed_with_retry(client: &reqwest::Client, text: &str) -> Result<Vec<f32>, EmbedError> {
     match embed(client, text, std::time::Duration::from_secs(60)).await {
         Ok(v) => Ok(v),
@@ -111,7 +119,22 @@ async fn embed_with_retry(client: &reqwest::Client, text: &str) -> Result<Vec<f3
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             match embed(client, text, std::time::Duration::from_secs(10)).await {
                 Ok(v) => Ok(v),
-                Err(e2) => Err(EmbedError::Transport(format!("{e}; retry also failed: {e2}"))),
+                // #R52 maintainability/low：保留重试的**自身变体**（e2 为准）——
+                // 此前无条件包 Transport 会把"重试命中确定性错误"（Malformed/4xx/
+                // 501）展平成瞬时类，未来任何消费该错误的 is_transient 判定会错误
+                // 重试；首次错误信息并入 e2 文本保留诊断。
+                Err(e2) => match e2 {
+                    EmbedError::Status(c, r) => Err(EmbedError::Status(
+                        c,
+                        format!("{r} (first attempt: {e})"),
+                    )),
+                    EmbedError::Malformed(m) => Err(EmbedError::Malformed(format!(
+                        "{m} (first attempt: {e})"
+                    ))),
+                    EmbedError::Transport(t) => {
+                        Err(EmbedError::Transport(format!("{e}; retry also failed: {t}")))
+                    }
+                },
             }
         }
     }
@@ -256,7 +279,10 @@ async fn memory_eval_semantic() {
         let ns = item["ns"].as_str().unwrap_or("agent/default");
         let tags = item["tags"].as_str().unwrap_or("[]");
 
-        let v = embed(&client, content, std::time::Duration::from_secs(60))
+        // #R52 test/low：content-embed 也走 embed_with_retry——瞬时 Transport/429/5xx
+        // 在任一语料项上会 panic 整个测试（embed_with_retry 引入的初衷正是吸收
+        // 本测试的瞬时抖动，HyPE 侧已用、内容侧此前漏用）。
+        let v = embed_with_retry(&client, content)
             .await
             .expect("corpus embed");
         // v 用于内容路（cache_query_vector）；HyPE 块需内容向量副本校验「问句向量与内容

@@ -583,7 +583,9 @@ pub fn migrate_evolution(pool: &SqlitePool) -> Result<(), String> {
 /// 同连接读锁升级写锁失败会报 LOCKED（#R51 bug/low：此前只匹配 DatabaseBusy，
 /// LOCKED 会立即终止重试并 .expect 硬失败启动）。main.rs/mcp_server.rs 用 .expect()，
 /// 硬失败会让并发首启部署直接 panic 中止（清理分支已软降级，DDL 硬失败是同类
-/// 风险）。3 次退避（500ms/1s/2s），仍失败才传播。
+/// 风险）。3 次退避（attempt=1,2,3 → **500ms/1s/1.5s**，合计 3s——#R52
+/// documentation/low：`500 * attempt` 的乘积是 500/1000/1500，文档按实际值写），
+/// 仍失败才传播。
 fn is_busy(e: &rusqlite::Error) -> bool {
     matches!(
         e,
@@ -623,13 +625,36 @@ fn execute_batch_retry(
 /// （web_api/mcp_server 的 DELETE 只删 memories，不碰向量表）。
 pub fn migrate_hype_vectors(pool: &SqlitePool) -> Result<(), String> {
     let mut conn = pool.get().map_err(|e| format!("pool get: {}", e))?;
+    // #R52 bug/low：存量库的 memory_vectors 可能缺 updated_at 列（旧 schema 无此列、
+    // 无历史 ALTER 迁移）——补齐后所有写入统一 4 列 upsert（当前 schema 部署的时间戳
+    // 不再因 3 列 upsert 陈旧；imp_exp 导出该列，陈旧时间戳会出现在导出数据里）。
+    // pragma_table_info 幂等；缺列才 ALTER（busy 退避重试）。
+    let has_upd: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('memory_vectors') WHERE name='updated_at'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    if has_upd == 0 {
+        execute_batch_retry(
+            &conn,
+            "ALTER TABLE memory_vectors ADD COLUMN updated_at TEXT DEFAULT (datetime('now'))",
+            "add memory_vectors.updated_at",
+        )?;
+        eprintln!("[Memoria] Migration: added memory_vectors.updated_at column");
+    }
     // #R43 bug/medium：busy_timeout 必须在**本函数所有 DDL/写操作之前**设置——连接来自
     // 池（create_pool 无 per-connection init），迁移可能拿到默认 busy_timeout=0 的连接，
     // 上面的 CREATE TABLE/INDEX/TRIGGER 与 migration_flags DDL 在并发首启场景下会立即
     // SQLITE_BUSY（本迁移正是为三进程并发首启设计的）。统一函数入口设置（幂等，覆盖
     // 池连接状态）。
-    conn.execute_batch("PRAGMA busy_timeout = 5000;")
-        .map_err(|e| format!("set busy_timeout: {}", e))?;
+    // #R52 bug/medium：PRAGMA 失败**软处理**（WARN 后继续）——PRAGMA 本身不依赖表
+    // 存在、失败仅极端场景（连接已坏），硬失败会让 .expect 中止部署；后续 DDL 仍有
+    // execute_batch_retry 兜底 BUSY。
+    if let Err(e) = conn.execute_batch("PRAGMA busy_timeout = 5000;") {
+        eprintln!("[Memoria] WARN: set busy_timeout failed (continuing): {e}");
+    }
     // #R49 bug/medium：DDL 用 BUSY 退避重试（见 execute_batch_retry）——并发首启时
     // 另一进程持写锁可能让本进程 DDL 立即 SQLITE_BUSY，.expect 硬失败会 panic 中止
     // 部署。
@@ -681,14 +706,22 @@ pub fn migrate_hype_vectors(pool: &SqlitePool) -> Result<(), String> {
     // 仅在未来出现第二个 body 版本时才实质化；届时可加降级守卫（对比已安装的最大
     // 触发器版本）或接受"回退 = 契约回退到旧版"的语义（与二进制回退一致）。
     const TRIGGER_VERSION: &str = "trigger_mem_ad_vec_v2";
-    let trig_done: i64 = conn
+    // #R52 bug/medium：trig_done 读取**软处理**（WARN + 视为未置位）——并发首启时
+    // 对端进程提交中可能让本进程此读 SQLITE_BUSY（busy_timeout 后）；硬失败会让
+    // .expect 中止部署（与触发器重建本身软降级、flag_set 软读取的意图一致）。
+    // 读失败=0 只会让触发器重建多跑一次（幂等 + 事务 + 版本 flag 幂等），安全。
+    let trig_done = conn
         .query_row(
             "SELECT COUNT(*) FROM migration_flags WHERE flag = ?1",
             rusqlite::params![TRIGGER_VERSION],
-            |r| r.get(0),
+            |r| r.get::<_, i64>(0),
         )
-        .map_err(|e| format!("check trigger version flag: {}", e))?;
-    if trig_done == 0 {
+        .map(|c| c > 0)
+        .unwrap_or_else(|e| {
+            eprintln!("[Memoria] WARN: check trigger version flag failed (treated as unset): {e}");
+            false
+        });
+    if !trig_done {
         // #R49 bug/medium：触发器重建**软降级**——BEGIN IMMEDIATE 在并发首启大库
         // 清理持锁时可能 BUSY（busy_timeout 超时）；触发器缺失只影响未来 memories
         // 删除的联动清理（孤儿可下次启动补，或孤儿清理段兜底），不阻断启动。
@@ -774,7 +807,12 @@ pub fn migrate_hype_vectors(pool: &SqlitePool) -> Result<(), String> {
     };
     let already = flag_set(&conn, CLEANUP_FLAG);
     let refused_done = flag_set(&conn, REFUSED_FLAG);
-    if (!already && !refused_done) || (force_cleanup && clean_vectors) {
+    // #R52 bug/medium：外层 gate **只由 CLEANUP_FLAG 门控**——refused 态只应跳过
+    // memory_vectors 段（事务内判定），此前 `!refused_done` 会把整个清理（含 hype
+    // 孤儿清理）跳过：用户仅忘记设 opt-in env 就会永久禁用 hype 清理（hype 行按
+    // 注释必为垃圾、无合法态），唯一出路是手删 migration_flags 行或 force env 对。
+    // force gate 保留（覆盖已置位标记的逃生通道，#R50/#R51）。
+    if !already || (force_cleanup && clean_vectors) {
         // 清理**软降级**（#R48 bug/medium）：BEGIN IMMEDIATE 阻塞超 busy_timeout（并发
         // 首启大库 DELETE 可超 5s）、或清理中任何 DB 错误，**不阻断启动**——main.rs/
         // mcp_server.rs 用 .expect()，硬失败会让并发首启部署直接 panic 中止。失败仅
@@ -787,14 +825,13 @@ pub fn migrate_hype_vectors(pool: &SqlitePool) -> Result<(), String> {
             let tx = conn
                 .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
                 .map_err(|e| format!("begin cleanup tx: {}", e))?;
-            // 事务内重读**两个**标记（#R50 bug/medium：并发首启时对端进程可能在本进程
-            // gate 检查后、BEGIN 生效前提交 REFUSED_FLAG——只查 CLEANUP_FLAG 会漏掉，
-            // 本进程带着 opt-in env 继续 DELETE 对端明确拒绝删除的行。任一已置位即
-            // noop 提交跳过）。
+            // 事务内重读**CLEANUP_FLAG**（#R52 bug/medium：并发首启时对端进程可能在
+            // 本进程 gate 检查后、BEGIN 生效前完成清理——只查 CLEANUP_FLAG；refused
+            // 不再参与短路（refused 只门控 memory_vectors 段，hype 段始终执行）。
             let already2: i64 = tx
                 .query_row(
-                    "SELECT COUNT(*) FROM migration_flags WHERE flag IN (?1, ?2)",
-                    rusqlite::params![CLEANUP_FLAG, REFUSED_FLAG],
+                    "SELECT COUNT(*) FROM migration_flags WHERE flag = ?1",
+                    rusqlite::params![CLEANUP_FLAG],
                     |r| r.get(0),
                 )
                 .map_err(|e| format!("check cleanup flag (tx): {}", e))?;

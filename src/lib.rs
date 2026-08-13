@@ -112,13 +112,22 @@ impl MemoriaEngine {
     /// 运行时写）不会自动反映；此前只能重启，文档里的手动方案（新建索引+重建+swap）
     /// 不是引擎方法、Python bindings 调不到。本方法执行"全新索引重建 → 整体替换"：
     /// HnswIndex::add 按 id 去重，in-place rebuild 只追加新 id（#R44），已存在 id 的
-    /// 向量更新必须全新索引拾取。返回新索引加载的向量数；失败不改变现有索引
-    /// （保持旧快照，检索不中断）。
+    /// 向量更新必须全新索引拾取。返回新索引加载的向量数。
+    /// #R52 maintainability/medium：用 **build_hype_hnsw（Result 版）**而非
+    /// `build_hype_hnsw_or_default`——or_default 把所有失败吸收成空索引 + WARN，
+    /// 本方法**永不返回 Err**（签名误导）：调用方（Python bindings/运维工具）无法
+    /// 程序化区分"刷新成功"与"降级空重建"，count==0 同时可能是"未启用"或"失败"。
+    /// Err 路径真实可达：失败保留旧快照（检索不中断）并向调用方显式报错。
     pub fn refresh_hype_index(&mut self) -> Result<usize, String> {
         let ef_search = vector::persist::resolve_ef_search();
-        let (fresh, count) = vector::persist::build_hype_hnsw_or_default(&self.pool, ef_search);
-        // 先构建后替换：失败路径（build 内部已软降级为空索引 + WARN）不会留下
-        // 半初始化状态——替换是最后一步原子操作。
+        let (fresh, count) = match vector::persist::build_hype_hnsw(&self.pool, ef_search) {
+            Ok(x) => x,
+            Err(e) => {
+                eprintln!("[Memoria] HYPE HNSW refresh failed, keeping existing index: {e}");
+                return Err(e);
+            }
+        };
+        // 仅构建成功才替换；失败保留旧快照，检索不中断。
         self.hype_hnsw = fresh;
         eprintln!("[Memoria] HYPE HNSW refreshed: {} vectors", count);
         Ok(count)

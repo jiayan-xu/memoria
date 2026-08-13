@@ -12,18 +12,20 @@ use std::collections::HashMap;
 /// static 冷却——复制到第 4 处时收敛为共享 helper，冷却语义一致；按 **key** 分开
 /// 计数（不同故障原因/路/调用点不互相抑制——单个全局 static 会让先失败的路径
 /// 永久压住后失败的路径）。
+/// #R52 maintainability/low：**64 槽 + SipHash（DefaultHasher）**——16 槽 FNV 有
+/// 实际碰撞破坏隔离：`fetch_row_mapping` 与 `fetch_systemic` 同槽（系统性漂移批的
+/// 逐行错误先于聚合升级行触发，聚合被同批压掉）；`fetch_stale`（删除后几乎每查询
+/// 触发）与 `hype` 同槽（压掉首条 road-fail 详情）。64 槽把碰撞概率降到可忽略。
 pub(crate) fn throttled_eprintln(key: &'static str, msg: String) {
     const COOLDOWN_SECS: u64 = 60;
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
-    static LAST_LOGS: [AtomicU64; 16] = [const { AtomicU64::new(0) }; 16];
-    // key → 固定槽位（fnv 风格简单散列；冲突只导致两 key 共享冷却槽，可接受）。
-    let mut h: u64 = 0xcbf29ce484222325;
-    for b in key.bytes() {
-        h ^= b as u64;
-        h = h.wrapping_mul(0x100000001b3);
-    }
-    let slot = &LAST_LOGS[(h as usize) % LAST_LOGS.len()];
+    static LAST_LOGS: [AtomicU64; 64] = [const { AtomicU64::new(0) }; 64];
+    let mut h = DefaultHasher::new();
+    key.hash(&mut h);
+    let slot = &LAST_LOGS[(h.finish() as usize) % LAST_LOGS.len()];
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())

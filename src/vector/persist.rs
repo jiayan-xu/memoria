@@ -96,21 +96,18 @@ fn select_sql(table: &str) -> String {
 /// SQL 会让存量部署的每次 put_stored_vector 报 "no column named updated_at" 且
 /// 生产调用方 let _ 丢弃 Result（向量持久化静默停止，仅 WARN 可见）。memory_vectors
 /// 保持原三列；updated_at 只写给 migration 显式创建该列的 memory_hype_vectors。
+/// #R51/#R52：**统一 4 列**——migrate_hype_vectors 已幂等补齐 memory_vectors 的
+/// updated_at 列（存量库缺列时 ALTER ADD，见 sqlite.rs #R52），两表列集一致、
+/// 写入路径无表级分歧（此前 3/4 列双形态靠表名 match 区分——第三张表/typo 会静默
+/// 选错形态，正是 descriptor 收口要消灭的漂移源）。
 fn insert_sql(table: &str) -> String {
-    match table {
-        "memory_vectors" => format!(
-            "INSERT INTO {table} (id, namespace, vector) VALUES (?, ?, ?) \
-             ON CONFLICT(id) DO UPDATE SET vector=excluded.vector, \
-                                            namespace=excluded.namespace"
-        ),
-        _ => format!(
-            "INSERT INTO {table} (id, namespace, vector, updated_at) \
-             VALUES (?, ?, ?, datetime('now')) \
-             ON CONFLICT(id) DO UPDATE SET vector=excluded.vector, \
-                                            namespace=excluded.namespace, \
-                                            updated_at=excluded.updated_at"
-        ),
-    }
+    format!(
+        "INSERT INTO {table} (id, namespace, vector, updated_at) \
+         VALUES (?, ?, ?, datetime('now')) \
+         ON CONFLICT(id) DO UPDATE SET vector=excluded.vector, \
+                                        namespace=excluded.namespace, \
+                                        updated_at=excluded.updated_at"
+    )
 }
 
 fn vector_tables() -> &'static [VectorTable] {
@@ -140,21 +137,31 @@ fn lookup_table(table: &str) -> Option<&'static VectorTable> {
 /// 每写一条刷一行相同 WARN。前 3 条打印（含具体错误文本），其后静默计数，每满
 /// 1000 次打一条聚合行——读侧 READ_ERR_LOG_CAP 同款纪律，镜像对称。
 fn warn_throttled(fn_name: &str, msg: &str) {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    static WARN_COUNT: AtomicUsize = AtomicUsize::new(0);
-    static WARN_LOGGED: AtomicUsize = AtomicUsize::new(0);
-    let n = WARN_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
-    let logged = WARN_LOGGED.load(Ordering::Relaxed);
-    if logged < 3 {
-        WARN_LOGGED.store(logged + 1, Ordering::Relaxed);
+    // #R52 bug/medium：**按 fn_name 分槽**（16 槽 fnv）——此前两个全局 static 被
+    // put_stored_vector/put_hype_stored_vector 共享：先失败的路径消耗前 3 条详情预算
+    // （另一路径早期失败永不单独记录），且聚合行把全局计数归因到碰巧落在 1000 倍数
+    // 的 fn_name（恰在 `let _` 丢弃 Result 的事故中，WARN 是唯一信号）。
+    // AtomicU64 fetch_add 原子递增——check-then-act 竞态（并发全过 `logged < 3` 门槛
+    // 超发详情行）不存在。槽冲突只造成两 fn_name 共享预算，可接受（与
+    // throttled_eprintln 同款权衡）。
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SLOTS: [AtomicU64; 16] = [const { AtomicU64::new(0) }; 16];
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in fn_name.bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    let slot = &SLOTS[(h as usize) % SLOTS.len()];
+    let n = slot.fetch_add(1, Ordering::Relaxed) + 1;
+    if n <= 3 {
         eprintln!("[persist] WARN: {msg}");
     } else if n % 1000 == 0 {
         eprintln!("[persist] WARN: {fn_name}: {n} failures so far (sample above; suppressing repeats)");
     }
 }
 
-/// 共享实现：校验后写入 `table`（须含 id/namespace/vector 列；updated_at 见
-/// `insert_sql` 的表级列集区分）。
+/// 共享实现：校验后写入 `table`（须含 id/namespace/vector/updated_at 列——
+/// 迁移已幂等补齐，见 insert_sql #R52）。
 ///
 /// `table` 仅接受 descriptor 白名单（杜绝字符串插值注入面）；
 /// 用 `ON CONFLICT(id) DO UPDATE` 而非 INSERT OR REPLACE——REPLACE 会整行删除重建，
