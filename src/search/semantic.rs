@@ -235,17 +235,25 @@ fn search_and_merge(
             // #R49 performance/medium：search_with_ef 只在 RwLock poisoning（持久条件）
             // 时失败——每查询 eprintln 会刷爆 stderr（与 degraded 日志同款问题）。
             // 60s 冷却：持续故障 ≤1 行/分钟，瞬时抖动只记一次。
+            // #R50 maintainability/low：冷却状态**按路分离**——单个全局 static 在
+            // content/hype 双路 60s 内相继失败时只记首路，另一路被静默抑制到首路
+            // 停止失败 >60s；match label 让每路独立计数，两路故障都可见。
             use std::sync::atomic::{AtomicU64, Ordering};
             use std::time::{SystemTime, UNIX_EPOCH};
             const COOLDOWN_SECS: u64 = 60;
-            static LAST_ROAD_FAIL_LOG: AtomicU64 = AtomicU64::new(0);
+            static CONTENT_LAST_LOG: AtomicU64 = AtomicU64::new(0);
+            static HYPE_LAST_LOG: AtomicU64 = AtomicU64::new(0);
+            let counter: &AtomicU64 = match label {
+                "content" => &CONTENT_LAST_LOG,
+                _ => &HYPE_LAST_LOG,
+            };
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map(|d| d.as_secs())
                 .unwrap_or(0);
-            let last = LAST_ROAD_FAIL_LOG.load(Ordering::Relaxed);
+            let last = counter.load(Ordering::Relaxed);
             if now.saturating_sub(last) >= COOLDOWN_SECS
-                && LAST_ROAD_FAIL_LOG
+                && counter
                     .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
                     .is_ok()
             {
@@ -296,8 +304,30 @@ fn fetch_memories_batch(
     // #R48 performance/medium：stale id 日志**聚合**——内存 HNSW 不随删除修剪
     // （预期滞后），批量删除后每次查询大量 stale id，逐批 eprintln 每查询刷 ~9 行
     // stderr 淹没真实错误。批内只累计计数，函数末尾汇总一行。
+    // #R50 performance/medium：批级诊断日志（prepare/query 失败、混合批、stale 汇总）
+    // **60s 冷却**（与 search_and_merge/degraded 同款）——持久故障时每查询 ~9 批 ×
+    // 每批 1 行刷爆 stderr；硬失败场景由 Err 传播 + hybrid 的 60s 冷却兜底可观测。
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+    const LOG_COOLDOWN_SECS: u64 = 60;
+    static LAST_FETCH_LOG: AtomicU64 = AtomicU64::new(0);
+    let mut log_throttled = |msg: String| {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let last = LAST_FETCH_LOG.load(Ordering::Relaxed);
+        if now.saturating_sub(last) >= LOG_COOLDOWN_SECS
+            && LAST_FETCH_LOG
+                .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+        {
+            eprintln!("[semantic] fetch: {msg} (at most once per {LOG_COOLDOWN_SECS}s)");
+        }
+    };
     let mut stale_ids_total = 0usize;
-    // 行级映射错误同样限流（前 3 条作原因样本，其余计数汇总）。
+    // 行级映射错误限流（前 3 条作原因样本，其余计数汇总）——错误内容本身是
+    // 诊断关键（列类型/值漂移的具体报错），保留未冷却的样本日志。
     let mut row_err_logged = 0usize;
     const ROW_ERR_LOG_CAP: usize = 3;
     for chunk in ids.chunks(BATCH) {
@@ -308,6 +338,8 @@ fn fetch_memories_batch(
             placeholders
         );
         let mut hard_failed = false;
+        let mut row_errors = 0usize;
+        let mut got = 0usize;
         // #R48 performance/low：连接**每批重新获取**——跨整循环持有会在并发搜索时
         // 把连接钉住 ~9 次往返时长，小池场景加剧耗尽（耗尽即整通道 Err）。
         let conn = pool.get().map_err(|e| format!("semantic fetch pool: {}", e))?;
@@ -328,8 +360,6 @@ fn fetch_memories_batch(
                 },
             ) {
                 Ok(rows) => {
-                    let mut row_errors = 0usize;
-                    let mut got = 0usize;
                     for r in rows {
                         match r {
                             Ok((id, ns, content)) => {
@@ -351,68 +381,62 @@ fn fetch_memories_batch(
                     }
                     // #R46 bug/medium：行映射失败默认**按行丢弃**。
                     // #R49 bug/high：系统性判定比较 **chunk.len()（请求数）**——
-                    // 上一轮改用 `row_errors == returned`（returned = got + row_errors）
-                    // 是**重言式**：本分支已要求 got == 0，returned == row_errors 恒真，
-                    // 任何"0 成功 + ≥1 映射错误"的批（包括 mostly stale + 单行异常）
-                    // 都被误判为系统性列漂移 → 整批 Err → hybrid 丢弃整个语义通道。
+                    // `row_errors == returned`（returned = got + row_errors）是重言式
+                    // （本分支已要求 got == 0），任何"0 成功 + ≥1 映射错误"的批
+                    // （含 mostly stale + 单行异常）都会被误判为系统性列漂移。
                     // 要求"无 stale 掺水"（所有请求 id 都返回了行且全部失败）必须
-                    // 比较请求数：`row_errors == chunk.len()`。
-                    // 已知权衡（#R48 评论 9 承认）：含 stale 的混合批（部分行全失败
-                    // + 部分悬空 id）不会升级——漏判但安全（按行丢弃、日志可见）。
+                    // 比较请求数；含 stale 的混合批不升级——漏判但安全（#R48 承认）。
                     if got == 0 && row_errors > 0 {
                         if row_errors == chunk.len() {
-                            eprintln!(
-                                "[semantic] fetch: all {} requested ids returned rows and ALL failed mapping (systematic column drift)",
+                            log_throttled(format!(
+                                "all {} requested ids returned rows and ALL failed mapping (systematic column drift)",
                                 chunk.len()
-                            );
+                            ));
                             hard_failed = true;
                         } else {
-                            eprintln!(
-                                "[semantic] fetch: batch of {} ids: {row_errors} row(s) failed mapping, 0 ok (row drops only; rest stale)",
+                            log_throttled(format!(
+                                "batch of {} ids: {row_errors} row(s) failed mapping, 0 ok (row drops only; rest stale)",
                                 chunk.len()
-                            );
+                            ));
                         }
-                    } else if got == 0 {
-                        // 0 行无错误 = stale ids（并发删除/悬空 HNSW id）——预期数据
-                        // 滞后态，仅计数不升级（#R45 bug/medium，见函数 doc）。
-                        stale_ids_total += chunk.len();
                     } else if row_errors > 0 {
-                        // #R49 other/low：**混合批**的 stale 也计入——成功行 + 悬空 id
-                        // 混存时，未返回的行数（chunk.len() - got - row_errors）此前
-                        // 被漏计，聚合诊断系统性低估内存 HNSW 滞后。
-                        stale_ids_total += chunk.len() - got - row_errors;
-                        eprintln!(
-                            "[semantic] fetch: {row_errors} of {} rows failed mapping (dropping those ids)",
+                        log_throttled(format!(
+                            "{row_errors} of {} rows failed mapping (dropping those ids)",
                             chunk.len()
-                        );
+                        ));
                     }
                 }
                 Err(e) => {
-                    eprintln!(
-                        "[semantic] fetch query failed (batch {} ids): {}",
+                    log_throttled(format!(
+                        "query failed (batch {} ids): {}",
                         chunk.len(),
                         e
-                    );
+                    ));
                     hard_failed = true;
                 }
             },
             Err(e) => {
-                eprintln!(
-                    "[semantic] fetch prepare failed (batch {} ids): {}",
+                log_throttled(format!(
+                    "prepare failed (batch {} ids): {}",
                     chunk.len(),
                     e
-                );
+                ));
                 hard_failed = true;
             }
         }
+        // #R50 maintainability/low：stale 计数**统一**——每 chunk 末尾计算未返回
+        // 行数（saturating 防下溢），覆盖全部混合形态：全 stale（got==0,
+        // row_errors==0 → 全计）、部分匹配（got>0 → 计缺口，此前漏计）、失败批
+        // 混合（row_errors>0 → 计缺口）。聚合诊断与真实内存 HNSW 滞后一致。
+        stale_ids_total += chunk.len().saturating_sub(got + row_errors);
         if hard_failed {
             hard_failed_batches += 1;
         }
     }
     if stale_ids_total > 0 {
-        eprintln!(
-            "[semantic] fetch: {stale_ids_total} candidate id(s) matched 0 rows (expected in-memory HNSW lag after deletions)"
-        );
+        log_throttled(format!(
+            "{stale_ids_total} candidate id(s) matched 0 rows (expected in-memory HNSW lag after deletions)"
+        ));
     }
     // #R47 bug/medium：**任一**批硬失败即 Err——部分失败返回 Ok(partial) 会让调用方
     // 把召回损失当完整结果（静默丢候选、监控不可见）；Err 使 hybrid.rs 记录
