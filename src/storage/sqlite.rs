@@ -997,24 +997,24 @@ pub fn migrate_hype_vectors(pool: &SqlitePool) -> Result<(), String> {
         .unwrap_or(false);
     // #R64 bug/medium：fallback 置位 → 重新评估（hype 表可能已恢复，需升级 full
     // body）；升级成功路径清除 fallback flag。
-    // #R66 bug/medium：**版本已置位也重查表存在**——full body 触发器在表缺失时
+    // #R66/#R67 bug/high：**表存在检查进 gate**——full body 触发器在表缺失时
     // （手动 DROP/部分恢复/损坏）让每次 DELETE memories 报 no such table（核心
     // 删除路径被可选表硬前置）；缺表 → 降级 content-only body + fallback flag。
-    if !trig_done || trig_fallback_done {
-        // 版本已置位时的降级检查：表缺失 → 强制重装 content-only body。
-        if trig_done && !trig_fallback_done {
-            let hype_present: i64 = conn
-                .query_row(
-                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='memory_hype_vectors'",
-                    [],
-                    |r| r.get(0),
-                )
-                .unwrap_or(0);
-            if hype_present == 0 {
-                eprintln!(
-                    "[Memoria] WARN: memory_hype_vectors absent though trigger v2 installed - downgrading trigger to content-only body"
-                );
-            }
+    // #R67 修正：原实现把降级检查放 `trig_done && !trig_fallback_done` 内——它是
+    // gate 的精确否定，**永不执行**（不可达降级路径）。
+    let hype_present: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='memory_hype_vectors'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    // 进入条件：触发器未装 / fallback 已置位（需升级）/ v2 已装但表缺失（需降级）。
+    if !trig_done || trig_fallback_done || (trig_done && hype_present == 0) {
+        if trig_done && !trig_fallback_done && hype_present == 0 {
+            eprintln!(
+                "[Memoria] WARN: memory_hype_vectors absent though trigger v2 installed - downgrading trigger to content-only body"
+            );
         }
         // #R49 bug/medium：触发器重建**软降级**——BEGIN IMMEDIATE 在并发首启大库
         // 清理持锁时可能 BUSY（busy_timeout 超时）；触发器缺失只影响未来 memories

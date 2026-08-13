@@ -339,6 +339,10 @@ fn search_and_merge(
                     // #R65 maintainability/low：**直接插真实值**——score > 0.0 过滤
                     // 保证新条目 score 必 > 0.0，or_insert((0.0, label)) 的默认
                     // 恒被覆盖（死默认营造"fallback 归因"假象）。
+                    // #R67 bug/low 取舍文档化：`score > e.0`（严格大于）使平分时
+                    // 标签保持先插入路（content 先于 hype）——tie 归因恒偏 content；
+                    // 改为 >= 会让 hype 后路胜出（问句路归因更贴诊断意图），但
+                    // 分数相同的双路命中本就罕见，保持现状并记录规则。
                     let e = best.entry(memory_id).or_insert((score, label));
                     if score > e.0 {
                         *e = (score, label);
@@ -354,7 +358,16 @@ fn search_and_merge(
             // #R50/#R51 maintainability/low：冷却按**路**分离（key=label）——单个
             // 全局 static 在 content/hype 双路 60s 内相继失败时只记首路；共享 helper
             // 的 key 隔离天然满足，无需手写双 static。
-            throttled_eprintln(label, || {
+            // #R67 maintainability/low：**key 命名空间化**（"semantic/{label}"）——
+            // crate 全局 key 空间下 "content"/"hype" 太泛，未来无关调用点复用
+            // 会静默跨抑制 60s。
+            throttled_eprintln(
+                if label == "content" {
+                    "semantic/content"
+                } else {
+                    "semantic/hype"
+                },
+                || {
                 format!("[semantic] {label} HNSW search failed: {e}")
             });
             false
@@ -471,9 +484,13 @@ fn fetch_memories_batch(
                             // 未读行不混入 stale 计数。
                             // #R66 bug/medium：**行级转换错误全集**——row.get() 在映射
                             // 闭包内除 FromSqlConversionFailure 外还有
-                            // InvalidColumnType/UnexpectedNullType/IntegralValueOutOfRange
-                            // （如 INTEGER 存 TEXT 亲和列）——漏列会落 catch-all 被误判
-                            // 为连接级硬失败、整批 Err 丢通道（fetch_systemic 永不触发）。
+                            // InvalidColumnType/IntegralValueOutOfRange（如 INTEGER 存
+                            // TEXT 亲和列）——漏列会落 catch-all 被误判为连接级硬失败、
+                            // 整批 Err 丢通道（fetch_systemic 永不触发）。
+                            // #R67 实证：rusqlite 0.32.1 **无 UnexpectedNullType 变体**
+                            // （NULL→String 经 ValueRef::as_str → FromSqlError::InvalidType
+                            // 归 FromSqlConversionFailure，已覆盖）；未来升级 rusqlite
+                            // 若新增该变体需补入此 arm。
                             Err(
                                 e @ (rusqlite::Error::FromSqlConversionFailure(..)
                                     | rusqlite::Error::InvalidColumnType(..)

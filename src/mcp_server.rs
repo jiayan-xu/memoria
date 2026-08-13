@@ -2079,12 +2079,12 @@ fn dispatch(
             // default 失败时软降级为空索引（仅 stderr WARN），live==0 无法区分
             // "未启用/空表"与"构建失败"；store>0 && live==0 揭示降级（镜像
             // lib.rs db_stats 双字段）。
-            let hype_store: i64 = match state.pool.get() {
-                Ok(c) => c
-                    .query_row("SELECT COUNT(*) FROM memory_hype_vectors", [], |r| r.get(0))
-                    .unwrap_or(-1),
-                Err(_) => -1,
-            };
+            // #R67 maintainability/low：**复用 conn**（本分支已有连接）+ **缺表与
+            // 故障分开 sentinel**（-1=查询失败；0=表存在但空/表缺失——legacy 库
+            // 缺表时 0 与"空表"不可分是既有表循环的惯例，但故障不再伪装）。
+            let hype_store: i64 = conn
+                .query_row("SELECT COUNT(*) FROM memory_hype_vectors", [], |r| r.get(0))
+                .unwrap_or(-1);
             m.insert(
                 "hype_hnsw_store".to_string(),
                 serde_json::Value::Number(hype_store.into()),

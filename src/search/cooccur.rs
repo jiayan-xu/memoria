@@ -155,8 +155,8 @@ fn match_query_entities(pool: &SqlitePool, namespace: &str, query: &str) -> Hash
 mod unit_tests {
     use super::*;
 
-    // #R66 maintainability/low：**共享测试夹具**（三测试复制漂移源）——共享缓存
-    // 内存库 + 15 字段 FusedResult 构造收敛为两 helper。
+    // 共享测试夹具：共享缓存内存库 + FusedResult 构造收敛为两 helper
+    // （三测试复制曾让 fixture 漂移）。
     fn test_pool(tag: &str) -> SqlitePool {
         static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -170,32 +170,24 @@ mod unit_tests {
         pool
     }
 
+    /// 初始分常量——断言 `> INIT_SCORE` 显式依赖 boost 保持正数，常数被调为
+    /// 零/负时失败信息自解释（而非与初始分 0.5 的隐式耦合）。
+    const INIT_SCORE: f64 = 0.5;
+
     fn mk_result(id: &str, content: &str) -> FusedResult {
         FusedResult {
             memory_id: id.into(),
             content: content.into(),
-            rrf_score: 0.5,
+            rrf_score: INIT_SCORE,
             source: "test".into(),
-            signal_scores: vec![],
-            sem_cos: None,
-            kw_bm25: None,
-            graph_signal: None,
-            evolved_at: None,
-            pending_evolution: false,
-            primary_channel: None,
-            channel_scores: std::collections::HashMap::new(),
-            access_count: 0,
-            last_recalled: None,
-            time_status: None,
+            ..Default::default()
         }
     }
 
-    // #R58 test/low：**真实调用** rerank_by_cooccurrence——此前只断言新空 Vec 为空
-    // （函数被删也会通过，假覆盖）。
-    // #R59 test/medium：**no-op 契约测试**——空结果集空进空出、不 panic。
-    // #R62 test/low 注释修正：本测试**无法区分**空集提前返回与静默失败路径
-    // （load_memory_entities 对空 id 短路、match_query_entities 吞缺表错误），
-    // 只验证"空进空出"行为本身；查询路径的真实覆盖由 rerank_with_data 承担。
+    // 真实调用 rerank_by_cooccurrence（旧断言空 Vec 恒真，函数被删也通过）。
+    // no-op 契约：空结果集空进空出、不 panic。注意本测试无法区分空集提前返回
+    // 与静默失败路径（load_memory_entities 对空 id 短路、match_query_entities
+    // 吞缺表错误）——只验证行为本身；查询路径覆盖由 rerank_with_data 承担。
     #[test]
     fn empty_results_noop() {
         let pool = crate::storage::create_pool(":memory:", 1).expect("pool");
@@ -262,7 +254,7 @@ mod unit_tests {
         assert!(
             boosted
                 .iter()
-                .all(|r| r.rrf_score > 0.5 && r.source.contains("cooccur")),
+                .all(|r| r.rrf_score > INIT_SCORE && r.source.contains("cooccur")),
             "cooccur boost must be applied: {:?}",
             results
                 .iter()
@@ -312,7 +304,7 @@ mod unit_tests {
         // #R64 test/low：**排序断言**替代精确浮点相等——boosted 必须排 unboosted
         // 前（直接表达契约；无浮点运算的 no-boost 分支被未来算术改动触碰时
         // assert_eq! 会假红）。
-        assert!(d.rrf_score > 0.5 && d.source.contains("cooccur"), "query-hit boost missing: {:?}", (&d.memory_id, d.rrf_score, &d.source));
+        assert!(d.rrf_score > INIT_SCORE && d.source.contains("cooccur"), "query-hit boost missing: {:?}", (&d.memory_id, d.rrf_score, &d.source));
         assert!(!e.source.contains("cooccur"), "m_e must stay unboosted");
         let d_pos = results.iter().position(|r| r.memory_id == "m_d").unwrap();
         let e_pos = results.iter().position(|r| r.memory_id == "m_e").unwrap();
@@ -347,7 +339,7 @@ mod unit_tests {
         // 单结果 + 匹配查询 → query-hit boost 生效（guard 未把单结果短路）。
         let f = &results[0];
         assert!(
-            f.rrf_score > 0.5 && f.source.contains("cooccur"),
+            f.rrf_score > INIT_SCORE && f.source.contains("cooccur"),
             "single-result query-hit boost missing: {:?}",
             (&f.memory_id, f.rrf_score, &f.source)
         );
@@ -357,7 +349,7 @@ mod unit_tests {
         let mut empty_q: Vec<FusedResult> = vec![mk_f()];
         rerank_by_cooccurrence(&pool, "agent/test", "  ", &mut empty_q);
         let f0 = &empty_q[0];
-        assert_eq!(f0.rrf_score, 0.5, "empty query must not boost");
+        assert_eq!(f0.rrf_score, INIT_SCORE, "empty query must not boost");
         assert!(!f0.source.contains("cooccur"), "empty query must not add marker");
     }
 }

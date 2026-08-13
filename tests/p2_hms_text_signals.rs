@@ -97,10 +97,13 @@ fn ledger_includes_text_signals() {
 // （search_boosts / env_off）拿 write 锁串行（全 Mutex 让 5 个测试完全序列化）。
 static ENV_LOCK: std::sync::RwLock<()> = std::sync::RwLock::new(());
 
-/// #R63 maintainability/low：共享 env 恢复 guard——Option<OsString> 无损快照 +
-/// Drop 恢复原值（含 unwind）；search_boosts（pin enabled）与 env_off 共用。
-/// #R64 maintainability/low：**生命周期编码锁不变量**——`'a` 绑定 write guard，
-/// 构造必须在锁作用域内（类型层面杜绝 drop 时无锁的 UB，此前只靠注释约定）。
+/// 共享 env 恢复 guard——Option<OsString> 无损快照 + Drop 恢复原值（含 unwind）；
+/// search_boosts（pin enabled）与 env_off 共用。
+/// **锁身份不变量**：`'a` 绑定 RwLockWriteGuard——构造必须在锁作用域内（类型
+/// 层面杜绝 drop 时无锁的 UB）。注意类型只证明"某把写锁存活"，soundness 还依赖
+/// 文件约定：**只能用 ENV_LOCK 的 write guard 构造**（本二进制所有 env 访问
+/// 均经 ENV_LOCK 串行）；用其他锁的 guard 构造会静默引入数据竞争（edition
+/// 2024 UB），不得违反。
 #[must_use = "EnvRestore::drop 负责恢复 env，丢弃即失去恢复（避免在语句末尾提前 drop）"]
 struct EnvRestore<'a>(Option<std::ffi::OsString>, &'a std::sync::RwLockWriteGuard<'a, ()>);
 impl Drop for EnvRestore<'_> {
@@ -237,7 +240,10 @@ fn relative_date_in_ledger_signals() {
         None,
     )
     .expect("context");
-    let row = &ctx["recall"].as_array().expect("recall")[0];
+    let recall = ctx["recall"].as_array().expect("recall");
+    // #R67 test/low：显式非空守卫（裸 [0] 在空 recall 时 index-out-of-bounds）。
+    assert!(!recall.is_empty(), "recall empty for relative-date memory");
+    let row = &recall[0];
     let dates = row["text_signals"]["dates"].as_array().expect("dates");
     assert!(
         dates.len() >= 2,

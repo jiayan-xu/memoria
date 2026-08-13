@@ -164,9 +164,15 @@ async fn embed_with_retry(client: &reqwest::Client, text: &str) -> Result<Vec<f3
                         // #R56 maintainability/low：用**内部消息** t 而非首次错误的
                         // Display `{e}`——Transport 的 Display 已渲染 `embed http: <err>`
                         // 前缀，直接拼 `{e}` 会产出 `embed http: embed http: ...` 双重
-                        // 前缀（与 #R53 给 Status 修的同类缺陷）。首次错误并入文本
-                        // 保留诊断（t 通常即同一传输错误，信息不丢）。
-                        Err(EmbedError::Transport(format!("{t} (first attempt: {e})")))
+                        // 前缀（与 #R53 给 Status 修的同类缺陷）。
+                        // #R67 maintainability/low：括号内的 `{e}` 仍含完整 Display
+                        // （`embed http: <orig>`）——同样双前缀；取首次 Transport 的
+                        // 内部消息并入。
+                        let first_inner = match &e {
+                            EmbedError::Transport(m) => m.clone(),
+                            other => other.to_string(),
+                        };
+                        Err(EmbedError::Transport(format!("{t} (first attempt: {first_inner})")))
                     }
                 },
             }
@@ -512,7 +518,6 @@ async fn memory_eval_semantic_inner() {
     // #R64 test/low：**hv 多样性断言**——唯一问句向量数非病态（恒等映射服务会让
     // 所有 hv 相同 → 1 个唯一向量，双路合并退化单路而覆盖断言全绿）。
     {
-        use std::sync::Mutex;
         // #R65：锁失败硬错误（unwrap_or(0) 会把毒锁误报为"0 唯一向量"）。
         let uniq = HV_POOL
             .lock()
@@ -522,7 +527,11 @@ async fn memory_eval_semantic_inner() {
             .unwrap_or(0);
         // #R66 test/low：**下限钳制 hype_total**——近义去重把唯一 rid 压到 1 时
         // floor.max(2) 恒不成立（正常服务也假红）；与覆盖断言的 min(3) 门控一致。
+        // #R67 bug/medium：**max(2) 在 min 之前**——min(hype_total) 后 floor 可能
+        // 被压到 1（hype_total==1 近义去重塌缩），断言再要求 uniq>=2 数学上不可能
+        // （HV_POOL 至多 1 个向量）——25 分钟评测必然假红。
         let floor = ((hype_total as f64 * 0.3).ceil() as usize)
+            .min(hype_total.max(1))
             .max(2)
             .min(hype_total.max(1));
         assert!(
@@ -711,6 +720,9 @@ async fn memory_eval_semantic_inner() {
 
     // #R62 test/medium：**skip 断言前置**——退化语料（跳过项）先于 recall 断言
     // 大声失败且根因直接可见。
+    // #R67 bug/medium：**还要先于 HyPE asserts**——embed 服务通过预检但每次 POST
+    // 失败时全部 id 变占位符、无 HyPE put/add，"hype index empty" 先触发把根因
+    // 误指为 question-embed（实际是 corpus-embed）；跳过诊断必须最先发声。
     // #R64 test/low：**按引用门控**——跳过位置被任一 case（expect/must_not/
     // paraphrase）引用才硬失败；未被引用的跳过项只 warn（单次瞬时双败不至于
     // 让 ~25 分钟评测整体 flake，引用的 case 会显式失败暴露缺口）。
