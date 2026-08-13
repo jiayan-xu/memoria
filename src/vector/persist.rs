@@ -215,6 +215,9 @@ pub fn rebuild_hype_hnsw_from_store(pool: &SqlitePool, hnsw: &HnswIndex) -> Resu
 /// 并在原始值非法/被 clamp 时告警——此前静默映射默认值无任何诊断。
 pub fn resolve_ef_search() -> usize {
     const EF_MAX: usize = 4096;
+    // #R45 maintainability/low：默认值单一常量——此前不可解析分支与缺省分支各写
+    // 一个 128，未来改默认只改一处时另一处静默保留旧值（入口收口的初衷就是防分裂）。
+    const DEFAULT_EF: usize = 128;
     match std::env::var("MEMORIA_EF_SEARCH") {
         Ok(v) => match v.trim().parse::<usize>() {
             Ok(raw) => {
@@ -228,12 +231,12 @@ pub fn resolve_ef_search() -> usize {
             }
             Err(_) => {
                 eprintln!(
-                    "[persist] WARN: MEMORIA_EF_SEARCH={v:?} not parseable, using default 128"
+                    "[persist] WARN: MEMORIA_EF_SEARCH={v:?} not parseable, using default {DEFAULT_EF}"
                 );
-                128
+                DEFAULT_EF
             }
         },
-        Err(_) => 128,
+        Err(_) => DEFAULT_EF,
     }
 }
 
@@ -306,6 +309,7 @@ fn rebuild_from_table(
 
     let mut entries: Vec<VectorEntry> = Vec::new();
     let mut skipped = 0usize;
+    let mut read_errors = 0usize;
     let mut rows_seen = 0usize;
     for row in rows {
         match row {
@@ -316,8 +320,16 @@ fn rebuild_from_table(
                 // 行（写侧 P0 防御的注释承认已存在）若只查维度会被**每次启动重新加载进
                 // HNSW**，写侧防御形同虚设。有限且非零范数才入索引，退化行计入 skipped
                 // 并出现在诊断里。
+                // #R45 bug/low：`decode_vector` 用 chunks_exact(4)——blob 长度
+                // DIM*4+1..3 字节时恰好解出 DIM 个 float，能通过 `v.len() == DIM`，
+                // 把截断向量静默装入索引。显式校验 blob 字节长度 = DIM*4 彻底关闭
+                // 小尾部损坏缝隙（"损坏行被跳过"的保证对尾部损坏同样成立）。
                 let norm_sq: f64 = v.iter().map(|x| (*x as f64) * (*x as f64)).sum();
-                if v.len() == DIM && norm_sq.is_finite() && norm_sq > 0.0 {
+                if blob.len() == DIM * 4
+                    && v.len() == DIM
+                    && norm_sq.is_finite()
+                    && norm_sq > 0.0
+                {
                     entries.push(VectorEntry { id, vector: v });
                 } else {
                     skipped += 1;
@@ -325,7 +337,7 @@ fn rebuild_from_table(
             }
             Err(e) => {
                 rows_seen += 1;
-                skipped += 1;
+                read_errors += 1;
                 // 注意：decode_vector 本身不可失败（长度不符走 Ok 分支的跳过路径），
                 // 此 Err 分支捕获的是 query_map 的行读取/列转换/SQLite 迭代错误。
                 eprintln!("[persist] {label} row read/iteration failed: {e}");
@@ -334,12 +346,16 @@ fn rebuild_from_table(
     }
     if skipped > 0 {
         // #R43/#R44 other/low：decode_vector 不可失败（chunks_exact 丢尾部字节 → 长度
-        // 不符走 dim 分支）——真实行级失败只有 Err 臂（已单独 eprintln）。聚合摘要
-        // 只列实际原因（行读取错误已单列，不混入聚合消息，避免"哪条原因真的发生了"
-        // 无法从报告判断）。
+        // 不符走 dim 分支）——真实行级失败只有 Err 臂（已单独 eprintln）。
+        // #R45 other/low：行读取错误（read_errors）**单独计数**、不混入聚合摘要——
+        // 否则 schema 漂移场景（每行都转换失败）摘要会错误归因为 degenerate/dim，
+        // 与"只列实际原因"的注释矛盾。
         eprintln!(
-            "[persist] {label}: {skipped} row(s) skipped (degenerate zero/NaN or dim != {DIM})"
+            "[persist] {label}: {skipped} row(s) skipped (degenerate zero/NaN, dim != {DIM}, or corrupt blob length)"
         );
+    }
+    if read_errors > 0 {
+        eprintln!("[persist] {label}: {read_errors} row(s) failed read/iteration (see per-row logs above)");
     }
 
     // #R37 bug/medium：区分"空表"（无行，count=0 = 功能未启用）与"表有数据但全部损坏"。
