@@ -280,13 +280,17 @@ fn fetch_memories_batch(
                             }
                         }
                     }
+                    // #R46 bug/medium：行映射失败**按行丢弃**（逐行已 eprintln），不
+                    // 整批硬失败——`got == 0 && row_errors > 0` 无法区分"系统性列漂移"
+                    // （所有返回行都失败）与"mostly stale + 单行异常"（一批 500 个请求
+                    // 只有 1 行存在且恰好不可映射，其余 499 是悬空 id）：后者整批升级
+                    // 会让 hybrid.rs 因**单条**异常行丢弃整个语义通道（小候选集时
+                    // fetch 直接 Err）。prepare/query 错误（基础设施）才升级。
                     if got == 0 && row_errors > 0 {
-                        // 全部行映射失败 = 系统性列问题（列类型漂移），硬失败。
                         eprintln!(
-                            "[semantic] fetch: batch of {} ids all failed row mapping",
+                            "[semantic] fetch: batch of {} ids: {row_errors} row(s) failed mapping, 0 ok (row drops only)",
                             chunk.len()
                         );
-                        hard_failed = true;
                     } else if got == 0 {
                         // 0 行无错误 = stale ids（并发删除/悬空 HNSW id）——预期数据
                         // 滞后态，仅记录不升级（#R45 bug/medium，见函数 doc）。
@@ -323,11 +327,20 @@ fn fetch_memories_batch(
             hard_failed_batches += 1;
         }
     }
-    // 全批升级只看**硬失败**（prepare/query 错误或全行映射失败）：部分失败批已保留
-    // 成功行（只损失失败行召回），stale 批不计数——全部批都硬失败（系统性故障）才
-    // escalate（#R41 bug/high 语义保留）。
+    // 全批升级只看**硬失败**（prepare/query 错误）：部分失败批已保留成功行（只损失
+    // 失败行召回），stale 批不计数——全部批都硬失败（系统性故障）才 escalate
+    // （#R41 bug/high 语义保留；#R46 bug/medium：行映射失败不再计入硬失败）。
+    // #R46 other/low：**部分**批硬失败时返回 Ok 部分 map，调用方（hybrid.rs）按完整
+    // 结果处理——失败批的召回损失不可见。在此汇总一行，使"部分损坏"与"干净空结果"
+    // 在日志层面可区分（逐批错误已有 eprintln，汇总便于一眼定位范围）。
     if hard_failed_batches > 0 && hard_failed_batches == batches_total {
         return Err("semantic_search: memories fetch hard-failed for all batches".into());
+    }
+    if hard_failed_batches > 0 {
+        eprintln!(
+            "[semantic] fetch: {hard_failed_batches} of {batches_total} batches hard-failed (prepare/query), returning partial map of {} ids",
+            out.len()
+        );
     }
     Ok(out)
 }
