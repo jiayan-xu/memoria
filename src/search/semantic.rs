@@ -146,7 +146,7 @@ pub fn semantic_search(
     ids.sort_unstable();
     // #R48 performance/medium：ns 过滤推入 SQL（见 fetch_memories_batch doc）——
     // 返回行已属当前 ns，输出循环无需再判 ns。
-    let rows: HashMap<String, (String, Option<String>)> = match pool {
+    let mut rows: HashMap<String, (String, Option<String>)> = match pool {
         Some(p) => fetch_memories_batch(p, &ids, namespace)?,
         None => return Ok(vec![]),
     };
@@ -157,28 +157,30 @@ pub fn semantic_search(
         // 删除/失败行）在此直接跳过——正文缺失的命中若进入融合会被 rrf_merge 以空
         // 正文锁定（P3-0），不返回候选只损失召回、不污染正文。此前 `unwrap_or_default`
         // 兜底在此**不可达**（死默认掩盖了 P3-0 不变量），已删除。
-        let Some((_ns, content)) = rows.get(*memory_id) else {
+        let Some((_ns, content)) = rows.remove(*memory_id) else {
             continue;
         };
         // NULL content = 合法数据态，召回损失（剔 id）——与映射失败区分（#R42）。
         let Some(content) = content else {
             continue;
         };
-        if let Some((score, road)) = best.get(*memory_id) {
-            out.push(SignalResult {
-                memory_id: (*memory_id).to_string(),
-                content: content.clone(),
-                score: *score,
-                // 归因：winning road 标记进 source（#R35 maintainability/low）——
-                // rrf.rs 的 channel_of 按子串匹配通道，";hype" 后缀不影响现有融合，
-                // 但诊断"命中来自内容路还是问句路"成为可能。
-                source: if *road == "hype" {
-                    "hnsw_semantic;hype".to_string()
-                } else {
-                    "hnsw_semantic".to_string()
-                },
-            });
-        }
+        // #R49 performance/low：`best.get` guard 是死逻辑——ids 直接来自 best.keys()，
+        // 每个迭代 id 必然在 best 中（原 guard 掩盖了循环不变量）。rows.remove 移出
+        // content（每 id 恰访问一次，省 clone 分配；~8k/查询）。
+        let (score, road) = best[*memory_id];
+        out.push(SignalResult {
+            memory_id: (*memory_id).to_string(),
+            content,
+            score,
+            // 归因：winning road 标记进 source（#R35 maintainability/low）——
+            // rrf.rs 的 channel_of 按子串匹配通道，";hype" 后缀不影响现有融合，
+            // 但诊断"命中来自内容路还是问句路"成为可能。
+            source: if road == "hype" {
+                "hnsw_semantic;hype".to_string()
+            } else {
+                "hnsw_semantic".to_string()
+            },
+        });
     }
     // 按合并后分数降序（保持原语义：语义通道按相似度排序进入融合）。
     // 二级排序 key = memory_id：allowed 是 HashSet，迭代顺序每次运行随机——
@@ -230,7 +232,27 @@ fn search_and_merge(
             true
         }
         Err(e) => {
-            eprintln!("[semantic] {label} HNSW search failed: {e}");
+            // #R49 performance/medium：search_with_ef 只在 RwLock poisoning（持久条件）
+            // 时失败——每查询 eprintln 会刷爆 stderr（与 degraded 日志同款问题）。
+            // 60s 冷却：持续故障 ≤1 行/分钟，瞬时抖动只记一次。
+            use std::sync::atomic::{AtomicU64, Ordering};
+            use std::time::{SystemTime, UNIX_EPOCH};
+            const COOLDOWN_SECS: u64 = 60;
+            static LAST_ROAD_FAIL_LOG: AtomicU64 = AtomicU64::new(0);
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let last = LAST_ROAD_FAIL_LOG.load(Ordering::Relaxed);
+            if now.saturating_sub(last) >= COOLDOWN_SECS
+                && LAST_ROAD_FAIL_LOG
+                    .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+                    .is_ok()
+            {
+                eprintln!(
+                    "[semantic] {label} HNSW search failed: {e} (at most once per {COOLDOWN_SECS}s)"
+                );
+            }
             false
         }
     }
@@ -328,17 +350,20 @@ fn fetch_memories_batch(
                         }
                     }
                     // #R46 bug/medium：行映射失败默认**按行丢弃**。
-                    // #R48 bug/medium：系统性判定用**实际返回行数** returned——
-                    // `row_errors == chunk.len()` 要求批内无 stale（任何 stale id 都
-                    // 让 row_errors < chunk.len()，真实列漂移被降级为逐行 eprintln，
-                    // 安全网永不触发）。returned 计数后 `row_errors == returned` 即
-                    // "所有返回行都失败"且无 stale 掺水 → 确凿列漂移，硬失败升级。
-                    let returned = got + row_errors;
+                    // #R49 bug/high：系统性判定比较 **chunk.len()（请求数）**——
+                    // 上一轮改用 `row_errors == returned`（returned = got + row_errors）
+                    // 是**重言式**：本分支已要求 got == 0，returned == row_errors 恒真，
+                    // 任何"0 成功 + ≥1 映射错误"的批（包括 mostly stale + 单行异常）
+                    // 都被误判为系统性列漂移 → 整批 Err → hybrid 丢弃整个语义通道。
+                    // 要求"无 stale 掺水"（所有请求 id 都返回了行且全部失败）必须
+                    // 比较请求数：`row_errors == chunk.len()`。
+                    // 已知权衡（#R48 评论 9 承认）：含 stale 的混合批（部分行全失败
+                    // + 部分悬空 id）不会升级——漏判但安全（按行丢弃、日志可见）。
                     if got == 0 && row_errors > 0 {
-                        if row_errors == returned {
+                        if row_errors == chunk.len() {
                             eprintln!(
-                                "[semantic] fetch: all {} returned rows failed mapping (systematic column drift)",
-                                returned
+                                "[semantic] fetch: all {} requested ids returned rows and ALL failed mapping (systematic column drift)",
+                                chunk.len()
                             );
                             hard_failed = true;
                         } else {
@@ -352,6 +377,10 @@ fn fetch_memories_batch(
                         // 滞后态，仅计数不升级（#R45 bug/medium，见函数 doc）。
                         stale_ids_total += chunk.len();
                     } else if row_errors > 0 {
+                        // #R49 other/low：**混合批**的 stale 也计入——成功行 + 悬空 id
+                        // 混存时，未返回的行数（chunk.len() - got - row_errors）此前
+                        // 被漏计，聚合诊断系统性低估内存 HNSW 滞后。
+                        stale_ids_total += chunk.len() - got - row_errors;
                         eprintln!(
                             "[semantic] fetch: {row_errors} of {} rows failed mapping (dropping those ids)",
                             chunk.len()

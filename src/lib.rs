@@ -29,8 +29,13 @@ pub struct MemoriaEngine {
     /// semantic_search 双路合并（取 max）。空索引=功能未启用，检索退化为单路内容向量。
     /// **限制（#R37 maintainability/low）**：仅在构造时从表一次性构建；引擎存活期间
     /// memory_hype_vectors 被外部写入（如离线脚本重跑、未来工具运行时写 hype 向量）时，
-    /// 本索引不会自动刷新——需重建引擎/重启才能加载新向量。若要运行时刷新，调用
-    /// `persist::rebuild_hype_hnsw_from_store(&self.pool, &self.hype_hnsw)` 手动重建。
+    /// 本索引不会自动刷新——需重建引擎/重启才能加载新向量。
+    /// **#R49 documentation/low 运行时刷新**：在**已填充**索引上调用
+    /// `persist::rebuild_hype_hnsw_from_store` 只**追加新 id**（HnswIndex::add 按 id 去重，
+    /// 已存在 id 的向量更新被静默忽略——见 persist.rs #R44）。要拾取已存在 id 的更新
+    /// 向量，必须全新索引替换：`let fresh = HnswIndex::new();
+    /// fresh.set_ef_search(resolve_ef_search()); rebuild_hype_hnsw_from_store(&pool, &fresh)?;
+    /// engine.hype_hnsw = fresh;`（两索引交替重建避免查询间隙）。
     pub hype_hnsw: HnswIndex,
     pub query_cache: QueryCache,
 }
