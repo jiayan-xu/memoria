@@ -77,10 +77,16 @@ async fn embed(
             resp.status().to_string(),
         ));
     }
-    let data: Value = resp
-        .json()
-        .await
-        .map_err(|e| EmbedError::Malformed(format!("parse: {e}")))?;
+    // #R56 bug/medium：**解码与 body 读取错误分开归类**——resp.json() 的失败既可能
+    // 是确定性畸形 payload（JSON 解析失败，is_decode）也可能是瞬时网络故障（body
+    // 流中途 reset/读超时，is_body/is_timeout）——此前全部归 Malformed（确定性、
+    // 不重试）：corpus 路径 expect panic 整个测试（单次抖动全红）、HyPE 路径该 rid
+    // 永久 skip（覆盖率假红），恰与有界重试要吸收的瞬时抖动目标相悖。
+    let data: Value = match resp.json().await {
+        Ok(v) => v,
+        Err(e) if e.is_decode() => return Err(EmbedError::Malformed(format!("parse: {e}"))),
+        Err(e) => return Err(EmbedError::Transport(format!("body read: {e}"))),
+    };
     let arr = data["embeddings"]
         .as_array()
         .ok_or_else(|| EmbedError::Malformed("missing embeddings".to_string()))?;
@@ -135,7 +141,12 @@ async fn embed_with_retry(client: &reqwest::Client, text: &str) -> Result<Vec<f3
                         "{m} (first attempt: {e})"
                     ))),
                     EmbedError::Transport(t) => {
-                        Err(EmbedError::Transport(format!("{e}; retry also failed: {t}")))
+                        // #R56 maintainability/low：用**内部消息** t 而非首次错误的
+                        // Display `{e}`——Transport 的 Display 已渲染 `embed http: <err>`
+                        // 前缀，直接拼 `{e}` 会产出 `embed http: embed http: ...` 双重
+                        // 前缀（与 #R53 给 Status 修的同类缺陷）。首次错误并入文本
+                        // 保留诊断（t 通常即同一传输错误，信息不丢）。
+                        Err(EmbedError::Transport(format!("{t} (first attempt: {e})")))
                     }
                 },
             }
@@ -428,10 +439,15 @@ async fn memory_eval_semantic_inner() {
 
         // query 嵌入
         // #R54 test/medium：query 嵌入也走 embed_with_retry——单发 embed 的瞬时
-                // Transport/429/5xx 会静默丢 query 向量（if let Ok 吞错），hybrid
-                // 召回低于 RECALL_FLOOR(0.85) 假红；与 corpus/HyPE 路径统一重试策略。
-                if let Ok(v) = embed_with_retry(&client, q).await {
-            engine.cache_query_vector(q, v);
+        // Transport/429/5xx 会静默丢 query 向量（if let Ok 吞错），hybrid
+        // 召回低于 RECALL_FLOOR(0.85) 假红；与 corpus/HyPE 路径统一重试策略。
+        // #R56 bug/low：双 attempt 全败时**必须记录**——静默降级为 content-only
+        // 检索会让召回低于 RECALL_FLOOR 与真实回归不可区分。
+        match embed_with_retry(&client, q).await {
+            Ok(v) => engine.cache_query_vector(q, v),
+            Err(e) => {
+                eprintln!("[eval_semantic] query embed failed (content-only for this case): {e}")
+            }
         }
 
         let start = Instant::now();
@@ -497,8 +513,13 @@ async fn memory_eval_semantic_inner() {
     for (pq, idx) in &paraphrase_cases {
         let ns = "agent/default";
         let k = 5;
-        if let Ok(v) = embed_with_retry(&client, pq).await {
-            engine.cache_query_vector(pq, v);
+        // #R56 bug/low：同 query 路径——双败记录，防 content-only 静默降级
+        // 与真实回归不可区分。
+        match embed_with_retry(&client, pq).await {
+            Ok(v) => engine.cache_query_vector(pq, v),
+            Err(e) => {
+                eprintln!("[eval_semantic] paraphrase embed failed (content-only): {e}")
+            }
         }
         let results = hybrid_search(
             &pool, pq, ns, k,

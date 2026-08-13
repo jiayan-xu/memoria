@@ -168,6 +168,13 @@ def generate_question(content: str) -> str:
             if attempt == 2:
                 raise RuntimeError(f"chat HTTP {e.code} 重试耗尽: {e}") from e
             time.sleep(min(2 ** attempt, 10))
+        except DeterministicSkipError:
+            # #R56 bug/medium：确定性错误（2xx 非 JSON/非 dict，同形状每次必现）**直接
+            # 穿透不重试**——它是 RuntimeError 子类，落下面 except Exception 会重试 3
+            # 次（每次白付一次付费 chat 调用）且末次 re-raise 后被主循环归为瞬时失败
+            # 进 fail_ids（清单永不收敛）；与 embed() 的 #R53 前置子句同款。
+            # 必须排在 except Exception **之前**（Python 按序匹配，先命中先处理）。
+            raise
         except Exception as e:
             if attempt == 2:
                 # #R38 bug/medium：重试耗尽 = 瞬时故障（网络/API 抖动），可重跑修复——
@@ -386,6 +393,13 @@ def main():
         # 运行静默抹掉上次全量运行累积的失败清单（"定点重跑"工件），运维先 --limit
         # 调试再定点重跑时清单已丢，被迫全量 --all 再付几千次付费调用。dry-run 与
         # preflight 失败已有守卫，部分运行此前漏网。
+        # #R56 bug/medium：**清理前 fail-fast 空目标**——--all 选 0 行（库路径错/
+        # ns 过滤不匹配/库是冷的）时继续走到这里会删掉上次全量累积的清单，然后
+        # 零迭代退出 0 报"写入 0 / 跳过 0 / 失败 0"假成功：误配置的运行静默销毁了
+        # 它本应服务的重跑工件。
+        if not targets:
+            print(f"错误: 目标集为空（{args.db} 无匹配行或 ns 过滤不匹配）——已中止，未清理 fail_ids")
+            sys.exit(1)
         if args.all and args.limit is None:
             try:
                 if os.path.exists(failed_ids_path):
@@ -513,7 +527,7 @@ def main():
             try:
                 v = vecs[0]
                 blob = struct.pack(f"<{len(v)}f", *v)
-            except (IndexError, KeyError, struct.error, TypeError, ValueError) as e:
+            except (IndexError, KeyError, struct.error, TypeError, ValueError, OverflowError) as e:
                 raise DeterministicSkipError(f"embed 响应向量畸形（{type(e).__name__}: {e}）") from e
             # 维度校验也在 try 内：畸形响应（非序列/非数值）抛异常 →
             # 按失败计数跳过而非中断整个 --all 批（否则 5339 条白跑且无 fail_ids）。

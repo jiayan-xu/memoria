@@ -7,6 +7,42 @@ use crate::storage::SqlitePool;
 use crate::vector::HnswIndex;
 use std::collections::HashMap;
 
+/// #R56 maintainability/medium：语义检索的**结构化错误**——hybrid.rs 的冷却 key 此前
+/// 靠子串匹配 String 错误文本派生（"query vector dim" / "all HNSW roads failed" /
+/// fetch 类），文案改动会静默把故障重新归类进 hybrid_drop_other 桶（跨抑制回归，
+/// #R54 声称修复的问题在消息层重现）；且 hybrid_drop_db 把 pool get / prepare /
+/// query / 硬失败批等**不同** DB 故障合并一 key（并发异因互相压制）。枚举使 key
+/// 派生结构化为 match，错误消息可任意改写而不影响分类。
+#[derive(Debug)]
+pub enum SemanticError {
+    /// 查询向量维度 ≠ HNSW DIM（嵌入模型/配置漂移）
+    QueryDim(usize),
+    /// 全部存在的路都失败（RwLock poisoned / 索引损坏）
+    RoadsFailed(String),
+    /// memories 回查硬失败（pool/prepare/query/整批硬失败）
+    Fetch(String),
+    /// 其他未分类故障
+    Other(String),
+}
+
+impl std::fmt::Display for SemanticError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SemanticError::QueryDim(d) => write!(
+                f,
+                "semantic_search: query vector dim {d} != HNSW DIM {}",
+                crate::vector::DIM
+            ),
+            SemanticError::RoadsFailed(m) => write!(
+                f,
+                "semantic_search: all HNSW roads failed (poisoned/corrupted index){m}"
+            ),
+            SemanticError::Fetch(m) => write!(f, "semantic_search: memories fetch failed: {m}"),
+            SemanticError::Other(m) => write!(f, "semantic_search: {m}"),
+        }
+    }
+}
+
 /// 60s 冷却的 eprintln（#R50/#R51 maintainability/low）：语义检索路径多处诊断日志
 /// （road fail / degraded / fetch 批级 / stale 汇总 / hybrid drop）此前各自实现
 /// static 冷却——复制到第 4 处时收敛为共享 helper，冷却语义一致；按 **key** 分开
@@ -62,7 +98,7 @@ pub fn semantic_search(
     hype_hnsw: Option<&HnswIndex>,
     query_cache: Option<&QueryCache>,
     pool: Option<&SqlitePool>,
-) -> Result<Vec<SignalResult>, String> {
+) -> Result<Vec<SignalResult>, SemanticError> {
     let cache = match query_cache {
         Some(c) => c,
         None => return Ok(vec![]),
@@ -80,11 +116,8 @@ pub fn semantic_search(
     // query 向量长度 ≠ DIM 时 HNSW 距离计算跑在错配维度上，静默产生垃圾分数（最坏
     // panic 污染索引锁）。离线脚本已防服务器模型漂移（768d），运行时路径同样显式拒绝。
     if vector.len() != crate::vector::DIM {
-        return Err(format!(
-            "semantic_search: query vector dim {} != HNSW DIM {}",
-            vector.len(),
-            crate::vector::DIM
-        ));
+        // #R56 maintainability/medium：结构化错误（hybrid.rs 按变体派生冷却 key）。
+        return Err(SemanticError::QueryDim(vector.len()));
     }
 
     // P0 防御：查询向量退化（NaN / 全零）则无法产生有效语义信号，提前返回空集。
@@ -146,7 +179,8 @@ pub fn semantic_search(
         }
     }
     if roads_ok == 0 && roads_failed > 0 {
-        return Err("semantic_search: all HNSW roads failed (poisoned/corrupted index)".into());
+        // #R56 maintainability/medium：结构化错误（RoadsFailed 变体）。
+        return Err(SemanticError::RoadsFailed(String::new()));
     }
     // #R44 bug/medium：升级缺口——一路失败但幸存路**合法返回 0 结果**时（如 hype 空
     // 索引 + content 索引损坏，或反之），`roads_ok==1` 且 best 空会走 Ok(vec![])，
@@ -193,7 +227,7 @@ pub fn semantic_search(
     // 返回行已属当前 ns，输出循环无需再判 ns。
     // #R53 performance/low：rows 容量由 fetch_memories_batch 内部按 ids.len() 预分配。
     let mut rows: HashMap<String, (String, Option<String>)> = match pool {
-        Some(p) => fetch_memories_batch(p, &ids, namespace)?,
+        Some(p) => fetch_memories_batch(p, &ids, namespace).map_err(SemanticError::Fetch)?,
         None => return Ok(vec![]),
     };
 

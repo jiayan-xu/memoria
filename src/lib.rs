@@ -217,7 +217,7 @@ impl MemoriaEngine {
         // O(n) 全表扫描（在 8 个既有 COUNT 之上），监控循环高频轮询时逐次放大；
         // 缓存由内存 HNSW 滞后语义兜底（live len 仍实时）。失败 WARN 走 60s 冷却
         // ——持续故障下每调用刷一行会把 stderr 淹没在同一行里。
-        let hype_store = query_hype_count_cached(&conn);
+        let hype_store = query_hype_count_cached(&conn, &self.db_path);
         m.insert(
             "hype_vector_index_size".to_string(),
             serde_json::Value::Number(hype_store.into()),
@@ -285,18 +285,27 @@ impl MemoriaEngine {
 /// 服务外写入，30s 陈旧可接受（live 索引 len 在 stats 中仍实时）。查询失败
 /// WARN 60s 冷却（throttled_eprintln）——持续故障（缺表/锁）下每调用刷一行
 /// 会把 stderr 淹没在同一行。
-fn query_hype_count_cached(conn: &rusqlite::Connection) -> i64 {
+/// #R56 bug/medium：**缓存按 db 身份键控**——进程级 static 若不区分 db，同进程
+/// 内多引擎实例（多 PyEngine / 测试 recreate 模式）会让先填缓存的那个实例把
+/// 自己的行数供给所有其他实例最多 30s；`hype_vector_index_size` 恰是检测 HyPE
+/// 构建降级（store>0 && live==0）的关键指标，错值会让除第一个外的所有库误判。
+/// 键 = db_path（进程内实例的辨识身份）。`Instant::now()` 在**锁内**取并用
+/// saturating_duration_since——锁外捕获存在竞态：对端线程可先写入更新的时间戳，
+/// 本线程 `now.duration_since(*at)` 在 now < at 时 panic（与 semantic.rs #R55
+/// 同款竞态，db_stats 是库路径，panic 不可接受）。
+fn query_hype_count_cached(conn: &rusqlite::Connection, db_path: &str) -> i64 {
+    use std::collections::HashMap;
     use std::sync::atomic::{AtomicI64, Ordering};
     use std::sync::Mutex;
     use std::time::Instant;
-    static CACHE: Mutex<Option<(Instant, i64)>> = Mutex::new(None);
+    static CACHE: Mutex<Option<HashMap<String, (Instant, i64)>>> = Mutex::new(None);
     // 失败冷却（秒级时间戳；跨线程近似即可，精确隔离非目标）
     static LAST_FAIL_EPOCH: AtomicI64 = AtomicI64::new(0);
-    let now = Instant::now();
     {
         let cache = CACHE.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some((at, v)) = cache.as_ref() {
-            if now.duration_since(*at).as_secs() < 30 && *v != -1 {
+        if let Some((at, v)) = cache.as_ref().and_then(|m| m.get(db_path)) {
+            let now = Instant::now();
+            if now.saturating_duration_since(*at).as_secs() < 30 && *v != -1 {
                 return *v;
             }
         }
@@ -306,7 +315,9 @@ fn query_hype_count_cached(conn: &rusqlite::Connection) -> i64 {
     });
     match r {
         Ok(c) => {
-            *CACHE.lock().unwrap_or_else(|p| p.into_inner()) = Some((Instant::now(), c));
+            let mut cache = CACHE.lock().unwrap_or_else(|p| p.into_inner());
+            let m = cache.get_or_insert_with(HashMap::new);
+            m.insert(db_path.to_string(), (Instant::now(), c));
             c
         }
         Err(e) => {
@@ -384,9 +395,13 @@ mod python {
         // 正确性优先，宿主可错峰刷新）。此前该方法无任何调用点（doc 声称给
         // Python bindings 用但未绑定），refresh 不可达。
         // #R55 performance/medium：**释放 GIL**——`py.allow_threads` 让构建期间
-        // 其他 Python 线程继续运行（此前整段重建冻结整个解释器，与 Arc<Mutex>
-        // 宿主阻塞并发检索同款问题；PyEngine.inner 是实例独占非 Mutex 共享，
-        // allow_threads 无锁竞争语义）。
+        // 其他 Python 线程继续运行（此前整段重建冻结整个解释器；PyEngine.inner 是
+        // 实例独占非 Mutex 共享，allow_threads 无锁竞争语义）。
+        // #R56 bug/medium 已知取舍：`&mut self` 的 PyRefMut 借用在 allow_threads 期间
+        // 仍持有——其他线程若在刷新中调用**同一实例**的任何方法，PyO3 运行时借用
+        // 检查会抛 PyBorrowError（"Already borrowed"）。benefit 只对"从不触碰该实例
+        // 的线程"成立；跨实例（多 PyEngine）完全安全。文档明示该限制，完整方案
+        // （interior-mutex 字段使其他线程刷新期间仍可搜索）留待后续。
         fn refresh_hype_index(&mut self, py: Python<'_>) -> PyResult<usize> {
             let r: Result<usize, String> = py.allow_threads(|| self.inner.refresh_hype_index());
             r.map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))
