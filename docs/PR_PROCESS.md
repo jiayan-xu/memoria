@@ -1,17 +1,19 @@
 # PR 流程规定（Pull Request Workflow）
 
 > 适用仓库：GitHub `jiayan-xu/memoria`（本地 canonical 见 AGENTS.md）
-> 更新日期：2026-08-07
+> 更新日期：2026-08-13
 > 状态：**强制执行**（pre-push hook 已机械拦截直推默认分支）
+>
+> 默认分支是 **`main`**（不是 `master`）。本文示例一律走 `main`。
 
 ---
 
 ## 1. 为什么必须走 PR
 
-**背景**：GitHub 的 `required status checks` 只对 **PR 合并**强制，**不拦截直接 push 到 master**——
-直接 `git push origin master` 永远放行（仅提示 `Bypassed rule violations`），CI 红代码照样进主分支。
+**背景**：GitHub 的 `required status checks` 只对 **PR 合并**强制，**不拦截直接 push 到默认分支**——
+直接 `git push origin main` 永远放行（仅提示 `Bypassed rule violations`），CI 红代码照样进主分支。
 
-**目的**：让 `ocr-review` + `gitleaks` 门禁在代码进入 master **之前**拦截，而不是事后检查。
+**目的**：让 `ocr-review` + `gitleaks` + `build` 门禁在代码进入 **main** **之前**拦截，而不是事后检查。
 
 ---
 
@@ -26,7 +28,7 @@
 
 ## 3. 标准操作流程
 
-### 3.1 新建 feature 分支（从最新 master 切出）
+### 3.1 新建 feature 分支（从最新 main 切出）
 
 ```bash
 git fetch origin
@@ -47,19 +49,20 @@ git commit -m "feat(xxx): 一句话" -m "- 要点列表"
 
 ```bash
 git push origin feat/<简述>
-# hook 只审查该分支相对 origin/master 的增量，有评论会拦截
+# hook 只审查该分支相对 origin/main 的增量，有评论会拦截
 ```
 
 ### 3.4 开 PR + 等 CI
 
 ```bash
-# 用 gh CLI 或网页：feat/<简述> → master
-gh pr create --base master --title "..." --body "..."
+# 用 gh CLI 或网页：feat/<简述> → main
+gh pr create --base main --title "..." --body "..."
 ```
 
-PR 页面确认：
-- `ocr-review` ✅ 绿
-- `gitleaks` ✅ 绿
+PR 页面确认（5 个 required checks）：
+- `build` (ubuntu / macos / windows) ✅
+- `ocr-review` ✅
+- `gitleaks` ✅
 - 有红灯 → 看评论 → 修 → push 更新分支（PR 自动刷新）→ 直到全绿
 
 ### 3.5 合并
@@ -76,8 +79,8 @@ gh pr merge --merge   # 或网页点 Merge
 |---|---|
 | **hook 拦了但确实要直推**（如紧急回滚） | `git push --no-verify`，但**必须在 PR 描述/commit 里说明理由**，事后补 PR |
 | **PR CI 卡在 in_progress 很久** | 等；或看 Actions 日志确认是 runner 排队还是 API 超时 |
-| **只想改文档/注释** | 同样走 PR（小改动用 `docs/` 前缀分支） |
-| **多人协作** | PR 里 @ 协作者 review；master 只有维护者能合并 |
+| **只想改文档/注释** | 同样走 PR（小改动用 `feat/docs-*` 分支；hook 只放行 `feat/*`，`docs/` 前缀会被拦） |
+| **多人协作** | PR 里 @ 协作者 review；main 只有维护者能合并 |
 
 ---
 
@@ -98,7 +101,7 @@ gh pr merge --merge   # 或网页点 Merge
 
 | | 旧（2026-08-07 前） | 新（本文件） |
 |---|---|---|
-| master 直推 | ✅ 允许（hook 只验分支名） | ❌ 禁止（hook 拦截） |
+| main 直推 | ✅ 允许（hook 只验分支名） | ❌ 禁止（hook 拦截） |
 | 门禁时机 | push 后事后检查 | PR 合并前强制 |
 | feature 分支 | 不允许存在 | ✅ 正常流程 |
 | 紧急绕过 | — | `--no-verify` + 说明理由 |
