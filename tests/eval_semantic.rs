@@ -65,9 +65,13 @@ impl<T> Pipe for T {}
 /// 时每条语料多付 500ms + 一次必然失败的请求（22 条 → 10s+ 浪费）。
 /// #R48 bug/medium：4xx 中 **429（限流）/408（请求超时）是瞬时**——本地 embed_server
 /// 限流时按永久跳过会静默丢语料、触发覆盖率假红（正是有界重试要防的故障模式）。
-/// 字符串前缀分类脆弱（错误格式改动会静默改变重试行为），结构化错误留待后续。
+/// #R49 performance/low：**parse/missing/bad vector 也是确定性**——它们来自 2xx 响应
+/// 的畸形/错误 payload（系统性服务配置错误，同形状响应每次必现），重试只多付
+/// 500ms + 重复请求。仅 send 失败（`embed http: ...` 无 status 前缀，网络抖动）与
+/// 429/408 视为瞬时。字符串前缀分类脆弱（错误格式改动会静默改变重试行为），
+/// 结构化错误留待后续。
 fn is_transient_embed_err(e: &str) -> bool {
-    !e.starts_with("embed http status 4")
+    (e.starts_with("embed http:") && !e.starts_with("embed http status"))
         || e.starts_with("embed http status 429")
         || e.starts_with("embed http status 408")
 }

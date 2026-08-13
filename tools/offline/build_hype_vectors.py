@@ -422,10 +422,14 @@ def main():
             # 按失败计数跳过而非中断整个 --all 批（否则 5339 条白跑且无 fail_ids）。
             # 同时校验 embed_server 的 dim 与 Rust 侧 DIM 一致：服务器若跑 local 模型
             # （768d），len(v)==dim 会通过但 rebuild 侧全部静默跳过——必须显式拒绝。
+            # #R49 bug/medium：维度/向量校验失败是**确定性**的（模型/响应缺陷，重跑
+            # 必然同样失败）——抛 DeterministicSkipError 计 skip（skip_ids），若抛
+            # ValueError 会被 catch-all 归为瞬时失败记入 fail_ids：清单永不收敛且每轮
+            # 重跑先白付一次 Qwen chat 调用。struct.pack 失败（非数值向量）同理。
             if dim != RUST_DIM:
-                raise ValueError(f"服务维度 {dim}≠Rust DIM {RUST_DIM}（模型不匹配）")
+                raise DeterministicSkipError(f"服务维度 {dim}≠Rust DIM {RUST_DIM}（模型不匹配）")
             if len(v) != dim:
-                raise ValueError(f"维度异常 {len(v)}≠{dim}")
+                raise DeterministicSkipError(f"维度异常 {len(v)}≠{dim}")
             blob = struct.pack(f"<{len(v)}f", *v)
             # 写入也在此 try 内（#R35 bug/medium）：服务运行中 DB 可能被锁/磁盘满，
             # 单行写失败若抛到外层会中断整批且 fail_ids 永不落盘——违背

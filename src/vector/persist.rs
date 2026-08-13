@@ -61,14 +61,17 @@ pub fn put_hype_stored_vector(
     put_vector_into(pool, id, namespace, vector, "memory_hype_vectors")
 }
 
-/// 向量表描述符（#R37 maintainability/low）：表名 → 建表/写入/读取 SQL + 公开函数名 +
-/// 日志 label 的**单一事实源**。此前三处 match 各自硬编码同一组字符串字面量——新增第三张
-/// 向量表需同步改三处，漏改会导致错误前缀错配或 SQL 不匹配。收口为 descriptor 后，
-/// 新增表只改这里。
+/// 向量表描述符（#R37 maintainability/low）：表名 → 公开函数名 + 日志 label 的
+/// **单一事实源**。此前三处 match 各自硬编码同一组字符串字面量——新增第三张向量表需
+/// 同步改三处，漏改会导致错误前缀错配或 SQL 不匹配。收口为 descriptor 后，新增表只改
+/// 这里。
+///
+/// #R49 maintainability/low：**SQL 不再存于 descriptor**——两张表的 select/insert SQL
+/// 只差表名（复制粘贴正是 descriptor 要消除的漂移源：改一张表的 upsert 列集而忘改另
+/// 一张会静默分裂两条写入路径）。表名经白名单 lookup 校验（无注入面），SQL 由
+/// `select_sql(table)` / `insert_sql(table)` 单源构建，表名占位拼接使分歧不可能发生。
 struct VectorTable {
     table: &'static str,
-    select_sql: &'static str,
-    insert_sql: &'static str,
     fn_name: &'static str,
     label: &'static str,
     /// #R44 maintainability/medium：全 skip 时的错误语义（Err vs Ok(0)+WARN）作为**显式
@@ -79,28 +82,35 @@ struct VectorTable {
     error_on_all_skipped: bool,
 }
 
+/// 读取 SQL（#R49 maintainability/low 单源；#R49 maintainability/low ORDER BY id——
+/// HNSW 图结构依赖插入顺序，无排序则同数据的 rebuild 跨运行不可复现，recall 对比/
+/// 质量调试噪声大；id 是 TEXT PRIMARY KEY，ORDER BY 走 PK 索引，代价可忽略）。
+fn select_sql(table: &str) -> String {
+    format!("SELECT id, vector FROM {table} ORDER BY id")
+}
+
+/// 写入 SQL（ON CONFLICT upsert 而非 INSERT OR REPLACE——REPLACE 会整行删除重建，
+/// 把 `memory_hype_vectors.question`（离线脚本写入的假设问句）静默抹成 NULL）。
+fn insert_sql(table: &str) -> String {
+    format!(
+        "INSERT INTO {table} (id, namespace, vector, updated_at) \
+         VALUES (?, ?, ?, datetime('now')) \
+         ON CONFLICT(id) DO UPDATE SET vector=excluded.vector, \
+                                        namespace=excluded.namespace, \
+                                        updated_at=excluded.updated_at"
+    )
+}
+
 fn vector_tables() -> &'static [VectorTable] {
     static TABLES: [VectorTable; 2] = [
         VectorTable {
             table: "memory_vectors",
-            select_sql: "SELECT id, vector FROM memory_vectors",
-            insert_sql: "INSERT INTO memory_vectors (id, namespace, vector, updated_at) \
-                         VALUES (?, ?, ?, datetime('now')) \
-                         ON CONFLICT(id) DO UPDATE SET vector=excluded.vector, \
-                                                        namespace=excluded.namespace, \
-                                                        updated_at=excluded.updated_at",
             fn_name: "put_stored_vector",
             label: "content",
             error_on_all_skipped: false,
         },
         VectorTable {
             table: "memory_hype_vectors",
-            select_sql: "SELECT id, vector FROM memory_hype_vectors",
-            insert_sql: "INSERT INTO memory_hype_vectors (id, namespace, vector, updated_at) \
-                         VALUES (?, ?, ?, datetime('now')) \
-                         ON CONFLICT(id) DO UPDATE SET vector=excluded.vector, \
-                                                        namespace=excluded.namespace, \
-                                                        updated_at=excluded.updated_at",
             fn_name: "put_hype_stored_vector",
             label: "hype",
             error_on_all_skipped: true,
@@ -155,7 +165,10 @@ fn put_vector_into(
         eprintln!("[persist] WARN: {msg}");
         return Err(msg);
     }
-    conn.execute(td.insert_sql, rusqlite::params![id, namespace, encode_vector(vector)])
+    conn.execute(
+        &insert_sql(td.table),
+        rusqlite::params![id, namespace, encode_vector(vector)],
+    )
         .map(|_| ())
         .map_err(|e| {
             // #R44 bug/medium：execute 失败必须 eprintln——所有生产调用方 `let _ =`
@@ -299,7 +312,7 @@ fn rebuild_from_table(
         .ok_or_else(|| format!("rebuild_from_table: unknown rebuild table {table}"))?;
     let label = td.label;
     let mut stmt = conn
-        .prepare(td.select_sql)
+        .prepare(&select_sql(td.table))
         .map_err(|e| format!("prepare {}: {}", label, e))?;
     let rows = stmt
         .query_map([], |row| {
