@@ -609,10 +609,17 @@ fn is_busy(e: &rusqlite::Error) -> bool {
     // 同连接冲突（未终结语句/事务内读→写升级），等待不能解决，重试只烧 ~3s
     // 启动延迟（500ms/1s/1.5s）后照样失败；WARN 文案 "busy/locked" 会误导部署
     // 停滞诊断。LOCKED 按真实错误传播。
+    // #R69 bug/medium：**扩展 BUSY 码也重试**——SQLite >= 3.14 默认返回扩展
+    // 结果码：SQLITE_BUSY_SNAPSHOT(517)/BUSY_RECOVERY(261)（WAL 自动 checkpoint
+    // COMMIT / 快照争用的常见瞬态）经 rusqlite From<c_int> 映射（只认显式列表）
+    // 落为 ErrorCode::Unknown → 此前永不重试、传播到 .expect() 中止启动。扩展码
+    // 低 8 位即主码（SQLITE_BUSY=5），`extended_code & 0xff == 5` 覆盖全部 BUSY
+    // 变体；LOCKED(6) 低 8 位 != 5 不受影响。
     matches!(
         e,
         rusqlite::Error::SqliteFailure(se, _)
             if se.code == rusqlite::ErrorCode::DatabaseBusy
+                || (se.extended_code & 0xff) == 5 /* SQLITE_BUSY primary code */
     )
 }
 
@@ -1353,28 +1360,31 @@ pub fn migrate_hype_vectors(pool: &SqlitePool) -> Result<(), String> {
                             // add_vectors/put_hype_stored_vector 接受任意 id、外部注册/
                             // 暂存向量是合法数据态（"无 memories 行 ⇒ 垃圾"并非写侧
                             // 强制不变量）。现在只陈述事实 + 提示 dry-run 审计通道。
-                            if !clean_vectors {
+                            // #R69 bug/medium：**dry-run 直达审计清单**——此前仅
+                            // DRY_RUN=1 时（未设 CLEANUP_VECTORS）落入 `!clean_vectors`
+                            // 分支重打 WARN、清单只存在于最终 else（额外要求双 env）：
+                            // 按 WARN 指引操作零审计输出（R45 指出，hype/vec 两段
+                            // 同款）。dry_run 时跳过全部 WARN 分支直达下方清单
+                            // 打印（只列不删）；非 dry-run 保持四分支语义。
+                            if !clean_vectors && !dry_run {
                                 eprintln!(
                                 "[Memoria] WARN: {orphans_hype} orphan memory_hype_vectors rows (no matching memories row; may be legit staged/external hype vectors). Cleanup is opt-in and disabled by default. To inspect before any decision, restart with MEMORIA_ORPHAN_DRY_RUN=1 to list every id (nothing will be deleted)."
                             );
                                 // #R69 bug/high：dry-run 时**不写任何 flag**——refused
                                 // 态也会跳过后续启动评估；dry-run 是纯审计预览，不固化
-                                // "已拒绝/已处理"状态（下次启动重新评估）。此前这里
-                                // 只注释不置位（hype 段拒绝由 HYPE_FLAG 记录），dry-run
-                                // 时 HYPE_FLAG 同样不置（见段尾 !dry_ran 门）。
-                                if dry_run {
-                                    }
+                                // "已拒绝/已处理"状态（下次启动重新评估）。
                                 // #R57 bug/low：hype 段拒绝**不置 refused**——REFUSED_FLAG
                                 // 语义 = memory_vectors 段拒绝（见下）；hype 拒绝态由
                                 // HYPE_FLAG 记录（段完成=删除或拒绝）。混用会让 vec 段
                                 // 干净完成也被标记 refused、下次启动 WARN 误导归因。
-                            } else if orphans_hype > ORPHAN_REFUSE_THRESHOLD && !force_cleanup {
+                            } else if orphans_hype > ORPHAN_REFUSE_THRESHOLD
+                                && !force_cleanup
+                                && !dry_run
+                            {
                                 eprintln!(
                                 "[Memoria] WARN: {orphans_hype} orphan memory_hype_vectors rows ABOVE safety threshold {ORPHAN_REFUSE_THRESHOLD}; cleanup refused (count too large to be safely attributable to staged/external writes; inspect with MEMORIA_ORPHAN_DRY_RUN=1)"
                             );
-                                if dry_run {
-                                    }
-                            } else if !force_cleanup {
+                            } else if !force_cleanup && !dry_run {
                                 // #R60 bug/high：**单 OPT_IN 只报告不删**——"无 memories 行
                                 // ⇒ 垃圾"非强制不变量（外部/暂存向量是合法态）；删除执行
                                 // 必须 OPT_IN + FORCE 双 env 显式确认（清单审计 + 阈值只
@@ -1382,8 +1392,6 @@ pub fn migrate_hype_vectors(pool: &SqlitePool) -> Result<(), String> {
                                 eprintln!(
                                 "[Memoria] WARN: {orphans_hype} orphan memory_hype_vectors rows (no matching memories row; may be legit staged/external hype vectors); not deleting. MEMORIA_ORPHAN_DRY_RUN=1 lists every id without deleting."
                             );
-                                if dry_run {
-                                    }
                             } else {
                                 // #R57 bug/medium：**删除前打印完整清单**——opt-in 时 DELETE
                                 // 永久销毁所有无 memories 行的向量行，但 add_vectors/
@@ -1408,7 +1416,7 @@ pub fn migrate_hype_vectors(pool: &SqlitePool) -> Result<(), String> {
                                     eprintln!(
                                     "[Memoria] DRY-RUN: {orphans_hype} orphan memory_hype_vectors rows would be deleted (nothing deleted; rerun without MEMORIA_ORPHAN_DRY_RUN to execute):\n{audit}"
                                 );
-                                    } else {
+                                } else {
                                     eprintln!(
                                     "[Memoria] Migration: deleting {orphans_hype} orphan memory_hype_vectors rows:\n{audit}"
                                 );
@@ -1485,33 +1493,30 @@ pub fn migrate_hype_vectors(pool: &SqlitePool) -> Result<(), String> {
                     if orphans_vec > 0 {
                         // #R69 bug/high：WARN 文案**中性化**（同 hype 段）——不读作
                         // 操作指引；提示 dry-run 审计通道（完整 id 清单）。
-                        if !clean_vectors {
+                        // #R69 bug/medium：**dry-run 直达审计清单**（同 hype 段——
+                        // 仅 DRY_RUN=1 时此前落入 !clean_vectors 分支重打 WARN、
+                        // 清单只在最终 else（要求双 env）——按指引操作零输出）。
+                        if !clean_vectors && !dry_run {
                             eprintln!(
                                 "[Memoria] WARN: {orphans_vec} orphan memory_vectors rows (no matching memories row; may be legit external vectors via add_vectors). Cleanup is opt-in and disabled by default. To inspect before any decision, restart with MEMORIA_ORPHAN_DRY_RUN=1 to list every id (nothing will be deleted)."
                             );
                             // #R69 bug/high：dry-run 时**不置 refused**——审计预览
                             // 不固化"已拒绝"状态（否则后续启动跳过评估，运维无法
-                            if dry_run {
-                            } else {
-                                refused = true;
-                            }
-                        } else if orphans_vec > ORPHAN_REFUSE_THRESHOLD && !force_cleanup {
+                            refused = true;
+                        } else if orphans_vec > ORPHAN_REFUSE_THRESHOLD
+                            && !force_cleanup
+                            && !dry_run
+                        {
                             eprintln!(
                                 "[Memoria] WARN: {orphans_vec} orphan memory_vectors rows ABOVE safety threshold {ORPHAN_REFUSE_THRESHOLD}; cleanup refused (count too large to be safely attributable to external writes; inspect with MEMORIA_ORPHAN_DRY_RUN=1)"
                             );
-                            if dry_run {
-                            } else {
-                                refused = true;
-                            }
-                        } else if !force_cleanup {
+                            refused = true;
+                        } else if !force_cleanup && !dry_run {
                             // #R60 bug/high：单 OPT_IN 只报告不删（同 hype 段理由）。
                             eprintln!(
                                 "[Memoria] WARN: {orphans_vec} orphan memory_vectors rows (no matching memories row; may be legit external vectors via add_vectors); not deleting. MEMORIA_ORPHAN_DRY_RUN=1 lists every id without deleting."
                             );
-                            if dry_run {
-                            } else {
-                                refused = true;
-                            }
+                            refused = true;
                         } else {
                             // #R57 bug/medium：删除前打印**完整清单**（同 hype 段——
                             // opt-in 时 ≤5000 的合法外部向量也会被永久销毁，清单
