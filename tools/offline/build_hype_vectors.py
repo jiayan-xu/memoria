@@ -255,8 +255,12 @@ def main():
         "--ids",
         default=None,
         help=f"定点重跑：读取 id 清单文件（默认清单位置: {os.path.join(HERE, 'hype_failed_ids.txt')}，"
-        "或任意逗号分隔 id 列表文件）仅处理这些 id。**必须与 --all 组合**（fail_ids "
-        "清单只由全量运行产生；独立 --ids 会对 golden 集过滤、报'已删除/失效'后空目标退出）",
+        "或任意逗号分隔 id 列表文件）仅处理这些 id。可独立使用（从 golden/全库目标中"
+        "筛出清单 id）；不强制 --all（#R69 documentation/low：help 此前承诺'必须与 "
+        "--all 组合'但实现从不强制——独立 --ids 照常过滤执行）。注意 fail_ids 清单"
+        "（hype_failed_ids.txt）的更新只属于纯全量运行（--all 且 --limit/--ids 均为空）："
+        "--ids 模式下本运行的失败**不会**写回清单、清单也不会被清理——需要更新清单"
+        "请用纯 --all 重跑",
     )
     ap.add_argument("--all", action="store_true", help="全库补嵌（验证通过后）")
     ap.add_argument("--db", default=DB)
@@ -428,7 +432,16 @@ def main():
             print(f"错误: embed_server 预检向量畸形（{type(_vecs).__name__}），请检查嵌入服务配置")
             sys.exit(1)
         _pv = _vecs[0]
-        _pnorm = math.sqrt(sum(float(x) * float(x) for x in _pv))
+        # #R69 bug/medium：**非数值元素友好失败**——float(x) 在畸形上游返回
+        # 形状合法但含字符串/None 的向量时抛 ValueError/TypeError；裸转换会让
+        # 脚本带原始 traceback 崩溃，违反本 preflight 块"fail-fast-with-friendly-
+        # diagnostic"纪律（main loop 的 #R52 guard 经 struct.pack try/except 已
+        # 捕获同类畸形，此处须镜像）。
+        try:
+            _pnorm = math.sqrt(sum(float(x) * float(x) for x in _pv))
+        except (TypeError, ValueError) as e:
+            print(f"错误: embed_server 预检向量含非数值元素（{e}）——请检查嵌入服务输出")
+            sys.exit(1)
         if not math.isfinite(_pnorm) or _pnorm == 0.0:
             print("错误: embed_server 预检向量退化（零/NaN 范数）——嵌入服务输出异常")
             sys.exit(1)

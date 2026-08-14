@@ -193,19 +193,18 @@ pub fn set_event_time(pool: &SqlitePool, memory_id: &str, event_time: &str) -> R
 /// 三路统一的向量持久化+索引 helper（此前复制粘贴的 if/else-if 链让失败语义
 /// 漂移，抽单点防未来只改一路）：put 失败短路 add（防 memory-only 向量）；
 /// add 失败记录并注明重启 rebuild 自愈。
-/// #R69 documentation/medium（自相矛盾注释重写）：本函数返回 ()，不传播任何
-/// 状态——semantic_related 边的门控由 edge_refresh 统一负责（#R67/#R68 契约）：
-/// **以持久向量存在为准**（put 成功即建边，add 失败由重启 rebuild 对齐）；
-/// 此前注释残留"返回 put+add 是否都成功（edge 门控）"与 "semantic_related 边仅
-/// put+add 都成功才建" 均已过时（edge_refresh 在 add 失败时仍建边），误导
-/// 维护者依赖不存在的返回值或错误假设 add 失败阻断建边。
+/// #R69 documentation/medium（自相矛盾注释重写）：本函数返回 `bool`（put 是否
+/// 成功）——调用方据此门控 semantic_related 边（#R67/#R68 契约：**以持久向量
+/// 存在为准**，put 成功即建边，add 失败由重启 rebuild 对齐；此前注释残留
+/// "返回 ()"与 "返回 put+add 是否都成功" 均不准确）。created 路径用返回值
+/// 跳过 edge_refresh 的冗余存在性探测（刚 put 过必存在，见 #R69 perf/medium）。
 fn persist_and_index(
     pool: &SqlitePool,
     hnsw: &HnswIndex,
     id: &str,
     ns: &str,
     qv: &[f32],
-) {
+) -> bool {
     let put_ok = match crate::vector::persist::put_stored_vector(pool, id, ns, qv) {
         Ok(()) => true,
         Err(e) => {
@@ -220,10 +219,11 @@ fn persist_and_index(
         }])
     {
         // put 成功 add 失败：向量已持久化但内存索引缺失；外层
-        // get_stored_vector 守卫会让后续 remember 跳过 add（发散到重启，
+        // stored_vector_exists 守卫会让后续 remember 跳过 add（发散到重启，
         // #R65：长期运行服务可能持续缺失——重启 rebuild 对齐权威表自愈）。
         eprintln!("[remember] hnsw add failed for {id}: {e} (index rebuild at next start reconciles)");
     }
+    put_ok
 }
 
 /// #R66：semantic_related 边的**幂等刷新**——is_none 守卫之外统一调用（已存在
@@ -346,7 +346,16 @@ pub fn remember_with_dedup(
 
             if near_dup_enabled() {
                 if let (Some(hnsw_idx), Some(qv)) = (hnsw, &candidate_vector) {
-                    if crate::vector::persist::get_stored_vector(pool, &mem_id).is_none() {
+                    // #R69 performance/medium：**统一轻量存在探测**——此前 guard 用
+                    // get_stored_vector（拉全 BLOB + 解码 DIM 长 Vec<f32> 只为判
+                    // 存在），与 edge_refresh 的 stored_vector_exists 是两个不同
+                    // 谓词：corrupt/partial 行（长度≠DIM）在 get_stored_vector 下
+                    // 返回 None（触发重新 persist），在 stored_vector_exists 下
+                    // 返回 true（跳过）——同一"持久向量是否存在"的决策随探测点
+                    // 分歧。统一为 stored_vector_exists：corrupt 行不再由写路径
+                    // 覆盖修复，改由 HNSW rebuild 读侧跳过（persist.rs 的
+                    // skipped_dim 防御，见 #R52），功能一致且热路径单次轻量探测。
+                    if !crate::vector::persist::stored_vector_exists(pool, &mem_id) {
                         // #R63 maintainability/medium：**与 updated 路径同款失败
                         // 处理**——put 失败短路 add（瞬态 BUSY 留 memory-only 向量、
                         // 重启后消失）；失败可见（低频异常直接 eprintln）。
@@ -383,7 +392,9 @@ pub fn remember_with_dedup(
         }
         if near_dup_enabled() {
             if let (Some(hnsw_idx), Some(qv)) = (hnsw, &candidate_vector) {
-                if crate::vector::persist::get_stored_vector(pool, &mem_id).is_none() {
+                // #R69 performance/medium：统一轻量存在探测（同 superseded 路，
+                // 见上——单一谓词 + 热路径免全量解码）。
+                if !crate::vector::persist::stored_vector_exists(pool, &mem_id) {
                     // #R61 maintainability/medium：**失败可见**（put 失败短路 add，
                     // 见 persist_and_index doc）；#R65：共享 helper。
                     persist_and_index(pool, hnsw_idx, &mem_id, namespace, qv);
@@ -531,14 +542,27 @@ pub fn remember_with_dedup(
 
     // 向量持久化在事务外（非 tip 权威）；失败不回滚记忆写入
     // #R64 maintainability/medium：创建路径与 exact/superseded 路径同款失败处理
-    // （put 失败短路 add；edge upsert 仅 put+add 成功时跑——无向量的记忆不该有
+    // （put 失败短路 add；edge upsert 仅 put 成功时跑——无向量的记忆不该有
     // 图边，且失败可见）。
     if near_dup_enabled() {
         if let (Some(hnsw_idx), Some(qv)) = (hnsw, candidate_vector.as_ref()) {
             // #R65：共享 helper（put 失败短路 add）。
-            persist_and_index(pool, hnsw_idx, &mem_id, namespace, qv);
-            // #R66：edge 刷新（创建路径无存量向量——helper 后直接刷新，三路统一）。
-            edge_refresh(pool, hnsw_idx, &mem_id, namespace, qv);
+            // #R69 performance/medium：**created 路径跳过冗余探测**——
+            // persist_and_index 刚 put 过（created 无存量向量、同线程无其他
+            // 写者），edge_refresh 的 stored_vector_exists 探测必真——直接用
+            // 返回值门控建边，省一次 SELECT 1；put 失败（false）与 edge_refresh
+            // 探测失败同语义（无持久向量不建边）。失败仍可见（eprintln）。
+            if persist_and_index(pool, hnsw_idx, &mem_id, namespace, qv) {
+                if let Err(e) = crate::search::semantic_edges::upsert_semantic_edges_for(
+                    pool,
+                    hnsw_idx,
+                    &mem_id,
+                    namespace,
+                    qv,
+                ) {
+                    eprintln!("[remember] upsert_semantic_edges failed for {mem_id}: {e}");
+                }
+            }
         }
     }
 

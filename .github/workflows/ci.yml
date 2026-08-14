@@ -77,4 +77,9 @@ jobs:
         shell: bash
         run: |
           export REQUIRE_ONTOLOGIES_BIN=1
-          cargo test --verbose
+          # #R69 bug/medium：单线程强制——p2_hms_text_signals 用 unsafe set_var/
+          # remove_var（edition 2024 契约要求调用期间无任何线程访问进程环境）；
+          # ENV_LOCK 只能串行化本二进制内协作访问，无法排除 libtest/panic
+          # handler 的惰性 env 读。--test-threads=1 使该妥协成为保证的前置条件
+          # （默认并行 libtest 下操作在名义上不 sound，见测试内 SAFETY 注释）。
+          cargo test --verbose -- --test-threads=1

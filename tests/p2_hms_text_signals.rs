@@ -106,7 +106,13 @@ static ENV_LOCK: std::sync::RwLock<()> = std::sync::RwLock::new(());
 /// static，其 guard 类型与此相同，pin_rerank 会无差别接受、误传后静默复现
 /// 数据竞争（"依赖文件约定"与 soundness 注自相矛盾）。EnvWriteGuard 只能由
 /// `ENV_LOCK.write()` 产生（构造点唯一），其他锁的 guard 无法构造本类型。
-#[must_use = "EnvRestore::drop 负责恢复 env：必须具名绑定（let _pin = ...），禁止 let _ = 丢弃（语句末尾立即 drop，pin 变静默空操作）"]
+// #R69 maintainability/low：**约定而非强制保证**——`#[must_use]` 只拦截裸语句
+// （`EnvRestore::pin_rerank(...);`），`let _ = ...` 是显式丢弃、完全抑制该 lint：
+// 维护者写 `let _ = pin_rerank(...)` 时编译干净、语句末尾立即 drop、env 恢复、
+// pin 静默空操作。本文件约定（见 must_use 消息与 pin_rerank doc）：**必须具名
+// 绑定**（let _pin = ...）；CI 单线程（--test-threads=1）下即使误写也只会让
+// 依赖 pin 的测试假红而非 UB，属可检测的约定违规，不是类型强制。
+#[must_use = "EnvRestore::drop 负责恢复 env：本文件约定必须具名绑定（let _pin = ...）；let _ = 丢弃会静默 no-op（lint 不拦截），测试行为依赖环境预设"]
 struct EnvRestore<'a>(
     Option<std::ffi::OsString>,
     &'a EnvWriteGuard<'a>,
@@ -129,9 +135,12 @@ impl EnvRestore<'_> {
         // 期间**无任何线程以任何方式访问进程环境**（包括读取**其他**变量）——
         // ENV_LOCK 只能串行化本二进制内相互协作的 env 访问，无法排除 libtest/
         // panic handler/第三方 C 代码对任意 env 的惰性并发读（如 RUST_BACKTRACE）。
-        // 彻底消除 UB 需配合 RUST_TEST_THREADS=1（单线程测试）；默认并行 libtest
-        // 下本操作在名义上不满足 edition 2024 契约，属测试专用、风险可控的
-        // 已知妥协——维护者不得把"经 ENV_LOCK 串行"误读为完全安全。
+        // #R69 bug/medium（前置条件已保证）：**CI 已强制单线程**（ci.yml
+        // `cargo test -- --test-threads=1`）——单线程下 libtest 无并行线程、
+        // panic handler 读 env 与本线程 set_var 不构成并发（本线程自身读取
+        // 是顺序的），edition 2024 契约实际满足。本地并行跑该测试（不经
+        // --test-threads=1）仍是名义上不 sound 的已知妥协；维护者不得把
+        // "经 ENV_LOCK 串行"误读为完全安全。
         unsafe {
             std::env::set_var("MEMORIA_TEXT_SIGNALS_RERANK", value);
         }

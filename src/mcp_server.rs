@@ -475,7 +475,11 @@ pub fn tools_list() -> Vec<serde_json::Value> {
             "memory_search_v2",
             // #R68 documentation/low：HyPE 启动快照限制同样适用（与 memory_search
             // 共享同一 dispatch 分支）。
-            "多信号融合搜索",
+            // #R69 documentation/low：**公开描述同步披露**——MCP 工具发现
+            // （agent-core 会话开场、dashboard 徽标）只读 description 字符串，
+            // 内部 #R68 注释对调用方不可见；不披露会让调用方误以为问句路
+            // 覆盖全部记忆。
+            "多信号融合搜索（HyPE 问句路仅覆盖启动时已建索引的记忆；重启后全量生效）",
             serde_json::json!({
                 "query": {"type": "string", "description": "搜索关键词（必填）"},
                 "namespace": {"type": "string", "description": "命名空间（必填）；缺省时由 agent-core 注入调用者主 ns"},
@@ -551,7 +555,9 @@ pub fn tools_list() -> Vec<serde_json::Value> {
             "memory_context",
             // #R68 documentation/low：带 query 时经 profile::memory_context 走
             // Some(&state.hype_hnsw)——HyPE 启动快照限制同样适用。
-            "会话开场注入：memory_profile + 可选 query 追加 top-k recall，产出 prompt_block",
+            // #R69 documentation/low：公开描述同步披露（同 memory_search_v2——
+            // memory_context 的 query recall 正是会话开场检索，最需要声明）。
+            "会话开场注入：memory_profile + 可选 query 追加 top-k recall，产出 prompt_block（query recall 的 HyPE 问句路仅覆盖启动时已建索引的记忆；重启后全量生效）",
             serde_json::json!({
                 "namespace": {"type": "string", "description": "命名空间，默认 default"},
                 "query": {"type": "string", "description": "可选：本轮用户首句，用于追加 recall"},
@@ -565,7 +571,8 @@ pub fn tools_list() -> Vec<serde_json::Value> {
         tool(
             "memory_recall",
             // #R68 documentation/low：同上（共享 dispatch 分支）。
-            "回忆检索（别名 memory_search_v2）：默认 isLatest，走 search 配额",
+            // #R69 documentation/low：公开描述同步披露（同 memory_search_v2）。
+            "回忆检索（别名 memory_search_v2）：默认 isLatest，走 search 配额（HyPE 问句路仅覆盖启动时已建索引的记忆；重启后全量生效）",
             serde_json::json!({
                 "query": {"type": "string", "description": "搜索关键词（必填）"},
                 "namespace": {"type": "string", "description": "命名空间（必填）；缺省时由 agent-core 注入调用者主 ns"},
@@ -2087,8 +2094,16 @@ fn dispatch(
             // #R67 maintainability/low：**复用 conn**（本分支已有连接）+ **缺表与
             // 故障分开 sentinel**（-1=查询失败；0=表存在但空/表缺失——legacy 库
             // 缺表时 0 与"空表"不可分是既有表循环的惯例，但故障不再伪装）。
+            // #R69 maintainability/low：**表名共享常量**——此前内嵌字面量构成
+            // 同一表的第四处独立查询点（lib.rs query_hype_count_cached 双字段 +
+            // 本处），表 rename/迁移时本处静默翻 -1 而 lib.rs 仍工作；收敛到
+            // storage::MEMORY_HYPE_VECTORS_TABLE 单一事实源。
             let hype_store: i64 = conn
-                .query_row("SELECT COUNT(*) FROM memory_hype_vectors", [], |r| r.get(0))
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {}", crate::storage::MEMORY_HYPE_VECTORS_TABLE),
+                    [],
+                    |r| r.get(0),
+                )
                 .unwrap_or(-1);
             m.insert(
                 "hype_hnsw_store".to_string(),

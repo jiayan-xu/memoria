@@ -113,8 +113,10 @@ impl MemoriaEngine {
     /// 快照，引擎存活期间 memory_hype_vectors 被外部写入（离线脚本重跑、未来工具
     /// 运行时写）不会自动反映；此前只能重启，文档里的手动方案（新建索引+重建+swap）
     /// 不是引擎方法、Python bindings 调不到。本方法执行"全新索引重建 → 整体替换"：
-    /// HnswIndex::add 按 id 去重，in-place rebuild 只追加新 id（#R44），已存在 id 的
-    /// 向量更新必须全新索引拾取。返回新索引加载的向量数。
+    /// #R69 documentation/low（与 persist.rs #R44 doc 修订同步）：hype 表经
+    /// require_fresh guard 对已填充索引**返回 Err**（见 rebuild_from_table #R62），
+    /// 不存在"in-place 只追加新 id"路径——已存在 id 的向量更新必须全新索引拾取。
+    /// 返回新索引加载的向量数。
     /// #R52 maintainability/medium：用 **build_hype_hnsw（Result 版）**而非
     /// `build_hype_hnsw_or_default`——or_default 把所有失败吸收成空索引 + WARN，
     /// 本方法**永不返回 Err**（签名误导）：调用方（Python bindings/运维工具）无法
@@ -373,9 +375,11 @@ fn query_hype_count_cached(conn: &rusqlite::Connection, db_path: &str) -> i64 {
                 }
             }
         }
-        return match conn.query_row("SELECT COUNT(*) FROM memory_hype_vectors", [], |r| {
-            r.get::<_, i64>(0)
-        }) {
+        return match conn.query_row(
+            &format!("SELECT COUNT(*) FROM {}", crate::storage::MEMORY_HYPE_VECTORS_TABLE),
+            [],
+            |r| r.get::<_, i64>(0),
+        ) {
             Ok(c) => c,
             Err(e) => {
                 // #R69 bug/low：`Instant::now()` 在**锁内**取（#R56/#R66 纪律）——
@@ -429,9 +433,13 @@ fn query_hype_count_cached(conn: &rusqlite::Connection, db_path: &str) -> i64 {
             }
         }
     }
-    let r = conn.query_row("SELECT COUNT(*) FROM memory_hype_vectors", [], |r| {
-        r.get::<_, i64>(0)
-    });
+    // #R69 maintainability/low：表名走共享常量（同 :memory: 分支——rename/迁移
+    // 只改 storage::MEMORY_HYPE_VECTORS_TABLE 一处）。
+    let r = conn.query_row(
+        &format!("SELECT COUNT(*) FROM {}", crate::storage::MEMORY_HYPE_VECTORS_TABLE),
+        [],
+        |r| r.get::<_, i64>(0),
+    );
     match r {
         Ok(c) => {
             let mut cache = CACHE.lock().unwrap_or_else(|p| p.into_inner());

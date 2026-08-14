@@ -7,7 +7,6 @@
 //! 运行：`cargo test --test eval_semantic -- --nocapture`
 //! 前置：embed_server.py 运行于 127.0.0.1:8777（MEMORIA_EMBEDDING_URL）。
 
-use std::cmp::min;
 use memoria_core::MemoriaEngine;
 use memoria_core::search::hybrid::hybrid_search;
 use memoria_core::storage::{SqlitePool, create_pool, init_core_tables, init_schema};
@@ -336,6 +335,15 @@ async fn memory_eval_semantic_inner() {
     let cases_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/cases");
     let corpus: Vec<Value> = read_json_array(&cases_dir.join("corpus.json"));
     let cases: Vec<Value> = read_json_array(&cases_dir.join("cases.json"));
+    // #R69 bug/medium：paraphrase 用例**提前声明**——skip 诊断块（须先于 HyPE
+    // 断言发声，#R67）引用 paraphrase_cases；其定义原在函数中部（HyPE asserts
+    // 之后），诊断块前置后需在 501 行前可用。纯字面量定义，提前无副作用。
+    let paraphrase_cases: Vec<(String, usize)> = vec![
+        // 官方 corpus 中的记忆，用完全不同的说法查询
+        ("代码托管平台开源仓库".to_string(), 5), // corpus 中 GitHub 相关
+        ("在线的开发项目托管服务".to_string(), 5),
+        ("技术文档的版本管理".to_string(), 3),
+    ];
     assert!(
         !corpus.is_empty() && !cases.is_empty(),
         "eval cases 不能为空"
@@ -404,9 +412,18 @@ async fn memory_eval_semantic_inner() {
         let v = match embed_with_retry(&client, content).await {
             Ok(v) => v,
             Err(e) => {
+                // #R69 other/low：**预览按 80 字符而非 80 字节截断**——CJK 语料
+                // ~3 字节/字符，此前 min(len,80) 字节边界只显示 ~26 字符，长
+                // 非 ASCII 内容的 skip 诊断丢失大部分上下文；char_indices 取
+                // 第 80 个字符的字节偏移（&content[..i] 天然防字符内切片；
+                // as_str() 是 unstable str_as_str，不可用）。
+                let preview = content
+                    .char_indices()
+                    .nth(80)
+                    .map_or(content, |(i, _)| &content[..i]);
                 eprintln!(
                     "[eval_semantic] corpus embed failed: {e} for {:?}; skipping this item (placeholder keeps id alignment)",
-                    content.get(..content.floor_char_boundary(min(content.len(), 80)))
+                    preview
                 );
                 // #R61 bug/medium：**corpus_skipped 计数**——占位符使引用该位置的
                 // expect_indices 必败且后续近义去重漂移（错位假红）；计数在最终
@@ -494,10 +511,81 @@ async fn memory_eval_semantic_inner() {
     // content-only 路径仍通过——正是本块要防的 no-op 假覆盖。断言**高覆盖率**：
     // 分母用 hype_total（唯一记忆数，无论成败都计入）——processed 在失败时被 remove
     // 无法作分母（重言式）。
-    // #R68 bug/medium：**corpus-skip 诊断在函数尾统一承担**（#R69 bug/medium 删除
-    // 早期 `assert_eq!(corpus_skipped, 0)`——它使尾部诊断块（含 expect/must_not
-    // 引用门控 + hard-fail-vs-WARN 决策）成为不可达死代码，panic 消息承诺的
-    // "see diagnostics below" 永不兑现；尾部块现在是跳过诊断的唯一真相源。
+    // #R69 bug/medium：**skip 诊断块已前置到本断言之前**（见下）——R40 删除早期
+    // `assert_eq!(corpus_skipped, 0)` 后诊断块落在 HyPE 断言之后：corpus 全失败
+    // 场景（embed 过预检但每次 POST 失败）"hype index empty" 先 panic 把根因误指
+    // 为 question-embed（实际是 corpus-embed），诊断块再次不可达（R41 指出）。
+    // 现将整块前移——skip 诊断永远最先发声，根因直指 corpus-embed。
+    // #R62 test/medium：**skip 断言前置**——退化语料（跳过项）先于 recall 断言
+    // 大声失败且根因直接可见。
+    // #R67 bug/medium：**还要先于 HyPE asserts**——embed 服务通过预检但每次 POST
+    // 失败时全部 id 变占位符、无 HyPE put/add，"hype index empty" 先触发把根因
+    // 误指为 question-embed（实际是 corpus-embed）；跳过诊断必须最先发声。
+    // #R64 test/low：**按引用门控**——跳过位置被任一 case（expect/must_not/
+    // paraphrase）引用才硬失败；未被引用的跳过项只 warn（单次瞬时双败不至于
+    // 让 ~25 分钟评测整体 flake，引用的 case 会显式失败暴露缺口）。
+    if corpus_skipped > 0 {
+        use std::collections::HashSet;
+        // #R65 other/low：**expect/paraphrase 与 must_not 分开**——占位符 id 永不
+        // 被 hybrid_search 返回：expect/paraphrase 引用它 = 期望 id 永不入 top-k
+        // （recall 断言不可靠 → 硬失败）；must_not 引用它平凡满足（vacuously
+        // pass）→ 只 WARN。
+        let mut expect_ref: HashSet<usize> = HashSet::new();
+        for c in &cases {
+            if let Some(arr) = c["expect_indices"].as_array() {
+                for v in arr {
+                    if let Some(i) = v.as_u64() {
+                        expect_ref.insert(i as usize);
+                    }
+                }
+            }
+        }
+        let mut must_not_ref: HashSet<usize> = HashSet::new();
+        for c in &cases {
+            if let Some(arr) = c["must_not_indices"].as_array() {
+                for v in arr {
+                    if let Some(i) = v.as_u64() {
+                        must_not_ref.insert(i as usize);
+                    }
+                }
+            }
+        }
+        for (_, idx) in &paraphrase_cases {
+            expect_ref.insert(*idx);
+        }
+        // 占位符形如 "<embed-failed-N>"，N = corpus 索引。
+        // #R69 bug/medium：`strip_prefix` 后仍带尾部 `>`——"<embed-failed-5>" 得
+        // `Some("5>")`，parse::<usize> 恒失败（尾部非数字），skipped_idx 恒空、
+        // overlapping_expect/must_not 恒空，期望位置引用跳过项时 hard-fail 静默
+        // 退化为 WARN（recall 断言不可靠却无检测）。先 strip_suffix('>')。
+        let skipped_idx: HashSet<usize> = ids
+            .iter()
+            .filter_map(|id| {
+                id.strip_prefix("<embed-failed-")
+                    .and_then(|s| s.strip_suffix('>'))
+                    .and_then(|s| s.parse::<usize>().ok())
+            })
+            .collect();
+        let overlapping_expect: Vec<usize> =
+            skipped_idx.intersection(&expect_ref).copied().collect();
+        let overlapping_must_not: Vec<usize> =
+            skipped_idx.intersection(&must_not_ref).copied().collect();
+        if !overlapping_expect.is_empty() {
+            // #R66 style/low：panic! 直接表达失败原因（assert_eq 在 if 内恒假，
+            // 渲染成误导性的相等性不匹配）。
+            panic!(
+                "{corpus_skipped} corpus item(s) skipped; expect/paraphrase positions {overlapping_expect:?} referenced - recall assertions unreliable"
+            );
+        } else if !overlapping_must_not.is_empty() {
+            eprintln!(
+                "[eval_semantic] WARN: {corpus_skipped} corpus item(s) skipped; must_not positions {overlapping_must_not:?} vacuously satisfied by placeholder - recall unaffected"
+            );
+        } else {
+            eprintln!(
+                "[eval_semantic] WARN: {corpus_skipped} corpus item(s) skipped (not referenced by any case; recall unaffected)"
+            );
+        }
+    }
     assert!(
         engine.hype_hnsw.len() > 0,
         "hype index empty after corpus setup: question-embed likely failing"
@@ -645,12 +733,8 @@ async fn memory_eval_semantic_inner() {
     }
 
     // 3) 追加「同义改写」用例：验证语义召回（不共享关键词）
-    let paraphrase_cases: Vec<(String, usize)> = vec![
-        // 官方 corpus 中的记忆，用完全不同的说法查询
-        ("代码托管平台开源仓库".to_string(), 5), // corpus 中 GitHub 相关
-        ("在线的开发项目托管服务".to_string(), 5),
-        ("技术文档的版本管理".to_string(), 3),
-    ];
+    // （paraphrase_cases 定义已前置到 cases 处，#R69——skip 诊断块引用它且须
+    // 先于 HyPE 断言发声；此处仅消费。）
     let mut sem_hits = 0u32;
     let mut sem_failures: Vec<String> = Vec::new();
     for (pq, idx) in &paraphrase_cases {
@@ -721,76 +805,6 @@ async fn memory_eval_semantic_inner() {
     }
     eprintln!("=================================================");
 
-    // #R62 test/medium：**skip 断言前置**——退化语料（跳过项）先于 recall 断言
-    // 大声失败且根因直接可见。
-    // #R67 bug/medium：**还要先于 HyPE asserts**——embed 服务通过预检但每次 POST
-    // 失败时全部 id 变占位符、无 HyPE put/add，"hype index empty" 先触发把根因
-    // 误指为 question-embed（实际是 corpus-embed）；跳过诊断必须最先发声。
-    // #R64 test/low：**按引用门控**——跳过位置被任一 case（expect/must_not/
-    // paraphrase）引用才硬失败；未被引用的跳过项只 warn（单次瞬时双败不至于
-    // 让 ~25 分钟评测整体 flake，引用的 case 会显式失败暴露缺口）。
-    if corpus_skipped > 0 {
-        use std::collections::HashSet;
-        // #R65 other/low：**expect/paraphrase 与 must_not 分开**——占位符 id 永不
-        // 被 hybrid_search 返回：expect/paraphrase 引用它 = 期望 id 永不入 top-k
-        // （recall 断言不可靠 → 硬失败）；must_not 引用它平凡满足（vacuously
-        // pass）→ 只 WARN。
-        let mut expect_ref: HashSet<usize> = HashSet::new();
-        for c in &cases {
-            if let Some(arr) = c["expect_indices"].as_array() {
-                for v in arr {
-                    if let Some(i) = v.as_u64() {
-                        expect_ref.insert(i as usize);
-                    }
-                }
-            }
-        }
-        let mut must_not_ref: HashSet<usize> = HashSet::new();
-        for c in &cases {
-            if let Some(arr) = c["must_not_indices"].as_array() {
-                for v in arr {
-                    if let Some(i) = v.as_u64() {
-                        must_not_ref.insert(i as usize);
-                    }
-                }
-            }
-        }
-        for (_, idx) in &paraphrase_cases {
-            expect_ref.insert(*idx);
-        }
-        // 占位符形如 "<embed-failed-N>"，N = corpus 索引。
-        // #R69 bug/medium：`strip_prefix` 后仍带尾部 `>`——"<embed-failed-5>" 得
-        // `Some("5>")`，parse::<usize> 恒失败（尾部非数字），skipped_idx 恒空、
-        // overlapping_expect/must_not 恒空，期望位置引用跳过项时 hard-fail 静默
-        // 退化为 WARN（recall 断言不可靠却无检测）。先 strip_suffix('>')。
-        let skipped_idx: HashSet<usize> = ids
-            .iter()
-            .filter_map(|id| {
-                id.strip_prefix("<embed-failed-")
-                    .and_then(|s| s.strip_suffix('>'))
-                    .and_then(|s| s.parse::<usize>().ok())
-            })
-            .collect();
-        let overlapping_expect: Vec<usize> =
-            skipped_idx.intersection(&expect_ref).copied().collect();
-        let overlapping_must_not: Vec<usize> =
-            skipped_idx.intersection(&must_not_ref).copied().collect();
-        if !overlapping_expect.is_empty() {
-            // #R66 style/low：panic! 直接表达失败原因（assert_eq 在 if 内恒假，
-            // 渲染成误导性的相等性不匹配）。
-            panic!(
-                "{corpus_skipped} corpus item(s) skipped; expect/paraphrase positions {overlapping_expect:?} referenced - recall assertions unreliable"
-            );
-        } else if !overlapping_must_not.is_empty() {
-            eprintln!(
-                "[eval_semantic] WARN: {corpus_skipped} corpus item(s) skipped; must_not positions {overlapping_must_not:?} vacuously satisfied by placeholder - recall unaffected"
-            );
-        } else {
-            eprintln!(
-                "[eval_semantic] WARN: {corpus_skipped} corpus item(s) skipped (not referenced by any case; recall unaffected)"
-            );
-        }
-    }
     assert!(
         recall >= RECALL_FLOOR,
         "召回@k {:.2} 低于下限 {:.2}",

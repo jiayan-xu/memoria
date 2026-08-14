@@ -42,17 +42,38 @@ pub fn get_stored_vector(pool: &SqlitePool, id: &str) -> Option<Vec<f32>> {
 /// 每 remember_with_dedup 调用一次（近义去重开启且有候选向量时），此前
 /// get_stored_vector 为判存在而拉全向量 + 解码成 DIM 长 Vec<f32>，多一次 DB
 /// 往返 + 一次完整解码；SELECT 1 只取标量（query_row 单行单列，无 BLOB 传输）。
+/// #R69 bug/low：**错误可见性**——pool/DB 故障与"无行"区分：错误走节流 WARN
+/// （warn_throttled，3600s 窗口，与写路径同款纪律）而非静默折叠为 false——
+/// 否则调用方（edge_refresh）会把瞬态 DB 中断误诊为"写入失败"而跳过建边
+/// （静默丢 semantic_related 边），正是其余路径都要消除的无声失败。
 pub fn stored_vector_exists(pool: &SqlitePool, id: &str) -> bool {
     let conn = match pool.get() {
         Ok(c) => c,
-        Err(_) => return false,
+        Err(e) => {
+            warn_throttled(
+                "stored_vector_exists",
+                "pool",
+                &format!("pool get failed for {id}: {e}"),
+            );
+            return false;
+        }
     };
-    conn.query_row(
+    match conn.query_row(
         "SELECT 1 FROM memory_vectors WHERE id = ?",
         rusqlite::params![id],
         |_| Ok(()),
-    )
-    .is_ok()
+    ) {
+        Ok(_) => true,
+        Err(e) if matches!(e, rusqlite::Error::QueryReturnedNoRows) => false,
+        Err(e) => {
+            warn_throttled(
+                "stored_vector_exists",
+                "query",
+                &format!("row probe failed for {id}: {e}"),
+            );
+            false
+        }
+    }
 }
 
 /// 写入/覆盖某记忆的持久向量（#R38 documentation/low：实现为 `ON CONFLICT(id) DO UPDATE`
@@ -319,12 +340,13 @@ pub fn rebuild_hnsw_from_store(pool: &SqlitePool, hnsw: &HnswIndex) -> Result<us
 /// 一条向量）。调用方（main.rs/lib.rs）在启动时对两个索引分别 rebuild；`semantic_search`
 /// 双路搜索后按 memory_id 取 max 合并。
 ///
-/// #R44 bug/medium 已知限制：HnswIndex::add 按 id 去重（已存在 id 静默跳过），本函数
-/// 在**已填充**的索引上调用时只**追加新 id**——已存在 id 的表内向量更新（离线脚本
-/// `INSERT ... ON CONFLICT(id) DO UPDATE` 重跑，#R60：脚本自 R25 起已与 Rust 写契约
-/// 对齐，REPLACE 语义早已不用）不会反映到运行中索引。生产路径（main.rs/lib.rs）启动时
-/// 均新建空索引再 rebuild，无此问题；仅"运行中对已填充索引调用"的场景受限。需要
-/// 拾取更新向量时须**全新索引**重建：`let fresh = HnswIndex::new(); fresh.set_ef_search(..);
+/// #R44 bug/medium 已知限制（#R69 documentation/low 修订：**与 require_fresh 行为
+/// 对齐**——此前 doc 说"已填充索引只追加新 id、已存在 id 更新被静默忽略"，但
+/// require_fresh guard（见 rebuild_from_table #R62）使 **hype 表在 hnsw.len() > 0
+/// 时直接返回 Err**，并非静默追加：调用方读到旧 doc 会期待 append 语义而收到
+/// 错误。当前准确契约：content 表（rebuild_hnsw_from_store）可增量补齐（add 按
+/// id 去重）；hype 表要求**全新索引**，已填充索引调用返回 Err——需要拾取更新
+/// 向量时须 `let fresh = HnswIndex::new(); fresh.set_ef_search(..);
 /// rebuild_hype_hnsw_from_store(pool, &fresh)?;` 后整体替换。
 pub fn rebuild_hype_hnsw_from_store(pool: &SqlitePool, hnsw: &HnswIndex) -> Result<usize, String> {
     rebuild_from_table(pool, hnsw, "memory_hype_vectors")
