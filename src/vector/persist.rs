@@ -38,6 +38,23 @@ pub fn get_stored_vector(pool: &SqlitePool, id: &str) -> Option<Vec<f32>> {
     if v.len() == DIM { Some(v) } else { None }
 }
 
+/// 轻量存在性探测（#R69 performance/low）：只查一行、不解码 BLOB——edge_refresh
+/// 每 remember_with_dedup 调用一次（近义去重开启且有候选向量时），此前
+/// get_stored_vector 为判存在而拉全向量 + 解码成 DIM 长 Vec<f32>，多一次 DB
+/// 往返 + 一次完整解码；SELECT 1 只取标量（query_row 单行单列，无 BLOB 传输）。
+pub fn stored_vector_exists(pool: &SqlitePool, id: &str) -> bool {
+    let conn = match pool.get() {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    conn.query_row(
+        "SELECT 1 FROM memory_vectors WHERE id = ?",
+        rusqlite::params![id],
+        |_| Ok(()),
+    )
+    .is_ok()
+}
+
 /// 写入/覆盖某记忆的持久向量（#R38 documentation/low：实现为 `ON CONFLICT(id) DO UPDATE`
 /// upsert，而非 INSERT OR REPLACE——REPLACE 会整行删除重建，把
 /// `memory_hype_vectors.question` 等非本函数列静默抹成 NULL）。
@@ -492,12 +509,14 @@ fn rebuild_from_table(pool: &SqlitePool, hnsw: &HnswIndex, table: &str) -> Resul
                 // （chunks_exact 可解出 DIM+1 个有效 float）；`%4!=0`/`<=4` 分支
                 // 已捕获字节级损坏，此处归 corrupt 会把运维引向"存储损坏"而非
                 // "模型维度变更"。
-                if blob.len() > DIM * 4 && blob.len() % 4 == 0 {
-                    skipped_dim += 1;
-                    continue;
-                }
+                // #R69 maintainability/low：**死代码清理**——`% 4 == 0` 谓词冗余：
+                // 上面 `%4 != 0` guard 之后所有到达此处的 blob 必 4 对齐，原
+                // `> DIM*4 && %4==0` 与随后的 `> DIM*4`（归 skipped_blob）两个分支
+                // 中后者不可达（前者的条件已覆盖全部超长）。合并为单分支归
+                // skipped_dim——维度漂移与字节损坏的分类由 %4!=0/<=4 guard 完成，
+                // 无功能性变化，但消除"未来编辑误把超长改回 skipped_blob"的陷阱。
                 if blob.len() > DIM * 4 {
-                    skipped_blob += 1;
+                    skipped_dim += 1;
                     continue;
                 }
                 let v = decode_vector(&blob);
@@ -520,8 +539,10 @@ fn rebuild_from_table(pool: &SqlitePool, hnsw: &HnswIndex, table: &str) -> Resul
                 if read_err_logged < READ_ERR_LOG_CAP {
                     read_err_logged += 1;
                     // #R66 other/low：统一 [persist] WARN 前缀（写路径 let _ 丢弃 Result 时这些
-        // 样本行是主要失败信号，ops grep [persist] WARN 会漏掉引用了错误文本的行）。
-        eprintln!("[persist] WARN: {label} row read/iteration failed: {e}");
+                    // 样本行是主要失败信号，ops grep [persist] WARN 会漏掉引用了错误文本的行）。
+                    // #R69 style/low：缩进对齐 enclosing 块（此前 8 空格错位，ops grep
+                    // [persist] WARN 时难以阅读）。
+                    eprintln!("[persist] WARN: {label} row read/iteration failed: {e}");
                 }
             }
         }

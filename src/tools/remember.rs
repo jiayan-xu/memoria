@@ -192,12 +192,13 @@ pub fn set_event_time(pool: &SqlitePool, memory_id: &str, event_time: &str) -> R
 
 /// 三路统一的向量持久化+索引 helper（此前复制粘贴的 if/else-if 链让失败语义
 /// 漂移，抽单点防未来只改一路）：put 失败短路 add（防 memory-only 向量）；
-/// add 失败记录并注明重启 rebuild 自愈。semantic_related 边的幂等刷新由调用方
-/// 在 is_none 守卫之外统一调 edge_refresh（本函数只管 put+add，返回 ()）。
-/// 短路 add（防 memory-only 向量）；semantic_related 边仅 put+add 都成功才建
-/// （无向量的记忆不该有图边）；add 失败记录并注明重启 rebuild 自愈。返回
-/// put+add 是否都成功（edge 门控）。此前三路复制粘贴的 if/else-if 链让门控
-/// 语义漂移（更新/superseded 路 edge 无条件），抽单点防未来只改一路。
+/// add 失败记录并注明重启 rebuild 自愈。
+/// #R69 documentation/medium（自相矛盾注释重写）：本函数返回 ()，不传播任何
+/// 状态——semantic_related 边的门控由 edge_refresh 统一负责（#R67/#R68 契约）：
+/// **以持久向量存在为准**（put 成功即建边，add 失败由重启 rebuild 对齐）；
+/// 此前注释残留"返回 put+add 是否都成功（edge 门控）"与 "semantic_related 边仅
+/// put+add 都成功才建" 均已过时（edge_refresh 在 add 失败时仍建边），误导
+/// 维护者依赖不存在的返回值或错误假设 add 失败阻断建边。
 fn persist_and_index(
     pool: &SqlitePool,
     hnsw: &HnswIndex,
@@ -237,7 +238,10 @@ fn edge_refresh(
     ns: &str,
     qv: &[f32],
 ) {
-    if crate::vector::persist::get_stored_vector(pool, id).is_none() {
+    // #R69 performance/low：轻量存在性探测（SELECT 1，不解码全向量）——此前
+    // get_stored_vector 拉 BLOB + 解码成 DIM 长 Vec<f32> 只为判存在；此路径在
+    // near_dup_enabled 且存在候选向量时每 remember_with_dedup 都执行。
+    if !crate::vector::persist::stored_vector_exists(pool, id) {
         eprintln!(
             "[remember] edge_refresh skipped for {id}: no persisted vector (put/add failed earlier)"
         );

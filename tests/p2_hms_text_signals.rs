@@ -99,25 +99,39 @@ static ENV_LOCK: std::sync::RwLock<()> = std::sync::RwLock::new(());
 
 /// 共享 env 恢复 guard——Option<OsString> 无损快照 + Drop 恢复原值（含 unwind）；
 /// search_boosts（pin enabled）与 env_off 共用。
-/// **锁身份不变量**：`'a` 绑定 RwLockWriteGuard——构造必须在锁作用域内（类型
-/// 层面杜绝 drop 时无锁的 UB）。注意类型只证明"某把写锁存活"，soundness 还依赖
-/// 文件约定：**只能用 ENV_LOCK 的 write guard 构造**（本二进制所有 env 访问
-/// 均经 ENV_LOCK 串行）；用其他锁的 guard 构造会静默引入数据竞争（edition
-/// 2024 UB），不得违反。
-#[must_use = "EnvRestore::drop 负责恢复 env，丢弃即失去恢复（避免在语句末尾提前 drop）"]
-struct EnvRestore<'a>(Option<std::ffi::OsString>, &'a std::sync::RwLockWriteGuard<'a, ()>);
+/// **锁身份不变量**：`'a` 绑定 EnvWriteGuard（ENV_LOCK 专属 newtype，见下）——
+/// 构造必须在锁作用域内（类型层面杜绝 drop 时无锁的 UB）。
+/// #R69 maintainability/low：**newtype 强制锁身份**——此前 `&'a RwLockWriteGuard<
+/// 'a, ()>` 对任何 `RwLock<()>` 完全透明：本二进制未来若新增第二把 `RwLock<()>`
+/// static，其 guard 类型与此相同，pin_rerank 会无差别接受、误传后静默复现
+/// 数据竞争（"依赖文件约定"与 soundness 注自相矛盾）。EnvWriteGuard 只能由
+/// `ENV_LOCK.write()` 产生（构造点唯一），其他锁的 guard 无法构造本类型。
+#[must_use = "EnvRestore::drop 负责恢复 env：必须具名绑定（let _pin = ...），禁止 let _ = 丢弃（语句末尾立即 drop，pin 变静默空操作）"]
+struct EnvRestore<'a>(
+    Option<std::ffi::OsString>,
+    &'a EnvWriteGuard<'a>,
+);
+
+/// #R69 maintainability/low：ENV_LOCK 专属 write-guard newtype——类型层面区分
+/// ENV_LOCK 与其他任意 `RwLock<()>`；仅由 `ENV_LOCK.write()` 包装构造。
+struct EnvWriteGuard<'a>(std::sync::RwLockWriteGuard<'a, ()>);
+
 impl EnvRestore<'_> {
     /// #R68 maintainability/medium：**唯一正确构造入口**——绑定 ENV_LOCK 的 write
     /// guard + 固定变量名（快照/置位/恢复三合一）；类型层面杜绝"借了别的锁的
     /// guard / 快照了别的变量"的误用（此前不变量只在 doc 注释里）。
-    fn pin_rerank<'a>(
-        guard: &'a std::sync::RwLockWriteGuard<'a, ()>,
-        value: &str,
-    ) -> EnvRestore<'a> {
+    fn pin_rerank<'a>(guard: &'a EnvWriteGuard<'a>, value: &str) -> EnvRestore<'a> {
         let prev = std::env::var_os("MEMORIA_TEXT_SIGNALS_RERANK");
-        // SAFETY: guard 由 ENV_LOCK.write() 产生——本二进制所有 env 访问约定
-        // 经 ENV_LOCK 串行；libtest/panic handler 的惰性 env 读（如 RUST_BACKTRACE）
-        // 不读本变量，不构成并发访问。恢复由 Drop 保证（guard 存活期内）。
+        // SAFETY: guard 是 ENV_LOCK.write() 的 newtype 包装（唯一构造点，类型
+        // 强制）——本二进制内所有协作 env 变异经 ENV_LOCK 串行。
+        // #R69 bug/medium（残余风险如实标注）：进程环境是单一全局资源（glibc
+        // setenv 可能 realloc environ），Rust 2024 的安全条件要求 set_var/remove_var
+        // 期间**无任何线程以任何方式访问进程环境**（包括读取**其他**变量）——
+        // ENV_LOCK 只能串行化本二进制内相互协作的 env 访问，无法排除 libtest/
+        // panic handler/第三方 C 代码对任意 env 的惰性并发读（如 RUST_BACKTRACE）。
+        // 彻底消除 UB 需配合 RUST_TEST_THREADS=1（单线程测试）；默认并行 libtest
+        // 下本操作在名义上不满足 edition 2024 契约，属测试专用、风险可控的
+        // 已知妥协——维护者不得把"经 ENV_LOCK 串行"误读为完全安全。
         unsafe {
             std::env::set_var("MEMORIA_TEXT_SIGNALS_RERANK", value);
         }
@@ -141,7 +155,7 @@ fn search_boosts_on_numeric_query_overlap() {
     // #R62 test/medium：**显式 pin enabled**——强化断言依赖 rerank 默认开启；环境
     // 预设 MEMORIA_TEXT_SIGNALS_RERANK=0（dev shell/CI）会让正确代码假红。
     // ENV_LOCK 只串行化本二进制内的变异，管不到环境预设。
-    let _env_guard = ENV_LOCK.write().unwrap_or_else(|p| p.into_inner());
+    let _env_guard = EnvWriteGuard(ENV_LOCK.write().unwrap_or_else(|p| p.into_inner()));
     // #R63 maintainability/low：共享 guard（EnvRestore 同款，见下——防两份恢复
     // 语义静默分歧）。
     let _pin = EnvRestore::pin_rerank(&_env_guard, "1");
@@ -276,7 +290,7 @@ fn text_signals_rerank_env_off() {
     // #R65 bug/medium：**锁在 fresh_engine 之前**——fresh_engine/remember_with_dedup
     // 读 env（MEMORIA_NEAR_DUP_ENABLED/PERSIST/POOL_SIZE），与变异测试的 set_var
     // 窗口重叠即 UB（edition 2024 set_var 的并发访问契约）。
-    let _guard = ENV_LOCK.write().unwrap_or_else(|p| p.into_inner());
+    let _guard = EnvWriteGuard(ENV_LOCK.write().unwrap_or_else(|p| p.into_inner()));
     let (engine, ns) = fresh_engine("envoff");
     let _ = remember_with_dedup(
         &engine.pool,
