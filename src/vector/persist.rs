@@ -58,6 +58,14 @@ pub fn get_stored_vector(pool: &SqlitePool, id: &str) -> Option<Vec<f32>> {
 /// #R69 bug/medium（R41 三态诉求）：**Result 返回**——pool/DB 故障返回 Err
 /// （含内部节流 WARN，3600s 窗口），调用方区分"无行/损坏"（Ok(false)）与
 /// "无法检查"（Err），不再把瞬态 DB 中断误诊为"写入失败"。
+/// #R69 bug/medium（R45 退化感知）：**degenerate 行也判不存在**——长度正确但
+/// 全零的 legacy 行（put_vector_into 的"历史嵌入失败写入全 0 向量"注释承认的
+/// 真实态）经 rebuild 的 skipped_degenerate 永久排除出 HNSW，但本探测此前
+/// 只看长度返回 Ok(true)：守卫跳过 re-persist、edge_refresh 仍建边——复现
+/// 本函数 doc 声称已消除的图/索引分歧，且 put_vector_into 拒绝退化向量使
+/// 自愈循环（Ok(false)→re-persist）永不触发。`vector != zeroblob(DIM*4)` 把
+/// 全零行归 Ok(false)（re-persist 尝试覆盖；NaN 行因非零仍 Ok(true)——写侧
+/// 拒绝 NaN、历史 NaN 罕见，长度+全零守卫覆盖主要真实态）。
 pub fn stored_vector_exists(pool: &SqlitePool, id: &str) -> Result<bool, String> {
     let conn = match pool.get() {
         Ok(c) => c,
@@ -71,8 +79,8 @@ pub fn stored_vector_exists(pool: &SqlitePool, id: &str) -> Result<bool, String>
         }
     };
     match conn.query_row(
-        "SELECT 1 FROM memory_vectors WHERE id = ? AND length(vector) = ?",
-        rusqlite::params![id, DIM as i64 * 4],
+        "SELECT 1 FROM memory_vectors WHERE id = ? AND length(vector) = ? AND vector != zeroblob(?)",
+        rusqlite::params![id, DIM as i64 * 4, DIM as i64 * 4],
         |_| Ok(()),
     ) {
         Ok(_) => Ok(true),
