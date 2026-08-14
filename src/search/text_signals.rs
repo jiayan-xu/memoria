@@ -225,6 +225,12 @@ pub fn rerank_by_text_signals(query: &str, results: &mut Vec<FusedResult>) {
             r.rrf_score += boost;
             if !r.source.contains(SOURCE_MARKER) {
                 // #R67 performance/low：原地追加（热路径免 format! 分配）。
+                // #R69 performance/low：先 reserve 精确容量——两次 push 对短
+                // source（如 "keyword" 7 字节，追加后 20 字节）可能各自触发
+                // capacity 增长（第一次 push 扩容、第二次 push_str 再扩容），
+                // 比 format! 的单次精确分配还多；reserve(1 + len) 保证至多
+                // 一次增长，声称的"免分配"才真正成立。
+                r.source.reserve(1 + SOURCE_MARKER.len());
                 r.source.push(';');
                 r.source.push_str(SOURCE_MARKER);
             }

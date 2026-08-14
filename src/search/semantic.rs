@@ -87,8 +87,13 @@ pub(crate) fn semantic_drop_count() -> u64 {
 /// 永久压住后失败的路径）。
 /// #R52/#R53 maintainability/low：**Mutex<HashMap> 无碰撞存储**——固定槽数组
 /// （16/64 槽）总有确定性碰撞（DefaultHasher 固定 key，11 个键 64 槽碰撞概率
-/// ~58%；碰撞是永久性的，正是 16 槽 FNV 的跨抑制问题）。60s 冷却下锁竞争无关
-/// 紧要，per-key 精确隔离。
+/// ~58%；碰撞是永久性的，正是 16 槽 FNV 的跨抑制问题）。per-key 精确隔离
+/// 优先于无锁化：锁内仅 O(1) HashMap 读改写（无 I/O、无阻塞调用），std Mutex
+/// 无争用时 ~20ns；且本 helper **只在降级/异常路径被调用**（正常检索路径不经过
+/// 任何 throttled 点），锁竞争仅发生在已降级的系统上——冷却限制输出频率但
+/// 锁获取每调用发生（#R69 performance/low 如实修正：此前的"60s 冷却下锁竞争
+/// 无关紧要"把输出频率误当作锁获取频率；正确理由是锁窗口本身极小 + 调用面
+/// 限于故障路径，打印仍在锁外执行）。
 /// #R54 other/low：**单调时钟（Instant）**——SystemTime 是墙钟，回拨时
 /// now < last 使 saturating_sub 恒 < 60s，所有冷却日志被静默压制到时钟追平；
 /// 恰在需要可观测性的故障场景失效。Instant 对墙钟调整免疫。
@@ -436,7 +441,11 @@ fn fetch_memories_batch(
     const BATCH: usize = 500;
     // #R53 performance/low：容量 = ids.len()（上界已知，避免 growth/rehash）。
     let mut out = HashMap::with_capacity(ids.len());
-    let mut batches_total = 0usize;
+    // #R69 other/low：**分母预计算**——此前循环内 `batches_total += 1` 只统计
+    // 实际开始的 chunk：首批 pool 耗尽 break 时报告 "1 of 1 batches"，剩余 8 批
+    // 未尝试却在诊断中隐身（DB/pool 全面故障时严重低估影响面）。`div_ceil`
+    // 在循环前算出预期批数，任一批失败都如实反映"9 批中失败 N 批"。
+    let batches_total = ids.len().div_ceil(BATCH);
     let mut hard_failed_batches = 0usize;
     // #R48 performance/medium：stale id 日志**聚合**——内存 HNSW 不随删除修剪
     // （预期滞后），批量删除后每次查询大量 stale id，逐批 eprintln 每查询刷 ~9 行
@@ -450,7 +459,6 @@ fn fetch_memories_batch(
     // #R61：首个硬失败（prepare/query）的底层错误文本（见函数尾 Err 组装）。
     let mut first_hard_err: Option<String> = None;
     for chunk in ids.chunks(BATCH) {
-        batches_total += 1;
         let placeholders = vec!["?"; chunk.len()].join(",");
         let sql = format!(
             "SELECT id, content FROM memories WHERE id IN ({}) AND namespace = ?",

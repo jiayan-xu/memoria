@@ -494,13 +494,10 @@ async fn memory_eval_semantic_inner() {
     // content-only 路径仍通过——正是本块要防的 no-op 假覆盖。断言**高覆盖率**：
     // 分母用 hype_total（唯一记忆数，无论成败都计入）——processed 在失败时被 remove
     // 无法作分母（重言式）。
-    // #R68 bug/medium：**corpus-skip 前置**——embed 服务通过预检但每次 POST 失败
-    // 时全部 id 变占位符、无 HyPE put/add；此检查先于 "hype index empty" 触发，
-    // 根因直指 corpus-embed（而非被误指的 question-embed）。详细诊断见函数尾。
-    assert_eq!(
-        corpus_skipped, 0,
-        "corpus embed failures detected ({corpus_skipped}); run aborted before HyPE asserts - see diagnostics below"
-    );
+    // #R68 bug/medium：**corpus-skip 诊断在函数尾统一承担**（#R69 bug/medium 删除
+    // 早期 `assert_eq!(corpus_skipped, 0)`——它使尾部诊断块（含 expect/must_not
+    // 引用门控 + hard-fail-vs-WARN 决策）成为不可达死代码，panic 消息承诺的
+    // "see diagnostics below" 永不兑现；尾部块现在是跳过诊断的唯一真相源。
     assert!(
         engine.hype_hnsw.len() > 0,
         "hype index empty after corpus setup: question-embed likely failing"
@@ -762,9 +759,17 @@ async fn memory_eval_semantic_inner() {
             expect_ref.insert(*idx);
         }
         // 占位符形如 "<embed-failed-N>"，N = corpus 索引。
+        // #R69 bug/medium：`strip_prefix` 后仍带尾部 `>`——"<embed-failed-5>" 得
+        // `Some("5>")`，parse::<usize> 恒失败（尾部非数字），skipped_idx 恒空、
+        // overlapping_expect/must_not 恒空，期望位置引用跳过项时 hard-fail 静默
+        // 退化为 WARN（recall 断言不可靠却无检测）。先 strip_suffix('>')。
         let skipped_idx: HashSet<usize> = ids
             .iter()
-            .filter_map(|id| id.strip_prefix("<embed-failed-").and_then(|s| s.parse::<usize>().ok()))
+            .filter_map(|id| {
+                id.strip_prefix("<embed-failed-")
+                    .and_then(|s| s.strip_suffix('>'))
+                    .and_then(|s| s.parse::<usize>().ok())
+            })
             .collect();
         let overlapping_expect: Vec<usize> =
             skipped_idx.intersection(&expect_ref).copied().collect();

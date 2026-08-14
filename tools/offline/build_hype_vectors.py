@@ -24,6 +24,7 @@ import os
 import sys
 import json
 import time
+import math
 import struct
 import sqlite3
 import urllib.request
@@ -416,6 +417,20 @@ def main():
             sys.exit(1)
         if pre_dim != RUST_DIM:
             print(f"错误: embed_server 维度 {pre_dim}≠Rust DIM {RUST_DIM}（模型不匹配，无法补嵌）")
+            sys.exit(1)
+        # #R69 bug/low：**预检向量内容校验**——embed() 对缺省 dim 回退 1024
+        # （resp.get("dim", 1024)），1024==RUST_DIM 时省略/误报 dim 字段、空/
+        # 畸形/退化（零向量/NaN）向量都能通过预检，--all 会为每条记忆付一次
+        # 真实 chat 调用后才在 main loop 确定性 skip——正是 #R39/#R55/#R58 的
+        # fail-fast-before-spending 防线要防的付费 no-op。镜像 main loop 的
+        # #R52 退化向量守卫做内容校验（非空 + 首元素为 pre_dim 长度数值序列）。
+        if not _vecs or not isinstance(_vecs[0], (list, tuple)) or len(_vecs[0]) != pre_dim:
+            print(f"错误: embed_server 预检向量畸形（{type(_vecs).__name__}），请检查嵌入服务配置")
+            sys.exit(1)
+        _pv = _vecs[0]
+        _pnorm = math.sqrt(sum(float(x) * float(x) for x in _pv))
+        if not math.isfinite(_pnorm) or _pnorm == 0.0:
+            print("错误: embed_server 预检向量退化（零/NaN 范数）——嵌入服务输出异常")
             sys.exit(1)
         print(f"预检通过: embed_server dim={pre_dim} == RUST_DIM")
         # #R44 bug/medium：chat 端点同样预检——generate_question 对确定性 4xx（401 无效

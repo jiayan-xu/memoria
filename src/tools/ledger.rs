@@ -20,6 +20,22 @@ struct MemMeta {
     event_time_legacy: String,
 }
 
+/// 共享日期前缀校验：字节 0..4/5-6/8-9 全 digit + 字节 4/7 == '-'（YYYY-MM-DD 的
+/// 前 10 字节形态）。**格式校验而非真实日期校验**——"2024-13-99" 仍通过；
+/// 下游日期处理是字符串比较而非解析，影响有限。规则统一由本 helper 承载
+/// （#R69 maintainability/low：此前 parse_occurred_tag / occurred_tag_from_iso /
+/// legacy_occurred 三处逐字节复制粘贴，格式演进需改四处——含 text_signals::
+/// is_iso_date_at——静默漂移；抽单点防 writer/reader 规则再次分歧）。
+fn is_iso_date_prefix(b: &[u8]) -> bool {
+    b[0..4].iter().all(|c| c.is_ascii_digit())
+        && b[4] == b'-'
+        && b[5].is_ascii_digit()
+        && b[6].is_ascii_digit()
+        && b[7] == b'-'
+        && b[8].is_ascii_digit()
+        && b[9].is_ascii_digit()
+}
+
 /// 从 tags JSON 数组解析 `occurred:YYYY-MM-DD`（O3）。
 pub fn parse_occurred_tag(tags_json: &str) -> Option<String> {
     let tags: Vec<String> = serde_json::from_str(tags_json).unwrap_or_default();
@@ -39,15 +55,7 @@ pub fn parse_occurred_tag(tags_json: &str) -> Option<String> {
                 let Some(d) = date.get(..10) else {
                     continue;
                 };
-                let b = d.as_bytes();
-                if b[0..4].iter().all(|c| c.is_ascii_digit())
-                    && b[4] == b'-'
-                    && b[5].is_ascii_digit()
-                    && b[6].is_ascii_digit()
-                    && b[7] == b'-'
-                    && b[8].is_ascii_digit()
-                    && b[9].is_ascii_digit()
-                {
+                if is_iso_date_prefix(d.as_bytes()) {
                     return Some(d.to_string());
                 }
             }
@@ -69,15 +77,7 @@ pub fn occurred_tag_from_iso(iso: &str) -> Option<String> {
         let Some(d) = s.get(..10) else {
             return None;
         };
-        let b = d.as_bytes();
-        if b[0..4].iter().all(|c| c.is_ascii_digit())
-            && b[4] == b'-'
-            && b[5].is_ascii_digit()
-            && b[6].is_ascii_digit()
-            && b[7] == b'-'
-            && b[8].is_ascii_digit()
-            && b[9].is_ascii_digit()
-        {
+        if is_iso_date_prefix(d.as_bytes()) {
             return Some(format!("occurred:{}", d));
         }
     }
@@ -115,16 +115,9 @@ pub(crate) fn legacy_occurred(legacy_et: &str) -> Option<String> {
     // extract_text_signals 日期解析（doc 声称"畸形值不进 ledger"但未实现）。
     // #R64 maintainability/low：**完整数字校验**（对齐 text_signals::is_iso_date_at）——
     // 分隔符正确的非日期串（"abcd-ef-gh"/"2024-13-99"）此前仍会通过。
+    // #R69 maintainability/low：校验逻辑统一走 is_iso_date_prefix（共享单点）。
     let d = legacy_et.get(..10)?;
-    let b = d.as_bytes();
-    if b[0..4].iter().all(|c| c.is_ascii_digit())
-        && b[4] == b'-'
-        && b[5].is_ascii_digit()
-        && b[6].is_ascii_digit()
-        && b[7] == b'-'
-        && b[8].is_ascii_digit()
-        && b[9].is_ascii_digit()
-    {
+    if is_iso_date_prefix(d.as_bytes()) {
         Some(d.to_string())
     } else {
         None

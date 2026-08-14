@@ -654,8 +654,11 @@ fn execute_batch_retry(conn: &rusqlite::Connection, sql: &str, label: &str) -> R
                 // #R55 maintainability/low：重试前 WARN——静默重试在并发首启锁竞争
                 // 下表现为数秒启动停滞零诊断，部署死锁难排查（与 updated_at BEGIN
                 // 循环同款）。
+                // #R69 other/low：**措辞与实现一致**——is_busy 只匹配 DatabaseBusy
+                // （SQLITE_BUSY），SQLITE_LOCKED 不重试；此前 "busy/locked" 让运维
+                // 误以为 LOCKED 也会重试（启动停滞排查时误导归因）。
                 eprintln!(
-                    "[Memoria] WARN: {label} busy/locked (attempt {attempt}/3), retrying in {}ms: {e}",
+                    "[Memoria] WARN: {label} busy (attempt {attempt}/3), retrying in {}ms: {e}",
                     500 * attempt
                 );
                 std::thread::sleep(std::time::Duration::from_millis(500 * attempt as u64));
@@ -826,8 +829,9 @@ pub fn migrate_hype_vectors(pool: &SqlitePool) -> Result<(), String> {
                         attempt += 1;
                         // #R55 maintainability/low：重试前 WARN——静默重试在并发首启
                         // 锁竞争下表现为数秒启动停滞零诊断，部署死锁难排查。
+                        // #R69 other/low：措辞与实现一致（is_busy 只匹配 DatabaseBusy）。
                         eprintln!(
-                            "[Memoria] WARN: updated_at migration busy/locked (attempt {attempt}/3), retrying in {}ms: {e}",
+                            "[Memoria] WARN: updated_at migration busy (attempt {attempt}/3), retrying in {}ms: {e}",
                             500 * attempt
                         );
                         std::thread::sleep(std::time::Duration::from_millis(500 * attempt as u64));
@@ -929,15 +933,14 @@ pub fn migrate_hype_vectors(pool: &SqlitePool) -> Result<(), String> {
                 "[Memoria] WARN: memory_hype_vectors table absent (DDL soft-degraded; will retry next start) - HyPE feature degraded"
             );
         } else {
-            let have: Vec<String> = match conn
-                .prepare("SELECT name FROM pragma_table_info('memory_hype_vectors')")
-            {
-                Ok(mut stmt) => stmt
-                    .query_map([], |r| r.get::<_, String>(0))
-                    .map(|rows| rows.filter_map(|r| r.ok()).collect())
-                    .unwrap_or_default(),
-                Err(_) => vec![],
-            };
+            let have: Vec<String> =
+                match conn.prepare("SELECT name FROM pragma_table_info('memory_hype_vectors')") {
+                    Ok(mut stmt) => stmt
+                        .query_map([], |r| r.get::<_, String>(0))
+                        .map(|rows| rows.filter_map(|r| r.ok()).collect())
+                        .unwrap_or_default(),
+                    Err(_) => vec![],
+                };
             let missing: Vec<&str> = expect
                 .iter()
                 .copied()
@@ -1000,9 +1003,7 @@ pub fn migrate_hype_vectors(pool: &SqlitePool) -> Result<(), String> {
         // #R68 other/low：读失败可见（与 trig_done 同款 WARN）——静默按未置位
         // 会让 fallback→full 升级被瞬时 BUSY 跳过（幂等，但自愈延迟不可见）。
         .unwrap_or_else(|e| {
-            eprintln!(
-                "[Memoria] WARN: check trigger fallback flag failed (treated as unset): {e}"
-            );
+            eprintln!("[Memoria] WARN: check trigger fallback flag failed (treated as unset): {e}");
             false
         });
     // #R64 bug/medium：fallback 置位 → 重新评估（hype 表可能已恢复，需升级 full
@@ -1134,6 +1135,15 @@ pub fn migrate_hype_vectors(pool: &SqlitePool) -> Result<(), String> {
     let clean_vectors = std::env::var("MEMORIA_ORPHAN_CLEANUP_VECTORS")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
+    // #R69 bug/high：**dry-run 审计模式**——orphan 判定是"无 memories 行即垃圾"，
+    // 但写侧不强制该不变量（add_vectors/put_stored_vector 接受任意 id，外部注册/
+    // 暂存向量是合法数据态）；即使双 env 齐备，删除也是永久性销毁。dry_run 时
+    // 打印**全部**待删 id 清单（而非仅 5 行样本）供人工确认，且不执行 DELETE、
+    // 不置任何完成 flag（下次启动重新评估）。运维流程：先 dry-run 审清单 →
+    // 确认无误后去掉 dry_run 再启动执行删除。
+    let dry_run = std::env::var("MEMORIA_ORPHAN_DRY_RUN")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
     // #R50 bug/low：flag 读取软降级（BUSY/DB 故障时按"未置位"处理）——硬失败会让
     // 并发首启在 .expect 处 panic（与 DDL/清理的软降级意图一致）；读失败=0 只会让
     // 清理多跑一次（清理本身软降级 + 事务内重读 + 幂等），安全。
@@ -1230,7 +1240,12 @@ pub fn migrate_hype_vectors(pool: &SqlitePool) -> Result<(), String> {
             // 与 memory_vectors 段一致。
             const ORPHAN_REFUSE_THRESHOLD: i64 = 5000;
             // force/opt-in env 在 gate 之前已读取（#R50 bug/medium，见函数上方）。
+            // #R69 bug/high：**dry-run 审计标记**——任一表段进入 dry-run 删除分支时
+            // 置位：跳过 DELETE、跳过全部完成 flag（HYPE_FLAG/CLEANUP_FLAG/REFUSED_
+            // FLAG 都不写），事务照常提交，下次启动重新评估。dry-run 语义 =
+            // 审计预览，不固化任何"已处理"状态。
             let mut refused = false;
+            let mut dry_ran = false;
             // ── hype 段（HYPE_FLAG 未评估，或 force 覆盖）──
             // #R55 bug/medium：force 时**重新评估**——HYPE_FLAG 置位后（含 refused
             // 路径）`hype_done2 == 0` 恒假，hype 段对 force env 组合（FORCE+OPT_IN）
@@ -1277,7 +1292,7 @@ pub fn migrate_hype_vectors(pool: &SqlitePool) -> Result<(), String> {
                         )
                         .map_err(|e| format!("check memory_hype_vectors rows: {}", e))?;
                     if h_exists > 0 {
-                    let orphans_hype: i64 = tx
+                        let orphans_hype: i64 = tx
                         .query_row(
                             "SELECT COUNT(*) FROM memory_hype_vectors \
                              WHERE NOT EXISTS (SELECT 1 FROM memories m WHERE m.id = memory_hype_vectors.id)",
@@ -1285,63 +1300,98 @@ pub fn migrate_hype_vectors(pool: &SqlitePool) -> Result<(), String> {
                             |r| r.get(0),
                         )
                         .map_err(|e| format!("count memory_hype_vectors orphans: {}", e))?;
-                    if orphans_hype > 0 {
-                        if !clean_vectors {
-                            eprintln!(
-                                "[Memoria] WARN: {orphans_hype} orphan memory_hype_vectors rows (possible staged/external hype rows); NOT deleting - MEMORIA_ORPHAN_CLEANUP_VECTORS=1 AND MEMORIA_FORCE_ORPHAN_CLEANUP=1 are BOTH required to clean (once refused state is recorded, both envs are required to re-enter; threshold {ORPHAN_REFUSE_THRESHOLD} bypassed by force)"
+                        if orphans_hype > 0 {
+                            // #R69 bug/high：WARN 文案**中性化**——此前 "are BOTH required
+                            // to clean" 读起来像操作指引，运维照做即触发永久删除，但
+                            // add_vectors/put_hype_stored_vector 接受任意 id、外部注册/
+                            // 暂存向量是合法数据态（"无 memories 行 ⇒ 垃圾"并非写侧
+                            // 强制不变量）。现在只陈述事实 + 提示 dry-run 审计通道。
+                            if !clean_vectors {
+                                eprintln!(
+                                "[Memoria] WARN: {orphans_hype} orphan memory_hype_vectors rows (no matching memories row; may be legit staged/external hype vectors). Cleanup is opt-in and disabled by default. To inspect before any decision, restart with MEMORIA_ORPHAN_DRY_RUN=1 to list every id (nothing will be deleted)."
                             );
-                            // #R57 bug/low：hype 段拒绝**不置 refused**——REFUSED_FLAG
-                            // 语义 = memory_vectors 段拒绝（见下）；hype 拒绝态由
-                            // HYPE_FLAG 记录（段完成=删除或拒绝）。混用会让 vec 段
-                            // 干净完成也被标记 refused、下次启动 WARN 误导归因。
-                        } else if orphans_hype > ORPHAN_REFUSE_THRESHOLD && !force_cleanup {
-                            eprintln!(
-                                "[Memoria] WARN: {orphans_hype} orphan memory_hype_vectors rows ABOVE safety threshold {ORPHAN_REFUSE_THRESHOLD}; refusing auto-delete (set MEMORIA_FORCE_ORPHAN_CLEANUP=1 to force; once refused state is recorded, BOTH envs are required to re-enter)"
+                                // #R69 bug/high：dry-run 时**不写任何 flag**——refused
+                                // 态也会跳过后续启动评估；dry-run 是纯审计预览，不固化
+                                // "已拒绝/已处理"状态（下次启动重新评估）。此前这里
+                                // 只注释不置位（hype 段拒绝由 HYPE_FLAG 记录），dry-run
+                                // 时 HYPE_FLAG 同样不置（见段尾 !dry_ran 门）。
+                                if dry_run {
+                                    dry_ran = true;
+                                }
+                                // #R57 bug/low：hype 段拒绝**不置 refused**——REFUSED_FLAG
+                                // 语义 = memory_vectors 段拒绝（见下）；hype 拒绝态由
+                                // HYPE_FLAG 记录（段完成=删除或拒绝）。混用会让 vec 段
+                                // 干净完成也被标记 refused、下次启动 WARN 误导归因。
+                            } else if orphans_hype > ORPHAN_REFUSE_THRESHOLD && !force_cleanup {
+                                eprintln!(
+                                "[Memoria] WARN: {orphans_hype} orphan memory_hype_vectors rows ABOVE safety threshold {ORPHAN_REFUSE_THRESHOLD}; cleanup refused (count too large to be safely attributable to staged/external writes; inspect with MEMORIA_ORPHAN_DRY_RUN=1)"
                             );
-                        } else if !force_cleanup {
-                            // #R60 bug/high：**单 OPT_IN 只报告不删**——"无 memories 行
-                            // ⇒ 垃圾"非强制不变量（外部/暂存向量是合法态）；删除执行
-                            // 必须 OPT_IN + FORCE 双 env 显式确认（样本审计 + 阈值只
-                            // 缓解可见性/数量，不修正分类正确性）。
-                            eprintln!(
-                                "[Memoria] WARN: {orphans_hype} orphan memory_hype_vectors rows detected (possible staged/external hype rows); NOT deleting - MEMORIA_ORPHAN_CLEANUP_VECTORS=1 AND MEMORIA_FORCE_ORPHAN_CLEANUP=1 are both required to delete"
+                                if dry_run {
+                                    dry_ran = true;
+                                }
+                            } else if !force_cleanup {
+                                // #R60 bug/high：**单 OPT_IN 只报告不删**——"无 memories 行
+                                // ⇒ 垃圾"非强制不变量（外部/暂存向量是合法态）；删除执行
+                                // 必须 OPT_IN + FORCE 双 env 显式确认（清单审计 + 阈值只
+                                // 缓解可见性/数量，不修正分类正确性）。
+                                eprintln!(
+                                "[Memoria] WARN: {orphans_hype} orphan memory_hype_vectors rows (no matching memories row; may be legit staged/external hype vectors); not deleting. MEMORIA_ORPHAN_DRY_RUN=1 lists every id without deleting."
                             );
-                        } else {
-                            // #R57 bug/medium：**删除前打印样本**——opt-in 时 DELETE
-                            // 永久销毁所有无 memories 行的向量行，但 add_vectors/
-                            // put_stored_vector 接受任意 id、lookup_namespace 回退
-                            // default、vector_search 不 join memories：外部注册向量是
-                            // 合法数据态，阈值只限数量不限分类正确性。删除前列出前
-                            // 5 个 id 使"删了什么"可审计（组内 concat 至多 5 个）。
-                            let samples: String = tx
+                                if dry_run {
+                                    dry_ran = true;
+                                }
+                            } else {
+                                // #R57 bug/medium：**删除前打印完整清单**——opt-in 时 DELETE
+                                // 永久销毁所有无 memories 行的向量行，但 add_vectors/
+                                // put_stored_vector 接受任意 id、lookup_namespace 回退
+                                // default、vector_search 不 join memories：外部注册向量是
+                                // 合法数据态，阈值只限数量不限分类正确性。删除前列出
+                                // **全部** id（#R69 bug/high：此前 LIMIT 5 样本在 >5 行时
+                                // 无法审计"删了什么"）使操作可审计。
+                                // #R69 bug/high：**dry-run 分支**——MEMORIA_ORPHAN_DRY_RUN=1
+                                // 时打印完整 id 清单但跳过 DELETE 且不置完成 flag（下次
+                                // 启动重新评估）；运维先审计清单、确认无误后再去掉
+                                // dry-run 重启执行删除。
+                                let audit: String = tx
                                 .query_row(
-                                    "SELECT COALESCE(group_concat(id, ', '), '') FROM (SELECT id FROM memory_hype_vectors \
-                                     WHERE NOT EXISTS (SELECT 1 FROM memories m WHERE m.id = memory_hype_vectors.id) LIMIT 5)",
+                                    "SELECT COALESCE(group_concat(id, char(10)), '(none)') FROM (SELECT id FROM memory_hype_vectors \
+                                     WHERE NOT EXISTS (SELECT 1 FROM memories m WHERE m.id = memory_hype_vectors.id))",
                                     [],
                                     |r| r.get(0),
                                 )
-                                .map_err(|e| format!("sample hype orphans: {e}"))?;
-                            eprintln!(
-                                "[Memoria] Migration: deleting {orphans_hype} orphan memory_hype_vectors rows (samples: {samples})"
-                            );
-                            const DEL_HYPE: &str = "DELETE FROM memory_hype_vectors \
-                                WHERE NOT EXISTS (SELECT 1 FROM memories m WHERE m.id = memory_hype_vectors.id)";
-                            tx.execute(DEL_HYPE, []).map_err(|e| {
-                                format!("clean memory_hype_vectors orphans: {e} [SQL: {DEL_HYPE}]")
-                            })?;
+                                .map_err(|e| format!("audit hype orphans: {e}"))?;
+                                if dry_run {
+                                    eprintln!(
+                                    "[Memoria] DRY-RUN: {orphans_hype} orphan memory_hype_vectors rows would be deleted (nothing deleted; rerun without MEMORIA_ORPHAN_DRY_RUN to execute):\n{audit}"
+                                );
+                                    dry_ran = true;
+                                } else {
+                                    eprintln!(
+                                    "[Memoria] Migration: deleting {orphans_hype} orphan memory_hype_vectors rows:\n{audit}"
+                                );
+                                    const DEL_HYPE: &str = "DELETE FROM memory_hype_vectors \
+                                    WHERE NOT EXISTS (SELECT 1 FROM memories m WHERE m.id = memory_hype_vectors.id)";
+                                    tx.execute(DEL_HYPE, []).map_err(|e| {
+                                    format!("clean memory_hype_vectors orphans: {e} [SQL: {DEL_HYPE}]")
+                                })?;
+                                }
+                            }
                         }
                     }
-                }
-                // #R54 performance/medium：段完成（删除或拒绝）都置 HYPE_FLAG——
-                // 评估过即跳过后续启动的持锁重扫，force 覆盖重新评估。
-                // #R57 bug/low：hype 拒绝态**只由 HYPE_FLAG 记录**（不再写
-                // REFUSED_FLAG——该 flag 语义 = memory_vectors 段拒绝，混用会让
-                // vec 段干净完成也被标记拒绝、下次启动 WARN 误导归因）。
-                    tx.execute(
-                        "INSERT OR IGNORE INTO migration_flags (flag) VALUES (?1)",
-                        rusqlite::params![HYPE_FLAG],
-                    )
-                    .map_err(|e| format!("set hype flag: {}", e))?;
+                    // #R54 performance/medium：段完成（删除或拒绝）都置 HYPE_FLAG——
+                    // 评估过即跳过后续启动的持锁重扫，force 覆盖重新评估。
+                    // #R57 bug/low：hype 拒绝态**只由 HYPE_FLAG 记录**（不再写
+                    // REFUSED_FLAG——该 flag 语义 = memory_vectors 段拒绝，混用会让
+                    // vec 段干净完成也被标记拒绝、下次启动 WARN 误导归因）。
+                    // #R69 bug/high：**dry-run 时不置 HYPE_FLAG**——置位会让后续启动
+                    // 跳过评估（dry-run 语义 = 审计后待决定，不应固化"已处理"状态）。
+                    if !dry_ran {
+                        tx.execute(
+                            "INSERT OR IGNORE INTO migration_flags (flag) VALUES (?1)",
+                            rusqlite::params![HYPE_FLAG],
+                        )
+                        .map_err(|e| format!("set hype flag: {}", e))?;
+                    }
                 }
             }
             // ── memory_vectors 段 ──
@@ -1380,45 +1430,79 @@ pub fn migrate_hype_vectors(pool: &SqlitePool) -> Result<(), String> {
                         )
                         .map_err(|e| format!("count memory_vectors orphans: {}", e))?;
                     if orphans_vec > 0 {
+                        // #R69 bug/high：WARN 文案**中性化**（同 hype 段）——不读作
+                        // 操作指引；提示 dry-run 审计通道（完整 id 清单）。
                         if !clean_vectors {
                             eprintln!(
-                                "[Memoria] WARN: {orphans_vec} orphan memory_vectors rows (possible legit external vectors via add_vectors); NOT deleting - MEMORIA_ORPHAN_CLEANUP_VECTORS=1 AND MEMORIA_FORCE_ORPHAN_CLEANUP=1 are BOTH required to clean (once refused state is recorded, both envs are required to re-enter; threshold {ORPHAN_REFUSE_THRESHOLD} bypassed by force)"
+                                "[Memoria] WARN: {orphans_vec} orphan memory_vectors rows (no matching memories row; may be legit external vectors via add_vectors). Cleanup is opt-in and disabled by default. To inspect before any decision, restart with MEMORIA_ORPHAN_DRY_RUN=1 to list every id (nothing will be deleted)."
                             );
-                            refused = true;
+                            // #R69 bug/high：dry-run 时**不置 refused**——审计预览
+                            // 不固化"已拒绝"状态（否则后续启动跳过评估，运维无法
+                            // 反复审计）；dry_ran 使尾部跳过全部 flag 写入。
+                            if dry_run {
+                                dry_ran = true;
+                            } else {
+                                refused = true;
+                            }
                         } else if orphans_vec > ORPHAN_REFUSE_THRESHOLD && !force_cleanup {
                             eprintln!(
-                                "[Memoria] WARN: {orphans_vec} orphan memory_vectors rows ABOVE safety threshold {ORPHAN_REFUSE_THRESHOLD}; refusing auto-delete (set MEMORIA_FORCE_ORPHAN_CLEANUP=1 to force; once refused state is recorded, BOTH envs are required to re-enter)"
+                                "[Memoria] WARN: {orphans_vec} orphan memory_vectors rows ABOVE safety threshold {ORPHAN_REFUSE_THRESHOLD}; cleanup refused (count too large to be safely attributable to external writes; inspect with MEMORIA_ORPHAN_DRY_RUN=1)"
                             );
-                            refused = true;
+                            if dry_run {
+                                dry_ran = true;
+                            } else {
+                                refused = true;
+                            }
                         } else if !force_cleanup {
                             // #R60 bug/high：单 OPT_IN 只报告不删（同 hype 段理由）。
                             eprintln!(
-                                "[Memoria] WARN: {orphans_vec} orphan memory_vectors rows detected (possible legit external vectors via add_vectors); NOT deleting - MEMORIA_ORPHAN_CLEANUP_VECTORS=1 AND MEMORIA_FORCE_ORPHAN_CLEANUP=1 are both required to delete"
+                                "[Memoria] WARN: {orphans_vec} orphan memory_vectors rows (no matching memories row; may be legit external vectors via add_vectors); not deleting. MEMORIA_ORPHAN_DRY_RUN=1 lists every id without deleting."
                             );
-                            refused = true;
+                            if dry_run {
+                                dry_ran = true;
+                            } else {
+                                refused = true;
+                            }
                         } else {
-                            // #R57 bug/medium：删除前打印样本（同 hype 段理由——
-                            // opt-in 时 ≤5000 的合法外部向量也会被永久销毁，
-                            // 样本使操作可审计）。
-                            let samples: String = tx
+                            // #R57 bug/medium：删除前打印**完整清单**（同 hype 段——
+                            // opt-in 时 ≤5000 的合法外部向量也会被永久销毁，清单
+                            // 使操作可审计；此前 LIMIT 5 样本在 >5 行时无法审计）。
+                            // #R69 bug/high：dry-run 分支（打印清单、跳过 DELETE、
+                            // 不置完成 flag，下次启动重新评估）。
+                            let audit: String = tx
                                 .query_row(
-                                    "SELECT COALESCE(group_concat(id, ', '), '') FROM (SELECT id FROM memory_vectors \
-                                     WHERE NOT EXISTS (SELECT 1 FROM memories m WHERE m.id = memory_vectors.id) LIMIT 5)",
+                                    "SELECT COALESCE(group_concat(id, char(10)), '(none)') FROM (SELECT id FROM memory_vectors \
+                                     WHERE NOT EXISTS (SELECT 1 FROM memories m WHERE m.id = memory_vectors.id))",
                                     [],
                                     |r| r.get(0),
                                 )
-                                .map_err(|e| format!("sample vec orphans: {e}"))?;
-                            eprintln!(
-                                "[Memoria] Migration: deleting {orphans_vec} orphan memory_vectors rows (samples: {samples})"
-                            );
-                            const DEL_VEC: &str = "DELETE FROM memory_vectors \
-                                WHERE NOT EXISTS (SELECT 1 FROM memories m WHERE m.id = memory_vectors.id)";
-                            tx.execute(DEL_VEC, []).map_err(|e| {
-                                format!("clean memory_vectors orphans: {e} [SQL: {DEL_VEC}]")
-                            })?;
+                                .map_err(|e| format!("audit vec orphans: {e}"))?;
+                            if dry_run {
+                                eprintln!(
+                                    "[Memoria] DRY-RUN: {orphans_vec} orphan memory_vectors rows would be deleted (nothing deleted; rerun without MEMORIA_ORPHAN_DRY_RUN to execute):\n{audit}"
+                                );
+                                dry_ran = true;
+                            } else {
+                                eprintln!(
+                                    "[Memoria] Migration: deleting {orphans_vec} orphan memory_vectors rows:\n{audit}"
+                                );
+                                const DEL_VEC: &str = "DELETE FROM memory_vectors \
+                                    WHERE NOT EXISTS (SELECT 1 FROM memories m WHERE m.id = memory_vectors.id)";
+                                tx.execute(DEL_VEC, []).map_err(|e| {
+                                    format!("clean memory_vectors orphans: {e} [SQL: {DEL_VEC}]")
+                                })?;
+                            }
                         }
                     }
                 }
+            }
+            // #R69 bug/high：**dry-run 时不写任何 flag**——HYPE_FLAG（hype 段）
+            // 与 REFUSED/CLEANUP（vec 段）都跳过：dry-run 是审计预览，不固化
+            // "已处理/已拒绝"状态，下次启动重新评估（去掉 dry-run 后执行删除
+            // 才会置位）。直接提交空事务。
+            if dry_ran {
+                commit_tx(tx, "commit cleanup tx (dry-run)")?;
+                return Ok(());
             }
             // 置位标记（事务内，提交后对并发进程可见）：正常完成（含"无孤儿"）→
             // CLEANUP_FLAG；阈值/opt-in 拒绝（refused）→ REFUSED_FLAG——持久化拒绝态

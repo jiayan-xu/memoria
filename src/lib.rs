@@ -378,8 +378,13 @@ fn query_hype_count_cached(conn: &rusqlite::Connection, db_path: &str) -> i64 {
         }) {
             Ok(c) => c,
             Err(e) => {
-                let now = Instant::now();
+                // #R69 bug/low：`Instant::now()` 在**锁内**取（#R56/#R66 纪律）——
+                // 锁外采样时另一线程可在本线程取 now 后、本线程拿到锁前为同一
+                // db_path 插入更新的时间戳：更晚的时间戳使 saturating_duration_
+                // since 得 ~0（<60s），冷却被静默延长；更早的使条目被修剪、WARN
+                // 提前多发。锁窗口内采样保证判定与插入同一时钟视图。
                 let mut fe = FAIL_EPOCHS.lock().unwrap_or_else(|p| p.into_inner());
+                let now = Instant::now();
                 let fmap = fe.get_or_insert_with(HashMap::new);
                 let last = fmap.get(db_path).copied();
                 let due = match last {
@@ -464,8 +469,13 @@ fn query_hype_count_cached(conn: &rusqlite::Connection, db_path: &str) -> i64 {
             // saturating_sub 恒 <60s 静默压制所有 WARN（恰在故障场景失效），前跳则
             // 提前清冷却引发 WARN 风暴；与 CACHE 的 Instant 纪律一致（semantic #R54
             // 同款理由）。
-            let now_instant = Instant::now();
+            // #R69 bug/low：**now 在锁内取**（#R56/#R66 纪律）——锁外采样时另一线程
+            // 可在本线程取 now 后、本线程拿到锁前插入更新的时间戳：更晚的时间戳
+            // 使 saturating_duration_since 得 ~0（<60s），条目被保留、WARN 被静默
+            // 抑制（恰在故障期最需要可见性时）；更早的时间戳使条目被修剪、WARN
+            // 提前多发。锁内采样保证判定与插入同一时钟视图。
             let mut fe = FAIL_EPOCHS.lock().unwrap_or_else(|p| p.into_inner());
+            let now_instant = Instant::now();
             let fmap = fe.get_or_insert_with(HashMap::new);
             fmap.retain(|_, at| now_instant.saturating_duration_since(*at).as_secs() < 60);
             let last = fmap.get(db_path).copied();
