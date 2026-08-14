@@ -381,7 +381,7 @@ def main():
         def _flush_pending_on_exit():
             # #R62 bug/low：**全量门控**——fail_ids 清单只属于全量运行（#R46/#R48）；
             # 调试运行（--limit N）中断时把子集 id 追加进去会污染累积清单。
-            if not (args.all and args.limit is None):
+            if not (args.all and args.limit is None and args.ids is None):
                 return
             try:
                 if pending_batch:
@@ -442,7 +442,10 @@ def main():
         # 运行静默抹掉上次全量运行累积的失败清单（"定点重跑"工件），运维先 --limit
         # 调试再定点重跑时清单已丢，被迫全量 --all 再付几千次付费调用。dry-run 与
         # preflight 失败已有守卫，部分运行此前漏网。
-        if args.all and args.limit is None:
+        # #R68 bug/medium：**--ids 子集运行不碰全量清单**——fail_ids 生命周期
+        # （清理/追加/重写/atexit）只属于纯全量运行；--ids 从该文件加载子集后
+        # 若也走全量门控会删掉累积清单、重写为仅子集失败（破坏定点重跑闭环）。
+        if args.all and args.limit is None and args.ids is None:
             try:
                 if os.path.exists(failed_ids_path):
                     os.remove(failed_ids_path)
@@ -524,8 +527,6 @@ def main():
             con.close()
             print(f"错误: 读取 {args.db} 的 memories 表失败（库未初始化/路径错误/损坏）: {e}")
             sys.exit(1)
-        before = len(targets)
-        targets = [(m, c) for m, c in targets if m in valid_ids]
         stale_ids = [m for m, _ in targets if m not in valid_ids]
         targets = [(m, c) for m, c in targets if m in valid_ids]
         stale = len(stale_ids)
@@ -542,7 +543,7 @@ def main():
         #R46 bug/medium：仅**全量**运行（--limit is None）落盘——--limit 调试/抽样
         运行的失败既不写盘也不清理，旧清单保持完整（不被部分运行污染/覆盖）。"""
         fail_ids.append(mid)
-        if not args.dry_run and args.all and args.limit is None:
+        if not args.dry_run and args.all and args.limit is None and args.ids is None:
             try:
                 with open(failed_ids_path, "a", encoding="utf-8") as f:
                     f.write(mid + "\n")
@@ -711,7 +712,7 @@ def main():
         # "--all 全量累积的定点重跑工件"（#R48：golden 默认运行此前也满足
         # `limit is None` 门控，会静默销毁全量清单）。
         dedup = list(dict.fromkeys(fail_ids))
-        if args.all and args.limit is None:
+        if args.all and args.limit is None and args.ids is None:
             try:
                 tmp = failed_ids_path + ".tmp"
                 with open(tmp, "w", encoding="utf-8") as f:

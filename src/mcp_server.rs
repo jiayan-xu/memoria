@@ -473,6 +473,8 @@ pub fn tools_list() -> Vec<serde_json::Value> {
         ),
         tool(
             "memory_search_v2",
+            // #R68 documentation/low：HyPE 启动快照限制同样适用（与 memory_search
+            // 共享同一 dispatch 分支）。
             "多信号融合搜索",
             serde_json::json!({
                 "query": {"type": "string", "description": "搜索关键词（必填）"},
@@ -547,6 +549,8 @@ pub fn tools_list() -> Vec<serde_json::Value> {
         ),
         tool(
             "memory_context",
+            // #R68 documentation/low：带 query 时经 profile::memory_context 走
+            // Some(&state.hype_hnsw)——HyPE 启动快照限制同样适用。
             "会话开场注入：memory_profile + 可选 query 追加 top-k recall，产出 prompt_block",
             serde_json::json!({
                 "namespace": {"type": "string", "description": "命名空间，默认 default"},
@@ -560,6 +564,7 @@ pub fn tools_list() -> Vec<serde_json::Value> {
         ),
         tool(
             "memory_recall",
+            // #R68 documentation/low：同上（共享 dispatch 分支）。
             "回忆检索（别名 memory_search_v2）：默认 isLatest，走 search 配额",
             serde_json::json!({
                 "query": {"type": "string", "description": "搜索关键词（必填）"},

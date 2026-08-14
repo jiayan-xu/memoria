@@ -61,11 +61,23 @@ pub fn occurred_tag_from_iso(iso: &str) -> Option<String> {
     let s = iso.trim();
     // #R58 bug/low：同 parse_occurred_tag——`&s[..10]` 在多字节 ISO 输入上可 panic，
     // get(..10) 安全（越界/非边界返回 None）。
+    // #R68 maintainability/medium：**数字校验与读路径对称**——写路径（mcp_server
+    // remember 传用户 event_time）只查分隔符会让 "abcd-ef-gh" 以 occurred 标签
+    // 持久化、读回时被新的严格 parse_occurred_tag 拒绝（writer/reader 规则分歧
+    // 丢可读值）。
     if s.len() >= 10 {
         let Some(d) = s.get(..10) else {
             return None;
         };
-        if d.as_bytes().get(4) == Some(&b'-') && d.as_bytes().get(7) == Some(&b'-') {
+        let b = d.as_bytes();
+        if b[0..4].iter().all(|c| c.is_ascii_digit())
+            && b[4] == b'-'
+            && b[5].is_ascii_digit()
+            && b[6].is_ascii_digit()
+            && b[7] == b'-'
+            && b[8].is_ascii_digit()
+            && b[9].is_ascii_digit()
+        {
             return Some(format!("occurred:{}", d));
         }
     }
@@ -85,8 +97,10 @@ pub fn merge_occurred_tag(tags_json: &str, occurred_tag: &str) -> String {
 /// 内（get(..10) None）均返回 None——短串或畸形值不进入 ledger 的 occurred 字段
 /// （下游 extract_text_signals 日期解析与 YYYY-MM-DD 约定不一致时会产生脏数据），
 /// 由调用方 valid_from 兜底。此路径曾是 `&s[..10]` 切片 panic 点（#R58）。
-/// 校验规则：**数字 + 分隔符**（字节 0..4/5-6/8-9 全 digit + 字节 4/7 == '-'，
-/// 与 text_signals::is_iso_date_at 一致）——"2024-13-99" 的数字非法值也会被拒。
+/// 校验规则：**数字 + 分隔符格式**（字节 0..4/5-6/8-9 全 digit + 字节 4/7 == '-'，
+/// 与 text_signals::is_iso_date_at 一致）。注意这是**格式校验**而非真实日期
+/// 校验——"2024-13-99"（月份 13）仍会通过；下游日期处理是字符串比较而非解析，
+/// 影响有限。
 pub(crate) fn legacy_occurred(legacy_et: &str) -> Option<String> {
     if legacy_et.is_empty() {
         return None;

@@ -486,6 +486,16 @@ fn rebuild_from_table(pool: &SqlitePool, hnsw: &HnswIndex, table: &str) -> Resul
                     skipped_dim += 1;
                     continue;
                 }
+                // #R68 maintainability/low：**4 对齐超长归 skipped_dim**（与短侧
+                // 对称）——写入端 encode_vector 恒产出 v.len()*4 字节，超长 4 对齐
+                // blob（如 (DIM+1)*4，大维度写时代遗留）与短侧同为维度漂移产物
+                // （chunks_exact 可解出 DIM+1 个有效 float）；`%4!=0`/`<=4` 分支
+                // 已捕获字节级损坏，此处归 corrupt 会把运维引向"存储损坏"而非
+                // "模型维度变更"。
+                if blob.len() > DIM * 4 && blob.len() % 4 == 0 {
+                    skipped_dim += 1;
+                    continue;
+                }
                 if blob.len() > DIM * 4 {
                     skipped_blob += 1;
                     continue;
@@ -562,7 +572,9 @@ fn rebuild_from_table(pool: &SqlitePool, hnsw: &HnswIndex, table: &str) -> Resul
             };
             return Err(format!("{label}: {cause}{detail}"));
         }
-        eprintln!("[persist] {label}: {cause}; returning 0 (historical behavior)");
+        // #R68 other/low：统一 [persist] WARN 前缀（skip 健康信号是 let-_ 调用方
+        // 的主要可观测性，ops grep [persist] WARN 必须能命中）。
+        eprintln!("[persist] WARN: {label}: {cause}; returning 0 (historical behavior)");
     }
     if entries.is_empty() {
         return Ok(0);

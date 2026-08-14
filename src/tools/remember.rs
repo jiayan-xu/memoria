@@ -227,9 +227,9 @@ fn persist_and_index(
 
 /// #R66：semantic_related 边的**幂等刷新**——is_none 守卫之外统一调用（已存在
 /// 向量的记忆也应重算邻接，删除旧出边 + 按当前 HNSW 邻域重算）；失败可见。
-/// #R67 bug/medium：**向量落库门控**——put/add 失败时该记忆无持久/索引向量，
-/// 建边会留 dangling edges（重启 rebuild 只从持久向量重建索引、不重算边，
-/// 反向邻接永不再现）；refresh 前重查 get_stored_vector，无向量则跳过。
+/// #R67/#R68 门控契约：**以持久向量存在为准**——put 失败（无持久向量）跳过建边
+/// （防 dangling edges）；put 成功但 add 失败（向量持久、内存索引缺失）仍建边
+/// （add 失败由下次启动 rebuild 对齐；此时边基于持久向量邻域，重启后一致）。
 fn edge_refresh(
     pool: &SqlitePool,
     hnsw: &HnswIndex,
