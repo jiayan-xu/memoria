@@ -853,7 +853,15 @@ pub fn migrate_hype_vectors(pool: &SqlitePool) -> Result<(), String> {
                                 [],
                                 |r| r.get(0),
                             )
-                            .unwrap_or(0);
+                            // #R69 bug/medium：**读失败传播而非掩蔽**——unwrap_or(0)
+                            // 会把瞬态读错误（并发首启 busy_timeout 后的 SQLITE_BUSY、
+                            // 坏池连接）误判为"列缺失"：此检查在硬失败决策路径上，
+                            // 误报产出误导性 `updated_at missing after retries` 并
+                            // 经 .expect() 中止启动——与同函数内事务中该读错误
+                            // 传播的原则矛盾。只有确认的 0 才算缺失。
+                            .map_err(|e| {
+                                format!("verify memory_vectors.updated_at after retries: {e}")
+                            })?;
                         if has_upd_after == 0 {
                             return Err(format!(
                                 "memory_vectors.updated_at missing after retries (core write path requires it): {msg}"
@@ -1035,8 +1043,11 @@ pub fn migrate_hype_vectors(pool: &SqlitePool) -> Result<(), String> {
             let tx = conn
                 .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
                 .map_err(|e| format!("begin trigger tx: {}", e))?;
-            tx.execute_batch("DROP TRIGGER IF EXISTS mem_ad_vec")
-                .map_err(|e| format!("drop mem_ad_vec trigger: {}", e))?;
+            // #R69 bug/high（R41 短路回归修复）：**DROP TRIGGER 移到短路判断之后**——
+            // 此前 DROP 在闭包开头无条件执行、fallback 短路（表仍缺 + fallback 已装）
+            // 在其后提交：DROP 已执行而 CREATE 被跳过 → mem_ad_vec 触发器永久消失
+            // （hype 表缺失期间），DELETE FROM memories 不再级联清理 memory_vectors，
+            // 孤儿行每启动 rebuild 重入 HNSW——正是迁移要防的无界泄漏。
             // #R63 bug/medium：**触发器 body 按 hype 表存在性分支**——SQLite 在
             // 触发时（而非 CREATE 时）解析 body 的表名：memory_hype_vectors 的 DDL
             // 是 ddl_soft（可能软降级缺表），无条件引用它会让之后**每次** DELETE
@@ -1060,6 +1071,10 @@ pub fn migrate_hype_vectors(pool: &SqlitePool) -> Result<(), String> {
                 commit_tx(tx, "commit trigger tx (fallback unchanged)")?;
                 return Ok(());
             }
+            // 到达此处必然重建（升级 full body 或首次安装 fallback）：先 DROP
+            // 旧 body（#R69 bug/high：DROP 不得早于短路判断——见上方注释）。
+            tx.execute_batch("DROP TRIGGER IF EXISTS mem_ad_vec")
+                .map_err(|e| format!("drop mem_ad_vec trigger: {}", e))?;
             // #R66：降级路径（版本已置位 + 表缺失）——hype_table_exists==0 时走
             // fallback body + fallback flag（下段分支已按表存在分流）。
             if hype_table_exists > 0 {
@@ -1269,7 +1284,6 @@ pub fn migrate_hype_vectors(pool: &SqlitePool) -> Result<(), String> {
             // FLAG 都不写），事务照常提交，下次启动重新评估。dry-run 语义 =
             // 审计预览，不固化任何"已处理"状态。
             let mut refused = false;
-            let mut dry_ran = false;
             // ── hype 段（HYPE_FLAG 未评估，或 force 覆盖）──
             // #R55 bug/medium：force 时**重新评估**——HYPE_FLAG 置位后（含 refused
             // 路径）`hype_done2 == 0` 恒假，hype 段对 force env 组合（FORCE+OPT_IN）
@@ -1349,8 +1363,7 @@ pub fn migrate_hype_vectors(pool: &SqlitePool) -> Result<(), String> {
                                 // 只注释不置位（hype 段拒绝由 HYPE_FLAG 记录），dry-run
                                 // 时 HYPE_FLAG 同样不置（见段尾 !dry_ran 门）。
                                 if dry_run {
-                                    dry_ran = true;
-                                }
+                                    }
                                 // #R57 bug/low：hype 段拒绝**不置 refused**——REFUSED_FLAG
                                 // 语义 = memory_vectors 段拒绝（见下）；hype 拒绝态由
                                 // HYPE_FLAG 记录（段完成=删除或拒绝）。混用会让 vec 段
@@ -1360,8 +1373,7 @@ pub fn migrate_hype_vectors(pool: &SqlitePool) -> Result<(), String> {
                                 "[Memoria] WARN: {orphans_hype} orphan memory_hype_vectors rows ABOVE safety threshold {ORPHAN_REFUSE_THRESHOLD}; cleanup refused (count too large to be safely attributable to staged/external writes; inspect with MEMORIA_ORPHAN_DRY_RUN=1)"
                             );
                                 if dry_run {
-                                    dry_ran = true;
-                                }
+                                    }
                             } else if !force_cleanup {
                                 // #R60 bug/high：**单 OPT_IN 只报告不删**——"无 memories 行
                                 // ⇒ 垃圾"非强制不变量（外部/暂存向量是合法态）；删除执行
@@ -1371,8 +1383,7 @@ pub fn migrate_hype_vectors(pool: &SqlitePool) -> Result<(), String> {
                                 "[Memoria] WARN: {orphans_hype} orphan memory_hype_vectors rows (no matching memories row; may be legit staged/external hype vectors); not deleting. MEMORIA_ORPHAN_DRY_RUN=1 lists every id without deleting."
                             );
                                 if dry_run {
-                                    dry_ran = true;
-                                }
+                                    }
                             } else {
                                 // #R57 bug/medium：**删除前打印完整清单**——opt-in 时 DELETE
                                 // 永久销毁所有无 memories 行的向量行，但 add_vectors/
@@ -1397,8 +1408,7 @@ pub fn migrate_hype_vectors(pool: &SqlitePool) -> Result<(), String> {
                                     eprintln!(
                                     "[Memoria] DRY-RUN: {orphans_hype} orphan memory_hype_vectors rows would be deleted (nothing deleted; rerun without MEMORIA_ORPHAN_DRY_RUN to execute):\n{audit}"
                                 );
-                                    dry_ran = true;
-                                } else {
+                                    } else {
                                     eprintln!(
                                     "[Memoria] Migration: deleting {orphans_hype} orphan memory_hype_vectors rows:\n{audit}"
                                 );
@@ -1418,7 +1428,13 @@ pub fn migrate_hype_vectors(pool: &SqlitePool) -> Result<(), String> {
                     // vec 段干净完成也被标记拒绝、下次启动 WARN 误导归因）。
                     // #R69 bug/high：**dry-run 时不置 HYPE_FLAG**——置位会让后续启动
                     // 跳过评估（dry-run 语义 = 审计后待决定，不应固化"已处理"状态）。
-                    if !dry_ran {
+                    // #R69 bug/medium：**dry_ran 门控不足**——表存在但空/无孤儿时
+                    // dry_ran 保持 false、此写入在事务内执行、尾部 `if dry_run` 提前
+                    // 返回把事务提交——审计运行仍固化 HYPE_FLAG（此后孤儿行出现时
+                    // hype 段永久跳过、无重复 WARN）；与表缺失分支的 !dry_run 守卫
+                    // 对称，统一 `!dry_run`（dry_ran 已删除——dry_run 单条件覆盖，
+                    // 见 R44 maint/low 死代码清理）。
+                    if !dry_run {
                         tx.execute(
                             "INSERT OR IGNORE INTO migration_flags (flag) VALUES (?1)",
                             rusqlite::params![HYPE_FLAG],
@@ -1475,9 +1491,7 @@ pub fn migrate_hype_vectors(pool: &SqlitePool) -> Result<(), String> {
                             );
                             // #R69 bug/high：dry-run 时**不置 refused**——审计预览
                             // 不固化"已拒绝"状态（否则后续启动跳过评估，运维无法
-                            // 反复审计）；dry_ran 使尾部跳过全部 flag 写入。
                             if dry_run {
-                                dry_ran = true;
                             } else {
                                 refused = true;
                             }
@@ -1486,7 +1500,6 @@ pub fn migrate_hype_vectors(pool: &SqlitePool) -> Result<(), String> {
                                 "[Memoria] WARN: {orphans_vec} orphan memory_vectors rows ABOVE safety threshold {ORPHAN_REFUSE_THRESHOLD}; cleanup refused (count too large to be safely attributable to external writes; inspect with MEMORIA_ORPHAN_DRY_RUN=1)"
                             );
                             if dry_run {
-                                dry_ran = true;
                             } else {
                                 refused = true;
                             }
@@ -1496,7 +1509,6 @@ pub fn migrate_hype_vectors(pool: &SqlitePool) -> Result<(), String> {
                                 "[Memoria] WARN: {orphans_vec} orphan memory_vectors rows (no matching memories row; may be legit external vectors via add_vectors); not deleting. MEMORIA_ORPHAN_DRY_RUN=1 lists every id without deleting."
                             );
                             if dry_run {
-                                dry_ran = true;
                             } else {
                                 refused = true;
                             }
@@ -1518,7 +1530,6 @@ pub fn migrate_hype_vectors(pool: &SqlitePool) -> Result<(), String> {
                                 eprintln!(
                                     "[Memoria] DRY-RUN: {orphans_vec} orphan memory_vectors rows would be deleted (nothing deleted; rerun without MEMORIA_ORPHAN_DRY_RUN to execute):\n{audit}"
                                 );
-                                dry_ran = true;
                             } else {
                                 eprintln!(
                                     "[Memoria] Migration: deleting {orphans_vec} orphan memory_vectors rows:\n{audit}"
@@ -1544,12 +1555,9 @@ pub fn migrate_hype_vectors(pool: &SqlitePool) -> Result<(), String> {
                 commit_tx(tx, "commit cleanup tx (dry-run)")?;
                 return Ok(());
             }
-            if dry_ran {
-                // #R69 maintainability/low：非 dry-run 时 dry_ran 不应为 true
-                // （dry_ran 只在 dry_run 分支置位）；防御性保留（drop guard 语义）。
-                commit_tx(tx, "commit cleanup tx (noop)")?;
-                return Ok(());
-            }
+            // #R69 maintainability/low：**删除 dry_ran 死代码**——dry_ran 只在
+            // dry_run 分支置位，而上方 `if dry_run` 无条件提前返回先于此处，
+            // 此分支不可达（R44 指出：保留为"防御性"会模糊 flag 写入纪律）。
             // 置位标记（事务内，提交后对并发进程可见）：正常完成（含"无孤儿"）→
             // CLEANUP_FLAG；阈值/opt-in 拒绝（refused）→ REFUSED_FLAG——持久化拒绝态
             // 使后续启动跳过 memory_vectors 段评估（不再持写锁重扫相关扫描，
