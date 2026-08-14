@@ -27,6 +27,13 @@ struct MemMeta {
 /// legacy_occurred 三处逐字节复制粘贴，格式演进需改四处——含 text_signals::
 /// is_iso_date_at——静默漂移；抽单点防 writer/reader 规则再次分歧）。
 fn is_iso_date_prefix(b: &[u8]) -> bool {
+    // #R69 bug/medium：**长度守卫**——短于 10 字节的切片返回 false 而非
+    // 索引越界 panic。当前三处调用点都传 get(..10) 保证的 10 字节切片
+    // （不可达），但本 helper 是共享单点校验器，未来调用方传短输入
+    // （如 b"2024"）应优雅拒绝而非崩溃，与调用点 get(..10) 的语义一致。
+    if b.len() < 10 {
+        return false;
+    }
     b[0..4].iter().all(|c| c.is_ascii_digit())
         && b[4] == b'-'
         && b[5].is_ascii_digit()

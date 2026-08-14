@@ -1049,6 +1049,17 @@ pub fn migrate_hype_vectors(pool: &SqlitePool) -> Result<(), String> {
                     |r| r.get(0),
                 )
                 .map_err(|e| format!("check memory_hype_vectors existence: {}", e))?;
+            // #R69 performance/low：**fallback 持久态短路**——表仍缺失 + fallback
+            // body 已装（trig_fallback_done）时，content-only body 已是当前版本且
+            // 未变：重建 DROP+CREATE 是纯浪费的写锁 DDL 序列化（每启动一次，直到
+            // 表恢复），正是版本 flag 设计（#R46）要避免的。此时跳过 DROP+CREATE
+            // 与 flag 写入直接提交（幂等）；表一旦恢复，`trig_fallback_done` 使
+            // gate 仍进入（`trig_fallback_done` 恒 true），hype_table_exists > 0
+            // 分支照常升级 full body——自愈路径不受影响。
+            if hype_table_exists == 0 && trig_fallback_done {
+                commit_tx(tx, "commit trigger tx (fallback unchanged)")?;
+                return Ok(());
+            }
             // #R66：降级路径（版本已置位 + 表缺失）——hype_table_exists==0 时走
             // fallback body + fallback flag（下段分支已按表存在分流）。
             if hype_table_exists > 0 {
@@ -1180,7 +1191,14 @@ pub fn migrate_hype_vectors(pool: &SqlitePool) -> Result<(), String> {
     // 逻辑：`(!already && !refused_done) || !hype_done`——refused_done 只压掉
     // `!already`（vec 段拒绝态），hype 未完成仍进。
     let refused_done = flag_set(&conn, REFUSED_FLAG);
-    if (!already && !refused_done) || !hype_done || (force_cleanup && clean_vectors) {
+    // #R69 bug/medium：**dry-run 必须绕过 gate**——WARN 文案指引运维
+    // "restart with MEMORIA_ORPHAN_DRY_RUN=1 to list every id"，但默认（无 env）
+    // refuse 运行已置位 HYPE_FLAG + REFUSED_FLAG：此后 `(!already && !refused_
+    // done) || !hype_done` 恒 false，清理块整体跳过、审计输出为零——逃生通道
+    // 只在任何 refuse 评估持久化前有效，照文案操作反而拿不到清单。`|| dry_run`
+    // 使审计总是可请求；dry-run 分支自身不写任何 flag（见 cleanup 闭包内
+    // dry_ran 处理），下次启动状态不变。
+    if (!already && !refused_done) || !hype_done || (force_cleanup && clean_vectors) || dry_run {
         // 清理**软降级**（#R48 bug/medium）：BEGIN IMMEDIATE 阻塞超 busy_timeout（并发
         // 首启大库 DELETE 可超 5s）、或清理中任何 DB 错误，**不阻断启动**——main.rs/
         // mcp_server.rs 用 .expect()，硬失败会让并发首启部署直接 panic 中止。失败仅
@@ -1259,7 +1277,10 @@ pub fn migrate_hype_vectors(pool: &SqlitePool) -> Result<(), String> {
                     |r| r.get(0),
                 )
                 .map_err(|e| format!("check hype flag (tx): {}", e))?;
-            if hype_done2 == 0 || (force_cleanup && clean_vectors) {
+            // #R69 bug/medium：**dry-run 强制重新评估**——refuse 运行已置 HYPE_FLAG，
+            // 不带 `|| dry_run` 时审计请求被 flag 短路（与 gate 处 #R69 同款问题）；
+            // dry-run 分支自身不写 flag（段尾 !dry_ran 门），下次启动状态不变。
+            if hype_done2 == 0 || (force_cleanup && clean_vectors) || dry_run {
                 // #R65 bug/medium：**表存在检查先行**——hype 表 DDL 是 ddl_soft（可
                 // 软降级缺表），直接 query 会 no such table 中止整个清理事务
                 // （vec 段被连带，与触发器段的缺表保护一致）。
@@ -1405,7 +1426,11 @@ pub fn migrate_hype_vectors(pool: &SqlitePool) -> Result<(), String> {
             // MEMORIA_FORCE_ORPHAN_CLEANUP=1 约束）。
             // #R51 maintainability/medium：此前 refused（refused2）→ 本段跳过——
             // 非 force 时保持拒绝态（不再重扫评估）；force 时重新评估。
-            if refused2 > 0 && !(force_cleanup && clean_vectors) {
+            // #R69 bug/medium：**dry-run 绕过 refused 短路**——refuse 运行已置
+            // REFUSED_FLAG，不带 `&& !dry_run` 时审计请求只看到 "previously
+            // refused; skipping" 而无清单（与 gate 处 #R69 同款问题）；dry-run
+            // 强制重扫评估、打印完整清单（其分支不写 refused/CLEANUP flag）。
+            if refused2 > 0 && !(force_cleanup && clean_vectors) && !dry_run {
                 // #R51：WARN 文案明确**两个 env 都要**（此前只提示 FORCE，而 gate
                 // 还要求 OPT_IN——误导运维）。
                 eprintln!(

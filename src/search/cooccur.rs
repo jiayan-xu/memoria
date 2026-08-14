@@ -22,10 +22,12 @@ pub fn rerank_by_cooccurrence(
     query: &str,
     results: &mut Vec<FusedResult>,
 ) {
-    if results.len() < 2 && query.trim().is_empty() {
-        return;
-    }
-    if results.is_empty() {
+    // #R69 maintainability/medium：**单结果一律早退**——此前 `len < 2 && query 非空`
+    // 才短路：单结果 + 匹配查询会跑全管线（2 次 DB 查询 + boost 计算 + marker）。
+    // 单结果无法重排，且 boost 经 two_stage_rerank 归一化（rrf_score/rrf_max，
+    // rrf_n=1.0）后不可观测；唯一真实副作用是 `;cooccur` marker 追加进 source
+    // 并序列化进 API 响应——纯浪费的管线执行。empty 也被 len < 2 覆盖。
+    if results.len() < 2 {
         return;
     }
 
@@ -342,18 +344,21 @@ mod unit_tests {
         let mk_f = || mk_result("m_f", "己记忆");
         let mut results: Vec<FusedResult> = vec![mk_f()];
         rerank_by_cooccurrence(&pool, "agent/test", "李四", &mut results);
-        // 单结果 + 匹配查询 → query-hit boost 生效（guard 未把单结果短路）。
+        // 单结果 + 匹配查询 → guard 一律早退（#R69 maintainability/medium：
+        // 单结果无法重排、boost 归一化后不可观测，全管线执行 + marker 纯浪费）。
+        // 历史实现（单结果跑 query-hit boost + marker）已由 #R69 简化移除。
         let f = &results[0];
-        assert!(
-            f.rrf_score > INIT_SCORE && f.source.contains("cooccur"),
-            "single-result query-hit boost missing: {:?}",
+        assert_eq!(
+            f.rrf_score, INIT_SCORE,
+            "single result must short-circuit (no query-hit boost): {:?}",
             (&f.memory_id, f.rrf_score, &f.source)
         );
+        assert!(
+            !f.source.contains("cooccur"),
+            "single result must not append cooccur marker"
+        );
         // 空查询 + 单结果下任何路径都无法 boost（match_query_entities 空 + 单记忆
-        // peer_overlap 恒 0）——断言只文档化 no-boost 契约。注意：单结果 + 非空
-        // 查询的当前行为（全管线执行 + boost + marker）是历史实现，单结果无法
-        // 重排、boost 经 two_stage 归一化后不可观测——若未来 guard 修正为
-        // len<2 一律早退，上方单结果+匹配查询的断言需同步调整。
+        // peer_overlap 恒 0）——断言只文档化 no-boost 契约（与早退行为一致）。
         let mut empty_q: Vec<FusedResult> = vec![mk_f()];
         rerank_by_cooccurrence(&pool, "agent/test", "  ", &mut empty_q);
         let f0 = &empty_q[0];

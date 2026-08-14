@@ -37,6 +37,10 @@ Memoria 本地嵌入服务（语义检索后端）
         return: {"embeddings": [[...]], "dim": <EMBED_DIM 默认 1024>, "model": "..."}
     GET  /health
         return: {"status": "ok", "model": "...", "dim": <EMBED_DIM 默认 1024>}
+    #R69 documentation/low：**dim 字段的 provider 语义**——siliconflow 后端按
+    EMBED_DIM（默认 1024）输出；local 后端返回模型原生维度（/embed 用
+    len(embeddings[0])、/health 用 _model_dim()，默认 text2vec-base-chinese 为
+    768，_embed_local 完全忽略 EMBED_DIM，见上）。
 """
 
 import os
