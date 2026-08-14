@@ -4,8 +4,12 @@
 //!   P2.1c: hybrid 检索数字/日期 query 与正文重叠加成（O5，无 cross-encoder）
 //!   P2.2c 已做: tags 持久化 signal:*（remember 写入 + ledger 读时合并）
 //!   P2.2d 已做: agent-core consolidate LLM 抽取 signal tags
-//!
-//! 运行：`cargo test --test p2_hms_text_signals`
+//! 运行：`cargo test --test p2_hms_text_signals -- --test-threads=1`
+//! （#R69 bug/medium：**单线程是 soundness 前置条件**——本文件含 unsafe
+//! set_var/remove_var，edition 2024 契约要求调用期间无任何线程访问进程环境；
+//! ENV_LOCK 只串行化本二进制内协作访问，无法排除 libtest/panic handler 的
+//! 并发 env 读。CI 已强制（ci.yml `cargo test -- --test-threads=1`），本地
+//! 运行也必须带该 flag——默认并行下操作在名义上不 sound。）
 
 use memoria_core::MemoriaEngine;
 use memoria_core::search::hybrid::hybrid_search;
@@ -128,6 +132,12 @@ impl EnvRestore<'_> {
     /// guard / 快照了别的变量"的误用（此前不变量只在 doc 注释里）。
     fn pin_rerank<'a>(guard: &'a EnvWriteGuard<'a>, value: &str) -> EnvRestore<'a> {
         let prev = std::env::var_os("MEMORIA_TEXT_SIGNALS_RERANK");
+        // #R69 maintainability/low：**值已相等时提前返回**——env 已是目标值
+        // （search_boosts 默认开启时 pin "1"、env_off 预设 "0" 时 pin "0"）
+        // 时跳过 set_var：窄化 unsafe 窗口、消除无意义的写+恢复周期。
+        if prev.as_deref() == Some(std::ffi::OsStr::new(value)) {
+            return EnvRestore(prev, guard);
+        }
         // SAFETY: guard 是 ENV_LOCK.write() 的 newtype 包装（唯一构造点，类型
         // 强制）——本二进制内所有协作 env 变异经 ENV_LOCK 串行。
         // #R69 bug/medium（残余风险如实标注）：进程环境是单一全局资源（glibc
