@@ -10,6 +10,17 @@ name: ocr-review
 # 模型：deepseek-v4-flash（轻量快，实测可扛 ~174k token 大 diff 不超时）
 #   —— 优于火山方舟 ark-code-latest（大 diff 稳定 context deadline exceeded）
 # 默认门禁：发现评论即 fail CI（见 scripts/ocr-review.sh 的 --gate）
+#
+# 2026-08-14 门禁阈值调整（R42 后，42 轮审查循环复盘）：
+# - **拦截条件**：仅 bug·critical / bug·high（数据安全、编译失败、核心路径破坏）
+# - **仅报告**：bug·medium 及以下 + performance/maintainability/documentation/
+#   style/other 全级别——近 10 轮已无 bug·critical/high，剩余评论集中在注释
+#   措辞/docstring 一致性/风格，继续追逐每轮消耗 ~6M token + 25 分钟 CI
+#   且产出递减（R34-R41 评论数 13-19 波动不收敛，R40 出现 critical 误报）。
+# 停止标准（满足其一即可人工 approve 合并，不再逐条追改）：
+#   a. OCR 连续 2 轮零 bug·critical/bug·high 且 build 三平台全绿；或
+#   b. 剩余评论全部为 documentation/style/other·low（纯文字性）。
+# 出现 bug·critical/high 时回到逐条修复流程。
 
 on:
   pull_request:
@@ -71,11 +82,23 @@ jobs:
           FINDINGS=$(echo "$OUT" | grep -oE '[0-9]+ finding\(s\)' | grep -oE '[0-9]+' | head -1)
           FINDINGS="${FINDINGS:-0}"
           echo "评论数 = $FINDINGS"
+          # 2026-08-14：按严重度分级统计（输出格式 [category · severity]）——
+          # 门禁只看 bug·critical / bug·high（数据安全/编译/核心路径），其余仅报告。
+          CRIT=$(echo "$OUT" | grep -cE '\[bug · critical\]' || true)
+          HIGH=$(echo "$OUT" | grep -cE '\[bug · high\]' || true)
+          MED=$(echo "$OUT" | grep -cE '\[bug · medium\]' || true)
+          BLOCKERS=$((CRIT + HIGH))
+          echo "分级: bug·critical=$CRIT, bug·high=$HIGH, bug·medium=$MED, 其他（low/perf/maint/doc/style）=$((FINDINGS - BLOCKERS - MED))"
           # 2026-08-06 决策：门禁仅对 PR 生效；直推 main 仅审查报告不拦截
           # （此前直推 main 任何 AI 评论即 exit 1，导致 CI 恒红、门禁形同虚设）
-          if [ "${{ github.event_name }}" = "pull_request" ] && [ "$FINDINGS" -gt 0 ]; then
-            echo "::error::OpenCodeReview 发现 $FINDINGS 条评论，门禁拦截合并"
+          # 2026-08-14 升级：拦截阈值收敛为 bug·critical/high（停止标准见顶部注释）
+          if [ "${{ github.event_name }}" = "pull_request" ] && [ "$BLOCKERS" -gt 0 ]; then
+            echo "::error::OpenCodeReview 发现 $BLOCKERS 条 critical/high 级 bug（critical=$CRIT, high=$HIGH），门禁拦截合并"
             exit 1
+          fi
+          if [ "$BLOCKERS" -eq 0 ]; then
+            echo "[ocr] 无 critical/high 级发现（评论 $FINDINGS 条均为 medium 及以下，仅报告不拦截）"
+            echo "[ocr] 停止标准提示：连续 2 轮无 critical/high 且 build 全绿 → 可人工 approve 合并"
           fi
           echo "[ocr] 审查完成（评论 $FINDINGS 条，push 模式仅报告）"
 
