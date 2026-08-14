@@ -565,8 +565,14 @@ fn fetch_memories_batch(
                     // （含 mostly stale + 单行异常）都会被误判为系统性列漂移。
                     // 要求"无 stale 掺水"（所有请求 id 都返回了行且全部失败）必须
                     // 比较请求数；含 stale 的混合批不升级——漏判但安全（#R48 承认）。
+                    // #R69 bug/medium：**单样本不判系统性**——chunk.len()==1 时
+                    // （合并候选集仅 1 条 id，或末批 ids.len()%500==1）单行损坏/
+                    // 不可映射与全 schema 漂移不可区分，但 row_errors==chunk.len()
+                    // 恒真 → 升级硬失败、整个 semantic 通道返回 Err(Fetch)，hybrid
+                    // 对每次查询丢弃全部语义信号（该行在候选集期间反复触发）。
+                    // 样本量≥2 才有"系统性"的证据意义；单行失败按普通行丢弃处理。
                     if got == 0 && row_errors > 0 {
-                        if row_errors == chunk.len() {
+                        if row_errors == chunk.len() && chunk.len() > 1 {
                             if first_hard_err.is_none() {
                                 // 行映射错误的文本在 Err(e) 分支可见——用行级 e 的
                                 // 内容不直接可得（循环外），记录类别级说明。
