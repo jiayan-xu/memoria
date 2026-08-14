@@ -2098,13 +2098,29 @@ fn dispatch(
             // 同一表的第四处独立查询点（lib.rs query_hype_count_cached 双字段 +
             // 本处），表 rename/迁移时本处静默翻 -1 而 lib.rs 仍工作；收敛到
             // storage::MEMORY_HYPE_VECTORS_TABLE 单一事实源。
-            let hype_store: i64 = conn
-                .query_row(
-                    &format!("SELECT COUNT(*) FROM {}", crate::storage::MEMORY_HYPE_VECTORS_TABLE),
-                    [],
-                    |r| r.get(0),
-                )
-                .unwrap_or(-1);
+            // #R69 bug/medium：**缺表与故障分开 sentinel**——#R67 注释契约
+            // "-1=查询失败；0=表存在但空/表缺失"但实现不符：SQLite 对缺失表的
+            // COUNT 返回错误（非 0 行），`.unwrap_or(-1)` 把"缺表"（DDL 软降级的
+            // legacy 库真实态，sqlite.rs 显式处理）与"真查询故障"折叠为同一 -1
+            // ——db_stats 的降级检测启发（store>0 && live==0 揭示软降级）在缺表
+            // 库上误报"查询失败"。缺表返回 0（与空表同义，#R67 注释原意），
+            // 仅真查询错误返回 -1。缺表错误是 SQLITE_ERROR(1) + "no such table"
+            // 消息（rusqlite 未映射为 CannotOpen，须按消息判别）。
+            let hype_store: i64 = match conn.query_row(
+                &format!("SELECT COUNT(*) FROM {}", crate::storage::MEMORY_HYPE_VECTORS_TABLE),
+                [],
+                |r| r.get(0),
+            ) {
+                Ok(c) => c,
+                Err(rusqlite::Error::SqliteFailure(_, msg))
+                    if msg
+                        .as_deref()
+                        .is_some_and(|m| m.contains("no such table")) =>
+                {
+                    0
+                }
+                Err(_) => -1,
+            };
             m.insert(
                 "hype_hnsw_store".to_string(),
                 serde_json::Value::Number(hype_store.into()),
