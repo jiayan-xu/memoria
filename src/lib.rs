@@ -140,7 +140,6 @@ impl MemoriaEngine {
         let ef_search = self.hnsw.ef_search();
         vector::persist::build_hype_hnsw(&self.pool, ef_search)
     }
-
     pub fn swap_hype_index(&mut self, fresh: HnswIndex, count: usize) {
         // #R63 maintainability/low：**API 边界校验**——count 与 fresh.len() 不匹配的
         // 发布会让 db_stats 的降级检测启发（store>0 && live==0）被歪曲；调用方
@@ -161,14 +160,29 @@ impl MemoriaEngine {
     }
 
     pub fn refresh_hype_index(&mut self) -> Result<usize, String> {
-        let (fresh, count) = match self.build_hype_index_fresh() {
+        // #R69 bug/medium：**部分重建不替换健康快照**——build_hype_hnsw 的 Err
+        // 只覆盖全损；单行读取错误（NULL/类型漂移 blob）被计数 + WARN 吸收为
+        // Ok(partial)。refresh 若用降级索引 swap 掉健康快照，双路语义检索静默
+        // 退化为单路且无错误上报。detailed 版暴露 read_errors：>0 时保留旧
+        // 快照并 Err（显式告知部分重建，调用方可决定重试/人工处理）。
+        let (fresh, count, read_errors) = match vector::persist::build_hype_hnsw_detailed(
+            &self.pool,
+            self.hnsw.ef_search(),
+        ) {
             Ok(x) => x,
             Err(e) => {
                 eprintln!("[Memoria] HYPE HNSW refresh failed, keeping existing index: {e}");
                 return Err(e);
             }
         };
-        // 仅构建成功才替换；失败保留旧快照，检索不中断。
+        if read_errors > 0 {
+            let msg = format!(
+                "HYPE HNSW refresh: {read_errors} row(s) failed read/iteration (partial rebuild); keeping existing index"
+            );
+            eprintln!("[Memoria] WARN: {msg}");
+            return Err(msg);
+        }
+        // 仅构建成功（且无部分重建）才替换；失败保留旧快照，检索不中断。
         // #R65 bug/medium：pending 槽的失效由 PyEngine::refresh_hype_index 处理
         // （字段属 PyEngine——两阶段 build/swap 与一步 refresh 不得混用，见其 doc）。
         // #R66 bug/low：返回**实际应用长度**（swap 内部对 count 不匹配做了修正——
@@ -588,6 +602,23 @@ mod python {
         // 包括 hybrid_search），构建完成后 `swap_hype_index` 的 &mut self 窗口只剩
         // O(1) 赋值（微秒级，PyBorrowError 窗口可忽略）。多线程宿主推荐此组合。
         fn refresh_hype_index(&mut self, py: Python<'_>) -> PyResult<usize> {
+            // #R69 bug/medium：**pending 存在时 fail-fast**——PyO3 只挡并发混用
+            // （borrow 错误），挡不住顺序序列 build→refresh→swap：refresh 无条件
+            // 清槽会静默丢弃刚构建的 HnswIndex（秒级重建白费），后续 swap(token)
+            // 报误导性 "no pending hype index; call build_hype_index first"——
+            // 正是两阶段 API 要防的失败模式，但工作已丢失。先检查 pending：有
+            // 则返回显式 Err 并保留槽位（调用方仍可 swap 落地上一个良好索引）。
+            {
+                let slot = self
+                    .pending_hype
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner());
+                if slot.is_some() {
+                    return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                        "pending two-phase build exists; call swap_hype_index first (refresh would discard the pending index)",
+                    ));
+                }
+            }
             let r: Result<usize, String> = py.detach(|| self.inner.refresh_hype_index());
             // #R65 bug/medium：**清 pending + 失效旧 token**——两阶段流程若先
             // build_hype_index()（pending 槽带 token N）后调 refresh，陈旧 pending
@@ -595,6 +626,8 @@ mod python {
             // #R67 bug/medium：**仅成功时清**——refresh 失败（瞬时 DB busy）时
             // 保留 pending 槽与已发 token：调用方仍可 swap(N) 落地上一个
             // 已知良好的索引（此前无条件清槽把有效快照连同逃生通道一起丢弃）。
+            // （#R69：上方 pending 前置检查使此处清槽只命中"无 pending"路径——
+            // 单槽语义下 refresh 与 build 不再能互踩。）
             if r.is_ok() {
                 *self
                     .pending_hype
