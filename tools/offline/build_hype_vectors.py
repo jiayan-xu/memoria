@@ -272,17 +272,24 @@ def main():
         sys.exit(1)
 
     # ── 目标记忆列表 ──
+    # #R69 bug/medium：**DB 存在性检查无条件前置**（preflight 之前）——此前仅
+    # `--all` 路径检查：golden（默认）模式配错 --db/MEMORIA_DB_PATH 时 preflight
+    # 的 embed 探针 + chat 探针（各一次付费调用）先执行、之后 DDL 块才暴露库
+    # 不存在——违反脚本自身的 fail-fast-before-spending 纪律（#R42/#R58）。
+    # 所有模式最终都要写库（golden 写入 memory_hype_vectors），检查独立于
+    # --all；dry-run 不写库故跳过（#R37：dry-run 只展示问句生成）。
+    if not args.dry_run:
+        if not os.path.exists(args.db):
+            print(f"错误: 数据库不存在 {args.db}（请检查 MEMORIA_DB_PATH / --db）")
+            sys.exit(1)
     # #R37 bug/low：--all 的 DB 访问也须在 dry-run 守卫后——否则 --all --dry-run 仍会
     # connect（创建不存在的 DB 文件）并 SELECT（无 memories 表时裸抛
     # OperationalError，dry-run 带副作用崩溃）。dry-run 一律用 golden 目标
     # （只需展示问句生成，不需要全库枚举）。
-    # #R42 bug/low：--all 非 dry-run 的 connect 前先做**存在性检查**——DB 缺失/路径
-    # 错误时 connect 会静默创建空文件，随后 SELECT memories 裸抛 traceback 且留下
-    # 副作用空库。明确诊断先行。
+    # #R42 bug/low：--all 非 dry-run 的 connect 前先做**存在性检查**（已上移到
+    # 无条件前置，#R69）——DB 缺失/路径错误时 connect 会静默创建空文件，随后
+    # SELECT memories 裸抛 traceback 且留下副作用空库。明确诊断先行。
     if args.all and not args.dry_run:
-        if not os.path.exists(args.db):
-            print(f"错误: 数据库不存在 {args.db}（请检查 MEMORIA_DB_PATH / --db）")
-            sys.exit(1)
         con = sqlite3.connect(args.db)
         try:
             # #R43 bug/low：补充 valid_to 过期过滤——过期记忆（valid_to < now）经
@@ -298,7 +305,12 @@ def main():
                 "SELECT id, content FROM memories WHERE namespace='agent/xujiayan' "
                 "AND superseded_by IS NULL "
                 "AND (valid_to IS NULL OR valid_to='' OR valid_to > strftime('%Y-%m-%dT%H:%M:%S','now')) "
-                "AND length(content) BETWEEN 10 AND 500"
+                "AND length(content) BETWEEN 10 AND 500 "
+                # #R69 bug/medium：**稳定行序**——SQLite 无 ORDER BY 时不保证行序
+                # （DELETE/VACUUM 后可能变化）：`--all --limit N` 的"前 N 条"跨运行
+                # 漂移，调试前后对比不可靠且可能对意外行付费；与 #R66/#R67 保持的
+                # 确定性纪律一致（sibling rebuild_vectors.py 显式 ORDER BY RANDOM()）。
+                "ORDER BY id"
             ).fetchall()
         except sqlite3.Error as e:
             con.close()

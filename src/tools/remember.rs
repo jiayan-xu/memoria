@@ -238,14 +238,25 @@ fn edge_refresh(
     ns: &str,
     qv: &[f32],
 ) {
-    // #R69 performance/low：轻量存在性探测（SELECT 1，不解码全向量）——此前
-    // get_stored_vector 拉 BLOB + 解码成 DIM 长 Vec<f32> 只为判存在；此路径在
-    // near_dup_enabled 且存在候选向量时每 remember_with_dedup 都执行。
-    if !crate::vector::persist::stored_vector_exists(pool, id) {
-        eprintln!(
-            "[remember] edge_refresh skipped for {id}: no persisted vector (put/add failed earlier)"
-        );
-        return;
+    // #R69 performance/low：轻量存在性探测（SELECT 1 + length，不解码全向量）
+    // ——此前 get_stored_vector 拉 BLOB + 解码成 DIM 长 Vec<f32> 只为判存在；
+    // 此路径在 near_dup_enabled 且存在候选向量时每 remember_with_dedup 都执行。
+    // #R69 bug/medium：**Result 三态**——Ok(false)（无行/损坏行）跳过建边并
+    // 指明原因；Err（pool/DB 瞬态故障，内部已节流 WARN）同样跳过建边但**不
+    // 误诊为"put/add 失败"**——错误消息区分，运维可归因（此前 bool 折叠后
+    // 一律打印 "no persisted vector (put/add failed earlier)"，静默丢边）。
+    match crate::vector::persist::stored_vector_exists(pool, id) {
+        Ok(true) => {}
+        Ok(false) => {
+            eprintln!(
+                "[remember] edge_refresh skipped for {id}: no persisted vector (put/add failed earlier or corrupt row)"
+            );
+            return;
+        }
+        Err(e) => {
+            eprintln!("[remember] edge_refresh skipped for {id}: existence probe unavailable ({e}); edges may lag until next remember");
+            return;
+        }
     }
     if let Err(e) = crate::search::semantic_edges::upsert_semantic_edges_for(pool, hnsw, id, ns, qv)
     {
@@ -352,15 +363,25 @@ pub fn remember_with_dedup(
                     // 谓词：corrupt/partial 行（长度≠DIM）在 get_stored_vector 下
                     // 返回 None（触发重新 persist），在 stored_vector_exists 下
                     // 返回 true（跳过）——同一"持久向量是否存在"的决策随探测点
-                    // 分歧。统一为 stored_vector_exists：corrupt 行不再由写路径
-                    // 覆盖修复，改由 HNSW rebuild 读侧跳过（persist.rs 的
-                    // skipped_dim 防御，见 #R52），功能一致且热路径单次轻量探测。
-                    if !crate::vector::persist::stored_vector_exists(pool, &mem_id) {
-                        // #R63 maintainability/medium：**与 updated 路径同款失败
-                        // 处理**——put 失败短路 add（瞬态 BUSY 留 memory-only 向量、
+                    // 分歧。统一为 stored_vector_exists（#R69 bug/medium：DIM 感知
+                    // 后 corrupt 行返回 Ok(false)，写路径重新 persist 治愈——恢复
+                    // R41 谓词统一时丢失的自愈行为；损坏行对 HNSW rebuild 的
+                    // skipped_dim 防御永久跳过、却仍被 edge_refresh 建边 → 图与
+                    // 索引分歧，正是旧 get_stored_vector 语义已消除的问题）。
+                    // Err（DB 瞬态故障）跳过 persist——故障期不做写操作，下次
+                    // remember 重试；错误已由探测内部节流 WARN 可见。
+                    match crate::vector::persist::stored_vector_exists(pool, &mem_id) {
+                        Ok(false) => {
+                            // #R63 maintainability/medium：**与 updated 路径同款失败
+                            // 处理**——put 失败短路 add（瞬态 BUSY 留 memory-only 向量、
                         // 重启后消失）；失败可见（低频异常直接 eprintln）。
                         // #R65：共享 helper（put 失败短路 add）。
                         persist_and_index(pool, hnsw_idx, &mem_id, namespace, qv);
+                        }
+                        // Ok(true)：已存在有效向量，无需重复 persist。
+                        // Err：DB 瞬态故障——跳过 persist（故障期不做写操作，
+                        // 下次 remember 重试；探测内部已节流 WARN）。
+                        Ok(true) | Err(_) => {}
                     }
                     // #R66 bug/medium：edge 刷新在 is_none 守卫**之外**——已存在
                     // 向量的记忆也需重算邻接（幂等维护）；移入 helper 且只在
@@ -394,10 +415,15 @@ pub fn remember_with_dedup(
             if let (Some(hnsw_idx), Some(qv)) = (hnsw, &candidate_vector) {
                 // #R69 performance/medium：统一轻量存在探测（同 superseded 路，
                 // 见上——单一谓词 + 热路径免全量解码）。
-                if !crate::vector::persist::stored_vector_exists(pool, &mem_id) {
-                    // #R61 maintainability/medium：**失败可见**（put 失败短路 add，
-                    // 见 persist_and_index doc）；#R65：共享 helper。
-                    persist_and_index(pool, hnsw_idx, &mem_id, namespace, qv);
+                match crate::vector::persist::stored_vector_exists(pool, &mem_id) {
+                    Ok(false) => {
+                        // #R61 maintainability/medium：**失败可见**（put 失败短路 add，
+                        // 见 persist_and_index doc）；#R65：共享 helper。
+                        // Ok(false) 含 corrupt/partial 行（DIM 感知）——写路径
+                        // 重新 persist 治愈（#R69 bug/medium，同 superseded 路）。
+                        persist_and_index(pool, hnsw_idx, &mem_id, namespace, qv);
+                    }
+                    Ok(true) | Err(_) => {}
                 }
                 // #R66：edge 刷新在 is_none 之外（幂等维护，同 superseded 路）。
                 edge_refresh(pool, hnsw_idx, &mem_id, namespace, qv);

@@ -6,7 +6,7 @@
 //! - 启动时从本表重建 HNSW，使近义去重在重启后依然可靠（不再依赖进程内 QueryCache 与 .bin 快取）。
 
 use crate::storage::SqlitePool;
-use crate::vector::{DIM, HnswIndex, VectorEntry};
+use crate::vector::{HnswIndex, VectorEntry, DIM};
 
 /// 将 `Vec<f32>` 编码为 little-endian BLOB。
 pub fn encode_vector(v: &[f32]) -> Vec<u8> {
@@ -35,18 +35,30 @@ pub fn get_stored_vector(pool: &SqlitePool, id: &str) -> Option<Vec<f32>> {
         )
         .ok()?;
     let v = decode_vector(&blob);
-    if v.len() == DIM { Some(v) } else { None }
+    if v.len() == DIM {
+        Some(v)
+    } else {
+        None
+    }
 }
 
 /// 轻量存在性探测（#R69 performance/low）：只查一行、不解码 BLOB——edge_refresh
 /// 每 remember_with_dedup 调用一次（近义去重开启且有候选向量时），此前
 /// get_stored_vector 为判存在而拉全向量 + 解码成 DIM 长 Vec<f32>，多一次 DB
-/// 往返 + 一次完整解码；SELECT 1 只取标量（query_row 单行单列，无 BLOB 传输）。
-/// #R69 bug/low：**错误可见性**——pool/DB 故障与"无行"区分：错误走节流 WARN
-/// （warn_throttled，3600s 窗口，与写路径同款纪律）而非静默折叠为 false——
-/// 否则调用方（edge_refresh）会把瞬态 DB 中断误诊为"写入失败"而跳过建边
-/// （静默丢 semantic_related 边），正是其余路径都要消除的无声失败。
-pub fn stored_vector_exists(pool: &SqlitePool, id: &str) -> bool {
+/// 往返 + 一次完整解码；SELECT 1 + length(vector) 只取标量（SQLite 对 BLOB 的
+/// length() 读头部元数据，O(1)，无内容传输）。
+/// #R69 bug/medium（R41 谓词统一回归修复）：**DIM 感知**——`AND length(vector)
+/// = DIM*4` 使 corrupt/partial 行（blob 长度≠DIM）返回 Ok(false) 而非 true：
+/// 此前 R41 把守卫从 get_stored_vector 切到本函数时丢失了"损坏行被写路径
+/// 治愈"的行为（旧谓词解码后 None → 触发 re-persist）；损坏行对 exists 为
+/// true → persist 跳过、HNSW rebuild 的 skipped_dim 防御永久跳过它、edge_
+/// refresh 却仍建边——图与向量索引分歧。恢复：损坏行视为"不存在"，守卫
+/// 重新 persist 治愈（upsert 覆盖），edge_refresh 不建边，语义与旧
+/// get_stored_vector 完全一致且保持轻量。
+/// #R69 bug/medium（R41 三态诉求）：**Result 返回**——pool/DB 故障返回 Err
+/// （含内部节流 WARN，3600s 窗口），调用方区分"无行/损坏"（Ok(false)）与
+/// "无法检查"（Err），不再把瞬态 DB 中断误诊为"写入失败"。
+pub fn stored_vector_exists(pool: &SqlitePool, id: &str) -> Result<bool, String> {
     let conn = match pool.get() {
         Ok(c) => c,
         Err(e) => {
@@ -55,23 +67,23 @@ pub fn stored_vector_exists(pool: &SqlitePool, id: &str) -> bool {
                 "pool",
                 &format!("pool get failed for {id}: {e}"),
             );
-            return false;
+            return Err(format!("pool get failed for {id}: {e}"));
         }
     };
     match conn.query_row(
-        "SELECT 1 FROM memory_vectors WHERE id = ?",
-        rusqlite::params![id],
+        "SELECT 1 FROM memory_vectors WHERE id = ? AND length(vector) = ?",
+        rusqlite::params![id, DIM as i64 * 4],
         |_| Ok(()),
     ) {
-        Ok(_) => true,
-        Err(e) if matches!(e, rusqlite::Error::QueryReturnedNoRows) => false,
+        Ok(_) => Ok(true),
+        Err(e) if matches!(e, rusqlite::Error::QueryReturnedNoRows) => Ok(false),
         Err(e) => {
             warn_throttled(
                 "stored_vector_exists",
                 "query",
                 &format!("row probe failed for {id}: {e}"),
             );
-            false
+            Err(format!("row probe failed for {id}: {e}"))
         }
     }
 }
@@ -158,7 +170,13 @@ struct VectorTable {
 
 fn vector_tables() -> &'static [VectorTable] {
     static TABLES: [VectorTable; 2] = [
-        vector_table!("memory_vectors", "put_stored_vector", "content", false, false),
+        vector_table!(
+            "memory_vectors",
+            "put_stored_vector",
+            "content",
+            false,
+            false
+        ),
         vector_table!(
             "memory_hype_vectors",
             "put_hype_stored_vector",
@@ -228,7 +246,8 @@ fn warn_throttled(fn_name: &str, reason: &str, msg: &str) {
     let se = &SLOT_EPOCHS[(h as usize) % SLOT_EPOCHS.len()];
     let old_epoch = se.load(Ordering::Relaxed);
     if old_epoch != epoch
-        && se.compare_exchange(old_epoch, epoch, Ordering::Relaxed, Ordering::Relaxed)
+        && se
+            .compare_exchange(old_epoch, epoch, Ordering::Relaxed, Ordering::Relaxed)
             .is_ok()
     {
         slot.store(0, Ordering::Relaxed);

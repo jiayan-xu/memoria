@@ -1229,7 +1229,13 @@ pub fn migrate_hype_vectors(pool: &SqlitePool) -> Result<(), String> {
                     |r| r.get(0),
                 )
                 .map_err(|e| format!("check cleanup flags (tx): {}", e))?;
-            if done2 == 2 && !(force_cleanup && clean_vectors) {
+            // #R69 bug/high：**dry-run 绕过 done2 短路**——双 flag 已置（典型
+            // post-refusal 态：hype 段阈值拒绝 + vec 段干净完成）时，gate 仅因
+            // `|| dry_run` 进入，但本短路先触发：no-op commit、零审计输出——
+            // 运维按 WARN 指引"restart with MEMORIA_ORPHAN_DRY_RUN=1 to list
+            // every id"拿到空输出，hype 孤儿永久不可审计。dry-run 必须继续
+            // 走各段评估打印清单（各段 dry-run 分支自身不写 flag，见下）。
+            if done2 == 2 && !(force_cleanup && clean_vectors) && !dry_run {
                 // #R58 maintainability/low：共享 commit_tx（见 helper doc）。
                 commit_tx(tx, "commit cleanup tx (noop)")?;
                 return Ok(());
@@ -1299,11 +1305,17 @@ pub fn migrate_hype_vectors(pool: &SqlitePool) -> Result<(), String> {
                     // hype_done 恒 false，gate 每启动重进 BEGIN IMMEDIATE + 对
                     // memory_vectors 跑 COUNT NOT EXISTS 相关扫描（#R49/#R55 要
                     // 避免的写锁成本）；表未来出现时由 force 或手动清 flag 重扫。
-                    tx.execute(
-                        "INSERT OR IGNORE INTO migration_flags (flag) VALUES (?1)",
-                        rusqlite::params![HYPE_FLAG],
-                    )
-                    .map_err(|e| format!("set hype flag (table absent): {}", e))?;
+                    // #R69 bug/high：**dry-run 不写 HYPE_FLAG**——审计模式违反
+                    // "不固化任何状态"契约；且表未来出现（如离线脚本重建行、
+                    // 其 memories 已删）时 hype_done 恒 true、hype 孤儿段永久
+                    // 跳过且无重复 WARN（孤儿持续重入 HNSW rebuild）。
+                    if !dry_run {
+                        tx.execute(
+                            "INSERT OR IGNORE INTO migration_flags (flag) VALUES (?1)",
+                            rusqlite::params![HYPE_FLAG],
+                        )
+                        .map_err(|e| format!("set hype flag (table absent): {}", e))?;
+                    }
                 } else {
                     let h_exists: i64 = tx
                         .query_row(
@@ -1525,8 +1537,17 @@ pub fn migrate_hype_vectors(pool: &SqlitePool) -> Result<(), String> {
             // 与 REFUSED/CLEANUP（vec 段）都跳过：dry-run 是审计预览，不固化
             // "已处理/已拒绝"状态，下次启动重新评估（去掉 dry-run 后执行删除
             // 才会置位）。直接提交空事务。
-            if dry_ran {
+            // #R69 bug/medium：**dry-run 无条件提前返回**——此前以 `dry_ran` 门控：
+            // 两表均无孤儿时 dry_ran 保持 false、落入尾部 flag 块写入 CLEANUP_FLAG
+            // 并清 REFUSED_FLAG——审计运行仍改持久状态，违反 #R69 契约。
+            if dry_run {
                 commit_tx(tx, "commit cleanup tx (dry-run)")?;
+                return Ok(());
+            }
+            if dry_ran {
+                // #R69 maintainability/low：非 dry-run 时 dry_ran 不应为 true
+                // （dry_ran 只在 dry_run 分支置位）；防御性保留（drop guard 语义）。
+                commit_tx(tx, "commit cleanup tx (noop)")?;
                 return Ok(());
             }
             // 置位标记（事务内，提交后对并发进程可见）：正常完成（含"无孤儿"）→
