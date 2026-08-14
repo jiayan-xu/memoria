@@ -25,6 +25,13 @@ pub enum SemanticError {
     /// 拼接歧义（`{m}` 无分隔符粘贴）。
     RoadsFailed,
     /// memories 回查硬失败（pool/prepare/query/整批硬失败）
+    /// #R68 maintainability/medium 取舍文档化：DB 类各因（pool/prepare/query/系统性
+    /// 漂移）合并进单变体 → hybrid 单 key（hybrid_drop_db）——#R56 批评的
+    /// "并发异因互相压制"在此层级重演；且 String 包装丢失 rusqlite::Error 类型
+    /// （无 source() 链、无法编程分类 BUSY vs IOERR）。拆分 per-cause 变体
+    /// （FetchPool/FetchPrepare/FetchQuery/FetchSystematic）留待后续——当前
+    /// DB 故障共享冷却有实际价值（持续 DB 中断时抑制噪音），且 first_hard_err
+    /// 已内嵌首个底层错误文本跨边界传播。
     Fetch(String),
 }
 
@@ -71,6 +78,9 @@ pub(crate) fn semantic_drop_count() -> u64 {
 }
 
 /// 60s 冷却的 eprintln（#R50/#R51 maintainability/low）：语义检索路径多处诊断日志
+/// #R68 maintainability/low：**key 统一模块前缀（"semantic/..."）**——crate 全局
+/// key 空间下泛型 key（"content"/"hype"/"fetch_stale"）会被无关调用点复用、
+/// 静默跨抑制；key 是编译期内联的有限静态集（无运行期增长）。
 /// （road fail / degraded / fetch 批级 / stale 汇总 / hybrid drop）此前各自实现
 /// static 冷却——复制到第 4 处时收敛为共享 helper，冷却语义一致；按 **key** 分开
 /// 计数（不同故障原因/路/调用点不互相抑制——单个全局 static 会让先失败的路径
@@ -228,7 +238,11 @@ pub fn semantic_search(
     // 降级期保持静默。用**时间戳冷却**（60s）重武装：持续故障每 ~60s 出一条信号，
     // 瞬时抖动只出一条。冷却经共享 helper（#R51，key 隔离）。
     if roads_failed > 0 && best.is_empty() {
-        throttled_eprintln("roads_degraded", || {
+        // #R68 other/medium：**部分降级也计数**——SEMANTIC_DROPS 是监控机制但
+        // hybrid 只在 Err 分支 bump；一路失败 + 幸存路 0 匹配的持续部分降级
+        // （如 content 路 poisoned + hype 空）从不触计数——静默降级仍不可见。
+        bump_semantic_drops();
+        throttled_eprintln("semantic/roads_degraded", || {
             format!(
                 "semantic_search: {roads_failed} road(s) failed and survivors returned no matches (degraded)"
             )
@@ -278,7 +292,17 @@ pub fn semantic_search(
             continue;
         };
         // NULL content = 合法数据态，召回损失（剔 id）——与映射失败区分（#R42）。
+        // #R68 other/low：**NULL content 丢弃计数**（throttled 聚合）——静默剔除
+        // 让 NULL 记忆不可达语义通道且零可观测性；stale 有聚合诊断，NULL 应有
+        // 同类可见性。
         let Some(content) = content else {
+            static NULL_DROPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = NULL_DROPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            if n == 1 || n % 1000 == 0 {
+                eprintln!(
+                    "[semantic] fetch: {n} NULL-content id(s) dropped from semantic results (legitimate degraded data state)"
+                );
+            }
             continue;
         };
         out.push(SignalResult {
@@ -446,7 +470,7 @@ fn fetch_memories_batch(
                 if first_hard_err.is_none() {
                     first_hard_err = Some(format!("pool: {e}"));
                 }
-                throttled_eprintln("fetch_pool", || {
+                throttled_eprintln("semantic/fetch_pool", || {
                     format!("pool get failed (batch {} ids): {}", chunk.len(), e)
                 });
                 hard_failed = true;
@@ -497,7 +521,7 @@ fn fetch_memories_batch(
                                     | rusqlite::Error::IntegralValueOutOfRange(..)),
                             ) => {
                                 row_errors += 1;
-                                throttled_eprintln("fetch_row_mapping", || {
+                                throttled_eprintln("semantic/fetch_row_mapping", || {
                                     format!(
                                         "[semantic] fetch row mapping failed (batch {} ids): {}",
                                         chunk.len(),
@@ -509,7 +533,7 @@ fn fetch_memories_batch(
                                 if iterator_error.is_none() {
                                     iterator_error = Some(format!("step: {e}"));
                                 }
-                                throttled_eprintln("fetch_iterator", || {
+                                throttled_eprintln("semantic/fetch_iterator", || {
                                     format!(
                                         "[semantic] fetch row iteration failed (batch {} ids): {}",
                                         chunk.len(),
@@ -543,7 +567,7 @@ fn fetch_memories_batch(
                                     chunk.len()
                                 ));
                             }
-                            throttled_eprintln("fetch_systemic", || {
+                            throttled_eprintln("semantic/fetch_systemic", || {
                                 format!(
                                     "all {} requested ids returned rows and ALL failed mapping (systematic column drift)",
                                     chunk.len()
@@ -555,7 +579,7 @@ fn fetch_memories_batch(
                             // 连接级故障（BUSY/IOERR）打断循环后未读行从未被获取，
                             // 标 stale 是删除滞后误归因；硬失败已由 fetch_iterator
                             // + Err 传播。
-                            throttled_eprintln("fetch_mixed", || {
+                            throttled_eprintln("semantic/fetch_mixed", || {
                                 format!(
                                     "batch of {} ids: {row_errors} row(s) failed mapping, 0 ok (row drops only; rest stale)",
                                     chunk.len()
@@ -563,7 +587,7 @@ fn fetch_memories_batch(
                             });
                         }
                     } else if row_errors > 0 {
-                        throttled_eprintln("fetch_partial", || {
+                        throttled_eprintln("semantic/fetch_partial", || {
                             format!(
                                 "{row_errors} of {} rows failed mapping (dropping those ids)",
                                 chunk.len()
@@ -575,7 +599,7 @@ fn fetch_memories_batch(
                     if first_hard_err.is_none() {
                         first_hard_err = Some(format!("query: {e}"));
                     }
-                    throttled_eprintln("fetch_query", || {
+                    throttled_eprintln("semantic/fetch_query", || {
                         format!("query failed (batch {} ids): {}", chunk.len(), e)
                     });
                     hard_failed = true;
@@ -585,7 +609,7 @@ fn fetch_memories_batch(
                 if first_hard_err.is_none() {
                     first_hard_err = Some(format!("prepare: {e}"));
                 }
-                throttled_eprintln("fetch_prepare", || {
+                throttled_eprintln("semantic/fetch_prepare", || {
                     format!("prepare failed (batch {} ids): {}", chunk.len(), e)
                 });
                 hard_failed = true;
@@ -606,7 +630,7 @@ fn fetch_memories_batch(
         }
     }
     if stale_ids_total > 0 {
-        throttled_eprintln("fetch_stale", || {
+        throttled_eprintln("semantic/fetch_stale", || {
             // #R54 other/low：0 行有两类原因——跨 ns 候选（查询 SQL 已按 ns 过滤，
             // 全局 HNSW 过取窗口在多租户下大部分是外 ns 向量，属**设计的过滤行为**）
             // 与删除滞后（悬空 id）。文案并列两因，避免把正常跨租户过取误归因为

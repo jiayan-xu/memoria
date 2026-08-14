@@ -605,11 +605,14 @@ fn commit_tx(tx: rusqlite::Transaction, label: &str) -> Result<(), String> {
 /// documentation/low：`500 * attempt` 的乘积是 500/1000/1500，文档按实际值写），
 /// 仍失败才传播。
 fn is_busy(e: &rusqlite::Error) -> bool {
+    // #R68 bug/low：**只 DatabaseBusy 重试**——非共享缓存模式下 SQLITE_LOCKED 是
+    // 同连接冲突（未终结语句/事务内读→写升级），等待不能解决，重试只烧 ~3s
+    // 启动延迟（500ms/1s/1.5s）后照样失败；WARN 文案 "busy/locked" 会误导部署
+    // 停滞诊断。LOCKED 按真实错误传播。
     matches!(
         e,
         rusqlite::Error::SqliteFailure(se, _)
             if se.code == rusqlite::ErrorCode::DatabaseBusy
-                || se.code == rusqlite::ErrorCode::DatabaseLocked
     )
 }
 
@@ -994,7 +997,14 @@ pub fn migrate_hype_vectors(pool: &SqlitePool) -> Result<(), String> {
             |r| r.get::<_, i64>(0),
         )
         .map(|c| c > 0)
-        .unwrap_or(false);
+        // #R68 other/low：读失败可见（与 trig_done 同款 WARN）——静默按未置位
+        // 会让 fallback→full 升级被瞬时 BUSY 跳过（幂等，但自愈延迟不可见）。
+        .unwrap_or_else(|e| {
+            eprintln!(
+                "[Memoria] WARN: check trigger fallback flag failed (treated as unset): {e}"
+            );
+            false
+        });
     // #R64 bug/medium：fallback 置位 → 重新评估（hype 表可能已恢复，需升级 full
     // body）；升级成功路径清除 fallback flag。
     // #R66/#R67 bug/high：**表存在检查进 gate**——full body 触发器在表缺失时
@@ -1249,6 +1259,15 @@ pub fn migrate_hype_vectors(pool: &SqlitePool) -> Result<(), String> {
                     eprintln!(
                         "[Memoria] WARN: memory_hype_vectors absent (DDL soft-degraded); skipping hype orphan segment"
                     );
+                    // #R68 performance/medium：缺表也置 HYPE_FLAG——不置位会让
+                    // hype_done 恒 false，gate 每启动重进 BEGIN IMMEDIATE + 对
+                    // memory_vectors 跑 COUNT NOT EXISTS 相关扫描（#R49/#R55 要
+                    // 避免的写锁成本）；表未来出现时由 force 或手动清 flag 重扫。
+                    tx.execute(
+                        "INSERT OR IGNORE INTO migration_flags (flag) VALUES (?1)",
+                        rusqlite::params![HYPE_FLAG],
+                    )
+                    .map_err(|e| format!("set hype flag (table absent): {}", e))?;
                 } else {
                     let h_exists: i64 = tx
                         .query_row(

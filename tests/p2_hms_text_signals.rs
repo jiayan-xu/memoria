@@ -106,6 +106,24 @@ static ENV_LOCK: std::sync::RwLock<()> = std::sync::RwLock::new(());
 /// 2024 UB），不得违反。
 #[must_use = "EnvRestore::drop 负责恢复 env，丢弃即失去恢复（避免在语句末尾提前 drop）"]
 struct EnvRestore<'a>(Option<std::ffi::OsString>, &'a std::sync::RwLockWriteGuard<'a, ()>);
+impl EnvRestore<'_> {
+    /// #R68 maintainability/medium：**唯一正确构造入口**——绑定 ENV_LOCK 的 write
+    /// guard + 固定变量名（快照/置位/恢复三合一）；类型层面杜绝"借了别的锁的
+    /// guard / 快照了别的变量"的误用（此前不变量只在 doc 注释里）。
+    fn pin_rerank<'a>(
+        guard: &'a std::sync::RwLockWriteGuard<'a, ()>,
+        value: &str,
+    ) -> EnvRestore<'a> {
+        let prev = std::env::var_os("MEMORIA_TEXT_SIGNALS_RERANK");
+        // SAFETY: guard 由 ENV_LOCK.write() 产生——本二进制所有 env 访问约定
+        // 经 ENV_LOCK 串行；libtest/panic handler 的惰性 env 读（如 RUST_BACKTRACE）
+        // 不读本变量，不构成并发访问。恢复由 Drop 保证（guard 存活期内）。
+        unsafe {
+            std::env::set_var("MEMORIA_TEXT_SIGNALS_RERANK", value);
+        }
+        EnvRestore(prev, guard)
+    }
+}
 impl Drop for EnvRestore<'_> {
     fn drop(&mut self) {
         // SAFETY: 锁（write）在 drop 时仍持有——guard 生命周期保证（self.1 存活）。
@@ -126,13 +144,7 @@ fn search_boosts_on_numeric_query_overlap() {
     let _env_guard = ENV_LOCK.write().unwrap_or_else(|p| p.into_inner());
     // #R63 maintainability/low：共享 guard（EnvRestore 同款，见下——防两份恢复
     // 语义静默分歧）。
-    let prev = std::env::var_os("MEMORIA_TEXT_SIGNALS_RERANK");
-    // SAFETY: 在 ENV_LOCK 串行区内变异进程级 env（本文件全部测试共享该锁，
-    // 无并发读/写）；恢复由 guard 的 Drop 保证（含 unwind）。
-    unsafe {
-        std::env::set_var("MEMORIA_TEXT_SIGNALS_RERANK", "1");
-    }
-    let _pin = EnvRestore(prev, &_env_guard);
+    let _pin = EnvRestore::pin_rerank(&_env_guard, "1");
     let (engine, ns) = fresh_engine("rerank");
     let a = remember_with_dedup(
         &engine.pool,
@@ -294,13 +306,7 @@ fn text_signals_rerank_env_off() {
 
     // #R62 bug/low：var_os 无损快照——var().ok() 把非 Unicode 预设值归 None，
     // Drop 时误执行 remove_var（违反"恢复原值"契约）。
-    let prev = std::env::var_os("MEMORIA_TEXT_SIGNALS_RERANK");
-    // SAFETY: 本 unsafe 块处于 ENV_LOCK 写锁串行区内（_guard 持有），本二进制内
-    // 所有 env 读/写（含 EnvRestore::drop）均经同一把锁，无并发访问。
-    unsafe {
-        std::env::set_var("MEMORIA_TEXT_SIGNALS_RERANK", "0");
-    }
-    let _restore = EnvRestore(prev, &_guard);
+    let _restore = EnvRestore::pin_rerank(&_guard, "0");
     let fused =
         hybrid_search(&engine.pool, "999", &ns, 5, None, None, None, None, false).expect("s");
     assert!(!fused.is_empty(), "rerank-off search for '999' should return the memory");
@@ -365,7 +371,9 @@ fn signal_tags_persisted_on_remember() {
         None,
     )
     .expect("context");
-    let row = &ctx["recall"].as_array().expect("recall")[0];
+    let recall_arr = ctx["recall"].as_array().expect("recall");
+    assert!(!recall_arr.is_empty(), "recall empty for signal-tags memory");
+    let row = &recall_arr[0];
     let nums = row["text_signals"]["numbers"].as_array().expect("numbers");
     assert!(
         nums.iter().any(|n| n.as_str() == Some("120")),

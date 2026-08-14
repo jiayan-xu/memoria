@@ -278,19 +278,22 @@ mod unit_tests {
         let pool = test_pool("qh");
         let conn = pool.get().expect("conn");
         conn.execute(
-            "INSERT INTO memories (id, namespace, content, importance)              VALUES ('m_d', 'agent/test', '丁记忆', 3),
+            "INSERT INTO memories (id, namespace, content, importance) 
+             VALUES ('m_d', 'agent/test', '丁记忆', 3),
                     ('m_e', 'agent/test', '戊记忆', 3)",
             [],
         )
         .unwrap();
         conn.execute(
-            "INSERT INTO entities(id, namespace, entity_type, name, aliases, summary)              VALUES ('e1', 'agent/test', 'person', '张三', '[]', NULL)",
+            "INSERT INTO entities(id, namespace, entity_type, name, aliases, summary) 
+             VALUES ('e1', 'agent/test', 'person', '张三', '[]', NULL)",
             [],
         )
         .unwrap();
         // 仅 m_d 提及 e1（m_e 无任何提及）——m_d 的 boost 只可能来自 query-hit。
         conn.execute(
-            "INSERT INTO entity_mentions(entity_id, memory_id, context, namespace)              VALUES ('e1', 'm_d', '提及张三', 'agent/test')",
+            "INSERT INTO entity_mentions(entity_id, memory_id, context, namespace) 
+             VALUES ('e1', 'm_d', '提及张三', 'agent/test')",
             [],
         )
         .unwrap();
@@ -318,17 +321,20 @@ mod unit_tests {
         let pool = test_pool("sr");
         let conn = pool.get().expect("conn");
         conn.execute(
-            "INSERT INTO memories (id, namespace, content, importance)              VALUES ('m_f', 'agent/test', '己记忆', 3)",
+            "INSERT INTO memories (id, namespace, content, importance) 
+             VALUES ('m_f', 'agent/test', '己记忆', 3)",
             [],
         )
         .unwrap();
         conn.execute(
-            "INSERT INTO entities(id, namespace, entity_type, name, aliases, summary)              VALUES ('e1', 'agent/test', 'person', '李四', '[]', NULL)",
+            "INSERT INTO entities(id, namespace, entity_type, name, aliases, summary) 
+             VALUES ('e1', 'agent/test', 'person', '李四', '[]', NULL)",
             [],
         )
         .unwrap();
         conn.execute(
-            "INSERT INTO entity_mentions(entity_id, memory_id, context, namespace)              VALUES ('e1', 'm_f', '提及李四', 'agent/test')",
+            "INSERT INTO entity_mentions(entity_id, memory_id, context, namespace) 
+             VALUES ('e1', 'm_f', '提及李四', 'agent/test')",
             [],
         )
         .unwrap();
@@ -343,9 +349,11 @@ mod unit_tests {
             "single-result query-hit boost missing: {:?}",
             (&f.memory_id, f.rrf_score, &f.source)
         );
-        // #R66 test/low 注释修正：空查询 + 单结果下**任何路径都无法 boost**
-        // （match_query_entities 空 + 单记忆 peer_overlap 恒 0），断言只文档化
-        // no-boost 契约、不判别 guard 分支本身（guard 删除也通过）。
+        // 空查询 + 单结果下任何路径都无法 boost（match_query_entities 空 + 单记忆
+        // peer_overlap 恒 0）——断言只文档化 no-boost 契约。注意：单结果 + 非空
+        // 查询的当前行为（全管线执行 + boost + marker）是历史实现，单结果无法
+        // 重排、boost 经 two_stage 归一化后不可观测——若未来 guard 修正为
+        // len<2 一律早退，上方单结果+匹配查询的断言需同步调整。
         let mut empty_q: Vec<FusedResult> = vec![mk_f()];
         rerank_by_cooccurrence(&pool, "agent/test", "  ", &mut empty_q);
         let f0 = &empty_q[0];

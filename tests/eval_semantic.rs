@@ -494,6 +494,13 @@ async fn memory_eval_semantic_inner() {
     // content-only 路径仍通过——正是本块要防的 no-op 假覆盖。断言**高覆盖率**：
     // 分母用 hype_total（唯一记忆数，无论成败都计入）——processed 在失败时被 remove
     // 无法作分母（重言式）。
+    // #R68 bug/medium：**corpus-skip 前置**——embed 服务通过预检但每次 POST 失败
+    // 时全部 id 变占位符、无 HyPE put/add；此检查先于 "hype index empty" 触发，
+    // 根因直指 corpus-embed（而非被误指的 question-embed）。详细诊断见函数尾。
+    assert_eq!(
+        corpus_skipped, 0,
+        "corpus embed failures detected ({corpus_skipped}); run aborted before HyPE asserts - see diagnostics below"
+    );
     assert!(
         engine.hype_hnsw.len() > 0,
         "hype index empty after corpus setup: question-embed likely failing"
@@ -535,9 +542,8 @@ async fn memory_eval_semantic_inner() {
             .max(2)
             .min(hype_total.max(1));
         assert!(
-            uniq >= floor.max(2),
-            "hype question vectors degenerate: {uniq} unique vs {hype_total} total (min {}) - embed service mapping all questions to one vector?",
-            floor.max(2)
+            uniq >= floor,
+            "hype question vectors degenerate: {uniq} unique vs {hype_total} total (min {floor}) - embed service mapping all questions to one vector?",
         );
     }
 
