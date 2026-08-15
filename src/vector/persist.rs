@@ -357,7 +357,7 @@ pub fn lookup_namespace(pool: &SqlitePool, id: &str) -> Option<String> {
 /// `HnswIndex::add` 内部按 id 去重，因此即使 .bin 已加载也能安全增量补齐；
 /// 返回实际加入的向量条数。
 pub fn rebuild_hnsw_from_store(pool: &SqlitePool, hnsw: &HnswIndex) -> Result<usize, String> {
-    rebuild_from_table(pool, hnsw, "memory_vectors").map(|(count, _)| count)
+    rebuild_from_table(pool, hnsw, "memory_vectors").map(|(count, _, _)| count)
 }
 
 /// V1（2026-08-12）：从 `memory_hype_vectors` 表重建 HyPE 问句向量 HNSW 索引。
@@ -376,17 +376,18 @@ pub fn rebuild_hnsw_from_store(pool: &SqlitePool, hnsw: &HnswIndex) -> Result<us
 /// 向量时须 `let fresh = HnswIndex::new(); fresh.set_ef_search(..);
 /// rebuild_hype_hnsw_from_store(pool, &fresh)?;` 后整体替换。
 pub fn rebuild_hype_hnsw_from_store(pool: &SqlitePool, hnsw: &HnswIndex) -> Result<usize, String> {
-    rebuild_from_table(pool, hnsw, "memory_hype_vectors").map(|(count, _)| count)
+    rebuild_from_table(pool, hnsw, "memory_hype_vectors").map(|(count, _, _)| count)
 }
 
-/// 带 read_errors 的 HyPE rebuild（#R69 bug/medium）：build_hype_hnsw 的底层——
-/// 部分重建（行级读取错误被吸收为 WARN）对 refresh 路径不可接受：refresh 会
-/// 用降级索引静默替换健康快照。返回 (count, read_errors) 供调用方在 swap 前
-/// 决策（read_errors > 0 → 拒绝替换，保留旧快照）。
+/// 带 read_errors/skipped 的 HyPE rebuild（#R69 bug/medium）：build_hype_hnsw 的
+/// 底层——部分重建（行级读取错误、或 dim 漂移/degenerate/corrupt 跳过行被吸收
+/// 为 WARN）对 refresh 路径不可接受：refresh 会用降级索引静默替换健康快照。
+/// 返回 (count, read_errors, skipped) 供调用方在 swap 前决策（任一 > 0 → 拒绝
+/// 替换，保留旧快照）。
 pub fn rebuild_hype_hnsw_from_store_detailed(
     pool: &SqlitePool,
     hnsw: &HnswIndex,
-) -> Result<(usize, usize), String> {
+) -> Result<(usize, usize, usize), String> {
     rebuild_from_table(pool, hnsw, "memory_hype_vectors")
 }
 
@@ -436,21 +437,22 @@ pub fn resolve_ef_search() -> usize {
 pub fn build_hype_hnsw(pool: &SqlitePool, ef_search: usize) -> Result<(HnswIndex, usize), String> {
     let hype_hnsw = HnswIndex::new();
     hype_hnsw.set_ef_search(ef_search);
-    let (count, _) = rebuild_hype_hnsw_from_store_detailed(pool, &hype_hnsw)?;
+    let (count, _, _) = rebuild_hype_hnsw_from_store_detailed(pool, &hype_hnsw)?;
     Ok((hype_hnsw, count))
 }
 
-/// 带 read_errors 的 build（#R69 bug/medium）：refresh 路径专用——部分重建
-/// （read_errors > 0）必须由调用方拒绝替换健康快照；or_default 与启动路径
+/// 带 read_errors/skipped 的 build（#R69 bug/medium）：refresh 路径专用——部分
+/// 重建（read_errors > 0 或 skipped > 0——dim 漂移/degenerate/corrupt 跳过行
+/// 是更常见的降级信号）必须由调用方拒绝替换健康快照；or_default 与启动路径
 /// 保持原语义（容忍部分行，WARN 可见）。
 pub fn build_hype_hnsw_detailed(
     pool: &SqlitePool,
     ef_search: usize,
-) -> Result<(HnswIndex, usize, usize), String> {
+) -> Result<(HnswIndex, usize, usize, usize), String> {
     let hype_hnsw = HnswIndex::new();
     hype_hnsw.set_ef_search(ef_search);
-    let (count, read_errors) = rebuild_hype_hnsw_from_store_detailed(pool, &hype_hnsw)?;
-    Ok((hype_hnsw, count, read_errors))
+    let (count, read_errors, skipped) = rebuild_hype_hnsw_from_store_detailed(pool, &hype_hnsw)?;
+    Ok((hype_hnsw, count, read_errors, skipped))
 }
 
 /// V1（2026-08-12）：build + 软降级兜底的**唯一入口**（main.rs 与 lib.rs 共用）。
@@ -491,7 +493,7 @@ fn rebuild_from_table(
     pool: &SqlitePool,
     hnsw: &HnswIndex,
     table: &str,
-) -> Result<(usize, usize), String> {
+) -> Result<(usize, usize, usize), String> {
     // #R61 maintainability/medium：**fresh-index 契约强制**——HnswIndex::add 按 id
     // 去重：已填充索引上 rebuild 只追加新 id、已有 id 的向量更新被静默忽略，而
     // "rebuild" 名字与 Ok(count) 暗示全量刷新（调用方拿到陈旧结果不自知）。doc
@@ -675,8 +677,8 @@ fn rebuild_from_table(
         eprintln!("[persist] WARN: {label}: {cause}; returning 0 (historical behavior)");
     }
     if entries.is_empty() {
-        return Ok((0, read_errors));
+        return Ok((0, read_errors, skipped));
     }
     let added = hnsw.add(&entries)?;
-    Ok((added, read_errors))
+    Ok((added, read_errors, skipped))
 }
