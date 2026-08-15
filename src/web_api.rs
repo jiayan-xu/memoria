@@ -217,15 +217,7 @@ async fn api_upload_document(
     let kind_owned = kind.to_string();
 
     let result = tokio::task::spawn_blocking(move || {
-        document::ingest_bytes(
-            &pool,
-            &doc_dir,
-            &ns,
-            &fname,
-            &kind_owned,
-            &bytes,
-            &actor,
-        )
+        document::ingest_bytes(&pool, &doc_dir, &ns, &fname, &kind_owned, &bytes, &actor)
     })
     .await;
 
@@ -405,9 +397,9 @@ async fn api_graph(
             .to_string()
     };
     if let Ok(mut stmt) = conn.prepare(&seed_sql) {
-        if let Ok(rows) =
-            stmt.query_map(rusqlite::params![ns, node_cap as i64], |r| r.get::<_, String>(0))
-        {
+        if let Ok(rows) = stmt.query_map(rusqlite::params![ns, node_cap as i64], |r| {
+            r.get::<_, String>(0)
+        }) {
             for id in rows.flatten() {
                 if id_set.insert(id.clone()) {
                     id_order.push(id);
@@ -846,7 +838,9 @@ async fn api_list_memories(
         Some("importance") => " ORDER BY importance DESC, decay_factor DESC",
         Some("decay") => " ORDER BY decay_factor ASC, importance DESC",
         Some("created") => " ORDER BY created_at DESC",
-        _ => " ORDER BY CASE tier WHEN 'hot' THEN 0 WHEN 'warm' THEN 1 ELSE 2 END, decay_factor DESC",
+        _ => {
+            " ORDER BY CASE tier WHEN 'hot' THEN 0 WHEN 'warm' THEN 1 ELSE 2 END, decay_factor DESC"
+        }
     };
     sql.push_str(order_clause);
     sql.push_str(" LIMIT ?");
@@ -878,7 +872,8 @@ async fn api_list_memories(
             let raw_ref: Option<String> = r.get(9).ok();
             let source: Option<String> = r.get(10).ok();
             Ok((
-                id, content, category, tier, importance, decay, recall, created, ns_val, raw_ref, source,
+                id, content, category, tier, importance, decay, recall, created, ns_val, raw_ref,
+                source,
             ))
         })
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -886,7 +881,19 @@ async fn api_list_memories(
     let memories: Vec<Value> = rows
         .filter_map(|r| r.ok())
         .map(
-            |(id, content, category, tier, importance, decay, recall, created, ns_val, raw_ref, source)| {
+            |(
+                id,
+                content,
+                category,
+                tier,
+                importance,
+                decay,
+                recall,
+                created,
+                ns_val,
+                raw_ref,
+                source,
+            )| {
                 json!({
                     "id": id,
                     "content": content,
@@ -926,7 +933,12 @@ fn load_memory_by_id(
             r.get::<_, String>(0)
         })
         .map_err(|e| {
-            eprintln!("[api_get_memory] miss id={:?} len={} err={}", id, id.len(), e);
+            eprintln!(
+                "[api_get_memory] miss id={:?} len={} err={}",
+                id,
+                id.len(),
+                e
+            );
             StatusCode::NOT_FOUND
         })?;
     if !auth::check_ns_access(auth, &mem_ns) {

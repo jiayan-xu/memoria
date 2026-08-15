@@ -187,7 +187,9 @@ fn http_get_json_summary(url: &str, timeout_ms: u64) -> Result<(u16, String), St
         "GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
         path, host_port
     );
-    stream.write_all(req.as_bytes()).map_err(|e| e.to_string())?;
+    stream
+        .write_all(req.as_bytes())
+        .map_err(|e| e.to_string())?;
     let mut buf = Vec::new();
     stream.read_to_end(&mut buf).map_err(|e| e.to_string())?;
     let text = String::from_utf8_lossy(&buf);
@@ -450,18 +452,27 @@ fn check_hnsw_index(hnsw: &HnswIndex, status: &str) -> CheckResult {
     let (st, msg) = match (status, count) {
         ("corrupted", _) => (
             "warn",
-            format!("HNSW 索引损坏已回退空索引 — 语义检索降级 (ef_search={})", ef),
+            format!(
+                "HNSW 索引损坏已回退空索引 — 语义检索降级 (ef_search={})",
+                ef
+            ),
         ),
         // ⚠️ 空索引优先判定：无论 status 是什么，count==0 都说明语义检索无结果，
         //    绝不能报“可用”（原 "uninitialized" 分支会掩盖 0 向量假象）。
         (_, 0) => (
             "warn",
-            format!("HNSW 索引为空（status={}）— 语义检索无结果，请确认 memory_vectors 已重嵌并重启 memoria (ef_search={})", status, ef),
+            format!(
+                "HNSW 索引为空（status={}）— 语义检索无结果，请确认 memory_vectors 已重嵌并重启 memoria (ef_search={})",
+                status, ef
+            ),
         ),
         // 未初始化但有向量：首次运行从 memory_vectors 重建成功 → 实际可用
         ("uninitialized", n) => (
             "pass",
-            format!("HNSW 索引未初始化（首次运行），已从 memory_vectors 重建 {} 条 — 语义检索可用 (ef_search={})", n, ef),
+            format!(
+                "HNSW 索引未初始化（首次运行），已从 memory_vectors 重建 {} 条 — 语义检索可用 (ef_search={})",
+                n, ef
+            ),
         ),
         (_, n) => ("pass", format!("{} vectors loaded; ef_search={}", n, ef)),
     };

@@ -11,8 +11,8 @@ use sha2::{Digest, Sha256};
 use std::borrow::Cow;
 use std::fs;
 use std::io::Read;
-use std::path::{Path, PathBuf};
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::path::{Path, PathBuf};
 
 pub const MAX_DOC_BYTES: u64 = 20 * 1024 * 1024; // 20 MiB
 pub const CHUNK_CHARS: usize = 3500;
@@ -43,8 +43,7 @@ pub fn detect_kind(filename: &str, content_type: Option<&str>) -> Option<&'stati
         return Some("docx");
     }
     if lower.ends_with(".xlsx")
-        || content_type
-            == Some("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        || content_type == Some("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
     {
         return Some("xlsx");
     }
@@ -73,9 +72,7 @@ fn extract_pdf(bytes: &[u8]) -> Result<String, String> {
     };
     let meaningful = text.chars().filter(|c| !c.is_whitespace()).count();
     if meaningful < 50 {
-        return Err(
-            "PDF 似乎是扫描件/纯图片，当前不支持 OCR。请上传可选中文字的 PDF。".into(),
-        );
+        return Err("PDF 似乎是扫描件/纯图片，当前不支持 OCR。请上传可选中文字的 PDF。".into());
     }
     Ok(text)
 }
@@ -147,8 +144,8 @@ fn extract_docx(bytes: &[u8]) -> Result<String, String> {
 fn extract_spreadsheet(bytes: &[u8]) -> Result<String, String> {
     use calamine::{DataType, Reader, open_workbook_auto_from_rs};
     let cursor = std::io::Cursor::new(bytes);
-    let mut workbook = open_workbook_auto_from_rs(cursor)
-        .map_err(|e| format!("Excel 打开失败: {e}"))?;
+    let mut workbook =
+        open_workbook_auto_from_rs(cursor).map_err(|e| format!("Excel 打开失败: {e}"))?;
     let mut out = String::new();
     for sheet_name in workbook.sheet_names().to_owned() {
         if let Ok(range) = workbook.worksheet_range(&sheet_name) {
@@ -239,7 +236,10 @@ pub fn ingest_bytes(
     actor: &str,
 ) -> Result<IngestOutcome, String> {
     if bytes.len() as u64 > MAX_DOC_BYTES {
-        return Err(format!("文件过大（上限 {} MiB）", MAX_DOC_BYTES / 1024 / 1024));
+        return Err(format!(
+            "文件过大（上限 {} MiB）",
+            MAX_DOC_BYTES / 1024 / 1024
+        ));
     }
     let text = extract_text(kind, bytes)?;
     let doc_id = content_hash16(bytes);
@@ -263,9 +263,7 @@ pub fn ingest_bytes(
         text.chars().count(),
         chunks.len(),
     );
-    let tags_manifest = format!(
-        r#"["document","{kind}","dept-share","file:{safe_name}"]"#
-    );
+    let tags_manifest = format!(r#"["document","{kind}","dept-share","file:{safe_name}"]"#);
     let man: RememberResult = remember::remember_with_dedup(
         pool,
         &manifest,
@@ -291,9 +289,7 @@ pub fn ingest_bytes(
     let total = chunks.len();
     for (i, chunk) in chunks.iter().enumerate() {
         let body = format!("[文档块 {}/{}] {filename}\n\n{chunk}", i + 1, total);
-        let tags = format!(
-            r#"["document","{kind}","dept-share","chunk","file:{safe_name}"]"#
-        );
+        let tags = format!(r#"["document","{kind}","dept-share","chunk","file:{safe_name}"]"#);
         let r = remember::remember_with_dedup(
             pool,
             &body,
@@ -353,9 +349,7 @@ pub fn ingest_plain_text(
         text.chars().count(),
         chunks.len(),
     );
-    let tags_manifest = format!(
-        r#"["document","{kind}","dept-share","file:{safe_name}"]"#
-    );
+    let tags_manifest = format!(r#"["document","{kind}","dept-share","file:{safe_name}"]"#);
     let man = remember::remember_with_dedup(
         pool,
         &manifest,
@@ -381,9 +375,7 @@ pub fn ingest_plain_text(
     let total = chunks.len();
     for (i, chunk) in chunks.iter().enumerate() {
         let body = format!("[文档块 {}/{}] {filename}\n\n{chunk}", i + 1, total);
-        let tags = format!(
-            r#"["document","{kind}","dept-share","chunk","file:{safe_name}"]"#
-        );
+        let tags = format!(r#"["document","{kind}","dept-share","chunk","file:{safe_name}"]"#);
         let r = remember::remember_with_dedup(
             pool,
             &body,

@@ -65,16 +65,37 @@ pub fn tokenize_for_fts(text: &str) -> String {
             return false;
         }
         if t.chars().all(|c| {
-            c == '_' || c == '.' || c == '/' || c == '-' || c == '['
-                || c == ']' || c == '(' || c == ')' || c == '*' || c == ':'
-                || c == '|' || c == '，' || c == '。' || c == '、' || c == '：'
-                || c == '（' || c == '）' || c == '“' || c == '”' || c == '；'
-                || c == '!' || c == '？' || c == '％' || c == '%'
+            c == '_'
+                || c == '.'
+                || c == '/'
+                || c == '-'
+                || c == '['
+                || c == ']'
+                || c == '('
+                || c == ')'
+                || c == '*'
+                || c == ':'
+                || c == '|'
+                || c == '，'
+                || c == '。'
+                || c == '、'
+                || c == '：'
+                || c == '（'
+                || c == '）'
+                || c == '“'
+                || c == '”'
+                || c == '；'
+                || c == '!'
+                || c == '？'
+                || c == '％'
+                || c == '%'
         }) {
             return false; // 纯标点/分隔符
         }
         let chars: Vec<char> = t.chars().collect();
-        let all_cjk = chars.iter().all(|c| (0x4E00..=0x9FFF).contains(&(*c as u32)));
+        let all_cjk = chars
+            .iter()
+            .all(|c| (0x4E00..=0x9FFF).contains(&(*c as u32)));
         if all_cjk && chars.len() < 2 {
             return false; // 单 CJK 字噪声
         }

@@ -237,11 +237,8 @@ fn main() {
     };
     // ef_search：默认 128（相比原 50 召回候选更多、精度↑；42k 向量下检索仍快）。
     // 可用环境变量 MEMORIA_EF_SEARCH 临时覆盖，免重编译。
-    let ef_search = std::env::var("MEMORIA_EF_SEARCH")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .filter(|&ef| ef >= 16)
-        .unwrap_or(128);
+    // 解析走 persist::resolve_ef_search 收口（与 lib.rs 的 MemoriaEngine 共用，防入口分叉）。
+    let ef_search = memoria_core::vector::persist::resolve_ef_search();
     hnsw.set_ef_search(ef_search);
     println!("[Memoria] HNSW ef_search = {}", ef_search);
     // P1-3：以 memory_vectors 持久表为权威源重建 HNSW（.bin 仅作可选快取）
@@ -249,6 +246,15 @@ fn main() {
         eprintln!("[Memoria] WARN: HNSW rebuild from memory_vectors: {}", e);
     }
     println!("[Memoria] HNSW vectors: {}", hnsw.len());
+
+    // V1（2026-08-12）：HyPE 假设问句索引（独立实例，memory_hype_vectors 为权威源）。
+    // 与 lib.rs 的 MemoriaEngine 路径共用 build_hype_hnsw_or_default 收口
+    // （build + 软降级 + WARN 单一实现，两入口只差日志流）。
+    // 计数**恒打印**（0 也打）。#R42：count=0 无法区分"未启用（空表）"与"重建失败
+    // （数据损坏）"——后者以构建时的 WARN 行为准（见 build_hype_hnsw_or_default）。
+    let (hype_hnsw, hype_count) =
+        memoria_core::vector::persist::build_hype_hnsw_or_default(&pool, ef_search);
+    println!("[Memoria] HYPE HNSW vectors: {}", hype_count);
 
     // ── P0: 启动健康检查 ──
     println!("[Memoria] Running startup health check...");
@@ -285,6 +291,7 @@ fn main() {
         pool,
         auth_pool,
         hnsw: Arc::new(hnsw),
+        hype_hnsw: Arc::new(hype_hnsw),
         hnsw_status: hnsw_status.to_string(),
         query_cache: Arc::new(memoria_core::vector::QueryCache::new()),
         admin_key,

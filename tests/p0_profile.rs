@@ -34,11 +34,11 @@ fn profile_returns_static_and_dynamic_excluding_insight() {
         None,
         None,
         None,
-    
         None,
         None,
         None,
-        None)
+        None,
+    )
     .expect("pref");
 
     // dynamic 源：decision
@@ -56,11 +56,11 @@ fn profile_returns_static_and_dynamic_excluding_insight() {
         None,
         None,
         None,
-    
         None,
         None,
         None,
-        None)
+        None,
+    )
     .expect("decision");
 
     // insight 不应进入 dynamic
@@ -78,11 +78,11 @@ fn profile_returns_static_and_dynamic_excluding_insight() {
         None,
         None,
         None,
-    
         None,
         None,
         None,
-        None)
+        None,
+    )
     .expect("insight");
 
     let v: Value = memory_profile(&engine.pool, ns, 12, 15, None).expect("profile");
@@ -91,7 +91,9 @@ fn profile_returns_static_and_dynamic_excluding_insight() {
 
     let static_arr = v["static"].as_array().expect("static array");
     assert!(
-        static_arr.iter().any(|e| e["content"].as_str().unwrap_or("").contains("老大")),
+        static_arr
+            .iter()
+            .any(|e| e["content"].as_str().unwrap_or("").contains("老大")),
         "static 应包含 hard_rule 偏好"
     );
 
@@ -103,9 +105,10 @@ fn profile_returns_static_and_dynamic_excluding_insight() {
         "dynamic 应包含 decision"
     );
     assert!(
-        !dynamic_arr
-            .iter()
-            .any(|e| e["content"].as_str().unwrap_or("").contains("入厂量周末偏低")),
+        !dynamic_arr.iter().any(|e| e["content"]
+            .as_str()
+            .unwrap_or("")
+            .contains("入厂量周末偏低")),
         "dynamic 应排除 insight 记忆"
     );
 
@@ -115,7 +118,10 @@ fn profile_returns_static_and_dynamic_excluding_insight() {
         "static_text 应含标题"
     );
     assert!(
-        v["dynamic_text"].as_str().unwrap_or("").contains("近期动态"),
+        v["dynamic_text"]
+            .as_str()
+            .unwrap_or("")
+            .contains("近期动态"),
         "dynamic_text 应含标题"
     );
 }

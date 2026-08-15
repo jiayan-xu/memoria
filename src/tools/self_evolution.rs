@@ -10,18 +10,52 @@ pub fn guardrails(query: &str) -> Vec<String> {
     let mut notes: Vec<String> = Vec::new();
 
     let count_kw = [
-        "how many", "total", "count", "数量", "总数", "几个", "多少个", "累计",
+        "how many",
+        "total",
+        "count",
+        "数量",
+        "总数",
+        "几个",
+        "多少个",
+        "累计",
     ];
     if count_kw.iter().any(|k| q.contains(k)) {
         notes.push(
-            "COUNT_TOTAL_DEDUP: 先枚举唯一事件再计数，避免把同一事件的多次提及重复累加。".to_string(),
+            "COUNT_TOTAL_DEDUP: 先枚举唯一事件再计数，避免把同一事件的多次提及重复累加。"
+                .to_string(),
         );
     }
 
     let date_kw = [
-        "ago", "before", "after", "last", "next", "yesterday", "tomorrow", "前", "后", "之前",
-        "之后", "昨天", "明天", "上周", "本周", "这周", "上月", "上个月", "下个月", "下月",
-        "去年", "今年", "本月", "今天", "今日", "当日", "当天", "近年", "相对",
+        "ago",
+        "before",
+        "after",
+        "last",
+        "next",
+        "yesterday",
+        "tomorrow",
+        "前",
+        "后",
+        "之前",
+        "之后",
+        "昨天",
+        "明天",
+        "上周",
+        "本周",
+        "这周",
+        "上月",
+        "上个月",
+        "下个月",
+        "下月",
+        "去年",
+        "今年",
+        "本月",
+        "今天",
+        "今日",
+        "当日",
+        "当天",
+        "近年",
+        "相对",
     ];
     if date_kw.iter().any(|k| q.contains(k)) {
         notes.push(
@@ -30,8 +64,17 @@ pub fn guardrails(query: &str) -> Vec<String> {
     }
 
     let amount_kw = [
-        "how much", "difference", "cost", "spent", "amount", "差额", "花了多少", "差多少",
-        "成本", "余额", "多少钱",
+        "how much",
+        "difference",
+        "cost",
+        "spent",
+        "amount",
+        "差额",
+        "花了多少",
+        "差多少",
+        "成本",
+        "余额",
+        "多少钱",
     ];
     if amount_kw.iter().any(|k| q.contains(k)) {
         notes.push(
@@ -40,8 +83,18 @@ pub fn guardrails(query: &str) -> Vec<String> {
     }
 
     let state_kw = [
-        "current", "latest", "previous", "initially", "before", "当前", "最新", "之前", "最初",
-        "原先", "现在", "过去",
+        "current",
+        "latest",
+        "previous",
+        "initially",
+        "before",
+        "当前",
+        "最新",
+        "之前",
+        "最初",
+        "原先",
+        "现在",
+        "过去",
     ];
     if state_kw.iter().any(|k| q.contains(k)) {
         notes.push(

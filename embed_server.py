@@ -15,11 +15,15 @@ Memoria 本地嵌入服务（语义检索后端）
         memory_search → POST /embed → 向量 → 注入 QueryCache → HNSW 参与融合。
 
 支持两种后端（env 切换，互不影响）：
-  - provider=local（默认）：sentence_transformers 离线 CPU 跑 text2vec（768d），
-    与历史 HNSW 存量向量同构。
+  - provider=local（默认）：sentence_transformers 离线 CPU 跑 text2vec，**固定输出
+    768d**（_embed_local 不读 MEMORIA_EMBED_DIM；模型原生维度 768）。
+    注意：Rust 侧 hnsw.rs:DIM=1024 是硬编码（semantic_search 按 len!=DIM 拒绝查询
+    向量，不读 env），local 后端的 768d 与 1024d 索引**不兼容**（QueryDim(768) 错误）；
+    设 MEMORIA_EMBED_DIM=768 对 local 无效。local 场景须改用 siliconflow，或换原生
+    1024d 的本地模型并全量重嵌 + 重建索引。
   - provider=siliconflow：调用 SiliconFlow 云端 /v1/embeddings（OpenAI-compatible），
     支持 MRL `dimensions` 参数，可输出 64~4096 任意维度。无需本地 GPU。
-    模型默认 Qwen/Qwen3-VL-Embedding-8B（纯文本+多模态；纯文本库用 768 截断即可）。
+    模型默认 Qwen/Qwen3-VL-Embedding-8B（纯文本+多模态）。
 
 安全：仅监听 127.0.0.1（回环），不暴露外网（云端调用走 HTTPS 出网，不监听外网）。
 
@@ -30,9 +34,13 @@ Memoria 本地嵌入服务（语义检索后端）
 接口：
     POST /embed
         body:  {"texts": ["..."], "normalize": false}
-        return: {"embeddings": [[...]], "dim": 768, "model": "..."}
+        return: {"embeddings": [[...]], "dim": <EMBED_DIM 默认 1024>, "model": "..."}
     GET  /health
-        return: {"status": "ok", "model": "...", "dim": 768}
+        return: {"status": "ok", "model": "...", "dim": <EMBED_DIM 默认 1024>}
+    #R69 documentation/low：**dim 字段的 provider 语义**——siliconflow 后端按
+    EMBED_DIM（默认 1024）输出；local 后端返回模型原生维度（/embed 用
+    len(embeddings[0])、/health 用 _model_dim()，默认 text2vec-base-chinese 为
+    768，_embed_local 完全忽略 EMBED_DIM，见上）。
 """
 
 import os
@@ -78,9 +86,9 @@ SF_CHAT_API = os.environ.get(
     "SILICONFLOW_CHAT_URL", "https://api.siliconflow.cn/v1/chat/completions"
 )
 HYDE_MODEL = os.environ.get("MEMORIA_HYDE_MODEL", "Qwen/Qwen2.5-7B-Instruct")
-# 输出维度：默认 768（与现有 hnsw.rs:DIM 对齐，零 Rust 改动）；
-# 可选 1024/4096（需同步改 hnsw.rs:DIM 并重编）。MRL 截断，精度损失极小。
-EMBED_DIM = int(os.environ.get("MEMORIA_EMBED_DIM", "768"))
+# 输出维度：默认 1024（与 hnsw.rs:DIM=1024 对齐，零 Rust 改动）；
+# 可选 768/4096（改维度须同步改 hnsw.rs:DIM 并重编 + 全量重嵌）。MRL 截断，精度损失极小。
+EMBED_DIM = int(os.environ.get("MEMORIA_EMBED_DIM", "1024"))
 
 HOST = os.environ.get("MEMORIA_EMBED_HOST", "127.0.0.1")
 PORT = int(os.environ.get("MEMORIA_EMBED_PORT", "8777"))

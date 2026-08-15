@@ -10,15 +10,15 @@
 
 use memoria_core::MemoriaEngine;
 use memoria_core::search::hybrid::hybrid_search;
-use memoria_core::tools::evolve::{evolve_memory, evolution_rollback};
+use memoria_core::tools::evolve::{evolution_rollback, evolve_memory};
 use memoria_core::tools::remember::remember_with_dedup;
 use rusqlite::params;
 
 /// 用与 p0_supersede 一致的 17 参签名插入一条记忆，返回其 id。
 fn remember(pool: &memoria_core::storage::SqlitePool, content: &str, ns: &str) -> String {
     remember_with_dedup(
-        pool, content, "fact", 3, "test", ns, "[]", None, None, None, None, None, None, None,
-        None, None, None,
+        pool, content, "fact", 3, "test", ns, "[]", None, None, None, None, None, None, None, None,
+        None, None,
     )
     .expect("remember")
     .id
@@ -61,7 +61,10 @@ fn evolve_writes_evolved_at_and_evolution_log() {
 
     // memories 列已写
     let (ctx, at, links) = memory_row(&engine.pool, &id);
-    assert_eq!(ctx.as_deref(), Some("用户固定周三上午有例会，需提前准备议程"));
+    assert_eq!(
+        ctx.as_deref(),
+        Some("用户固定周三上午有例会，需提前准备议程")
+    );
     assert!(at.is_some(), "evolved_at 必须非空");
     assert_eq!(links, Some(0), "无关联边时 link_count=0");
 
@@ -110,7 +113,10 @@ fn rollback_restores_old_value() {
     )
     .expect("evolve1");
     let log_id = r1["log_id"].as_str().expect("log_id").to_string();
-    assert_eq!(memory_row(&engine.pool, &id).0.as_deref(), Some("ctx1: 服务器位于 A 机房（北京）"));
+    assert_eq!(
+        memory_row(&engine.pool, &id).0.as_deref(),
+        Some("ctx1: 服务器位于 A 机房（北京）")
+    );
 
     // 回滚：恢复 old_value（首演化前 evolved_context=None）
     let rb = evolution_rollback(&engine.pool, &log_id).expect("rollback");
@@ -185,9 +191,26 @@ fn pending_evolution_flag_annotated_in_search() {
     let id = remember(&engine.pool, "可演化的关键事实：公司主营固废处理", ns);
 
     // 未演化：检索应标 pending_evolution=true
-    let before = hybrid_search(&engine.pool, "固废处理", ns, 10, None, None, None, false).unwrap();
-    let hit = before.iter().find(|r| r.memory_id == id).expect("should find memory");
-    assert!(hit.pending_evolution, "未演化记忆应标 pending_evolution=true");
+    let before = hybrid_search(
+        &engine.pool,
+        "固废处理",
+        ns,
+        10,
+        None,
+        None,
+        None,
+        None,
+        false,
+    )
+    .unwrap();
+    let hit = before
+        .iter()
+        .find(|r| r.memory_id == id)
+        .expect("should find memory");
+    assert!(
+        hit.pending_evolution,
+        "未演化记忆应标 pending_evolution=true"
+    );
     assert!(hit.evolved_at.is_none(), "未演化记忆 evolved_at 应为 NULL");
 
     // 演化后：检索应标 pending_evolution=false
@@ -201,8 +224,25 @@ fn pending_evolution_flag_annotated_in_search() {
         "context_update",
     )
     .expect("evolve");
-    let after = hybrid_search(&engine.pool, "固废处理", ns, 10, None, None, None, false).unwrap();
-    let hit2 = after.iter().find(|r| r.memory_id == id).expect("should find memory after evolve");
-    assert!(!hit2.pending_evolution, "演化后记忆应标 pending_evolution=false");
+    let after = hybrid_search(
+        &engine.pool,
+        "固废处理",
+        ns,
+        10,
+        None,
+        None,
+        None,
+        None,
+        false,
+    )
+    .unwrap();
+    let hit2 = after
+        .iter()
+        .find(|r| r.memory_id == id)
+        .expect("should find memory after evolve");
+    assert!(
+        !hit2.pending_evolution,
+        "演化后记忆应标 pending_evolution=false"
+    );
     assert!(hit2.evolved_at.is_some(), "演化后 evolved_at 应非空");
 }
