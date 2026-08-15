@@ -5,7 +5,7 @@
 //! 批处理 LLM 产出，再通过 MCP `memory_evolve` / `evolution_rollback` 调到这里落库。
 
 use rusqlite::params;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::storage::SqlitePool;
@@ -99,7 +99,8 @@ pub fn evolve_memory(
         params![log_id, target_id, target_id, change_type, old_value, new_value, model, now, namespace],
     )
     .map_err(|e| format!("evolution_log insert: {}", e))?;
-    tx.commit().map_err(|e| format!("commit evolve tx: {}", e))?;
+    tx.commit()
+        .map_err(|e| format!("commit evolve tx: {}", e))?;
 
     Ok(json!({
         "status": "evolved",
@@ -153,7 +154,8 @@ pub fn evolution_rollback(pool: &SqlitePool, log_id: &str) -> Result<Value, Stri
         params![log_id],
     )
     .map_err(|e| format!("rollback log mark: {}", e))?;
-    tx.commit().map_err(|e| format!("commit rollback tx: {}", e))?;
+    tx.commit()
+        .map_err(|e| format!("commit rollback tx: {}", e))?;
     Ok(json!({
         "status": "rolled_back",
         "target_id": target_id,
@@ -226,11 +228,7 @@ pub fn evolution_log_query(
 ///
 /// 注：`evolve_memory` 已遵守 `MEMORIA_EVOLVE_WRITE` 开关；关闭时返回 skipped。
 /// 生产级 LLM 演化仍由 agent-core 的 consolidate 通过 `memory_evolve` 驱动（后续接入）。
-pub fn evolve_memory_auto(
-    pool: &SqlitePool,
-    namespace: &str,
-    limit: i64,
-) -> Result<Value, String> {
+pub fn evolve_memory_auto(pool: &SqlitePool, namespace: &str, limit: i64) -> Result<Value, String> {
     let limit = if limit <= 0 { 50 } else { limit.min(2000) };
     let conn = pool.get().map_err(|e| format!("pool: {}", e))?;
     let rows: Vec<(String, Option<String>)> = conn
@@ -249,8 +247,16 @@ pub fn evolve_memory_auto(
     let mut evolved = 0i64;
     for (id, content) in rows {
         let ctx = synthesize_evolved_context(content.as_deref());
-        if evolve_memory(pool, &id, namespace, &ctx, None, "memoria:builtin-auto", "auto_promote")
-            .is_ok()
+        if evolve_memory(
+            pool,
+            &id,
+            namespace,
+            &ctx,
+            None,
+            "memoria:builtin-auto",
+            "auto_promote",
+        )
+        .is_ok()
         {
             evolved += 1;
         }

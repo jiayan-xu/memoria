@@ -12,7 +12,7 @@
 //!
 //! 硬约束（报告 §8）：离线物化，写回 entity_edges（受控枚举门禁），不动热路径。
 
-use memoria_core::ontology::{materialize, write_back_edges, OntologyConfig};
+use memoria_core::ontology::{OntologyConfig, materialize, write_back_edges};
 use rusqlite::params;
 
 /// 测试用最小 schema（含 supersedes 传递属性声明）。
@@ -143,7 +143,7 @@ fn locate_bin(env_bin: &Option<std::ffi::OsString>) -> Option<String> {
         if b.is_empty() {
             return None;
         }
-                // env 值先做 is_file() 校验 + 可执行/身份探测（--help 能 spawn 且输出确认是 open-ontologies），
+        // env 值先做 is_file() 校验 + 可执行/身份探测（--help 能 spawn 且输出确认是 open-ontologies），
         // 失败即权威地返回 None，避免后续 materialize(...).expect(...) 因 spawn 失败而 panic 或跑错
         // 二进制（#R3-1）。explicit 路径本就 fail-closed，`probe_bin` 的身份校验保证它不是同名其它工具。
         if std::path::Path::new(&*b).is_file() && probe_bin(&b, pt) {
@@ -234,7 +234,10 @@ fn probe_timeout() -> std::time::Duration {
             let v = os.to_string_lossy();
             match v.parse::<u64>() {
                 Ok(n) if n == 0 => {
-                    eprintln!("WARN: PROBE_TIMEOUT_SECS={:?} is 0/invalid, clamped to 1s", v);
+                    eprintln!(
+                        "WARN: PROBE_TIMEOUT_SECS={:?} is 0/invalid, clamped to 1s",
+                        v
+                    );
                     std::time::Duration::from_secs(1)
                 }
                 Ok(n) if n > PROBE_TIMEOUT_MAX_SECS => {
@@ -248,7 +251,8 @@ fn probe_timeout() -> std::time::Duration {
                 Err(_) => {
                     eprintln!(
                         "WARN: PROBE_TIMEOUT_SECS={:?} (non-UTF-8 or unparseable), falling back to default {}s",
-                        v, PROBE_TIMEOUT.as_secs()
+                        v,
+                        PROBE_TIMEOUT.as_secs()
                     );
                     PROBE_TIMEOUT
                 }
@@ -418,13 +422,11 @@ fn setup_bin_and_fixtures(
 /// 等错误 IRI，让 URI/存储格式回归在此暴露（#2 第5轮 test/low）。
 fn assert_inferred_doc_c_supersedes_doc_a(inferred: &[(String, String, String)]) {
     assert!(
-        inferred
-            .iter()
-            .any(|(s, p, o)| {
-                s == "http://memoria.ai/onto/docC"
-                    && p == "http://memoria.ai/onto/supersedes"
-                    && o == "http://memoria.ai/onto/docA"
-            }),
+        inferred.iter().any(|(s, p, o)| {
+            s == "http://memoria.ai/onto/docC"
+                && p == "http://memoria.ai/onto/supersedes"
+                && o == "http://memoria.ai/onto/docA"
+        }),
         "expected docC supersedes docA in inferred_edges, got {:?}",
         inferred
     );
@@ -463,8 +465,12 @@ fn materialize_infers_transitive_supersedes() {
     // #R19（第19轮 other/low）：fixture 路径本地生成，用 `to_str().expect` 显式失败而非
     // `to_string_lossy()` 静默替换非 UTF-8 字节（否则 materialize 会打开不同的、不存在的文件，
     // 报令人困惑的 "read source ttl" 错误）。变量名 data_path 明确其为路径而非 TTL 内容。
-    let res = materialize(&cfg, data_path.to_str().expect("fixture path must be UTF-8"), "owl-rl")
-        .expect("materialize");
+    let res = materialize(
+        &cfg,
+        data_path.to_str().expect("fixture path must be UTF-8"),
+        "owl-rl",
+    )
+    .expect("materialize");
     // OWL TransitiveProperty：docC supersedes docA 应被推断
     assert!(res.triples_after > res.triples_before, "expected inference");
     assert_inferred_doc_c_supersedes_doc_a(&res.inferred_edges);
@@ -476,16 +482,40 @@ fn materialize_infers_transitive_supersedes() {
     // 的场景，但此测试此前只断言"有 docC supersedes docA"仍会通过。负列表须穷尽全部 5 条显式边，
     // 才能拦住"`;` 续行回归把部分显式边当推断"的完整回归面。
     for (s, p, o) in &[
-        ("http://memoria.ai/onto/docB", "http://memoria.ai/onto/supersedes", "http://memoria.ai/onto/docA"),
-        ("http://memoria.ai/onto/docC", "http://memoria.ai/onto/supersedes", "http://memoria.ai/onto/docB"),
-        ("http://memoria.ai/onto/docA", "http://memoria.ai/onto/createdBy", "http://memoria.ai/onto/alice"),
-        ("http://memoria.ai/onto/docB", "http://memoria.ai/onto/createdBy", "http://memoria.ai/onto/alice"),
-        ("http://memoria.ai/onto/docC", "http://memoria.ai/onto/createdBy", "http://memoria.ai/onto/alice"),
+        (
+            "http://memoria.ai/onto/docB",
+            "http://memoria.ai/onto/supersedes",
+            "http://memoria.ai/onto/docA",
+        ),
+        (
+            "http://memoria.ai/onto/docC",
+            "http://memoria.ai/onto/supersedes",
+            "http://memoria.ai/onto/docB",
+        ),
+        (
+            "http://memoria.ai/onto/docA",
+            "http://memoria.ai/onto/createdBy",
+            "http://memoria.ai/onto/alice",
+        ),
+        (
+            "http://memoria.ai/onto/docB",
+            "http://memoria.ai/onto/createdBy",
+            "http://memoria.ai/onto/alice",
+        ),
+        (
+            "http://memoria.ai/onto/docC",
+            "http://memoria.ai/onto/createdBy",
+            "http://memoria.ai/onto/alice",
+        ),
     ] {
         assert!(
-            !res.inferred_edges.iter().any(|(s2, p2, o2)| s2 == s && p2 == p && o2 == o),
+            !res.inferred_edges
+                .iter()
+                .any(|(s2, p2, o2)| s2 == s && p2 == p && o2 == o),
             "explicit source edge ({}, {}, {}) must NOT be in inferred_edges — parse_ttl_edges regression?",
-            s, p, o
+            s,
+            p,
+            o
         );
     }
     println!("inferred_edges: {:?}", res.inferred_edges);
@@ -497,7 +527,8 @@ fn write_back_edges_upserts_into_entity_edges() {
     let _guard = temp_dir("writeback");
     let dir = _guard.path();
     let db = dir.join("mem.db");
-    let engine = memoria_core::MemoriaEngine::new(db.to_str().expect("temp path must be UTF-8")).expect("engine");
+    let engine = memoria_core::MemoriaEngine::new(db.to_str().expect("temp path must be UTF-8"))
+        .expect("engine");
     let conn = engine.pool.get().unwrap();
     let ns = "agent/onto";
 
@@ -570,19 +601,26 @@ fn end_to_end_materialize_and_writeback() {
     };
     let dir = guard.path().to_path_buf();
     // #R19：同 materialize_infers_transitive_supersedes——to_str().expect 显式失败，非静默替换。
-    let res =
-        materialize(&cfg, data_path.to_str().expect("fixture path must be UTF-8"), "owl-rl")
-            .expect("materialize");
+    let res = materialize(
+        &cfg,
+        data_path.to_str().expect("fixture path must be UTF-8"),
+        "owl-rl",
+    )
+    .expect("materialize");
 
     let db = dir.join("mem.db");
-    let engine = memoria_core::MemoriaEngine::new(db.to_str().expect("temp path must be UTF-8")).expect("engine");
+    let engine = memoria_core::MemoriaEngine::new(db.to_str().expect("temp path must be UTF-8"))
+        .expect("engine");
     let conn = engine.pool.get().unwrap();
     let ns = "agent/onto";
     let (written, _) = write_back_edges(&conn, ns, &res.inferred_edges).expect("write_back");
     // #R15（第15轮 test/low）：必须断言**精确计数**而非 `>=1`。DATA_TTL 的传递闭包只应推断
     // 恰好 1 条新 supersedes 边（docC supersedes docA）；重复插入或部分写入回归（如同一推断边
     // 写两次）会通过 `>=1` 却违反精确语义。查库数 supersedes 边数须 ==1，与单测级严格度一致。
-    assert_eq!(written, 1, "exactly 1 inferred supersedes edge written (DATA_TTL closure)");
+    assert_eq!(
+        written, 1,
+        "exactly 1 inferred supersedes edge written (DATA_TTL closure)"
+    );
     let supersedes_count: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM entity_edges WHERE namespace=?1 AND relation_type='supersedes'",
@@ -590,7 +628,10 @@ fn end_to_end_materialize_and_writeback() {
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(supersedes_count, 1, "exactly 1 supersedes edge persisted in entity_edges");
+    assert_eq!(
+        supersedes_count, 1,
+        "exactly 1 supersedes edge persisted in entity_edges"
+    );
 
     // 验证**具体推断边** docC supersedes docA 在库里（#123/#R3-10）：
     // 因 DATA_TTL 用完整 IRI，inferred_edges 只含真正新增的推断边。
