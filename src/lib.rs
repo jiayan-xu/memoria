@@ -544,6 +544,12 @@ mod python {
         pending_hype: std::sync::Mutex<Option<(HnswIndex, usize, u64)>>,
         /// #R61：build/swap 配对 token 序列（单调递增，见 build_hype_index doc）。
         build_seq: std::sync::atomic::AtomicU64,
+        /// #R69 bug/high：**build in-flight 守卫**——`build_hype_index` 是 &self
+        /// （PyO3 只挡并发 mix build/swap，挡不住并发 build/build）；token 在
+        /// build **开始**时分配（start order，#R61 的完成时分配让"先开始后完成"
+        /// 的 build 覆盖新快照并拿最高 token——陈旧索引静默安装）。同一实例
+        /// 并发 build 直接 Err（fail-fast），杜绝单槽竞态。
+        hype_build_inflight: std::sync::Mutex<Option<u64>>,
     }
 
     #[pymethods]
@@ -556,6 +562,7 @@ mod python {
                     inner: e,
                     pending_hype: std::sync::Mutex::new(None),
                     build_seq: std::sync::atomic::AtomicU64::new(0),
+                    hype_build_inflight: std::sync::Mutex::new(None),
                 })
                 .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))
         }
@@ -646,12 +653,51 @@ mod python {
         /// 会让先者被静默丢弃、swap 激活错误索引且 count 不匹配；调用方须把
         /// 返回值传给 swap_hype_index(token) 配对，陈旧 build 被拒绝（fail-fast
         /// 而非覆盖）。
+        /// #R69 bug/high：**token 在 build 开始时分配（start order）+ in-flight
+        /// 守卫**——此前 token 在构建完成后分配（completion order）：并发 build
+        /// A（先开始、读旧快照）后完成时覆盖 B（后开始、读新快照）的槽并拿
+        /// 最高 token，A 的 swap 成功安装**陈旧索引**（缺最近 HyPE 向量）而 B
+        /// 的新构建反被拒为 stale——单槽 last-writer-wins + completion-order 无法
+        /// 区分"最后完成者"与"最新快照"。token 前置 + `hype_build_inflight`
+        /// 守卫使同一实例并发 build 直接 fail-fast（A 未完成时 B 立即 Err，
+        /// 无竞态窗口）；build 失败/panic 路径清理守卫（防死锁后续 build）。
         fn build_hype_index(&self, py: Python<'_>) -> PyResult<u64> {
+            // token 在**构建开始前**分配：start order 决定槽所有权（#R69）。
+            let token = self.build_seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            // in-flight 守卫：同一实例并发 build fail-fast（#R69 bug/high——
+            // PyO3 的 &self 借用不阻止并发 build/build，之前两个 build 会竞态
+            // 覆盖 pending 槽）。
+            {
+                let mut inflight = self
+                    .hype_build_inflight
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner());
+                if inflight.is_some() {
+                    return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "concurrent hype build in progress (started token {}); build/swap must be serialized on one engine",
+                        inflight.unwrap()
+                    )));
+                }
+                *inflight = Some(token);
+            }
             let r: Result<(HnswIndex, usize), String> =
                 py.detach(|| self.inner.build_hype_index_fresh());
-            let (fresh, count) =
-                r.map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
-            let token = self.build_seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            let (fresh, count) = match r {
+                Ok(x) => x,
+                Err(e) => {
+                    // 失败路径清理守卫：否则后续 build 永久 Err（#R69）。
+                    *self
+                        .hype_build_inflight
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner()) = None;
+                    return Err(pyo3::exceptions::PyRuntimeError::new_err(e));
+                }
+            };
+            // 构建完成：清理守卫 + 写入 pending 槽（token 已配对 start order）。
+            *self
+                .hype_build_inflight
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()) = None;
             *self
                 .pending_hype
                 .lock()
