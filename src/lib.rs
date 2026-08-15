@@ -135,10 +135,21 @@ impl MemoriaEngine {
     /// 锁外/无独占借用下构建新索引）与 `swap_hype_index`（&mut self，O(1) 赋值）分离：
     /// Arc<Mutex> 宿主与多线程 Python 宿主可在**构建期间保持并发检索**，锁内窗口从
     /// "秒级构建"缩到"一次赋值"。refresh_hype_index 保留为简单宿主的一步封装。
+    /// #R69 bug/medium：**两阶段路径同严**——R48 指出此前本函数走 build_hype_hnsw
+    /// （丢弃 read_errors/skipped）：单行读取失败/跳过被吸收为 Ok(partial)，swap
+    /// 无 mismatch（count==fresh.len()）静默安装缺失行索引。改用 detailed 构建器，
+    /// 任一降级信号 >0 即 Err——与 refresh_hype_index 的门控一致。
     pub fn build_hype_index_fresh(&self) -> Result<(HnswIndex, usize), String> {
         // 复用 content 索引当前的 ef（#R54：避免 env 重解析导致双路 ef 分裂）。
         let ef_search = self.hnsw.ef_search();
-        vector::persist::build_hype_hnsw(&self.pool, ef_search)
+        let (fresh, count, read_errors, skipped) =
+            vector::persist::build_hype_hnsw_detailed(&self.pool, ef_search)?;
+        if read_errors > 0 || skipped > 0 {
+            return Err(format!(
+                "HYPE HNSW build: partial rebuild ({read_errors} read error(s), {skipped} skipped row(s)); refusing to publish degraded index"
+            ));
+        }
+        Ok((fresh, count))
     }
     pub fn swap_hype_index(&mut self, fresh: HnswIndex, count: usize) {
         // #R63 maintainability/low：**API 边界校验**——count 与 fresh.len() 不匹配的
@@ -163,9 +174,11 @@ impl MemoriaEngine {
         // #R69 bug/medium：**部分重建不替换健康快照**——build_hype_hnsw 的 Err
         // 只覆盖全损；单行读取错误（NULL/类型漂移 blob）被计数 + WARN 吸收为
         // Ok(partial)。refresh 若用降级索引 swap 掉健康快照，双路语义检索静默
-        // 退化为单路且无错误上报。detailed 版暴露 read_errors：>0 时保留旧
-        // 快照并 Err（显式告知部分重建，调用方可决定重试/人工处理）。
-        let (fresh, count, read_errors) = match vector::persist::build_hype_hnsw_detailed(
+        // 退化为单路且无错误上报。detailed 版暴露 read_errors/skipped：任一
+        // >0 时保留旧快照并 Err（显式告知部分重建，调用方可决定重试/人工处理；
+        // skipped 含 dim 漂移/degenerate/corrupt 跳过行——比 read_errors 更
+        // 常见的降级信号，R48 指出此前只查 read_errors 会漏掉维度漂移场景）。
+        let (fresh, count, read_errors, skipped) = match vector::persist::build_hype_hnsw_detailed(
             &self.pool,
             self.hnsw.ef_search(),
         ) {
@@ -175,9 +188,9 @@ impl MemoriaEngine {
                 return Err(e);
             }
         };
-        if read_errors > 0 {
+        if read_errors > 0 || skipped > 0 {
             let msg = format!(
-                "HYPE HNSW refresh: {read_errors} row(s) failed read/iteration (partial rebuild); keeping existing index"
+                "HYPE HNSW refresh: partial rebuild ({read_errors} read error(s), {skipped} skipped row(s)); keeping existing index"
             );
             eprintln!("[Memoria] WARN: {msg}");
             return Err(msg);
@@ -660,7 +673,11 @@ mod python {
         /// 的新构建反被拒为 stale——单槽 last-writer-wins + completion-order 无法
         /// 区分"最后完成者"与"最新快照"。token 前置 + `hype_build_inflight`
         /// 守卫使同一实例并发 build 直接 fail-fast（A 未完成时 B 立即 Err，
-        /// 无竞态窗口）；build 失败/panic 路径清理守卫（防死锁后续 build）。
+        /// 无竞态窗口）。
+        /// #R69 bug/medium：**panic 安全**——detach 内构建 panic（未来 unwrap、
+        /// hnsw_rs 内部 panic、锁中毒 unwind）时 PyO3 边界转 PanicException、
+        /// 手动清理行被跳过 → 守卫永久 Some、后续 build 永久 Err。改用 RAII
+        /// guard（Drop 无条件清守卫，含 panic 展开路径）。
         fn build_hype_index(&self, py: Python<'_>) -> PyResult<u64> {
             // token 在**构建开始前**分配：start order 决定槽所有权（#R69）。
             let token = self.build_seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
@@ -680,24 +697,20 @@ mod python {
                 }
                 *inflight = Some(token);
             }
+            // RAII 守卫：任何出口（Ok/Err/panic 展开）都清 in-flight（#R69
+            // bug/medium——手动清理在 panic 路径被跳过、守卫永久 Some）。
+            struct InflightGuard<'a>(&'a std::sync::Mutex<Option<u64>>);
+            impl Drop for InflightGuard<'_> {
+                fn drop(&mut self) {
+                    *self.0.lock().unwrap_or_else(|p| p.into_inner()) = None;
+                }
+            }
+            let _guard = InflightGuard(&self.hype_build_inflight);
             let r: Result<(HnswIndex, usize), String> =
                 py.detach(|| self.inner.build_hype_index_fresh());
-            let (fresh, count) = match r {
-                Ok(x) => x,
-                Err(e) => {
-                    // 失败路径清理守卫：否则后续 build 永久 Err（#R69）。
-                    *self
-                        .hype_build_inflight
-                        .lock()
-                        .unwrap_or_else(|p| p.into_inner()) = None;
-                    return Err(pyo3::exceptions::PyRuntimeError::new_err(e));
-                }
-            };
-            // 构建完成：清理守卫 + 写入 pending 槽（token 已配对 start order）。
-            *self
-                .hype_build_inflight
-                .lock()
-                .unwrap_or_else(|p| p.into_inner()) = None;
+            let (fresh, count) =
+                r.map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
+            // 写入 pending 槽（token 已配对 start order）；_guard drop 清 in-flight。
             *self
                 .pending_hype
                 .lock()
