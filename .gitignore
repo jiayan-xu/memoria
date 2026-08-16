@@ -95,3 +95,8 @@ start_memoria_prod.py
 
 # 本地召回探针（单查询诊断，eval/ 批量 scratch 规则外补充）
 eval/probe_single.py
+
+# LongMemEval 评测数据/结果/日志（277MB 数据 + 派生结果，仅本地，不入库）
+eval/longmemeval/*.json
+eval/longmemeval/*.log
+eval/longmemeval/*.err
