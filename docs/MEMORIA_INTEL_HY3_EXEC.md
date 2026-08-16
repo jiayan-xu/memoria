@@ -154,10 +154,10 @@ Dream / consolidate（agent-core 批处理）
 
 ## 7. Phase 4 — 评测与打磨（非阻塞主路径）
 
-- [ ] LongMemEval **完整集**作回归（报告数字，不绑发版门禁除非老大另定）——LoCoMo 完整集已本机跑（50 会话/1986 QA/avg 6.24，`eval/locomo/` 未入库）；LongMemEval 未跑  
+- [x] LongMemEval **完整集**作回归（2026-08-17 完成：500 问全评分，证据命中率 96.8%，平均分 7.05，pass@8 59.6%；harness+报告 `eval/longmemeval/` 已入库；LoCoMo 完整集已本机跑 50 会话/1986 QA/avg 6.24，`eval/locomo/` 未入库）  
 - [x] FTS5 中文（jieba 等）——`jieba-rs` 在 `Cargo.toml`；`storage/fts5.rs` / `search/keyword.rs` / `tools/compress.rs` 落地（2026-08-15 复核）  
 - [x] HNSW 增量持久化 / 启动加速——`vector/persist.rs`：`memory_vectors` 权威持久 + 启动重建 + 维度/退化防御；PR #6 附带 HyPE 双索引（2026-08-15 复核）  
-- [ ] `mcp_server` dispatch 单测补齐——目前仅 `test_dispatch_memory_search_hype_road` 一个  
+- [x] `mcp_server` dispatch 单测补齐——PR #9（862e713）补齐 unknown tool / 写路径 roundtrip / ns 默认 3 个用例，本地 4 测试全绿（2026-08-16 复核）  
 
 ---
 
