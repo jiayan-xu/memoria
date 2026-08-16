@@ -3593,8 +3593,16 @@ mod tests {
             out
         );
 
-        // 5) memory_recall 同路由可召回
-        let out = dispatch(&state, "memory_recall", &search_args, &auth);
+        // 5) memory_recall 同路由可召回——用 observe 专属词元做 query（与 remember 内容不同，
+        //    不依赖 RRF 融合的时序/importance 噪声兜底，直接验证 observe 行可被召回）
+        let mut recall_args = serde_json::Map::new();
+        recall_args.insert(
+            "query".into(),
+            serde_json::Value::String("记忆观察测试独有词元".into()),
+        );
+        recall_args.insert("namespace".into(), serde_json::Value::String(ns.into()));
+        recall_args.insert("max_results".into(), serde_json::Value::from(10));
+        let out = dispatch(&state, "memory_recall", &recall_args, &auth);
         let v: serde_json::Value = serde_json::from_str(&out).expect("recall returns JSON");
         assert_eq!(v["status"], "ok", "recall 响应: {}", out);
         assert!(
