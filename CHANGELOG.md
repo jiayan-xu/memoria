@@ -1,5 +1,14 @@
 # 演进日志 / CHANGELOG
 
+## 2026-08-17
+
+### SessionWatcher 观察落点可配置（MEMORIA_WATCH_NS）
+- **改动**：`src/session_watcher.rs` 观察写入命名空间由硬编码 `"default"` 改为环境变量 `MEMORIA_WATCH_NS`（缺省 `"default"`，保持历史行为）；新增 `watch_namespace()`，启动日志打印目标 ns（`[SessionWatcher] Observations ns: ...`）。
+- **动机**：观察与 consolidate/dsh 写入散落不同 ns，夜间巩固无原料可提炼。本机部署以 `MEMORIA_WATCH_NS=agent/xujiayan` 统一落点。
+- **不 bump 版本**：当前 `0.3.0` 保持。
+
+---
+
 ## 2026-08-10
 
 ### 版本管理补齐（发版纪律落地）
