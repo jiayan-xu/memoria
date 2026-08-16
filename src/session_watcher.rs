@@ -23,6 +23,13 @@ fn watch_dirs() -> Vec<String> {
     }
 }
 
+/// 观察写入的目标命名空间（MEMORIA_WATCH_NS 环境变量；缺省 "default" 保持历史行为）。
+/// 本机部署由 launcher 注入 MEMORIA_WATCH_NS=agent/xujiayan，
+/// 与 dsh-memoria 插件 / agent-core consolidate 的落点保持一致，避免观察散落 default。
+fn watch_namespace() -> String {
+    std::env::var("MEMORIA_WATCH_NS").unwrap_or_else(|_| "default".to_string())
+}
+
 /// 每轮最多处理的消息数
 const MAX_PER_POLL: usize = 20;
 
@@ -40,6 +47,8 @@ pub async fn watch_sessions_loop(pool: SqlitePool) {
         println!("[SessionWatcher] WATCH_DIRS 未设置，不监听");
         return;
     }
+    let ns = watch_namespace();
+    println!("[SessionWatcher] Observations ns: {}", ns);
     for d in &dirs {
         println!("[SessionWatcher] Watching: {}", d);
         // 初始化文件偏移 — 用 spawn_blocking 隔离文件系统操作
@@ -69,9 +78,10 @@ pub async fn watch_sessions_loop(pool: SqlitePool) {
         // poll_once 内含同步文件系统操作，用 spawn_blocking 隔离
         let pool_clone = pool.clone();
         let dirs_clone = dirs.clone();
+        let ns_clone = ns.clone();
         let offsets_clone = offsets.clone();
         match tokio::task::spawn_blocking(move || {
-            poll_once_blocking(&pool_clone, &dirs_clone, &mut offsets_clone.clone())
+            poll_once_blocking(&pool_clone, &dirs_clone, &ns_clone, &mut offsets_clone.clone())
         })
         .await
         {
@@ -88,6 +98,7 @@ pub async fn watch_sessions_loop(pool: SqlitePool) {
 fn poll_once_blocking(
     pool: &SqlitePool,
     dirs: &[String],
+    ns: &str,
     offsets: &mut HashMap<String, u64>,
 ) -> HashMap<String, u64> {
     let mut total = 0usize;
@@ -148,7 +159,7 @@ fn poll_once_blocking(
                         "user",
                         "session_watcher",
                         &p.to_string_lossy(),
-                        "default",
+                        ns,
                         None,
                         None,
                     );
