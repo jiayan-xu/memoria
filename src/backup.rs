@@ -39,12 +39,13 @@ struct BackupManifest {
 
 /// 计算文件 sha256（分块读取，避免大库一次性载入内存）。
 fn sha256_file(path: &str) -> Result<String, String> {
-    let mut f =
-        std::fs::File::open(path).map_err(|e| format!("open {}: {}", path, e))?;
+    let mut f = std::fs::File::open(path).map_err(|e| format!("open {}: {}", path, e))?;
     let mut hasher = Sha256::new();
     let mut buf = [0u8; 8192];
     loop {
-        let n = f.read(&mut buf).map_err(|e| format!("read {}: {}", path, e))?;
+        let n = f
+            .read(&mut buf)
+            .map_err(|e| format!("read {}: {}", path, e))?;
         if n == 0 {
             break;
         }
@@ -55,8 +56,8 @@ fn sha256_file(path: &str) -> Result<String, String> {
 
 /// 对源库做事务一致性热备（VACUUM INTO），复用 `perform_backup` 的范式。
 fn vacuum_into(src: &str, dst: &str) -> Result<(), String> {
-    let conn = rusqlite::Connection::open(src)
-        .map_err(|e| format!("open source {}: {}", src, e))?;
+    let conn =
+        rusqlite::Connection::open(src).map_err(|e| format!("open source {}: {}", src, e))?;
     let sql = format!("VACUUM INTO '{}'", escape_sql_path(dst));
     conn.execute_batch(&sql)
         .map_err(|e| format!("VACUUM INTO {}: {}", dst, e))?;
@@ -119,10 +120,14 @@ pub fn backup_create_cli(main_db: &str, auth_db: &str, backup_dir: &str) -> Resu
         path_allowlist: allowlist,
     };
     let manifest_path = archive_dir.join("manifest.json");
-    let json = serde_json::to_string_pretty(&manifest).map_err(|e| format!("manifest ser: {}", e))?;
+    let json =
+        serde_json::to_string_pretty(&manifest).map_err(|e| format!("manifest ser: {}", e))?;
     std::fs::write(&manifest_path, json).map_err(|e| format!("write manifest: {}", e))?;
 
-    println!("[Memoria][backup] created archive: {}", archive_dir.display());
+    println!(
+        "[Memoria][backup] created archive: {}",
+        archive_dir.display()
+    );
     println!("[Memoria][backup] entries: {}", manifest.entries.len());
     for e in &manifest.entries {
         println!(
@@ -132,7 +137,9 @@ pub fn backup_create_cli(main_db: &str, auth_db: &str, backup_dir: &str) -> Resu
             &e.sha256[..16.min(e.sha256.len())]
         );
     }
-    println!("[Memoria][backup] NOTE: HNSW vector index is rebuildable from memory_vectors; not archived separately.");
+    println!(
+        "[Memoria][backup] NOTE: HNSW vector index is rebuildable from memory_vectors; not archived separately."
+    );
     Ok(())
 }
 
@@ -248,7 +255,8 @@ pub fn backup_restore_cli(
     let target_main_parent = Path::new(target_main)
         .parent()
         .ok_or("invalid target_main path")?;
-    std::fs::create_dir_all(target_main_parent).map_err(|e| format!("mkdir target parent: {}", e))?;
+    std::fs::create_dir_all(target_main_parent)
+        .map_err(|e| format!("mkdir target parent: {}", e))?;
 
     for entry in &manifest.entries {
         let src = dir.join(&entry.name);
@@ -275,11 +283,17 @@ pub fn backup_restore_cli(
         let dst_parent = Path::new(&dst)
             .parent()
             .ok_or("invalid audit target path")?;
-        std::fs::create_dir_all(dst_parent).map_err(|e| format!("mkdir audit target parent: {}", e))?;
+        std::fs::create_dir_all(dst_parent)
+            .map_err(|e| format!("mkdir audit target parent: {}", e))?;
         restore_from_backup(&src.to_string_lossy(), &dst)?;
-        println!("[Memoria][backup][restore] restored {} -> {}", entry.name, dst);
+        println!(
+            "[Memoria][backup][restore] restored {} -> {}",
+            entry.name, dst
+        );
     }
-    println!("[Memoria][backup][restore] DONE. With the service stopped, swap the restored file into place, then start.");
+    println!(
+        "[Memoria][backup][restore] DONE. With the service stopped, swap the restored file into place, then start."
+    );
     Ok(())
 }
 

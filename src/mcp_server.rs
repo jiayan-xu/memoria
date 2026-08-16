@@ -30,6 +30,11 @@ pub struct AppState {
     pub pool: storage::SqlitePool,
     pub auth_pool: storage::SqlitePool,
     pub hnsw: Arc<memoria_core::vector::HnswIndex>,
+    /// HyPE 假设问句索引（memory_hype_vectors 重建，启动时一次性构建）。
+    /// **关键警告**：运行时外部重灌（重跑 build_hype_vectors.py）不会自动刷新——
+    /// 需重启进程（refresh 语义与 in-place rebuild 的追加限制见
+    /// `persist::rebuild_hype_hnsw_from_store` doc 与 `MemoriaEngine::refresh_hype_index`）。
+    pub hype_hnsw: Arc<memoria_core::vector::HnswIndex>,
     pub hnsw_status: String,
     pub query_cache: Arc<memoria_core::vector::QueryCache>,
     pub admin_key: String,
@@ -95,7 +100,12 @@ fn hyde_enabled() -> bool {
     }
 }
 
-async fn embed_query(client: &reqwest::Client, url: &str, query: &str, hyde: bool) -> Option<Vec<f32>> {
+async fn embed_query(
+    client: &reqwest::Client,
+    url: &str,
+    query: &str,
+    hyde: bool,
+) -> Option<Vec<f32>> {
     let body = if hyde {
         serde_json::json!({ "texts": [query], "hyde": true })
     } else {
@@ -155,7 +165,10 @@ async fn embed_query(client: &reqwest::Client, url: &str, query: &str, hyde: boo
             }
         }
     }
-    eprintln!("[embed_query] FAILED after retries for q={:?}: {:?}", query, last_err);
+    eprintln!(
+        "[embed_query] FAILED after retries for q={:?}: {:?}",
+        query, last_err
+    );
     None
 }
 
@@ -446,7 +459,10 @@ pub fn tools_list() -> Vec<serde_json::Value> {
     let mut tools = vec![
         tool(
             "memory_search",
-            "搜索记忆",
+            // #R63 bug/medium：**HyPE 索引是启动快照**——运行时写入（remember/
+            // observe/supersede）只更新 content 索引，启动后新建的记忆对问句路
+            // 不可见（不对称召回，重启后自愈）；工具描述如实声明限制。
+            "搜索记忆（HyPE 问句路仅覆盖启动时已建索引的记忆；重启后全量生效）",
             serde_json::json!({
                 "query": {"type": "string", "description": "搜索关键词（必填）"},
                 "namespace": {"type": "string", "description": "命名空间（必填）；缺省时由 agent-core 注入调用者主 ns"},
@@ -457,7 +473,13 @@ pub fn tools_list() -> Vec<serde_json::Value> {
         ),
         tool(
             "memory_search_v2",
-            "多信号融合搜索",
+            // #R68 documentation/low：HyPE 启动快照限制同样适用（与 memory_search
+            // 共享同一 dispatch 分支）。
+            // #R69 documentation/low：**公开描述同步披露**——MCP 工具发现
+            // （agent-core 会话开场、dashboard 徽标）只读 description 字符串，
+            // 内部 #R68 注释对调用方不可见；不披露会让调用方误以为问句路
+            // 覆盖全部记忆。
+            "多信号融合搜索（HyPE 问句路仅覆盖启动时已建索引的记忆；重启后全量生效）",
             serde_json::json!({
                 "query": {"type": "string", "description": "搜索关键词（必填）"},
                 "namespace": {"type": "string", "description": "命名空间（必填）；缺省时由 agent-core 注入调用者主 ns"},
@@ -531,7 +553,11 @@ pub fn tools_list() -> Vec<serde_json::Value> {
         ),
         tool(
             "memory_context",
-            "会话开场注入：memory_profile + 可选 query 追加 top-k recall，产出 prompt_block",
+            // #R68 documentation/low：带 query 时经 profile::memory_context 走
+            // Some(&state.hype_hnsw)——HyPE 启动快照限制同样适用。
+            // #R69 documentation/low：公开描述同步披露（同 memory_search_v2——
+            // memory_context 的 query recall 正是会话开场检索，最需要声明）。
+            "会话开场注入：memory_profile + 可选 query 追加 top-k recall，产出 prompt_block（query recall 的 HyPE 问句路仅覆盖启动时已建索引的记忆；重启后全量生效）",
             serde_json::json!({
                 "namespace": {"type": "string", "description": "命名空间，默认 default"},
                 "query": {"type": "string", "description": "可选：本轮用户首句，用于追加 recall"},
@@ -544,7 +570,9 @@ pub fn tools_list() -> Vec<serde_json::Value> {
         ),
         tool(
             "memory_recall",
-            "回忆检索（别名 memory_search_v2）：默认 isLatest，走 search 配额",
+            // #R68 documentation/low：同上（共享 dispatch 分支）。
+            // #R69 documentation/low：公开描述同步披露（同 memory_search_v2）。
+            "回忆检索（别名 memory_search_v2）：默认 isLatest，走 search 配额（HyPE 问句路仅覆盖启动时已建索引的记忆；重启后全量生效）",
             serde_json::json!({
                 "query": {"type": "string", "description": "搜索关键词（必填）"},
                 "namespace": {"type": "string", "description": "命名空间（必填）；缺省时由 agent-core 注入调用者主 ns"},
@@ -683,10 +711,7 @@ pub fn tools_list() -> Vec<serde_json::Value> {
                     "namespace": {"type": "string", "description": "可选；调用者主 ns，缺省由引擎注入"}
                 }),
             ),
-            "system_status" => (
-                "检查各Agent连接状态",
-                serde_json::json!({}),
-            ),
+            "system_status" => ("检查各Agent连接状态", serde_json::json!({})),
             "reasonix_dispatch" => (
                 "派发编码任务给Reasonix",
                 serde_json::json!({
@@ -1018,12 +1043,18 @@ async fn handle_tool_call(
     let ns_policy = crate::permissions::matrix_lookup(tool).map(|e| e.ns_policy.clone());
     let ns: &str = match ns_policy {
         // 无命名空间概念的工具：用调用者主命名空间占位，跳过校验
-        Some(crate::permissions::NsPolicy::None) => {
-            auth.allowed_ns.first().map(|s| s.as_str()).unwrap_or("default")
-        }
+        Some(crate::permissions::NsPolicy::None) => auth
+            .allowed_ns
+            .first()
+            .map(|s| s.as_str())
+            .unwrap_or("default"),
         // NamespaceArg 及其它需按 namespace 门控的变体：要求调用方显式传 namespace；
         // 若缺省则回退到调用者主授权 ns（禁止静默落到 "default" 造成跨租户串写）。
-        Some(_) => match safe_args.get("namespace").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+        Some(_) => match safe_args
+            .get("namespace")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+        {
             Some(n) => n,
             None => {
                 match auth
@@ -1091,7 +1122,9 @@ async fn handle_tool_call(
     {
         if let Some(q) = safe_args.get("query").and_then(|v| v.as_str()) {
             if !q.is_empty() {
-                if let Some(qvec) = embed_query(&state.http_client, &state.embedding_url, q, hyde_enabled()).await {
+                if let Some(qvec) =
+                    embed_query(&state.http_client, &state.embedding_url, q, hyde_enabled()).await
+                {
                     state.query_cache.put(q, qvec);
                 }
             }
@@ -1113,7 +1146,9 @@ async fn handle_tool_call(
         };
         if let Some(c) = text {
             if !c.is_empty() {
-                if let Some(cvec) = embed_query(&state.http_client, &state.embedding_url, c, false).await {
+                if let Some(cvec) =
+                    embed_query(&state.http_client, &state.embedding_url, c, false).await
+                {
                     state.query_cache.put(c, cvec);
                 }
             }
@@ -1328,6 +1363,7 @@ fn dispatch(
                 ns,
                 search_depth,
                 Some(&state.hnsw),
+                Some(&state.hype_hnsw),
                 Some(&state.query_cache),
                 as_of,
                 include_superseded,
@@ -1338,7 +1374,9 @@ fn dispatch(
             // 仅改变相对序，不增删候选；失败则保留 hybrid 原序（优雅降级）。
             if rerank_on && fused.len() > 1 {
                 let docs: Vec<String> = fused.iter().map(|r| r.content.clone()).collect();
-                if let Some(scored) = block_on_rerank(&state.http_client, &rerank_url(), query, &docs) {
+                if let Some(scored) =
+                    block_on_rerank(&state.http_client, &rerank_url(), query, &docs)
+                {
                     let mut order_score: Vec<f64> = vec![0.0; fused.len()];
                     for (i, s) in scored {
                         if i < order_score.len() {
@@ -1532,7 +1570,10 @@ fn dispatch(
                         },
                         None => (400u16, e.clone()),
                     };
-                    format!(r#"{{"status":"error","code":{},"message":"{}"}}"#, code, msg)
+                    format!(
+                        r#"{{"status":"error","code":{},"message":"{}"}}"#,
+                        code, msg
+                    )
                 }
             };
             body
@@ -1568,9 +1609,7 @@ fn dispatch(
                     "manifest_id": out.manifest_id,
                     "chunk_ids": out.chunk_ids,
                 }))
-                .unwrap_or_else(|_| {
-                    r#"{"status":"error","message":"serialize"}"#.to_string()
-                }),
+                .unwrap_or_else(|_| r#"{"status":"error","message":"serialize"}"#.to_string()),
                 Err(e) => format!(
                     r#"{{"status":"error","code":422,"message":"{}"}}"#,
                     e.replace('"', "'")
@@ -1599,8 +1638,9 @@ fn dispatch(
                 dynamic_limit,
                 as_of,
             ) {
-                Ok(v) => serde_json::to_string(&v)
-                    .unwrap_or_else(|_| "{\"status\":\"error\",\"message\":\"serialize\"}".to_string()),
+                Ok(v) => serde_json::to_string(&v).unwrap_or_else(|_| {
+                    "{\"status\":\"error\",\"message\":\"serialize\"}".to_string()
+                }),
                 Err(e) => format!(r#"{{"status":"error","message":"{}"}}"#, e),
             }
         }
@@ -1628,6 +1668,7 @@ fn dispatch(
             match tools::profile::memory_context(
                 &state.pool,
                 Some(&state.hnsw),
+                Some(&state.hype_hnsw),
                 Some(&state.query_cache),
                 ns,
                 query,
@@ -1637,8 +1678,9 @@ fn dispatch(
                 dynamic_limit,
                 as_of,
             ) {
-                Ok(v) => serde_json::to_string(&v)
-                    .unwrap_or_else(|_| "{\"status\":\"error\",\"message\":\"serialize\"}".to_string()),
+                Ok(v) => serde_json::to_string(&v).unwrap_or_else(|_| {
+                    "{\"status\":\"error\",\"message\":\"serialize\"}".to_string()
+                }),
                 Err(e) => format!(r#"{{"status":"error","message":"{}"}}"#, e),
             }
         }
@@ -2038,6 +2080,51 @@ fn dispatch(
                 "hnsw_vectors".to_string(),
                 serde_json::Value::Number((state.hnsw.len() as i64).into()),
             );
+            // #R63 maintainability/medium：HyPE 索引规模镜像 lib.rs 双字段——hype
+            // 空/构建失败时 memory_search 静默退化为 content-only，MCP stats 无
+            // 感知（lib.rs db_stats 已有 store/live 对照）。
+            m.insert(
+                "hype_hnsw_vectors".to_string(),
+                serde_json::Value::Number((state.hype_hnsw.len() as i64).into()),
+            );
+            // #R66 maintainability/low：**store count 对照**——build_hype_hnsw_or_
+            // default 失败时软降级为空索引（仅 stderr WARN），live==0 无法区分
+            // "未启用/空表"与"构建失败"；store>0 && live==0 揭示降级（镜像
+            // lib.rs db_stats 双字段）。
+            // #R67 maintainability/low：**复用 conn**（本分支已有连接）+ **缺表与
+            // 故障分开 sentinel**（-1=查询失败；0=表存在但空/表缺失——legacy 库
+            // 缺表时 0 与"空表"不可分是既有表循环的惯例，但故障不再伪装）。
+            // #R69 maintainability/low：**表名共享常量**——此前内嵌字面量构成
+            // 同一表的第四处独立查询点（lib.rs query_hype_count_cached 双字段 +
+            // 本处），表 rename/迁移时本处静默翻 -1 而 lib.rs 仍工作；收敛到
+            // storage::MEMORY_HYPE_VECTORS_TABLE 单一事实源。
+            // #R69 bug/medium：**缺表与故障分开 sentinel**——#R67 注释契约
+            // "-1=查询失败；0=表存在但空/表缺失"但实现不符：SQLite 对缺失表的
+            // COUNT 返回错误（非 0 行），`.unwrap_or(-1)` 把"缺表"（DDL 软降级的
+            // legacy 库真实态，sqlite.rs 显式处理）与"真查询故障"折叠为同一 -1
+            // ——db_stats 的降级检测启发（store>0 && live==0 揭示软降级）在缺表
+            // 库上误报"查询失败"。缺表返回 0（与空表同义，#R67 注释原意），
+            // 仅真查询错误返回 -1。缺表错误是 SQLITE_ERROR(1) + "no such table"
+            // 消息（rusqlite 未映射为 CannotOpen，须按消息判别）。
+            let hype_store: i64 = match conn.query_row(
+                &format!("SELECT COUNT(*) FROM {}", crate::storage::MEMORY_HYPE_VECTORS_TABLE),
+                [],
+                |r| r.get(0),
+            ) {
+                Ok(c) => c,
+                Err(rusqlite::Error::SqliteFailure(_, msg))
+                    if msg
+                        .as_deref()
+                        .is_some_and(|m| m.contains("no such table")) =>
+                {
+                    0
+                }
+                Err(_) => -1,
+            };
+            m.insert(
+                "hype_hnsw_store".to_string(),
+                serde_json::Value::Number(hype_store.into()),
+            );
             serde_json::to_string(&serde_json::json!({"status":"ok","stats":m})).unwrap_or_default()
         }
         "a2a_send" => {
@@ -2177,7 +2264,9 @@ fn dispatch(
                         );
                         format!(r#"{{"status":"ok","deleted":{}}}"#, deleted)
                     } else {
-                        format!(r#"{{"status":"ok","deleted":0,"message":"not found or not owned"}}"#)
+                        format!(
+                            r#"{{"status":"ok","deleted":0,"message":"not found or not owned"}}"#
+                        )
                     }
                 }
                 Err(e) => format!(r#"{{"status":"error","message":"{}"}}"#, e),
@@ -2621,7 +2710,7 @@ fn dispatch(
                 "embed": report.soft_checks.iter().find(|c| c.name == "embedding"),
                 "report": report
             }))
-                .unwrap_or_default()
+            .unwrap_or_default()
         }
         "memory_dedup_chain" => {
             let memory_id = args.get("memory_id").and_then(|v| v.as_str()).unwrap_or("");
@@ -2672,16 +2761,14 @@ fn dispatch(
         "memory_evolve" => {
             // 演化写回：ns 门控（与写入同权），不强制 admin（agent-core consolidate 用 dashboard badge 调）
             let target_id = args.get("target_id").and_then(|v| v.as_str()).unwrap_or("");
-            let ev_ns = args
-                .get("namespace")
-                .and_then(|v| v.as_str())
-                .unwrap_or(ns);
+            let ev_ns = args.get("namespace").and_then(|v| v.as_str()).unwrap_or(ns);
             let evolved_context = args
                 .get("evolved_context")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
             if target_id.is_empty() || evolved_context.is_empty() {
-                return r#"{"status":"error","message":"missing target_id or evolved_context"}"#.to_string();
+                return r#"{"status":"error","message":"missing target_id or evolved_context"}"#
+                    .to_string();
             }
             let link_count = args.get("link_count").and_then(|v| v.as_i64());
             let model = args.get("model").and_then(|v| v.as_str()).unwrap_or("");
@@ -2701,7 +2788,8 @@ fn dispatch(
                 model,
                 change_type,
             ) {
-                Ok(v) => serde_json::to_string(&v).unwrap_or_else(|_| r#"{"status":"evolved"}"#.to_string()),
+                Ok(v) => serde_json::to_string(&v)
+                    .unwrap_or_else(|_| r#"{"status":"evolved"}"#.to_string()),
                 Err(e) => format!(r#"{{"status":"error","message":"{}"}}"#, e),
             }
         }
@@ -2715,7 +2803,8 @@ fn dispatch(
                 return r#"{"status":"error","message":"missing log_id"}"#.to_string();
             }
             match tools::evolve::evolution_rollback(&state.pool, log_id) {
-                Ok(v) => serde_json::to_string(&v).unwrap_or_else(|_| r#"{"status":"rolled_back"}"#.to_string()),
+                Ok(v) => serde_json::to_string(&v)
+                    .unwrap_or_else(|_| r#"{"status":"rolled_back"}"#.to_string()),
                 Err(e) => format!(r#"{{"status":"error","message":"{}"}}"#, e),
             }
         }
@@ -2724,7 +2813,11 @@ fn dispatch(
             let change_types: Vec<String> = args
                 .get("change_types")
                 .and_then(|v| v.as_array())
-                .map(|a| a.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                        .collect()
+                })
                 .unwrap_or_default();
             let since = args
                 .get("since")
@@ -3127,6 +3220,93 @@ fn matches_memory_tags(pool: &storage::SqlitePool, memory_id: &str, tags: &[Stri
 mod tests {
     use super::*;
 
+    // #R58 test/low：HyPE 双路经 **dispatch 路径**的实测——build_test_state 恒用空
+    // hype_hnsw，Some(&state.hype_hnsw) 的双路合并/去重/归因此前只在引擎级
+    // （eval_semantic）间接覆盖。填充双索引（DIM=1024）+ query 缓存后经
+    // memory_search dispatch 断言命中被返回（content 回查要求 memories 行存在）。
+    #[test]
+    fn test_dispatch_memory_search_hype_road() {
+        use memoria_core::vector::{DIM, VectorEntry};
+        let state = build_test_state();
+        // 写 memories 行（hybrid 的 ns 回查/content 回填需要）
+        {
+            let conn = state.pool.get().unwrap();
+            conn.execute(
+                "INSERT OR IGNORE INTO memories (id, namespace, content, importance) \
+                 VALUES (?1, 'agent/test', ?2, 3)",
+                rusqlite::params!["mem_hype_1", "HyPE 双路测试记忆内容"],
+            )
+            .unwrap();
+        }
+        // #R59 test/medium：**隔离 HyPE 路**——content 向量 cv 与 query 向量 hv
+        // 正交（cv=[0,1,...]，hv=[1,0,...]）：content 路 cosine=0（score<=0 被
+        // filter 剔除），只有 hype 路能命中；再断言 results[0].source 含 "hype"
+        // （dispatch 的归因字段），双路合并/去重/归因任一坏掉测试即红。此前
+        // cv=[1,0] 与 hv=[0.95,...] 的 content 路 cosine≈0.95 也能命中——hype_hnsw
+        // 为空或双路逻辑全坏测试照样通过（假覆盖）。
+        let mut cv = vec![0.0f32; DIM];
+        cv[1] = 1.0; // 与 query 正交
+        let mut hv = vec![0.0f32; DIM];
+        hv[0] = 1.0;
+        // 双路都入索引（content 向量与问句向量不同——HyPE 双路合并的形态）
+        state
+            .hnsw
+            .add(&[VectorEntry { id: "mem_hype_1".into(), vector: cv }])
+            .unwrap();
+        state
+            .hype_hnsw
+            .add(&[VectorEntry { id: "mem_hype_1".into(), vector: hv.clone() }])
+            .unwrap();
+        state.query_cache.put("查询测试", hv.clone());
+        let mut args = serde_json::Map::new();
+        args.insert("query".into(), serde_json::Value::String("查询测试".into()));
+        args.insert(
+            "namespace".into(),
+            serde_json::Value::String("agent/test".into()),
+        );
+        args.insert("max_results".into(), serde_json::Value::from(5));
+        let auth = AuthResult {
+            agent_id: "tester".into(),
+            allowed_ns: vec!["agent/test".into()],
+            role: "admin".into(),
+        };
+        let out = dispatch(&state, "memory_search", &args, &auth);
+        let v: serde_json::Value =
+            serde_json::from_str(&out).expect("memory_search returns valid JSON");
+        assert_eq!(v["status"], "ok", "memory_search response: {out}");
+        // #R60 test/low：核心断言 = 正确记忆被命中（与 corpus 位置无关的稳定标识）；
+        // source 含 "hype" 作为语义通道证据保留——但注意它依赖 fused source 取
+        // RRF 合并首信号（temporal/importance 路对新建记忆也有贡献；keyword 路
+        // 目前因 unicode61 单 token 不匹配，切 jieba 后可能改变），若未来信号顺序
+        // 或分词变化导致 source 非 hype，应先确认 HyPE 路仍工作而非直接判失败。
+        assert_eq!(
+            v["results"][0]["memory_id"], "mem_hype_1",
+            "wrong memory hit through dispatch: {out}"
+        );
+        // #R61 test/medium：**语义通道确定性证据**——fused source 取 RRF 合并首信号
+        // （依赖信号顺序与分词，jieba 落地会假红）；content 向量与 query 正交
+        // （cosine=0 被滤），hype 路是语义通道唯一贡献者 → sem_cos ≈ 1.0。
+        let sem_cos = v["results"][0]["sem_cos"].as_f64().unwrap_or(0.0);
+        assert!(
+            (sem_cos - 1.0).abs() < 1e-3,
+            "expected hype-road sem_cos ≈ 1.0, got {sem_cos}: {out}"
+        );
+        // #R66 test/low：**channel_scores/primary_channel 断言**（替代顺序依赖的
+        // source）——semantic 通道幅度 > 0 即 hype 路贡献真实可证（归因回归如
+        // 恒标 content 路时 semantic 通道缺失会红）。
+        let sem_channel = v["results"]
+            .as_array()
+            .and_then(|arr| arr.first())
+            .and_then(|r| r["channel_scores"].as_object())
+            .and_then(|m| m.get("semantic"))
+            .and_then(|s| s.as_f64())
+            .unwrap_or(0.0);
+        assert!(
+            sem_channel > 0.0,
+            "semantic channel missing from results[0]: {out}"
+        );
+    }
+
     fn build_test_state() -> Arc<AppState> {
         // 每个测试用独立的共享内存库名，避免 :memory: 进程级共享导致的配额/数据串扰
         static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -3144,7 +3324,8 @@ mod tests {
         memoria_core::storage::migrate_temporal(&pool).expect("migrate temporal");
         memoria_core::storage::migrate_extract_fields(&pool).expect("migrate extract fields");
         memoria_core::storage::migrate_evolution(&pool).expect("migrate evolution");
-        memoria_core::storage::migrate_memory_relation_types(&pool).expect("migrate relation types");
+        memoria_core::storage::migrate_memory_relation_types(&pool)
+            .expect("migrate relation types");
         memoria_core::quota::init_quota_table(&pool).expect("quota table");
         let auth_pool = memoria_core::storage::create_pool(":memory:", 4).expect("auth pool");
         memoria_core::storage::init_schema(&auth_pool).expect("auth schema");
@@ -3157,6 +3338,7 @@ mod tests {
             pool,
             auth_pool,
             hnsw: Arc::new(memoria_core::vector::HnswIndex::new()),
+            hype_hnsw: Arc::new(memoria_core::vector::HnswIndex::new()),
             hnsw_status: "uninitialized".to_string(),
             query_cache: Arc::new(memoria_core::vector::QueryCache::new()),
             admin_key: "test-admin-key".to_string(),
@@ -3309,7 +3491,10 @@ mod tests {
         let text = dispatch(&state, "memory_context", &args, &auth);
         let v: serde_json::Value = serde_json::from_str(&text).expect("valid json");
         assert_eq!(v["status"], "ok", "memory_context response: {}", text);
-        assert!(v["prompt_block"].is_string(), "memory_context 应产出 prompt_block");
+        assert!(
+            v["prompt_block"].is_string(),
+            "memory_context 应产出 prompt_block"
+        );
         assert!(v["profile"].is_object(), "memory_context 应含 profile 块");
     }
 }

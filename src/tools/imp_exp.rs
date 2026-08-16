@@ -438,7 +438,9 @@ pub fn normalize_valid_to(pool: &SqlitePool) -> Result<NormalizeReport, String> 
                     .map_err(|e| format!("null {} {}: {}", table, col, e))?;
                 report.updated += 1;
                 if report.samples.len() < 20 {
-                    report.samples.push(format!("{}:{}:{}->NULL", table, col, rid));
+                    report
+                        .samples
+                        .push(format!("{}:{}:{}->NULL", table, col, rid));
                 }
             } else if val.contains(' ') {
                 // 空格格式 → 补 T
