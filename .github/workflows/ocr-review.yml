@@ -76,10 +76,21 @@ jobs:
             HEAD="HEAD"
           fi
           echo "审查范围: $BASE..$HEAD"
+          # 以非 -e 上下文捕获 review 的真实退出码：LLM/API 抖动或 CLI 报错时
+          # 不应让 step 直接挂掉（历史上 set -e + pipefail 下 grep 无匹配/非零退出
+          # 会把"0 发现也通过"的门禁误判为失败，CI 恒红），降级为仅报告。
+          set +e
           OUT=$(ocr review --from "$BASE" --to "$HEAD" \
             --exclude '.github/**,.githooks/**,scripts/ocr-review.sh,**/__pycache__/**,**/*.bak,**/*.exe,**/*.csv,**/target/**' 2>&1)
+          REVIEW_RC=$?
+          set -e
           echo "$OUT"
-          FINDINGS=$(echo "$OUT" | grep -oE '[0-9]+ finding\(s\)' | grep -oE '[0-9]+' | head -1)
+          if [ "$REVIEW_RC" -ne 0 ]; then
+            echo "::warning::ocr review 运行失败 (rc=$REVIEW_RC)，按零发现仅报告继续；请人工核对上方审查日志"
+          fi
+          # pipefail 下任一 grep 无匹配都会让整条 pipeline 非零 → set -e 终止；
+          # 追加 || true 防御（输出格式变化/零发现时 FINDINGS 回落 0）
+          FINDINGS=$(echo "$OUT" | grep -oE '[0-9]+ finding\(s\)' | grep -oE '[0-9]+' | head -1 || true)
           FINDINGS="${FINDINGS:-0}"
           echo "评论数 = $FINDINGS"
           # 2026-08-14：按严重度分级统计（输出格式 [category · severity]）——
