@@ -3497,4 +3497,172 @@ mod tests {
         );
         assert!(v["profile"].is_object(), "memory_context 应含 profile 块");
     }
+
+    // ── dispatch 路由补齐（Phase 4 未完成项）：unknown tool / 写路径 roundtrip / ns 默认 ──
+
+    #[test]
+    fn test_dispatch_unknown_tool_rejected() {
+        let state = build_test_state();
+        let auth = memoria_core::auth::AuthResult {
+            agent_id: "tester".to_string(),
+            allowed_ns: vec!["*".to_string()],
+            role: "admin".to_string(),
+        };
+        let out = dispatch(
+            &state,
+            "no_such_tool_xyz",
+            &serde_json::Map::new(),
+            &auth,
+        );
+        assert!(
+            out.contains(r#"error":"Unknown tool: no_such_tool_xyz"#),
+            "unknown tool 应返回路由 fallthrough 错误，得到: {}",
+            out
+        );
+    }
+
+    #[test]
+    fn test_dispatch_remember_observe_roundtrip() {
+        let state = build_test_state();
+        let auth = memoria_core::auth::AuthResult {
+            agent_id: "tester".to_string(),
+            allowed_ns: vec!["agent/test".to_string()],
+            role: "admin".to_string(),
+        };
+        let ns = "agent/test";
+
+        // 1) memory_remember 写路径
+        let mut remember_args = serde_json::Map::new();
+        remember_args.insert("content".into(), serde_json::Value::String("记忆路由测试独有词元 XYZ42".into()));
+        remember_args.insert("namespace".into(), serde_json::Value::String(ns.into()));
+        remember_args.insert("category".into(), serde_json::Value::String("fact".into()));
+        let out = dispatch(&state, "memory_remember", &remember_args, &auth);
+        let v: serde_json::Value = serde_json::from_str(&out).expect("remember returns JSON");
+        assert_eq!(v["status"], "remembered", "remember 响应: {}", out);
+        let mem_id = v["id"].as_str().expect("remember 应返回 id").to_string();
+        assert!(!mem_id.is_empty());
+
+        // 2) memory_observe 写路径
+        let mut observe_args = serde_json::Map::new();
+        observe_args.insert("dialog".into(), serde_json::Value::String("记忆观察测试独有词元 QRS77".into()));
+        observe_args.insert("namespace".into(), serde_json::Value::String(ns.into()));
+        let out = dispatch(&state, "memory_observe", &observe_args, &auth);
+        let v: serde_json::Value = serde_json::from_str(&out).expect("observe returns JSON");
+        assert_eq!(v["status"], "observed", "observe 响应: {}", out);
+        let obs_id = v["id"].as_str().expect("observe 应返回 id").to_string();
+        assert!(!obs_id.is_empty());
+
+        // 3) 落库实证：两条都进 memories
+        {
+            let conn = state.pool.get().unwrap();
+            let n: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM memories WHERE namespace = ?1",
+                    rusqlite::params![ns],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(n >= 2, "memories 应至少 2 行（remember+observe），实际 {}", n);
+            let saved: String = conn
+                .query_row(
+                    "SELECT content FROM memories WHERE id = ?1",
+                    rusqlite::params![mem_id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(
+                saved.contains("记忆路由测试独有词元"),
+                "content 应原样落库（未压缩），实际: {}",
+                saved
+            );
+        }
+
+        // 4) memory_search 经 dispatch 召回 remember 的记忆
+        let mut search_args = serde_json::Map::new();
+        search_args.insert("query".into(), serde_json::Value::String("记忆路由测试独有词元".into()));
+        search_args.insert("namespace".into(), serde_json::Value::String(ns.into()));
+        search_args.insert("max_results".into(), serde_json::Value::from(10));
+        let out = dispatch(&state, "memory_search", &search_args, &auth);
+        let v: serde_json::Value = serde_json::from_str(&out).expect("search returns JSON");
+        assert_eq!(v["status"], "ok", "search 响应: {}", out);
+        let hits = v["results"].as_array().expect("results 应为数组");
+        assert!(
+            hits.iter().any(|r| r["memory_id"].as_str() == Some(mem_id.as_str())),
+            "search 应召回 remember 的记忆 {}，实际: {}",
+            mem_id,
+            out
+        );
+
+        // 5) memory_recall 同路由可召回——用 observe 专属词元做 query（与 remember 内容不同，
+        //    不依赖 RRF 融合的时序/importance 噪声兜底，直接验证 observe 行可被召回）
+        let mut recall_args = serde_json::Map::new();
+        recall_args.insert(
+            "query".into(),
+            serde_json::Value::String("记忆观察测试独有词元".into()),
+        );
+        recall_args.insert("namespace".into(), serde_json::Value::String(ns.into()));
+        recall_args.insert("max_results".into(), serde_json::Value::from(10));
+        let out = dispatch(&state, "memory_recall", &recall_args, &auth);
+        let v: serde_json::Value = serde_json::from_str(&out).expect("recall returns JSON");
+        assert_eq!(v["status"], "ok", "recall 响应: {}", out);
+        assert!(
+            v["results"]
+                .as_array()
+                .map(|arr| arr.iter().any(|r| r["memory_id"].as_str() == Some(obs_id.as_str())))
+                .unwrap_or(false),
+            "recall 应召回 observe 的记忆 {}，实际: {}",
+            obs_id,
+            out
+        );
+
+        // 6) admin 门禁的只读工具经 dispatch 可达（db_stats / memory_health）
+        let out = dispatch(&state, "db_stats", &serde_json::Map::new(), &auth);
+        assert!(out.contains(r#""status":"ok""#), "db_stats 响应: {}", out);
+        let out = dispatch(&state, "memory_health", &serde_json::Map::new(), &auth);
+        assert!(out.contains(r#""status":"ok""#), "memory_health 响应: {}", out);
+    }
+
+    #[test]
+    fn test_dispatch_namespace_defaults_to_default() {
+        let state = build_test_state();
+        let auth = memoria_core::auth::AuthResult {
+            agent_id: "tester".to_string(),
+            allowed_ns: vec!["*".to_string()],
+            role: "admin".to_string(),
+        };
+        // 不传 namespace → dispatch 应落到 "default"
+        let mut remember_args = serde_json::Map::new();
+        remember_args.insert("content".into(), serde_json::Value::String("默认命名空间测试独有词元 WX88".into()));
+        let out = dispatch(&state, "memory_remember", &remember_args, &auth);
+        let v: serde_json::Value = serde_json::from_str(&out).expect("remember returns JSON");
+        assert_eq!(v["status"], "remembered", "remember 响应: {}", out);
+        let mem_id = v["id"].as_str().expect("id").to_string();
+        {
+            let conn = state.pool.get().unwrap();
+            let ns_val: String = conn
+                .query_row(
+                    "SELECT namespace FROM memories WHERE id = ?1",
+                    rusqlite::params![mem_id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(ns_val, "default", "缺省 ns 应为 default");
+        }
+        // 不传 namespace 的 search 应能命中同一默认 ns
+        let mut search_args = serde_json::Map::new();
+        search_args.insert("query".into(), serde_json::Value::String("默认命名空间测试独有词元".into()));
+        search_args.insert("max_results".into(), serde_json::Value::from(10));
+        let out = dispatch(&state, "memory_search", &search_args, &auth);
+        let v: serde_json::Value = serde_json::from_str(&out).expect("search returns JSON");
+        assert_eq!(v["status"], "ok", "search 响应: {}", out);
+        assert!(
+            v["results"]
+                .as_array()
+                .map(|arr| arr.iter().any(|r| r["memory_id"].as_str() == Some(mem_id.as_str())))
+                .unwrap_or(false),
+            "default ns search 应命中 {}，实际: {}",
+            mem_id,
+            out
+        );
+    }
 }
