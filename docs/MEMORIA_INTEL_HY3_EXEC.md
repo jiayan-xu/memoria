@@ -47,17 +47,17 @@
 
 ### 清单
 
-- [ ] **P0-1** 运维 Memoria 二进制与 `memoria-open` 目标 commit 对齐；确认 `CARGO_TARGET_DIR` 不写到沙箱导致「以为编了、托盘仍旧包」
-- [ ] **P0-2** 验证 P3-0 语义/HNSW 通道：新写入记忆有向量或明确降级日志；embed `:8777`（或现网 embed）健康进 `/health`
-- [ ] **P0-3** admin / `MEMORIA_JARVIS_BADGE` 与 K1+K3 文档一致；托盘与 `.env` 同源
-- [ ] **P0-4** 清理 `agent_registry` 测试残留（≥20 行量级，以现网为准）
+- [x] **P0-1** 运维 Memoria 二进制与 `memoria-open` 目标 commit 对齐；确认 `CARGO_TARGET_DIR` 不写到沙箱导致「以为编了、托盘仍旧包」
+- [x] **P0-2** 验证 P3-0 语义/HNSW 通道：新写入记忆有向量或明确降级日志；embed `:8777`（或现网 embed）健康进 `/health`
+- [x] **P0-3** admin / `MEMORIA_JARVIS_BADGE` 与 K1+K3 文档一致；托盘与 `.env` 同源
+- [x] **P0-4** 清理 `agent_registry` 测试残留（≥20 行量级，以现网为准）
 - [ ] **P0-5**（可选同迭代）密钥轮换若审计仍要求——单独清单，勿与功能 PR 混推
 
 ### 验收
 
-- [ ] `/health`：memoria + embed pass  
-- [ ] 新 `memory_remember` 后 hybrid/HNSW 行为可解释（有向量或明确无 embed）  
-- [ ] registry 无测试垃圾身份  
+- [x] `/health`：memoria + embed pass  
+- [x] 新 `memory_remember` 后 hybrid/HNSW 行为可解释（有向量或明确无 embed）  
+- [x] registry 无测试垃圾身份  
 
 ---
 
@@ -67,25 +67,25 @@
 
 ### 4.1 agent-core
 
-- [ ] 在调用 `memory_remember` **之前**增加可选提取门（默认开可用 env 关，建议：`AGENT_MEMORY_EXTRACT=1` 默认开 / `=0` 关）
-- [ ] LLM 输出：`facts[]` / `entities[]` / `preferences[]` / `relations[]` / `memory_type` / `actor`
-- [ ] **1 raw → N 原子事实**：每条 fact 单独 `memory_remember`；用 `parent_id` / links 挂回父；`raw_ref` 可指向原文或旁路存储
-- [ ] **失败降级**：LLM/超时/解析失败 → **原样** remember（行为与今日一致，不阻塞写入）
-- [ ] **语义保真校验（圆桌强制）**：抽样或规则检查「压缩后关键实体/数字/日期不丢」；失败则降级原样 + 打审计/日志
-- [ ] 中文 prompt；实体尽量走现有 `entity_*` / upsert
+- [x] 在调用 `memory_remember` **之前**增加可选提取门（默认开可用 env 关，建议：`AGENT_MEMORY_EXTRACT=1` 默认开 / `=0` 关）
+- [x] LLM 输出：`facts[]` / `entities[]` / `preferences[]` / `relations[]` / `memory_type` / `actor`
+- [x] **1 raw → N 原子事实**：每条 fact 单独 `memory_remember`；用 `parent_id` / links 挂回父；`raw_ref` 可指向原文或旁路存储
+- [x] **失败降级**：LLM/超时/解析失败 → **原样** remember（行为与今日一致，不阻塞写入）
+- [x] **语义保真校验（圆桌强制）**：抽样或规则检查「压缩后关键实体/数字/日期不丢」；失败则降级原样 + 打审计/日志
+- [x] 中文 prompt；实体尽量走现有 `entity_*` / upsert
 
 ### 4.2 memoria-open（哑存储扩展）
 
-- [ ] Schema（`ADD COLUMN`，可空）：`actor` / `memory_type` / `parent_id` / `raw_ref`
-- [ ] 检索/profile：旧行 NULL 视为 `agent_inferred` / `declarative`
-- [ ] **不**在 `remember_with_dedup` 内调 LLM
+- [x] Schema（`ADD COLUMN`，可空）：`actor` / `memory_type` / `parent_id` / `raw_ref`
+- [x] 检索/profile：旧行 NULL 视为 `agent_inferred` / `declarative`
+- [x] **不**在 `remember_with_dedup` 内调 LLM
 
 ### 验收
 
-- [ ] 长对话片段写入后，检索命中多为短原子事实，而非整段 raw  
-- [ ] `AGENT_MEMORY_EXTRACT=0` 时与旧行为一致  
-- [ ] 提取失败不丢写入  
-- [ ] 既有测试 + 新增提取/降级/ns 隔离单测  
+- [x] 长对话片段写入后，检索命中多为短原子事实，而非整段 raw  
+- [x] `AGENT_MEMORY_EXTRACT=0` 时与旧行为一致  
+- [x] 提取失败不丢写入  
+- [x] 既有测试 + 新增提取/降级/ns 隔离单测  
 
 ---
 
@@ -102,16 +102,16 @@
 
 ### 5.2 工作项
 
-- [ ] 统一更新路径：事实变更 → 旧 tip `valid_to=now`（或 supersede 必写 valid_to，与 DESIGN Profile 一致）+ 新 tip  
-- [ ] `memory_search` / hybrid：默认仅当前真值；`as_of=T` 返回历史窗口真值（与现有 `visible_as_of` 对齐，补测试）  
-- [ ] 实体级：同实体多事实按 valid 窗口解释「当时为真」  
-- [ ] **禁止**平行引入第二套四戳 API 命名混淆调用方  
+- [x] 统一更新路径：事实变更 → 旧 tip `valid_to=now`（或 supersede 必写 valid_to，与 DESIGN Profile 一致）+ 新 tip  
+- [x] `memory_search` / hybrid：默认仅当前真值；`as_of=T` 返回历史窗口真值（与现有 `visible_as_of` 对齐，补测试）  
+- [x] 实体级：同实体多事实按 valid 窗口解释「当时为真」  
+- [x] **禁止**平行引入第二套四戳 API 命名混淆调用方
 
 ### 验收
 
-- [ ] 「2026-01 在 A 公司 / 2026-07 在 B 公司」：`as_of=2026-03` → A；`as_of=now` → B  
-- [ ] 旧事实仍在库，非 DELETE  
-- [ ] 与 isLatest / supersede 单测不回归  
+- [x] 「2026-01 在 A 公司 / 2026-07 在 B 公司」：`as_of=2026-03` → A；`as_of=now` → B  
+- [x] 旧事实仍在库，非 DELETE  
+- [x] 与 isLatest / supersede 单测不回归  
 
 ---
 
@@ -134,30 +134,30 @@ Dream / consolidate（agent-core 批处理）
 
 ### 6.2 memoria-open
 
-- [ ] Schema：`evolved_context` / `evolved_at` / `link_count`（可空）  
-- [ ] 表 `evolution_log`（new_id, target_id, change_type, old_value, new_value, model, created_at）  
-- [ ] 回滚：按 `evolution_log.old_value` 可恢复  
+- [x] Schema：`evolved_context` / `evolved_at` / `link_count`（可空）  
+- [x] 表 `evolution_log`（new_id, target_id, change_type, old_value, new_value, model, created_at）  
+- [x] 回滚：按 `evolution_log.old_value` 可恢复  
 
 ### 6.3 演化滞后窗口（圆桌风险 — 必处理）
 
-- [ ] 脏标记或「待演化」tip：recall/`memory_context` 可降权或标注  
-- [ ] 文档写清：用户可见「未巩固」与「已演化」差异  
-- [ ] 触发：夜间 Dream + 可选 `POST` 手动 consolidate（已有则复用）  
+- [x] 脏标记或「待演化」tip：recall/`memory_context` 可降权或标注  
+- [x] 文档写清：用户可见「未巩固」与「已演化」差异  
+- [x] 触发：夜间 Dream + 可选 `POST` 手动 consolidate（已有则复用）  
 
 ### 验收
 
-- [ ] 写入「换了工作」后，经 consolidate，旧公司事实呈失效/已更新，且可 `evolution_log` 回滚  
-- [ ] 热路径 QPS 不因演化 LLM 线性恶化  
-- [ ] 限流单测 / 防风暴  
+- [x] 写入「换了工作」后，经 consolidate，旧公司事实呈失效/已更新，且可 `evolution_log` 回滚  
+- [x] 热路径 QPS 不因演化 LLM 线性恶化  
+- [x] 限流单测 / 防风暴  
 
 ---
 
 ## 7. Phase 4 — 评测与打磨（非阻塞主路径）
 
-- [ ] LongMemEval **完整集**作回归（报告数字，不绑发版门禁除非老大另定）  
-- [ ] FTS5 中文（jieba 等）按需  
-- [ ] HNSW 增量持久化 / 启动加速  
-- [ ] `mcp_server` dispatch 单测补齐  
+- [ ] LongMemEval **完整集**作回归（报告数字，不绑发版门禁除非老大另定）——LoCoMo 完整集已本机跑（50 会话/1986 QA/avg 6.24，`eval/locomo/` 未入库）；LongMemEval 未跑  
+- [x] FTS5 中文（jieba 等）——`jieba-rs` 在 `Cargo.toml`；`storage/fts5.rs` / `search/keyword.rs` / `tools/compress.rs` 落地（2026-08-15 复核）  
+- [x] HNSW 增量持久化 / 启动加速——`vector/persist.rs`：`memory_vectors` 权威持久 + 启动重建 + 维度/退化防御；PR #6 附带 HyPE 双索引（2026-08-15 复核）  
+- [ ] `mcp_server` dispatch 单测补齐——目前仅 `test_dispatch_memory_search_hype_road` 一个  
 
 ---
 
@@ -190,12 +190,12 @@ Dream / consolidate（agent-core 批处理）
 
 ## 10. 验收总表（全部 Phase 后）
 
-- [ ] Phase0 验收全过  
-- [ ] 跳槽场景：now / as_of 历史正确，旧行未删  
-- [ ] 长文本 → 原子事实检索；关提取开关可回退  
-- [ ] consolidate 后演化可见且可回滚  
-- [ ] 现有 p0/p1/p2 HMS 与 profile 相关测试不破  
-- [ ] 文档：更新 `OPTIMIZATION_*` 或本单链接；注明「Nova 原文已仲裁裁剪」  
+- [x] Phase0 验收全过  
+- [x] 跳槽场景：now / as_of 历史正确，旧行未删  
+- [x] 长文本 → 原子事实检索；关提取开关可回退  
+- [x] consolidate 后演化可见且可回滚  
+- [x] 现有 p0/p1/p2 HMS 与 profile 相关测试不破  
+- [x] 文档：更新 `OPTIMIZATION_*` 或本单链接；注明「Nova 原文已仲裁裁剪」  
 
 ---
 
@@ -209,3 +209,35 @@ Dream / consolidate（agent-core 批处理）
 **仲裁方**: Cursor（本会话）  
 **方案作者**: Nova（WorkBuddy）  
 **执行**: hy3  
+
+---
+
+## 12. 收尾记录
+
+### 12.1 实施完成（2026-07-20 部署，2026-08-14 复核勾选）
+
+- **PR4 部署完成**：memoria `:9003` / agent-core `:9753` / embed `:8777` 全绿；运行二进制 grep 证实含 `memory_evolve` / `evolution_rollback` / `agent_memory_evolve_enabled`。
+- **Phase0 种子清理**：`agent/emp_wang`、`agent/emp_manager` 两个命名空间下 8 条 `category=a2a_message` 的桥接测试广播消息已删除；备份 `memoria/emp_seed_backup_20260720.json`。
+- **决策记录已入 Memoria**：`memory_remember` `category=decision`、`tags=hy3,memoria-intel`（载明 Nova 原文经圆桌+Cursor 仲裁裁剪、以本单为准、热路径禁 LLM）。
+- **OPTIMIZATION_*** 注明：Nova 原文优化项一律以本执行单为准；`OPTIMIZATION_*` 在 Memoria 记忆中仅为真实工作记录，非待删对象。
+
+### 12.2 复核勾选依据（2026-08-14，代码实证）
+
+| 项 | 代码证据 |
+|---|---|
+| P0-1 二进制对齐 | `agent-core/docs/hy3-1.3-roadmap.md` G1 ✅；running memoria v0.3.0 |
+| P0-2 embed/HNSW 通道 | `embed_server.py` 运行中；`semantic_edges.rs` 增量近邻插边（HNSW 通道实跑） |
+| P0-3 密钥同源 | admin key 读 `agent-core/.env`，badge key 读环境变量（dsh-memoria-extra 同源实现） |
+| P0-4 registry 干净 | 现网 `agent_registry` 仅 5 个真实身份（admin/default/workbuddy+2 业务），无测试残留 |
+| PR1 Schema | `memoria-open/src/storage/sqlite.rs`（ADD COLUMN 迁移）+ `models.rs` + `mcp_server.rs` 工具 schema |
+| PR2 提取门 | `agent-core/src/memory_extract.rs`（`AGENT_MEMORY_EXTRACT` 默认开）+ `agent.rs`（raw 父 + N 原子事实 + 降级） |
+| PR3 双时态 | `memoria-open/src/search/hybrid.rs`（`valid_at`/`visible_as_of`/`is_latest_now`）+ 全工具 `as_of` 透传 |
+| PR4 演化 | `memoria-open/src/tools/evolve.rs`（`evolved_*`/`evolution_log`/回滚 `rolled_back`）+ `memory_evolve`/`memory_evolve_auto` |
+| PR5 元进化 | `agent-core/src/meta_evolve.rs` + `evolution_log_query` + `experience_memo.rs`（第二样本源） |
+| 夜间编排 | `agent-core/src/bootstrap.rs` 02:00-04:59 patrol：consolidate → meta_evolution → memoria_maintenance |
+
+### 12.3 未完成（非阻塞 / 可选）
+
+- Phase 4 评测打磨：LongMemEval 完整集回归（LoCoMo 完整集已本机跑 50 会话/1986 QA/avg 6.24，`eval/locomo/` 未入库）、`mcp_server` dispatch 单测补齐（现有仅 hype road 一个）。
+- FTS5 jieba 中文分词与 HNSW 增量持久化/启动重建已随 `storage/fts5.rs` / `vector/persist.rs` 落地（2026-08-15 复核，代码实证见 §7 / §12.2 同批）。
+- P0-5 密钥轮换（可选，审计要求时单独处理）。
