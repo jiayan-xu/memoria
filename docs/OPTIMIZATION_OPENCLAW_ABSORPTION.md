@@ -128,5 +128,7 @@
 - [x] 研究完成（v2026.7.1 源码深读 + 宣传对照）
 - [x] 方案修订（2026-07-18：对齐现网 HNSW/备份；Phase A 重切）
 - [x] **Phase A 已落地（2026-07-18）**：在 `backup.rs` 既有 `perform_backup`/`check_integrity`/`restore_from_backup` 上 WRAP（不引入 tar/gzip）——A1 `backup create`（VACUUM INTO `backups/cli/<ts>/` + `manifest.json` sha256 + 拒绝覆盖）；A2 `backup verify`（schema_version/allowlist/文件存在/sha256/integrity_check）；A3 `backup restore`（fresh-target-only，拒绝已存在库，自研语义）。`cargo check` 全绿。
-- [ ] Phase B 待开工（按 §6 路线）
+- [x] **B3 已落地（2026-08-14）**：`docs/RECALL_VS_CONSOLIDATE_BOUNDARY.md` 文档化「召回（context/recall）vs 整合（consolidate/Dream）」职责边界（HY3 H1/H2 语义固定，无代码大拆）。
+- [ ] **B1 可选**（非阻塞）：ns 访问路径强化来源/所有权校验（与 agent-core P0-2 对齐，不改单库模型）。
+- [ ] **B2 默认不做**（可选评估）：仅当产品明确要求换向量引擎时，对比 sqlite-vec vs 现 HNSW；禁止默认同跑双栈。
 - 探针目录 `openclaw-probe/` 为只读研究副本，可随时删除。
