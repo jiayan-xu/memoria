@@ -9,7 +9,7 @@
 use crate::search;
 use crate::storage::SqlitePool;
 use crate::vector::{HnswIndex, QueryCache};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// 由 `category` + `tags` 派生 `kind`（响应投影字段，无库列，禁止 ALTER 加 kind）。
 fn derive_kind(category: &str, tags: &str) -> String {
@@ -171,6 +171,7 @@ pub fn memory_profile(
 pub fn memory_context(
     pool: &SqlitePool,
     hnsw: Option<&HnswIndex>,
+    hype_hnsw: Option<&HnswIndex>,
     query_cache: Option<&QueryCache>,
     namespace: &str,
     query: Option<&str>,
@@ -195,6 +196,7 @@ pub fn memory_context(
                 namespace,
                 recall_k,
                 hnsw,
+                hype_hnsw,
                 query_cache,
                 as_of, // 透传 as_of；None → is_latest_now
                 false, // include_superseded=false

@@ -57,7 +57,11 @@ struct TempFileGuard {
 }
 impl TempFileGuard {
     fn new(batch: std::path::PathBuf, out: std::path::PathBuf) -> Self {
-        TempFileGuard { batch, out, extras: Vec::new() }
+        TempFileGuard {
+            batch,
+            out,
+            extras: Vec::new(),
+        }
     }
     fn batch_path(&self) -> &std::path::Path {
         &self.batch
@@ -642,10 +646,8 @@ pub fn materialize(
         all_edges.iter().map(normalize_edge).collect();
     let source_norm: std::collections::HashSet<(String, String, String)> =
         source_edges.iter().map(normalize_edge).collect();
-    let inferred_norm: std::collections::HashSet<(String, String, String)> = materialized_set
-        .difference(&source_norm)
-        .cloned()
-        .collect();
+    let inferred_norm: std::collections::HashSet<(String, String, String)> =
+        materialized_set.difference(&source_norm).cloned().collect();
     // 推断边 = all_edges（原始 IRI）中归一化后落在 inferred_norm 的边。逐条 filter 保留
     // 原始 IRI；同一归一化三元组对应多条原始边（如 docA 与 docA/ 都 supersedes docC）时
     // 全部保留——它们本是不同资源的边，写回各自建实体行，不合并。
@@ -714,9 +716,7 @@ fn read_ttl_no_follow(path: &std::path::Path) -> Result<String, String> {
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)
         .map_err(|e| format!("open ttl (O_NOFOLLOW|O_NONBLOCK): {}", e))?;
-    let md = f
-        .metadata()
-        .map_err(|e| format!("fstat ttl: {}", e))?;
+    let md = f.metadata().map_err(|e| format!("fstat ttl: {}", e))?;
     if !md.is_file() {
         return Err(format!(
             "{} is not a regular file (possible symlink/fifo attack)",
@@ -819,8 +819,8 @@ fn win_path_quoted(p: &std::path::Path) -> String {
 /// 关闭"模块读出后、子进程 load 前文件被换"的 TOCTOU。
 fn write_ttl_copy(path: &std::path::Path, content: &str) -> Result<(), String> {
     use std::io::Write;
-    let mut f = open_exclusive_0600(path)
-        .map_err(|e| format!("create ttl copy (exclusive): {}", e))?;
+    let mut f =
+        open_exclusive_0600(path).map_err(|e| format!("create ttl copy (exclusive): {}", e))?;
     f.write_all(content.as_bytes())
         .map_err(|e| format!("write ttl copy {}: {}", path.display(), e))
 }
@@ -1072,9 +1072,7 @@ fn parse_ttl_edges(ttl: &str) -> Vec<(String, String, String)> {
                                 }
                             }
                         }
-                    } else if pred.is_some()
-                        && (tok.starts_with("_:") || tok.starts_with('['))
-                    {
+                    } else if pred.is_some() && (tok.starts_with("_:") || tok.starts_with('[')) {
                         // #7（第10轮 bug/medium）：blank node **对象** 不能静默丢弃，须与
                         // 主语处理对称。若 `_:b0`/`[...]` 在对象位被丢，source_edges 漏算这些边；
                         // 物化后若 OWL 推理器把 blank node skolemize 成新 IRI，集合差会误标为
@@ -1171,7 +1169,9 @@ fn parse_base_decl(line: &str) -> Option<String> {
     let rest = line.strip_prefix("@base")?.trim_start();
     // `@base <iri> .` —— 末尾通常有 `.`，先剥掉再取 `<>` 内 IRI。
     let rest = rest.strip_suffix('.').unwrap_or(rest).trim_end();
-    rest.strip_prefix('<')?.strip_suffix('>').map(|s| s.to_string())
+    rest.strip_prefix('<')?
+        .strip_suffix('>')
+        .map(|s| s.to_string())
 }
 
 /// 把 TTL 术语 token 展开为完整 IRI。
@@ -1179,7 +1179,11 @@ fn parse_base_decl(line: &str) -> Option<String> {
 /// - `p:local`（含默认 `:local`）→ 用前缀表展开；前缀未声明则返回 None（跳过）。
 /// - 其它（如 `a`）→ None。
 /// #R15（第15轮 bug/high）：`base` 参数来自 `@base` 声明，供相对 `<rel>` 展开。
-fn expand_term(tok: &str, prefixes: &HashMap<String, String>, base: &Option<String>) -> Option<String> {
+fn expand_term(
+    tok: &str,
+    prefixes: &HashMap<String, String>,
+    base: &Option<String>,
+) -> Option<String> {
     if tok.starts_with('<') && tok.ends_with('>') && tok.len() >= 2 {
         let inner = &tok[1..tok.len() - 1];
         // 相对 IRI（无 scheme 且非 `//`、非绝对路径空根）：需 base 解析，否则受控谓词无法命中。
@@ -1297,9 +1301,7 @@ fn tokenize_ttl(line: &str) -> Vec<String> {
                 }
             } else if rest.starts_with('@') {
                 // `@lang`：吞到下一个空白/分隔符。
-                let next = rest
-                    .find([' ', '\t', ';', ',', '.'])
-                    .unwrap_or(rest.len());
+                let next = rest.find([' ', '\t', ';', ',', '.']).unwrap_or(rest.len());
                 rest = &rest[next..];
             }
         } else if b == b';' || b == b',' {
@@ -1402,7 +1404,11 @@ pub fn write_back_edges(
             // 不同命名空间/多次运行的同名 blank node 会坍缩成一个实体（ON CONFLICT DO NOTHING
             // 静默合并），在语义图里产生垃圾实体/边。物化后的 TTL 里 blank node 是推理器
             // skolemize 的临时节点，对下游无语义价值。写回前过滤掉 `_:` 与 `[` 端点。
-            if s.starts_with("_:") || o.starts_with("_:") || s.starts_with('[') || o.starts_with('[') {
+            if s.starts_with("_:")
+                || o.starts_with("_:")
+                || s.starts_with('[')
+                || o.starts_with('[')
+            {
                 skipped += 1;
                 continue;
             }
@@ -1459,10 +1465,7 @@ pub fn write_back_edges(
                      ON CONFLICT(id) DO NOTHING",
                     rusqlite::params![eid, namespace, ename],
                 )
-                .map_err(|e| format!(
-                    "upsert entity {}: {}",
-                    eid, e
-                ))?;
+                .map_err(|e| format!("upsert entity {}: {}", eid, e))?;
             }
             // #4（第9轮 bug/low）：`tx.execute` 返回受影响行数。conflict 且 WHERE 不满足
             // （既有 evidence 既非 NULL 也非 ontology:materialized，即用户手工/其它管线 curated）
@@ -1486,7 +1489,9 @@ pub fn write_back_edges(
     })();
     // 提交或回滚；即使业务循环出错也保证事务关闭。
     match r {
-        Ok(()) => tx.commit().map_err(|e| format!("commit transaction: {}", e))?,
+        Ok(()) => tx
+            .commit()
+            .map_err(|e| format!("commit transaction: {}", e))?,
         Err(e) => {
             let _ = tx.rollback();
             return Err(e);
@@ -1528,7 +1533,11 @@ fn normalize_iri(iri: &str) -> String {
 
 /// 对三元组做轻量 IRI 归一（用于集合差比较，#R17）。顺序不变。
 fn normalize_edge(e: &(String, String, String)) -> (String, String, String) {
-    (normalize_iri(&e.0), normalize_iri(&e.1), normalize_iri(&e.2))
+    (
+        normalize_iri(&e.0),
+        normalize_iri(&e.1),
+        normalize_iri(&e.2),
+    )
 }
 
 /// 受控本体命名空间前缀（#R4-1 命名空间感知）。
@@ -1610,12 +1619,16 @@ pub fn status(cfg: &OntologyConfig) -> Result<String, String> {
     let se = child.stderr.take();
     let stdout_reader = std::thread::spawn(move || {
         let mut b = String::new();
-        if let Some(mut o) = so { let _ = o.read_to_string(&mut b); }
+        if let Some(mut o) = so {
+            let _ = o.read_to_string(&mut b);
+        }
         b
     });
     let stderr_reader = std::thread::spawn(move || {
         let mut b = String::new();
-        if let Some(mut e) = se { let _ = e.read_to_string(&mut b); }
+        if let Some(mut e) = se {
+            let _ = e.read_to_string(&mut b);
+        }
         b
     });
     // `--help` 探测用固定短超时，与物化超时解耦：若二进制在 --help 上挂死，
@@ -1658,7 +1671,11 @@ pub fn status(cfg: &OntologyConfig) -> Result<String, String> {
         cfg.schema_path.display(),
         detected,
     );
-    Ok(format!("{}\ncheck_ms: {}", msg, start.elapsed().as_millis()))
+    Ok(format!(
+        "{}\ncheck_ms: {}",
+        msg,
+        start.elapsed().as_millis()
+    ))
 }
 
 #[cfg(test)]
@@ -1728,21 +1745,45 @@ mod tests {
 
     #[test]
     fn relation_iri_mapping() {
-        assert_eq!(map_relation_iri("http://example.org/supersedes").as_deref(), Some("supersedes"));
-        assert_eq!(map_relation_iri("http://example.org/createdBy").as_deref(), Some("created_by"));
-        assert_eq!(map_relation_iri("http://example.org/conflicts_with").as_deref(), Some("conflicts_with"));
-        assert_eq!(map_relation_iri("http://example.org/banana").as_deref(), None);
+        assert_eq!(
+            map_relation_iri("http://example.org/supersedes").as_deref(),
+            Some("supersedes")
+        );
+        assert_eq!(
+            map_relation_iri("http://example.org/createdBy").as_deref(),
+            Some("created_by")
+        );
+        assert_eq!(
+            map_relation_iri("http://example.org/conflicts_with").as_deref(),
+            Some("conflicts_with")
+        );
+        assert_eq!(
+            map_relation_iri("http://example.org/banana").as_deref(),
+            None
+        );
     }
 
     #[test]
     fn win_path_normalizes() {
         // Windows 风格路径：`\` → `/`
-        assert_eq!(win_path(std::path::Path::new("D:\\data\\a.ttl")), "D:/data/a.ttl");
+        assert_eq!(
+            win_path(std::path::Path::new("D:\\data\\a.ttl")),
+            "D:/data/a.ttl"
+        );
         // 盘符前缀路径也被识别为 Windows 风格
-        assert_eq!(win_path(std::path::Path::new("C:/data/a.ttl")), "C:/data/a.ttl");
+        assert_eq!(
+            win_path(std::path::Path::new("C:/data/a.ttl")),
+            "C:/data/a.ttl"
+        );
         // #117：路径始终双引号包裹（供 batch 脚本解析）
-        assert_eq!(win_path_quoted(std::path::Path::new("D:\\my data\\a.ttl")), "\"D:/my data/a.ttl\"");
-        assert_eq!(win_path_quoted(std::path::Path::new("D:\\data\\a.ttl")), "\"D:/data/a.ttl\"");
+        assert_eq!(
+            win_path_quoted(std::path::Path::new("D:\\my data\\a.ttl")),
+            "\"D:/my data/a.ttl\""
+        );
+        assert_eq!(
+            win_path_quoted(std::path::Path::new("D:\\data\\a.ttl")),
+            "\"D:/data/a.ttl\""
+        );
     }
 
     #[test]
@@ -1792,11 +1833,15 @@ mod tests {
         let all = parse_ttl_edges(ttl);
         // `a` 类型行不产边；只应产出 (docB, supersedes, docA)，且经 @base 展开为绝对 IRI。
         assert_eq!(all.len(), 1, "got {:?}", all);
-        assert!(all.contains(&(
-            "http://memoria.ai/onto/docB".to_string(),
-            "http://memoria.ai/onto/supersedes".to_string(),
-            "http://memoria.ai/onto/docA".to_string()
-        )), "got {:?}", all);
+        assert!(
+            all.contains(&(
+                "http://memoria.ai/onto/docB".to_string(),
+                "http://memoria.ai/onto/supersedes".to_string(),
+                "http://memoria.ai/onto/docA".to_string()
+            )),
+            "got {:?}",
+            all
+        );
     }
 
     #[test]
@@ -1812,11 +1857,15 @@ mod tests {
         let all = parse_ttl_edges(ttl);
         // 只产 1 条 (docC, supersedes, docA)；不得因类型对象 partOf/Agent 产伪边。
         assert_eq!(all.len(), 1, "got {:?}", all);
-        assert!(all.contains(&(
-            "http://memoria.ai/onto/docC".to_string(),
-            "http://memoria.ai/onto/supersedes".to_string(),
-            "http://memoria.ai/onto/docA".to_string()
-        )), "got {:?}", all);
+        assert!(
+            all.contains(&(
+                "http://memoria.ai/onto/docC".to_string(),
+                "http://memoria.ai/onto/supersedes".to_string(),
+                "http://memoria.ai/onto/docA".to_string()
+            )),
+            "got {:?}",
+            all
+        );
     }
 
     #[test]
@@ -1846,8 +1895,7 @@ mod tests {
         );
         // partOf 只应有合法对象 docB；若 stale pred 残留会把 supersedes/docC 也塞成 partOf 对象。
         assert!(
-            !all
-                .iter()
+            !all.iter()
                 .any(|(_, p, o)| p == "http://memoria.ai/onto/partOf"
                     && o != "http://memoria.ai/onto/docB"),
             "stale pred partOf must not capture supersedes/docC as objects: got {:?}",
@@ -1885,9 +1933,15 @@ mod tests {
     #[test]
     fn strip_inline_comment_ignores_iri_and_quotes() {
         // IRI 内 `#` 是 IRI 一部分，不是注释起点
-        assert_eq!(strip_inline_comment("<http://foo#bar> <p> <o> ."), "<http://foo#bar> <p> <o> .");
+        assert_eq!(
+            strip_inline_comment("<http://foo#bar> <p> <o> ."),
+            "<http://foo#bar> <p> <o> ."
+        );
         // 引号字面量内 `#` 不是注释起点
-        assert_eq!(strip_inline_comment("\"a#b\" <p> <o> ."), "\"a#b\" <p> <o> .");
+        assert_eq!(
+            strip_inline_comment("\"a#b\" <p> <o> ."),
+            "\"a#b\" <p> <o> ."
+        );
         // 行内裸 `#` 起注释
         assert_eq!(strip_inline_comment("<a> <b> . # comment"), "<a> <b> . ");
         // 行首 `#` 整行注释
@@ -1906,23 +1960,39 @@ mod tests {
         let all = parse_ttl_edges(ttl);
         // 对象是本 bracket 跨度占位（非内层 <Document>），partOf 受控关系应保留这条边
         assert_eq!(all.len(), 1, "got {:?}", all);
-        assert!(all.contains(&(
-            "http://example.org/docA".to_string(),
-            "http://example.org/partOf".to_string(),
-            "[ a <http://example.org/Document> ]".to_string()
-        )), "got {:?}", all);
+        assert!(
+            all.contains(&(
+                "http://example.org/docA".to_string(),
+                "http://example.org/partOf".to_string(),
+                "[ a <http://example.org/Document> ]".to_string()
+            )),
+            "got {:?}",
+            all
+        );
     }
 
     #[test]
     fn relation_iri_mapping_exact_prefix() {
         // #4（第6轮 security/high）：前缀匹配必须是"受控前缀+单个局部名"，
         // 深层 IRI（前缀后仍含 / 或 #）即使末段撞白名单也必须拒绝。
-        assert_eq!(map_relation_iri("http://example.org/supersedes").as_deref(), Some("supersedes"));
+        assert_eq!(
+            map_relation_iri("http://example.org/supersedes").as_deref(),
+            Some("supersedes")
+        );
         // 深层路径：前缀后含 '/'，必须拒绝（防注入白名单局部名）
-        assert_eq!(map_relation_iri("http://example.org/vendor/private/supersedes").as_deref(), None);
-        assert_eq!(map_relation_iri("http://memoria.ai/onto/foo/createdBy").as_deref(), None);
+        assert_eq!(
+            map_relation_iri("http://example.org/vendor/private/supersedes").as_deref(),
+            None
+        );
+        assert_eq!(
+            map_relation_iri("http://memoria.ai/onto/foo/createdBy").as_deref(),
+            None
+        );
         // 前缀后含 '#' 也拒绝
-        assert_eq!(map_relation_iri("http://example.org/sub#supersedes").as_deref(), None);
+        assert_eq!(
+            map_relation_iri("http://example.org/sub#supersedes").as_deref(),
+            None
+        );
         // 空局部名拒绝
         assert_eq!(map_relation_iri("http://example.org/").as_deref(), None);
     }
@@ -2012,10 +2082,7 @@ _:b0 <http://example.org/supersedes> :docA .
         // 在非 Windows 上，Unix 相对路径 `a:b.ttl`（含反斜杠）不得被改写。
         if !cfg!(windows) {
             // 仅冒号、后随非 / \ 的路径，不是盘符 → 保留反斜杠
-            assert_eq!(
-                win_path(std::path::Path::new("a:b.ttl")),
-                "a:b.ttl"
-            );
+            assert_eq!(win_path(std::path::Path::new("a:b.ttl")), "a:b.ttl");
             // 严格盘符（X:/ 或 X:\）→ 反斜杠转正斜杠
             assert_eq!(
                 win_path(std::path::Path::new("D:\\data\\a.ttl")),
@@ -2033,7 +2100,10 @@ _:b0 <http://example.org/supersedes> :docA .
             "\"a\\\"b\" <p> <o> . "
         );
         // 引号字面量内 `#` 不是注释起点
-        assert_eq!(strip_inline_comment("\"a#b\" <p> <o> ."), "\"a#b\" <p> <o> .");
+        assert_eq!(
+            strip_inline_comment("\"a#b\" <p> <o> ."),
+            "\"a#b\" <p> <o> ."
+        );
     }
 
     #[test]
@@ -2047,7 +2117,12 @@ _:b0 <http://example.org/supersedes> :docA .
 "#;
         let all = parse_ttl_edges(ttl);
         // 两个字面量对象（类型化 + 语言标签）都不应产出边，因为对象不是 IRI
-        assert_eq!(all.len(), 0, "typed literal datatype emitted a spurious edge: got {:?}", all);
+        assert_eq!(
+            all.len(),
+            0,
+            "typed literal datatype emitted a spurious edge: got {:?}",
+            all
+        );
     }
 
     #[test]
@@ -2166,18 +2241,18 @@ pub fn run_ontology_cli(args: &[String]) -> Result<String, String> {
                 Err(e) => return Err(e),
             };
             // #R17（第17轮 other/low）：`(inferred {})` 原用 `triples_after - triples_before`——那是三元组
-        // 计数差（含 schema 本体声明、rdf:type 等非语义边），与下一行 `inferred_edges: {}`（语义
-        // 推断边数）不一致，可能误导运维（"inferred 500" 而实际仅 3 条语义边）。改标签为
-        // `triples_delta` 明确其语义，避免与 inferred_edges 混淆。
-        Ok(format!(
-            "materialize OK\nduration_ms: {}\nprofile: {}\ntriples: {} -> {} (triples_delta {})\ninferred_edges: {}",
-            res.duration_ms,
-            res.profile,
-            res.triples_before,
-            res.triples_after,
-            res.triples_after.saturating_sub(res.triples_before),
-            res.inferred_edges.len(),
-        ))
+            // 计数差（含 schema 本体声明、rdf:type 等非语义边），与下一行 `inferred_edges: {}`（语义
+            // 推断边数）不一致，可能误导运维（"inferred 500" 而实际仅 3 条语义边）。改标签为
+            // `triples_delta` 明确其语义，避免与 inferred_edges 混淆。
+            Ok(format!(
+                "materialize OK\nduration_ms: {}\nprofile: {}\ntriples: {} -> {} (triples_delta {})\ninferred_edges: {}",
+                res.duration_ms,
+                res.profile,
+                res.triples_before,
+                res.triples_after,
+                res.triples_after.saturating_sub(res.triples_before),
+                res.inferred_edges.len(),
+            ))
         }
         "status" => status(&cfg),
         "serve" => serve_http_placeholder(&cfg, args),
@@ -2204,7 +2279,9 @@ fn serve_http_placeholder(cfg: &OntologyConfig, args: &[String]) -> Result<Strin
             .parse()
             .map_err(|_| format!("invalid --port value {:?} (expected 1..=65535)", raw))?;
         if parsed == 0 {
-            return Err("invalid --port value 0 (0 means ephemeral; specify 1..=65535)".to_string());
+            return Err(
+                "invalid --port value 0 (0 means ephemeral; specify 1..=65535)".to_string(),
+            );
         }
         port = parsed;
     }
@@ -2229,12 +2306,16 @@ fn serve_http_placeholder(cfg: &OntologyConfig, args: &[String]) -> Result<Strin
     let se = child.stderr.take();
     let stdout_reader = std::thread::spawn(move || {
         let mut b = String::new();
-        if let Some(mut o) = so { let _ = o.read_to_string(&mut b); }
+        if let Some(mut o) = so {
+            let _ = o.read_to_string(&mut b);
+        }
         b
     });
     let stderr_reader = std::thread::spawn(move || {
         let mut b = String::new();
-        if let Some(mut e) = se { let _ = e.read_to_string(&mut b); }
+        if let Some(mut e) = se {
+            let _ = e.read_to_string(&mut b);
+        }
         b
     });
     std::thread::sleep(Duration::from_millis(800));

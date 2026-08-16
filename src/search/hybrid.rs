@@ -2,6 +2,7 @@
 //!
 //! 替代 lib.rs hybrid_search 和 mcp_server.rs 中各自维护的搜索逻辑。
 
+use crate::search::semantic::{SemanticError, bump_semantic_drops, throttled_eprintln};
 use crate::search::{self, FusedResult, SignalResult};
 use crate::storage::SqlitePool;
 use crate::vector::{HnswIndex, QueryCache};
@@ -19,6 +20,7 @@ pub fn hybrid_search(
     namespace: &str,
     max_results: u32,
     hnsw: Option<&HnswIndex>,
+    hype_hnsw: Option<&HnswIndex>,
     query_cache: Option<&QueryCache>,
     as_of: Option<&str>,
     include_superseded: bool,
@@ -60,20 +62,55 @@ pub fn hybrid_search(
         }
     }
 
-    // S2: Semantic (HNSW vector) — 宽召回
-    if let (Some(hnsw), Some(qc)) = (hnsw, query_cache) {
-        if let Ok(sem) = search::semantic::semantic_search(
-            query,
-            namespace,
-            primary_limit,
-            Some(hnsw),
-            Some(qc),
-            Some(pool),
-        ) {
-            if !sem.is_empty() {
-                sem_res = Some(sem.clone());
-                signals.push(sem);
-                weights.push(w_semantic);
+    // S2: Semantic (HNSW vector) — 宽召回（V1：可选 HyPE 问句索引双路合并）。
+    // 门控：任一索引存在即启用——semantic_search 内部按索引各自独立搜索再合并，
+    // 单索引缺失时自然退化为单路（与 semantic_search 的契约一致）。若仅因 hnsw 为
+    // None 而整体跳过，会连已有的 hype 通道也一起丢掉。
+    if let Some(qc) = query_cache {
+        if hnsw.is_some() || hype_hnsw.is_some() {
+            match search::semantic::semantic_search(
+                query,
+                namespace,
+                primary_limit,
+                hnsw,
+                hype_hnsw,
+                Some(qc),
+                Some(pool),
+            ) {
+                Ok(sem) => {
+                    if !sem.is_empty() {
+                        sem_res = Some(sem.clone());
+                        signals.push(sem);
+                        weights.push(w_semantic);
+                    }
+                }
+                // #R35 maintainability/low：semantic_search 在"全部 HNSW 路失败"
+                // （poisoned/corrupted）时显式返回 Err——此处不能静默丢弃整个语义信号
+                // （退化为 keyword-only 无痕），至少记录，让降级可观测。
+                // #R37 maintainability/low：Err 也可能来自 DB/pool 故障（content backfill
+                // pool/get 失败等），日志前缀保持中立，不预设根因是索引损坏。
+                // #R49 performance/low：Err 是持久故障（RwLock poisoning/DB 持续故障）
+                // 时每查询刷一行 → 60s 冷却（共享 helper，#R51：按 key 隔离，不同故障
+                // 原因不互相抑制——单一全局 static 会让一种持续故障压住并发故障）。
+                // #R56 maintainability/medium：key 按**结构化错误变体**派生——此前
+                // 子串匹配 String 错误文本（"query vector dim"/"all HNSW roads failed"/
+                // fetch 类），文案改动会静默把故障重新归类进 other 桶（跨抑制回归）；
+                // 且 DB 类把 pool get/prepare/query/硬失败批合并一 key（并发异因
+                // 互相压制）。枚举 match 对消息改写免疫；Fetch 内部各因仍共享
+                // 60s 冷却（DB 故障恢复前持续压制同类噪音可接受）。
+                Err(e) => {
+                    // #R57 maintainability/low：RoadsFailed 现为 unit variant。
+                    let key: &'static str = match &e {
+                        SemanticError::QueryDim(_) => "hybrid_drop_dim",
+                        SemanticError::RoadsFailed => "hybrid_drop_roads",
+                        SemanticError::Fetch(_) => "hybrid_drop_db",
+                    };
+                    // 闭包求值：冷却期间零分配（#R57）。
+                    // #R62 maintainability/low：累计计数（db_stats 暴露，见
+                    // semantic::bump_semantic_drops doc）。
+                    bump_semantic_drops();
+                    throttled_eprintln(key, || format!("[hybrid] semantic signal dropped: {e}"));
+                }
             }
         }
     }
@@ -232,7 +269,10 @@ pub fn hybrid_search(
                     .query_map(rusqlite::params_from_iter(ids.iter()), |row| {
                         Ok((
                             row.get::<_, String>(0)?,
-                            (row.get::<_, i64>(1).unwrap_or(0), row.get::<_, Option<String>>(2)?),
+                            (
+                                row.get::<_, i64>(1).unwrap_or(0),
+                                row.get::<_, Option<String>>(2)?,
+                            ),
                         ))
                     })
                     .map(|rows| rows.flatten().collect())
@@ -382,7 +422,11 @@ fn two_stage_rerank(results: &mut Vec<FusedResult>, w_rrf: f64, w_sem: f64, w_kw
     let lambda = env_f64("MEMORIA_RECENCY_LAMBDA", 0.01).max(0.0);
     let now_secs = chrono::Utc::now().timestamp();
     for r in results.iter_mut() {
-        let rrf_n = if rrf_max > 0.0 { r.rrf_score / rrf_max } else { 0.0 };
+        let rrf_n = if rrf_max > 0.0 {
+            r.rrf_score / rrf_max
+        } else {
+            0.0
+        };
         let sem_n = if sem_max > 0.0 {
             r.sem_cos.unwrap_or(0.0) / sem_max
         } else {
@@ -411,9 +455,12 @@ fn two_stage_rerank(results: &mut Vec<FusedResult>, w_rrf: f64, w_sem: f64, w_kw
             }
             None => 0.5,
         };
-        r.rrf_score = w_rrf * rrf_n + w_sem * sem_n + w_kw * kw_n
+        r.rrf_score = w_rrf * rrf_n
+            + w_sem * sem_n
+            + w_kw * kw_n
             + w_graph * graph_n
-            + w_freq * freq_n + w_rec * recency_n;
+            + w_freq * freq_n
+            + w_rec * recency_n;
         if !r.source.contains("rerank2") {
             r.source = format!("{};rerank2", r.source);
         }
