@@ -24,10 +24,10 @@ LLM-as-judge 平均分 **7.05 / 10**（pass@8 = 59.6%）。检索侧（memoria �
    graph hops=0），top-8。
 3. **证据命中**：检索结果中是否出现 `answer_session_ids` 任一 session 的块（经 web API 拉全量
    内容后解析块头）。隔离「检索」与「作答」两个环节。
-4. **作答**：检索到的 8 个块**完整内容** + 问题 → Qwen2.5-72B-Instruct 生成答案
+4. **作答**：检索到的 8 个块**完整内容** + 问题 → DeepSeek deepseek-v4-flash（官方 api.deepseek.com）生成答案
    （服务端 search 响应截断 2000 字符，答案句常在块中后部，故经 `/api/memories?id=` 取全量）。
 5. **Judge**：0-10 宽松打分（与 LoCoMo 同 prompt；10=完全正确，8-9=小偏差，5-7=部分正确，
-   0-4=错误/幻觉/应答 UNKNOWN），Qwen2.5-72B-Instruct。
+   0-4=错误/幻觉/应答 UNKNOWN），DeepSeek deepseek-v4-flash（官方 api.deepseek.com）。
 6. **聚合**：总体均分、pass@8、证据命中率、按 `question_type` 与能力域（映射见下）。
 
 ### 能力域映射（cleaned 数据无 capability 字段，按官方任务命名近似映射）
@@ -54,7 +54,7 @@ python clean_lme.py --confirm --backup
 ```
 
 环境: memoria-server :9003（prod 配置）+ embed :8777（Qwen3-VL-Embedding-8B, 1024d）；
-SiliconFlow key 读 `SILICONFLOW_API_KEY` / `MEMORIA_JARVIS_BADGE`（兜底 `~/agent-core/.env`）。
+DeepSeek 官方 API key 读 `DEEPSEEK_API_KEY` / `AGENT_API_KEY`（兜底 `~/agent-core/.env`），端点 `https://api.deepseek.com/v1/chat/completions`。
 
 ## 3. 结果（全量 500 问）
 

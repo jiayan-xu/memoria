@@ -68,3 +68,7 @@ diag = ["console-subscriber"]
 lto = "fat"
 codegen-units = 1
 strip = "symbols"
+
+# 2026-08-22: 固定 HNSW 层级 RNG 种子，根治跨重启召回抖动（±3~5pp）
+[patch.crates-io]
+hnsw_rs = { path = "patches/hnsw_rs" }
