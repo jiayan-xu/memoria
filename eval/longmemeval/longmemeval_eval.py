@@ -10,7 +10,7 @@
 2. 检索：memory_search_v2（prod 配置：recall_depth=100 + cross-encoder rerank pool=100）。
 3. 证据命中：答案是否来自 answer_session_ids 所在块（从 content 头解析 session id）——
    隔离「检索」与「LLM 作答」两个环节。
-4. 答案生成：检索上下文 + question → SiliconFlow Qwen2.5-7B（同 LoCoMo 口径）。
+4. 答案生成：检索上下文 + question → DeepSeek deepseek-v4-flash（官方 api.deepseek.com，同 LoCoMo 口径）。
 5. Judge：0-10 宽松打分（同 LoCoMo judge prompt），按 question_type / 能力域聚合。
 
 用法（数据文件放脚本同目录，或 LME_DATA_PATH 指定）：
@@ -43,8 +43,8 @@ TOP_K = int(os.environ.get("LME_TOP_K", "8"))
 CTX_CHARS = int(os.environ.get("LME_CTX_CHARS", "2000"))  # 检索响应内截断上限（服务端 2000）
 BATCH_WAIT = float(os.environ.get("LME_BATCH_WAIT", "0.05"))
 INGEST_WORKERS = int(os.environ.get("LME_INGEST_WORKERS", "4"))
-CHAT_MODEL = os.environ.get("LME_CHAT_MODEL", "Qwen/Qwen2.5-72B-Instruct")
-JUDGE_MODEL = os.environ.get("LME_JUDGE_MODEL", "Qwen/Qwen2.5-72B-Instruct")
+CHAT_MODEL = os.environ.get("LME_CHAT_MODEL", "deepseek-v4-flash")
+JUDGE_MODEL = os.environ.get("LME_JUDGE_MODEL", "deepseek-v4-flash")
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA_PATH = os.environ.get(
@@ -53,15 +53,20 @@ DATA_PATH = os.environ.get(
 )
 RESULTS_PATH = os.path.join(HERE, "longmemeval_results.json")
 
-# ── SiliconFlow key：优先环境变量，兜底读 ~/agent-core/.env（不写死绝对路径）──
-SF_KEY = os.environ.get("SILICONFLOW_API_KEY", "")
-if not SF_KEY:
+# ── DeepSeek 官方 API key：优先环境变量，兜底读 ~/agent-core/.env（不写死绝对路径）──
+DS_KEY = os.environ.get("DEEPSEEK_API_KEY") or os.environ.get("AGENT_API_KEY") or ""
+if not DS_KEY:
     cand = os.path.join(os.path.expanduser("~"), "agent-core", ".env")
     if os.path.exists(cand):
         for line in open(cand, encoding="utf-8"):
-            if line.startswith("SILICONFLOW_API_KEY="):
-                SF_KEY = line.strip().split("=", 1)[1].strip().strip('"').strip("'")
+            if line.startswith("DEEPSEEK_API_KEY="):
+                DS_KEY = line.strip().split("=", 1)[1].strip().strip('"').strip("'")
                 break
+        if not DS_KEY:
+            for line in open(cand, encoding="utf-8"):
+                if line.startswith("AGENT_API_KEY="):
+                    DS_KEY = line.strip().split("=", 1)[1].strip().strip('"').strip("'")
+                    break
 if not AGENT_KEY:
     cand = os.path.join(os.path.expanduser("~"), "agent-core", ".env")
     if os.path.exists(cand):
@@ -70,7 +75,7 @@ if not AGENT_KEY:
                 AGENT_KEY = line.strip().split("=", 1)[1].strip().strip('"').strip("'")
                 break
 
-CHAT_URL = "https://api.siliconflow.cn/v1/chat/completions"
+CHAT_URL = "https://api.deepseek.com/v1/chat/completions"
 
 # question_type → 论文 5 能力域（cleaned 数据无 capability 字段，按官方任务命名映射，
 # 报告里标注为近似映射）
@@ -190,7 +195,7 @@ def search(query: str, ns: str) -> list:
 
 def chat(messages: list, model: str = None, max_tokens: int = 512,
          temperature: float = 0.2) -> str:
-    if not SF_KEY:
+    if not DS_KEY:
         return "[ERR:NO_KEY]"
     body = json.dumps({
         "model": model or CHAT_MODEL, "messages": messages,
@@ -199,7 +204,7 @@ def chat(messages: list, model: str = None, max_tokens: int = 512,
     req = urllib.request.Request(
         CHAT_URL, data=body,
         headers={"Content-Type": "application/json",
-                 "Authorization": f"Bearer {SF_KEY}"})
+                 "Authorization": f"Bearer {DS_KEY}"})
     for attempt in range(2):
         try:
             with urllib.request.urlopen(req, timeout=90) as resp:
@@ -331,8 +336,8 @@ def main():
     if not os.path.exists(DATA_PATH):
         print(f"FATAL: 数据文件不存在 {DATA_PATH}（下载到脚本同目录或设 LME_DATA_PATH）")
         sys.exit(1)
-    if not SF_KEY:
-        print("WARN: SILICONFLOW_API_KEY 未找到")
+    if not DS_KEY:
+        print("WARN: DEEPSEEK_API_KEY 未找到")
 
     with open(DATA_PATH, encoding="utf-8") as f:
         data = json.load(f)
