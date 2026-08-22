@@ -395,6 +395,9 @@ fn pending_downweight() -> f64 {
 /// 用「归一化 RRF + 原始 cosine(sem_cos) + 原始 BM25(kw_bm25)」的混合分重排，
 /// 再交回 `take(max_results)` 截断。cooccur/text_signals 的加成已折入 rrf_score，
 /// 归一化后相对序保留，故不丢失前序重排成果。
+/// 2026-08-22 追加「近精确语义匹配 boost」：sem_cos ≥ `MEMORIA_SEM_EXACT_T`(默认0.9)
+/// 时线性加成 `MEMORIA_SEM_EXACT_BOOST`(默认1.0)，把自匹配/近自匹配恒定顶进 top-k
+/// （修复 RRF k=60 压平 + kw_w>sem_w 导致语义 #1 被埋到 rank 10+ 的回归）。
 fn two_stage_rerank(results: &mut Vec<FusedResult>, w_rrf: f64, w_sem: f64, w_kw: f64) {
     if results.is_empty() {
         return;
@@ -418,6 +421,14 @@ fn two_stage_rerank(results: &mut Vec<FusedResult>, w_rrf: f64, w_sem: f64, w_kw
     // F1b：频率 + 新鲜度分量（env 可调权重，默认 0.1；为 0 时退化为现状）
     let w_freq = env_f64("MEMORIA_RERANK_W_FREQ", 0.1);
     let w_rec = env_f64("MEMORIA_RERANK_W_REC", 0.1);
+    // P0 召回回归修复（2026-08-22）：近精确语义匹配 boost。
+    // 根因：RRF k=60 把语义 rank 差压平到 1/61≈0.0164 区间，且 rerank 权重
+    // kw_w(0.5) > sem_w(0.2)，导致「查询与某记忆余弦≈1.0」的近精确/自匹配被埋到
+    // rank 10+（07-28 诊断「重排把语义 #1 压到 pos=14」，今 pos=15 复发）。
+    // 该 boost 仅对极高 cosine（≥阈值）单调加成，把近精确匹配顶进 top-k；
+    // 不影响模糊语义召回（cos<阈值不动）与关键词召回（kw_w 不变）。env 可调。
+    let sem_exact_t = env_f64("MEMORIA_SEM_EXACT_T", 0.9);
+    let sem_exact_boost = env_f64("MEMORIA_SEM_EXACT_BOOST", 1.0).max(0.0);
     let k_freq = env_f64("MEMORIA_FREQ_K", 10.0).max(1.0);
     let lambda = env_f64("MEMORIA_RECENCY_LAMBDA", 0.01).max(0.0);
     let now_secs = chrono::Utc::now().timestamp();
@@ -455,12 +466,22 @@ fn two_stage_rerank(results: &mut Vec<FusedResult>, w_rrf: f64, w_sem: f64, w_kw
             }
             None => 0.5,
         };
+        // 近精确语义匹配 boost：cosine ≥ 阈值时，沿 [阈值,1.0] 线性 ramp 加成，
+        // 确保「自匹配/近自匹配」恒定顶进 top-k，不被重排埋没。
+        let sem_exact = match r.sem_cos {
+            Some(c) if c >= sem_exact_t => {
+                let ramp = (c - sem_exact_t) / (1.0 - sem_exact_t).max(1e-6);
+                sem_exact_boost * ramp
+            }
+            _ => 0.0,
+        };
         r.rrf_score = w_rrf * rrf_n
             + w_sem * sem_n
             + w_kw * kw_n
             + w_graph * graph_n
             + w_freq * freq_n
-            + w_rec * recency_n;
+            + w_rec * recency_n
+            + sem_exact;
         if !r.source.contains("rerank2") {
             r.source = format!("{};rerank2", r.source);
         }
