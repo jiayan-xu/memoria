@@ -100,3 +100,6 @@ eval/probe_single.py
 eval/longmemeval/*.json
 eval/longmemeval/*.log
 eval/longmemeval/*.err
+
+# 本地测试产物
+detail_*.json
