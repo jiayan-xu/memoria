@@ -13,7 +13,10 @@ import json, os, sys, argparse, urllib.request, urllib.error
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 BENCH = os.path.join(HERE, "nl_recall_bench.json")
-MEMORIA_ENV = os.path.join(os.path.expanduser("~/.qclaw/workspace/memoria"), ".env")
+# R0 封口4 后密钥迁至 ~/.svc-secrets/memoria.env；回退旧路径兼容
+MEMORIA_ENV = os.path.join(os.path.expanduser("~/.svc-secrets"), "memoria.env")
+if not os.path.exists(MEMORIA_ENV):
+    MEMORIA_ENV = os.path.join(os.path.expanduser("~/.qclaw/workspace/memoria"), ".env")
 NS = "agent/xujiayan"
 
 def load_admin_key():
