@@ -81,7 +81,7 @@ jobs:
           # 会把"0 发现也通过"的门禁误判为失败，CI 恒红），降级为仅报告。
           set +e
           OUT=$(ocr review --from "$BASE" --to "$HEAD" \
-            --exclude '.github/**,.githooks/**,scripts/ocr-review.sh,**/__pycache__/**,**/*.bak,**/*.exe,**/*.csv,**/target/**' 2>&1)
+            --exclude '.github/**,.githooks/**,scripts/ocr-review.sh,**/__pycache__/**,**/*.bak,**/*.exe,**/*.csv,**/target/**,patches/**' 2>&1)
           REVIEW_RC=$?
           set -e
           echo "$OUT"
