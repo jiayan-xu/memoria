@@ -34,8 +34,20 @@ def load_env(p):
     return d
 
 
-def embed_batch(texts, retries=3):
-    """调用嵌入服务，单批；失败重试。返回向量列表或 None。"""
+def _is_degenerate(v):
+    """零向量 / 空向量判定（SiliconFlow 高负载下会返回缺项并兜底填零）。"""
+    if not v:
+        return True
+    return sum(x * x for x in v) < 1e-9
+
+
+def embed_batch(texts, retries=4):
+    """调用嵌入服务，单批；失败/退化重试。返回向量列表或 None。
+
+    关键修复（2026-08-22）：SiliconFlow 对 batch>=16 的请求会静默返回缺项，
+    embed_server._embed_siliconflow 兜底把缺项填成零向量 → 污染 memory_vectors。
+    这里在收到响应后立即校验「无零/退化向量」，遇退化整体重试，绝不把零向量交回上层。
+    """
     last_err = None
     for attempt in range(retries):
         try:
@@ -46,18 +58,21 @@ def embed_batch(texts, retries=3):
             vecs = d.get("vectors") or d.get("embeddings")
             if vecs is None or len(vecs) != len(texts):
                 last_err = f"返回数量不符 {len(vecs) if vecs else 0}/{len(texts)}"
+            elif any(_is_degenerate(v) for v in vecs):
+                last_err = "含零/退化向量(高负载静默退化), 重试"
             else:
                 return vecs
         except Exception as e:
             last_err = str(e)
         time.sleep(2 * (attempt + 1))
-    print(f"  [FAIL] batch {len(texts)} 重试3次失败: {last_err}")
+    print(f"  [FAIL] batch {len(texts)} 重试{retries}次失败: {last_err}")
     return None
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--batch", type=int, default=16)
+    # 2026-08-22：默认 16 会触发 SiliconFlow 批请求缺项→零向量污染；降到 8（实测干净）。
+    ap.add_argument("--batch", type=int, default=8)
     ap.add_argument("--dry-run", action="store_true", help="只算不写")
     ap.add_argument("--limit", type=int, default=0, help="只处理前 N 条（调试）")
     args = ap.parse_args()
