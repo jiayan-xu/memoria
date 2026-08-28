@@ -1000,9 +1000,16 @@ async fn handle_tool_call(
     let empty_args = serde_json::Map::new();
     let safe_args = if args.is_empty() { &empty_args } else { &args };
 
+    // 性能插桩（MEMORIA_TRACE=1 激活）：分段计时定位热路径等待
+    let trace_on = std::env::var("MEMORIA_TRACE").as_deref() == Ok("1");
+    let t_start = std::time::Instant::now();
+
     // 鉴权：同步 SQLite 查询，必须隔离到阻塞线程池，否则会占住 async worker
     // 导致整服务冻结（initialize/tools/list 全卡）。
     let auth_result = authenticate_async(state, agent_id, agent_key).await;
+    if trace_on {
+        eprintln!("[trace] {} auth +{:?}", tool, t_start.elapsed());
+    }
 
     let auth = match auth_result {
         Some(a) => a,
@@ -1122,10 +1129,14 @@ async fn handle_tool_call(
     {
         if let Some(q) = safe_args.get("query").and_then(|v| v.as_str()) {
             if !q.is_empty() {
+                let t_emb = std::time::Instant::now();
                 if let Some(qvec) =
                     embed_query(&state.http_client, &state.embedding_url, q, hyde_enabled()).await
                 {
                     state.query_cache.put(q, qvec);
+                }
+                if trace_on {
+                    eprintln!("[trace] {} query-embed +{:?}", tool, t_emb.elapsed());
                 }
             }
         }
@@ -1162,8 +1173,16 @@ async fn handle_tool_call(
     let args_owned = safe_args.clone();
     let auth_owned = auth.clone();
     let agent_id_owned = agent_id.to_string();
+    let t_disp = std::time::Instant::now();
     let text = match tokio::task::spawn_blocking(move || {
+        if trace_on {
+            eprintln!("[trace] {} spawn_blocking-queue +{:?}", tool_owned, t_disp.elapsed());
+        }
+        let t_run = std::time::Instant::now();
         let text = dispatch(&st, &tool_owned, &args_owned, &auth_owned);
+        if trace_on {
+            eprintln!("[trace] {} dispatch-run +{:?}", tool_owned, t_run.elapsed());
+        }
         let allowed = !text.contains(r#""error""#);
         // P0 修复（终极）：闭包内若 dispatch 已对 auth_pool 写过（如 register_agent），
         // 再同步调 auth::audit_log 写同一池 → WAL 串行写下第二次写死等第一次写锁释放，
@@ -1357,6 +1376,7 @@ fn dispatch(
             } else {
                 max_results
             };
+            let t_hybrid = std::time::Instant::now();
             let mut fused = search::hybrid::hybrid_search(
                 &state.pool,
                 query,
@@ -1369,6 +1389,10 @@ fn dispatch(
                 include_superseded,
             )
             .unwrap_or_default();
+            if std::env::var("MEMORIA_TRACE").as_deref() == Ok("1") {
+                eprintln!("[trace] {} hybrid_search +{:?} (fused={})",
+                    tool, t_hybrid.elapsed(), fused.len());
+            }
 
             // stage-2 重排：在宽候选池上用 cross-encoder 重排，再交回 tags 过滤 + take(max_results)。
             // 仅改变相对序，不增删候选；失败则保留 hybrid 原序（优雅降级）。
