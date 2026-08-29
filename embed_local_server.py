@@ -15,11 +15,28 @@ import onnxruntime as ort
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "embed-local")
-MODEL_PATH = os.path.join(DIR, "onnx_model_int8.onnx")
-TOKENIZER = os.path.join(DIR, "tokenizer.json")
+# 2026-08-29 模型切换：Qwen3-0.6B-int8 召回不达标（内存 A/B MRR 0.688 vs bge-m3 0.874，
+# recall@5 0.846 vs 0.962——见 embed_ab_test.py），默认换 bge-m3-int8（CLS pooling，1024d）。
+# MEMORIA_EMBED_LOCAL_MODEL=qwen3 可切回。
+WHICH = os.environ.get("MEMORIA_EMBED_LOCAL_MODEL", "bge-m3").lower()
+
+MODELS = {
+    "bge-m3": {
+        "onnx": "bge-m3_model_int8.onnx", "tokenizer": "bge-m3_tokenizer.json",
+        "pooling": "cls", "layers": 0, "kv_heads": 0, "head_dim": 0, "name": "bge-m3-int8-local",
+    },
+    "qwen3": {
+        "onnx": "onnx_model_int8.onnx", "tokenizer": "tokenizer.json",
+        "pooling": "last", "layers": 28, "kv_heads": 8, "head_dim": 128, "name": "Qwen3-Embedding-0.6B-int8-local",
+    },
+}
+_cfg = MODELS.get(WHICH) or MODELS["bge-m3"]
+
+MODEL_PATH = os.path.join(DIR, _cfg["onnx"])
+TOKENIZER = os.path.join(DIR, _cfg["tokenizer"])
 HOST = os.environ.get("MEMORIA_EMBED_HOST", "127.0.0.1")   # 与 8777 同规则：仅回环
 PORT = int(os.environ.get("MEMORIA_EMBED_PORT", "8778"))
-MAX_LEN = 2048
+MAX_LEN = 512 if _cfg["pooling"] == "cls" else 2048
 
 os.environ.setdefault("ORT_GLOBAL_THREAD_POOL", "4")
 _so = ort.SessionOptions()
@@ -27,7 +44,7 @@ _so.intra_op_num_threads = 2   # 单请求 2 线程，余量留给并发请求�
 _sess = ort.InferenceSession(MODEL_PATH, sess_options=_so, providers=["CPUExecutionProvider"])
 from tokenizers import Tokenizer
 _tok = Tokenizer.from_file(TOKENIZER)
-print(f"[embed-local] Qwen3-Embedding-0.6B int8 loaded, dim=1024 -> http://{HOST}:{PORT}/embed", flush=True)
+print(f"[embed-local] {_cfg['name']} ({_cfg['pooling']} pooling) loaded, dim=1024 -> http://{HOST}:{PORT}/embed", flush=True)
 
 _lock = threading.Lock()  # ORT session 并发 run 线程安全，锁只为控制 CPU 抢占抖动
 
@@ -35,21 +52,27 @@ def embed_batch(texts):
     out = []
     # 无全局锁：ORT session 并发 run 线程安全，放开多请求真正并行吃多核
     for t in texts:
-            enc = _tok.encode(t)
-            ids = enc.ids[:MAX_LEN]
-            n = len(ids)
-            feed = {
-                "input_ids": np.array([ids], dtype=np.int64),
-                "attention_mask": np.array([[1] * n], dtype=np.int64),
-                "position_ids": np.array([list(range(n))], dtype=np.int64),
-            }
-            for i in range(28):
-                feed[f"past_key_values.{i}.key"] = np.zeros((1, 8, 0, 128), dtype=np.float32)
-                feed[f"past_key_values.{i}.value"] = np.zeros((1, 8, 0, 128), dtype=np.float32)
+        enc = _tok.encode(t)
+        ids = enc.ids[:MAX_LEN]
+        n = len(ids)
+        feed = {
+            "input_ids": np.array([ids], dtype=np.int64),
+            "attention_mask": np.array([[1] * n], dtype=np.int64),
+        }
+        if _cfg["pooling"] == "cls":
+            # bge-m3 / XLM-R encoder：CLS token + L2 归一
+            h = _sess.run(["last_hidden_state"], feed)[0]
+            v = h[0, 0, :].astype(np.float32)
+        else:
+            # Qwen3 decoder：last-token pooling，需空 past KV + position_ids 做一次 prefill
+            feed["position_ids"] = np.array([list(range(n))], dtype=np.int64)
+            for i in range(_cfg["layers"]):
+                feed[f"past_key_values.{i}.key"] = np.zeros((1, _cfg["kv_heads"], 0, _cfg["head_dim"]), dtype=np.float32)
+                feed[f"past_key_values.{i}.value"] = np.zeros((1, _cfg["kv_heads"], 0, _cfg["head_dim"]), dtype=np.float32)
             h = _sess.run(["last_hidden_state"], feed)[0]
             v = h[0, n - 1, :].astype(np.float32)
-            v /= (np.linalg.norm(v) + 1e-12)
-            out.append(v.tolist())
+        v /= (np.linalg.norm(v) + 1e-12)
+        out.append(v.tolist())
     return out
 
 class Handler(BaseHTTPRequestHandler):
@@ -66,7 +89,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path.split("?")[0] in ("/health", "/"):
-            self._send(200, {"status": "ok", "model": "Qwen3-Embedding-0.6B-int8-local", "dim": 1024, "provider": "local-qwen3"})
+            self._send(200, {"status": "ok", "model": _cfg["name"], "dim": 1024, "provider": "local-" + WHICH})
         else:
             self._send(404, {"error": "not found"})
 
@@ -93,7 +116,7 @@ class Handler(BaseHTTPRequestHandler):
             self._send(500, {"error": f"encode failed: {e}"})
             return
         self._send(200, {"embeddings": embs, "dim": len(embs[0]) if embs else 0,
-                         "model": "Qwen3-Embedding-0.6B-int8-local"})
+                         "model": _cfg["name"]})
 
     def log_message(self, *a):
         pass
