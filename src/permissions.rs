@@ -202,6 +202,12 @@ pub const PERMISSION_MATRIX: &[Entry] = &[
         note: "实体搜索",
     },
     Entry {
+        tool: "memory_graph_query",
+        min_role: MinRole::Agent,
+        ns_policy: NsPolicy::NamespaceArg,
+        note: "Kuzu 时序图谱查询（多跳/只读 cypher/统计）",
+    },
+    Entry {
         tool: "memory_export",
         min_role: MinRole::Agent,
         ns_policy: NsPolicy::NamespaceArg,
