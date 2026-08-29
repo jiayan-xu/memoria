@@ -1282,8 +1282,9 @@ async fn handle_tool_call(
             }
             if let Some(d) = decision {
                 match d.action.as_str() {
-                    "NOOP" => {
-                        // 重复：不落库，直接返回既有记忆 id（fail-open 语义：候选缺失则照常 ADD）
+                    "NOOP" if d.target_id.is_some() => {
+                        // 重复：不落库，直接返回既有记忆 id。
+                        // 无目标的 NOOP 已在 parse 层拒绝（fail-open ADD），此处双保险
                         let resp = serde_json::json!({
                             "status": "remembered",
                             "id": d.target_id.clone().unwrap_or_default(),

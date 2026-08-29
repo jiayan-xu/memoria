@@ -73,8 +73,10 @@ pub fn parse_decision(text: &str) -> Option<Decision> {
         .and_then(|t| t.as_str())
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty() && s != "null");
-    if action == "UPDATE" && target_id.is_none() {
-        return None; // UPDATE 必须有目标，否则按解析失败处理（fail-open ADD）
+    if (action == "UPDATE" || action == "NOOP") && target_id.is_none() {
+        // UPDATE/NOOP 都必须有目标：无目标的 NOOP 会在调用侧变成"静默不落库"= 丢数据，
+        // 因此按解析失败处理，调用方 fail-open 退化为 ADD（ocr 审查 high 修复）
+        return None;
     }
     let reason = v
         .get("reason")
@@ -204,11 +206,25 @@ pub async fn classify(
         if !resp.status().is_success() {
             continue;
         }
-        let v: Value = resp.json().await.ok()?;
-        let text = v
-            .pointer("/choices/0/message/content")
-            .and_then(|c| c.as_str())?;
-        return parse_decision(text);
+        let v: Value = match resp.json().await {
+            Ok(v) => v,
+            Err(_) => continue, // JSON 解析失败可重试（非持久故障）
+        };
+        let Some(text) = v.pointer("/choices/0/message/content").and_then(|c| c.as_str()) else {
+            continue;
+        };
+        if let Some(mut d) = parse_decision(text) {
+            // 目标必须来自候选列表（防幻觉 id 造成取代错对象）；违规降级 ADD（抽取结果保留）
+            if let Some(tid) = &d.target_id {
+                if !candidates.iter().any(|(cid, _)| cid == tid) {
+                    d.action = "ADD".to_string();
+                    d.target_id = None;
+                    d.reason = format!("目标不在候选中，降级 ADD: {}", d.reason);
+                }
+            }
+            return Some(d);
+        }
+        // 解析失败 → 重试
     }
     None
 }
