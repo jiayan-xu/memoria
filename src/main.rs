@@ -10,6 +10,7 @@
 //!   MEMORIA_EMBEDDING_URL (default: http://127.0.0.1:8777/embed — local embed_server.py;
 //!                         set to empty ("") to disable HNSW semantic search)
 
+mod consolidation;
 mod mcp_server;
 mod permissions;
 
@@ -303,6 +304,14 @@ fn main() {
         embedding_url: std::env::var("MEMORIA_EMBEDDING_URL")
             .unwrap_or_else(|_| "http://127.0.0.1:8777/embed".to_string()),
         http_client: reqwest::Client::new(),
+        // P1 写入整合（mem0 式）：默认空 = 关闭（哑存储原则不破）。配置后 remember 走 LLM 判定。
+        consolidation_url: std::env::var("MEMORIA_CONSOLIDATION_URL").unwrap_or_default(),
+        consolidation_model: std::env::var("MEMORIA_CONSOLIDATION_MODEL")
+            .unwrap_or_else(|_| "qwen3.8-flash".to_string()),
+        consolidation_key: std::env::var("MEMORIA_CONSOLIDATION_API_KEY").unwrap_or_default(),
+        // P2 时序图谱 sidecar（Kuzu）
+        graph_url: std::env::var("MEMORIA_GRAPH_URL")
+            .unwrap_or_else(|_| "http://127.0.0.1:8779".to_string()),
         db_path: db_path.clone(),
         backup_dir: backup_dir.clone(),
         vec_index_path: vec_path.to_string_lossy().to_string(),
