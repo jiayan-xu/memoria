@@ -16,7 +16,7 @@ P2：把写入整合时抽取的实体/关系落到真图库，支持多跳遍�
   POST /neighbors {name, depth?, as_of?, namespace?}  —— 多跳邻居（含时效过滤）
   POST /stats     {namespace?}                        —— 节点/边计数
 """
-import os, sys, json, threading
+import os, sys, json, re, threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import kuzu
 
@@ -54,13 +54,6 @@ def rows_of(res):
 def q(sql, params=None):
     res = _conn.execute(sql, parameters=params or {})
     return rows_of(res)
-
-def as_of_ok(alias, as_of):
-    """时效 SQL 片段：as_of 为空 = 仅现行（valid_to 为空串）；否则区间包含 as_of。"""
-    if as_of:
-        return (f"r.valid_from = '' OR r.valid_from <= $as_of",) if False else \
-               f"(r.valid_from = '' OR r.valid_from <= $as_of) AND (r.valid_to = '' OR r.valid_to >= $as_of)"
-    return "r.valid_to = ''"
 
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
@@ -142,9 +135,17 @@ class Handler(BaseHTTPRequestHandler):
         cy = str(req.get("cypher") or "").strip()
         if not cy:
             return self._send(400, {"ok": False, "error": "cypher required"})
-        head = cy.split(None, 1)[0].upper()
+        # 只读护栏 v2：单语句 + 全 token 扫描写关键词。首关键词检查可被
+        # "MATCH (e) DETACH DELETE e" / "WITH 1 AS x CREATE ..." 绕过（ocr 审查发现）。
+        body = cy.rstrip().rstrip(";")
+        if ";" in body:
+            return self._send(403, {"ok": False, "error": "read-only: single statement only"})
+        head = body.split(None, 1)[0].upper()
         if head not in ("MATCH", "OPTIONAL", "WITH", "RETURN"):
             return self._send(403, {"ok": False, "error": "read-only: only MATCH/WITH/RETURN queries allowed"})
+        write_kw = re.compile(r"\b(CREATE|MERGE|DELETE|DETACH|SET|DROP|REMOVE|CALL|LOAD|FOREACH)\b", re.IGNORECASE)
+        if write_kw.search(body):
+            return self._send(403, {"ok": False, "error": "read-only: write keywords are not allowed"})
         params = {}
         as_of = req.get("as_of")
         if as_of:
@@ -173,8 +174,12 @@ class Handler(BaseHTTPRequestHandler):
                 for cur in frontier:
                     cy = (
                         "MATCH (a:Entity {name: $cur})-[r:Relation]->(b:Entity) "
-                        "WHERE r.namespace = $ns AND "
-                        "(r.valid_to = '' " + ("OR (r.valid_from <= $as_of AND r.valid_to >= $as_of)) " if as_of else ") ") +
+                        "WHERE r.namespace = $ns AND " +
+                        # 时效语义：空串=开放端。有 as_of=区间包含；无 as_of=仅现行（valid_to 空
+                        # 且 valid_from 已开始，防"未生效"边混入）
+                        ("(r.valid_from = '' OR r.valid_from <= $as_of) AND (r.valid_to = '' OR r.valid_to >= $as_of) "
+                         if as_of else
+                         "(r.valid_to = '' AND (r.valid_from = '' OR r.valid_from <= date())) ") +
                         "RETURN b.name AS name, b.etype AS etype, r.predicate AS via"
                     )
                     params = {"cur": cur, "ns": ns}
