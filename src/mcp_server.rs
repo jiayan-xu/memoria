@@ -50,6 +50,13 @@ pub struct AppState {
     pub auth_db_path: String,
     /// P2-12：审计事件有界通道（背压）。落库 worker 在 main.rs 启动。
     pub audit_tx: tokio::sync::mpsc::Sender<AuditEvent>,
+    /// P1 写入整合：OpenAI 兼容 chat/completions 完整 URL。空 = 关闭（保持哑存储，写入路径零 LLM）。
+    /// 非空时 memory_remember 先语义检索 top-K 旧记忆，LLM 判定 ADD/UPDATE/NOOP，fail-open。
+    pub consolidation_url: String,
+    pub consolidation_model: String,
+    pub consolidation_key: String,
+    /// P2 时序图谱 sidecar（Kuzu，:8779）。写入整合抽取的实体/关系 fire-and-forget 转发至此。
+    pub graph_url: String,
 }
 
 /// 审计事件（经有界通道异步落库，提供背压）
@@ -799,6 +806,16 @@ pub fn tools_list() -> Vec<serde_json::Value> {
             "batch_size": {"type": "number", "description": "批大小，默认 50"}
         }),
     ));
+    tools.push(tool(
+        "memory_graph_query",
+        "时序知识图谱查询（Kuzu :8779）：传 entity(+depth,默认2) 查多跳邻居；传 cypher 跑只读查询（MATCH/RETURN）；都不传返回统计。as_of=YYYY-MM-DD 过滤时效（缺省仅现行事实，valid_to 为空）",
+        serde_json::json!({
+            "entity": {"type": "string", "description": "起点实体名（与 cypher 二选一）"},
+            "depth": {"type": "number", "description": "多跳深度 1-4，默认 2"},
+            "cypher": {"type": "string", "description": "只读 Cypher（须 MATCH/WITH/RETURN 开头）"},
+            "as_of": {"type": "string", "description": "时效锚点 YYYY-MM-DD，缺省=仅现行"}
+        }),
+    ));
     tools.push(tool("memory_user_prefs", "获取用户偏好设置（按 ns 聚合，hard_rule 优先；写入走 memory_remember，category=preference，tags∈pref|hard_rule|style）", serde_json::json!({
         "tag": {"type": "string", "description": "可选：仅返回指定类型偏好 hard_rule|pref|style"}
     })));
@@ -992,13 +1009,13 @@ async fn handle_tool_call(
     // 联调：mcp.request span（与 agent-core http.request span 对接 x-trace-id 链）
     let span = tracing::info_span!("mcp.request", trace_id = %trace_id, tool = %tool, agent_id = %agent_id);
     let _guard = span.enter();
-    let args = params
+    let mut args = params
         .get("arguments")
         .and_then(|v| v.as_object())
         .cloned()
         .unwrap_or_default();
-    let empty_args = serde_json::Map::new();
-    let safe_args = if args.is_empty() { &empty_args } else { &args };
+    // P1 写入整合：owned 克隆——整合 hook 需注入 supersedes_id（原 & 借用不可变）
+    let mut safe_args: serde_json::Map<String, serde_json::Value> = args.clone();
 
     // 性能插桩（MEMORIA_TRACE=1 激活）：分段计时定位热路径等待
     let trace_on = std::env::var("MEMORIA_TRACE").as_deref() == Ok("1");
@@ -1104,10 +1121,53 @@ async fn handle_tool_call(
         );
         return rpc_error(id, -32002, &format!("Namespace '{}' not authorized.", ns));
     }
+    // P1：转为 owned，断开对 safe_args 的借用——后续整合 hook 需可变注入 supersedes_id
+    let ns = ns.to_string();
+
+    // ── P2：memory_graph_query —— Kuzu 时序图谱代理（异步早返回，不进 dispatch）──
+    // entity → /neighbors 多跳；cypher → /query 只读；缺省 → /stats。sidecar 不可用 → 错误 JSON（不挂起）。
+    if tool == "memory_graph_query" {
+        let has_entity = safe_args.get("entity").and_then(|v| v.as_str()).map(|s| !s.trim().is_empty()).unwrap_or(false);
+        let has_cypher = safe_args.get("cypher").and_then(|v| v.as_str()).map(|s| !s.trim().is_empty()).unwrap_or(false);
+        let path = if has_entity { "/neighbors" } else if has_cypher { "/query" } else { "/stats" };
+        let mut body = serde_json::Map::new();
+        body.insert("namespace".into(), serde_json::json!(ns));
+        for k in ["entity", "cypher", "as_of", "depth", "name"] {
+            if let Some(v) = safe_args.get(k) {
+                body.insert(k.into(), v.clone());
+            }
+        }
+        if path == "/neighbors" {
+            // neighbors 端点读 "name" 参数
+            if let Some(v) = safe_args.get("entity") {
+                body.insert("name".into(), v.clone());
+            }
+        }
+        let gurl = state.graph_url.trim_end_matches('/').to_string();
+        let resp = state
+            .http_client
+            .post(format!("{}{}", gurl, path))
+            .timeout(std::time::Duration::from_secs(5))
+            .json(&body)
+            .send()
+            .await;
+        let text = match resp {
+            Ok(r) => r.text().await.unwrap_or_else(|_| "{\"error\":\"graph service read failed\"}".to_string()),
+            Err(_) => "{\"error\":\"graph service unavailable\"}".to_string(),
+        };
+        spawn_audit(
+            state,
+            agent_id,
+            tool,
+            &format!("ns={} path={}", ns, path),
+            !text.contains("\"error\""),
+        );
+        return rpc_ok_text(id, &text);
+    }
 
     // Bridge 工具 → 异步转发（网络 I/O，留在 async worker，正确 yield）
     if BRIDGE_TOOLS.contains(&tool) {
-        let text = forward_to_bridge(state, tool, safe_args).await;
+        let text = forward_to_bridge(state, tool, &safe_args).await;
         let allowed = !text.contains(r#""error""#);
         spawn_audit(
             state,
@@ -1166,6 +1226,110 @@ async fn handle_tool_call(
         }
     }
 
+    // ── P1 写入整合（mem0 式，env 门控 + fail-open）────────────────────────
+    // 仅 MEMORIA_CONSOLIDATION_URL 非空时启用：语义检索 top-K 既有候选 → LLM 判
+    // ADD/UPDATE/NOOP。UPDATE 注入 supersedes_id 走既有显式取代链；NOOP 直接返回不落库；
+    // LLM 任何失败 → 原生 ADD（哑存储兜底）。实体/关系抽取缓存到 consolidation_decision，
+    // 插入成功后 fire-and-forget 转发 Kuzu 图谱与 SQLite 实体表（P2）。
+    let mut consolidation_decision: Option<crate::consolidation::Decision> = None;
+    if (tool == "memory_remember" || tool == "memory") && !state.consolidation_url.is_empty() {
+        let content = safe_args.get("content").and_then(|v| v.as_str()).unwrap_or("");
+        if !content.is_empty() {
+            let t_cons = std::time::Instant::now();
+            let ns_owned = ns.to_string();
+            let st_cand = state.clone();
+            let qv = state.query_cache.get(content);
+            let candidates = tokio::task::spawn_blocking(move || -> Vec<(String, String)> {
+                let Some(qv) = qv else { return vec![] };
+                let Ok(hits) = st_cand.hnsw.search(&qv, 8) else { return vec![] };
+                let Ok(conn) = st_cand.pool.get() else { return vec![] };
+                let mut out = Vec::new();
+                for (mid, _dist) in hits {
+                    let row: Option<(String, String)> = conn
+                        .query_row(
+                            "SELECT namespace, content FROM memories WHERE id = ? AND superseded_by IS NULL",
+                            [&mid],
+                            |r| Ok((r.get(0)?, r.get(1)?)),
+                        )
+                        .ok();
+                    if let Some((cand_ns, cand_content)) = row {
+                        if cand_ns == ns_owned && !cand_content.trim().is_empty() {
+                            out.push((mid, cand_content));
+                        }
+                    }
+                }
+                out
+            })
+            .await
+            .unwrap_or_default();
+            let decision = crate::consolidation::classify(
+                &state.http_client,
+                &state.consolidation_url,
+                &state.consolidation_model,
+                &state.consolidation_key,
+                content,
+                &candidates,
+            )
+            .await;
+            if trace_on {
+                eprintln!(
+                    "[trace] {} consolidation +{:?} (candidates={} decision={:?})",
+                    tool,
+                    t_cons.elapsed(),
+                    candidates.len(),
+                    decision.as_ref().map(|d| d.action.as_str())
+                );
+            }
+            if let Some(d) = decision {
+                match d.action.as_str() {
+                    "NOOP" if d.target_id.is_some() => {
+                        // 重复：不落库，直接返回既有记忆 id。
+                        // 无目标的 NOOP 已在 parse 层拒绝（fail-open ADD），此处双保险
+                        let resp = serde_json::json!({
+                            "status": "remembered",
+                            "id": d.target_id.clone().unwrap_or_default(),
+                            "action": "no_change_consolidated",
+                            "reason": d.reason,
+                        })
+                        .to_string();
+                        spawn_audit(
+                            state,
+                            agent_id,
+                            tool,
+                            &serde_json::to_string(&safe_args).unwrap_or_default(),
+                            true,
+                        );
+                        return rpc_ok_text(id, &resp);
+                    }
+                    "UPDATE" => {
+                        // 目标预校验（存在 + 同 ns + 现行 tip）；无效目标降级 ADD（防 LLM 幻觉卡死写入）
+                        if let Some(tid) = d.target_id.clone() {
+                            let st_v = state.clone();
+                            let ns_v = ns.to_string();
+                            let tid_v = tid.clone();
+                            let valid = tokio::task::spawn_blocking(move || {
+                                let Ok(conn) = st_v.pool.get() else { return false };
+                                conn.query_row(
+                                    "SELECT 1 FROM memories WHERE id = ? AND namespace = ? AND superseded_by IS NULL",
+                                    [&tid_v, &ns_v],
+                                    |_| Ok(()),
+                                )
+                                .is_ok()
+                            })
+                            .await
+                            .unwrap_or(false);
+                            if valid {
+                                safe_args.insert("supersedes_id".into(), serde_json::json!(tid));
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                consolidation_decision = Some(d);
+            }
+        }
+    }
+
     // P0 修复：dispatch 内含同步重计算（FTS5 / HNSW 语义检索等）+ audit_log 同步写，
     // 全部隔离到阻塞线程池，避免占住 async worker 导致整服务冻结。
     let st = state.clone();
@@ -1206,6 +1370,86 @@ async fn handle_tool_call(
         Ok(t) => t,
         Err(_) => "{\"error\":\"dispatch task panicked\"}".to_string(),
     };
+
+    // ── P2：插入成功后把抽取的实体/关系 fire-and-forget 转发（Kuzu + SQLite 实体表）──
+    if let Some(dec) = consolidation_decision.take() {
+        let remembered_ok = text.contains("\"status\":\"remembered\"");
+        if (remembered_ok) && (!dec.entities.is_empty() || !dec.edges.is_empty()) {
+            let resp: serde_json::Value = serde_json::from_str(&text).unwrap_or(serde_json::Value::Null);
+            if let Some(mid) = resp.get("id").and_then(|i| i.as_str()).map(|s| s.to_string()) {
+                let st_g = state.clone();
+                let ns_g = ns.to_string();
+                let gurl = state.graph_url.trim_end_matches('/').to_string();
+                tokio::spawn(async move {
+                    // 1) Kuzu sidecar（图查询面）
+                    let body = serde_json::json!({
+                        "namespace": ns_g,
+                        "memory_id": mid,
+                        "entities": dec.entities.iter()
+                            .map(|e| serde_json::json!({"name": e.name, "etype": e.etype}))
+                            .collect::<Vec<_>>(),
+                        "edges": dec.edges.iter()
+                            .map(|e| serde_json::json!({"subject": e.subject, "predicate": e.predicate,
+                                 "obj": e.obj, "valid_from": e.valid_from, "valid_to": e.valid_to}))
+                            .collect::<Vec<_>>(),
+                    });
+                    let _ = st_g
+                        .http_client
+                        .post(format!("{}/upsert", gurl))
+                        .timeout(std::time::Duration::from_secs(5))
+                        .json(&body)
+                        .send()
+                        .await;
+                    // 2) SQLite 实体表（entity_* MCP 工具的数据面），阻塞线程池
+                    let st_s = st_g.clone();
+                    let mid_s = mid.clone();
+                    let ents = dec.entities.clone();
+                    let egs = dec.edges.clone();
+                    let _ = tokio::task::spawn_blocking(move || {
+                        use chrono::Utc;
+                        let Ok(conn) = st_s.pool.get() else { return };
+                        let now = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+                        let mut ensure = |name: &str, etype: &str| -> Option<String> {
+                            let eid = crate::consolidation::auto_entity_id(&ns_g, name);
+                            let _ = conn.execute(
+                                "INSERT INTO entities (id, namespace, entity_type, name) VALUES (?, ?, ?, ?) \
+                                 ON CONFLICT(id) DO UPDATE SET entity_type = excluded.entity_type",
+                                rusqlite::params![eid, ns_g, etype, name],
+                            );
+                            Some(eid)
+                        };
+                        for e in &ents {
+                            if let Some(eid) = ensure(&e.name, &e.etype) {
+                                let _ = conn.execute(
+                                    "INSERT INTO entity_mentions (entity_id, memory_id, context, namespace) \
+                                     SELECT ?, ?, '', ? WHERE NOT EXISTS \
+                                     (SELECT 1 FROM entity_mentions WHERE entity_id = ? AND memory_id = ?)",
+                                    rusqlite::params![eid, mid_s, ns_g, eid, mid_s],
+                                );
+                            }
+                        }
+                        for ed in &egs {
+                            let se = ensure(&ed.subject, "other");
+                            let oe = ensure(&ed.obj, "other");
+                            if let (Some(se), Some(oe)) = (se, oe) {
+                                let vf = if ed.valid_from.is_empty() { now.clone() } else { ed.valid_from.clone() };
+                                let _ = conn.execute(
+                                    "INSERT INTO entity_edges (namespace, source_entity_id, target_entity_id, \
+                                     relation_type, weight, evidence, valid_from, valid_to) \
+                                     VALUES (?, ?, ?, ?, 1.0, ?, ?, ?) \
+                                     ON CONFLICT(namespace, source_entity_id, target_entity_id, relation_type) \
+                                     DO UPDATE SET weight = 1.0, evidence = excluded.evidence",
+                                    rusqlite::params![ns_g, se, oe, ed.predicate,
+                                        format!("auto:{}", mid_s), vf, ed.valid_to],
+                                );
+                            }
+                        }
+                    })
+                    .await;
+                });
+            }
+        }
+    }
 
     rpc_ok_text(id, &text)
 }
@@ -3368,6 +3612,10 @@ mod tests {
             admin_key: "test-admin-key".to_string(),
             bridge_url: "http://127.0.0.1:9000/mcp".to_string(),
             embedding_url: String::new(),
+            consolidation_url: String::new(),
+            consolidation_model: "qwen3.8-flash".to_string(),
+            consolidation_key: String::new(),
+            graph_url: "http://127.0.0.1:8779".to_string(),
             http_client: reqwest::Client::new(),
             db_path: ":memory:".to_string(),
             backup_dir: ".".to_string(),
