@@ -170,6 +170,8 @@ docker compose up -d --build
 | `memory_migration_manifest` | 跨机迁移包校验和清单（admin，P2-4） |
 | `memory_quota_status` | 当前配额用量与上限（P2-2） |
 | `memory_backup` / `memory_backup_list` | GFS 备份触发 / 列出 |
+| `memory_backup_verify` | 校验备份归档 manifest/sha256/integrity（admin；restore 仍走 CLI） |
+| `memory_ops_status` | 运维快照：图谱污染 / 整合 ADD·UPDATE·NOOP·FAIL_OPEN / 向量覆盖 / recall 告警 |
 | `memory_health` | 完整健康检查报告 |
 | `memory_decay` | 运行衰减循环 |
 | `memory_graph` | 构建记忆关系图 |

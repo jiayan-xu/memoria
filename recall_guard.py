@@ -55,6 +55,9 @@ SAMPLE_N = int(os.environ.get("RECALL_SAMPLE_N", "40"))
 # 极端卡顿时会逼近 2 小时；加此硬上限，超时即提前结束并据已测样本出结论，避免 run 拖死。
 GLOBAL_CAP = int(os.environ.get("RECALL_GLOBAL_CAP", "600"))
 TREND = os.environ.get("RECALL_TREND_CSV", os.path.join(HERE, "recall_trend.csv"))
+ALERT = os.environ.get("RECALL_ALERT_JSON", os.path.join(HERE, "recall_alert.json"))
+# 连续劣化达到该次数才写 elevated 告警（单次尖峰写 warn，供 memory_ops_status 读取）
+CONSEC_WARN = int(os.environ.get("RECALL_CONSEC_WARN", "2"))
 EXPECTED_HEADER = "timestamp,full_r5,kw_r5,n_full,n_kw,status\n"
 
 # 双口径基线/阈值 —— 2026-08-02 重订，基于清理 LoCoMo 后 Qwen3-VL 生产实测（40 抽样 @5）
@@ -277,6 +280,38 @@ def main():
     except Exception as e:
         print(f"[guard] 趋势写入失败: {e}")
 
+    # 连续劣化计数 + 结构化告警（供 memory_ops_status / 夜间巡检读取）
+    consec = count_consecutive_degraded(TREND)
+    severity = "ok"
+    if status != "OK":
+        severity = "elevated" if consec >= CONSEC_WARN else "warn"
+    alert = {
+        "timestamp": ts,
+        "status": status,
+        "severity": severity,
+        "consecutive_degraded": consec,
+        "full_r5": round(full_r5, 4),
+        "full_r10": round(full_r10, 4),
+        "kw_r5": round(kw_r5, 4),
+        "n_full": n_full,
+        "n_kw": n_kw,
+        "thresholds": {
+            "full_warn": FULL_WARN,
+            "kw_warn": KW_WARN,
+            "full_baseline": FULL_BASELINE,
+            "kw_baseline": KW_BASELINE,
+            "consec_warn": CONSEC_WARN,
+        },
+        "namespace": NS,
+        "exit_hint": 0 if status == "OK" else 1,
+    }
+    try:
+        with open(ALERT, "w", encoding="utf-8") as f:
+            json.dump(alert, f, ensure_ascii=False, indent=2)
+        print(f"告警快照 -> {ALERT} (severity={severity}, consec={consec})")
+    except Exception as e:
+        print(f"[guard] 告警写入失败: {e}")
+
     if args.json_out:
         json.dump(detail, open(args.json_out, "w", encoding="utf-8"),
                   ensure_ascii=False, indent=2)
@@ -289,13 +324,41 @@ def main():
         print(f"\n⚠️ 召回检索劣化：完整内容@5={full_r5*100:.1f}% 低于阈值 "
               f"{FULL_WARN*100:.0f}%（基线 {FULL_BASELINE*100:.1f}%）—— "
               f"embedding / 索引真故障，记忆无法被自身内容召回")
+        if consec >= CONSEC_WARN:
+            print(f"   🔴 连续 {consec} 次劣化，已达 elevated——建议核对最近部署/索引变更")
         sys.exit(1)
     else:  # SEMANTIC_DEGRADED
         print(f"\n⚠️ 语义召回劣化：关键词@5={kw_r5*100:.1f}% 低于阈值 "
               f"{KW_WARN*100:.0f}%（基线 {KW_BASELINE*100:.1f}%）—— "
               f"短词/泛化查询召回下降（embedding 质量或 rerank 异常），"
               f"但完整内容@5={full_r5*100:.1f}% 仍正常")
+        if consec >= CONSEC_WARN:
+            print(f"   🔴 连续 {consec} 次劣化，已达 elevated——建议核对最近部署/索引变更")
         sys.exit(1)
+
+
+def count_consecutive_degraded(trend_path):
+    """从趋势 CSV 尾部统计连续非 OK 次数（含本次）。文件缺失/空返回 0。"""
+    try:
+        with open(trend_path, "r", encoding="utf-8") as f:
+            lines = [ln.strip() for ln in f if ln.strip()]
+    except OSError:
+        return 0
+    if not lines:
+        return 0
+    # 跳过 header
+    if lines[0].startswith("timestamp"):
+        lines = lines[1:]
+    n = 0
+    for ln in reversed(lines):
+        parts = ln.split(",")
+        if len(parts) < 6:
+            break
+        status = parts[-1]
+        if status == "OK":
+            break
+        n += 1
+    return n
 
 
 if __name__ == "__main__":

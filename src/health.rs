@@ -91,6 +91,9 @@ pub fn run_health_check(
     // 11. 本地嵌入服务（语义检索通道）
     soft_checks.push(check_embedding_endpoint(embedding_url));
 
+    // 12. 图谱污染 / 整合日志 / 向量覆盖（候选生成健康，P3）
+    soft_checks.push(check_graph_and_consolidation(pool));
+
     // 判定总体状态
     let hard_fail = hard_checks.iter().any(|c| c.status == "fail");
     let soft_fail = soft_checks.iter().any(|c| c.status == "fail");
@@ -156,6 +159,111 @@ pub fn check_embedding_endpoint(url: &str) -> CheckResult {
             message: format!("嵌入服务不可达: {}（语义检索已降级）", e),
             duration_ms: start.elapsed().as_millis() as u64,
         },
+    }
+}
+
+/// 图谱 / 整合 / 向量覆盖率软检查（P3 可观测）。
+/// - 空名实体：历史污染主源（RECALL_GRAPH Phase0）
+/// - 24h 整合 FAIL_OPEN 率过高：LLM 整合通道不可用
+/// - 活跃记忆 vs HNSW 向量数严重偏离：语义召回会退化
+fn check_graph_and_consolidation(pool: &SqlitePool) -> CheckResult {
+    let start = std::time::Instant::now();
+    let name = "graph_consolidation".to_string();
+    let Ok(conn) = pool.get() else {
+        return CheckResult {
+            name,
+            status: "fail".to_string(),
+            message: "无法获取连接池".to_string(),
+            duration_ms: start.elapsed().as_millis() as u64,
+        };
+    };
+
+    let empty_entities: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM entities WHERE TRIM(COALESCE(name,'')) = ''",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+
+    let active_memories: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM memories WHERE superseded_by IS NULL",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    let stored_vectors: i64 = conn
+        .query_row("SELECT COUNT(*) FROM memory_vectors", [], |r| r.get(0))
+        .unwrap_or(0);
+    let vector_ratio = if active_memories > 0 {
+        stored_vectors as f64 / active_memories as f64
+    } else {
+        1.0
+    };
+
+    // 整合日志近 24h（表可能刚迁移，失败当 0）
+    let consol: Option<(i64, i64)> = conn
+        .query_row(
+            "SELECT
+                COUNT(*),
+                COALESCE(SUM(CASE WHEN action='FAIL_OPEN' THEN 1 ELSE 0 END),0)
+             FROM consolidation_log
+             WHERE created_at >= datetime('now','-1 day')",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .ok();
+    let (consol_total, consol_fail) = consol.unwrap_or((0, 0));
+
+    let mut warns: Vec<String> = Vec::new();
+    if empty_entities > 0 {
+        warns.push(format!("空名实体 {}（图共现污染）", empty_entities));
+    }
+    if active_memories > 100 && vector_ratio < 0.5 {
+        warns.push(format!(
+            "向量覆盖 {:.0}% (vectors={} / active={})",
+            vector_ratio * 100.0,
+            stored_vectors,
+            active_memories
+        ));
+    }
+    if consol_total >= 10 && consol_fail * 2 >= consol_total {
+        warns.push(format!(
+            "整合 FAIL_OPEN 率过高 {}/{} (24h)",
+            consol_fail, consol_total
+        ));
+    }
+
+    let status = if warns.is_empty() {
+        "pass"
+    } else {
+        "warn"
+    };
+    let message = if warns.is_empty() {
+        format!(
+            "ok empty_entities={} vector_cov={:.0}% consol_24h={} fail_open={}",
+            empty_entities,
+            vector_ratio * 100.0,
+            consol_total,
+            consol_fail
+        )
+    } else {
+        format!(
+            "{}; empty_entities={} vector_cov={:.0}% consol_24h={} fail_open={}",
+            warns.join("; "),
+            empty_entities,
+            vector_ratio * 100.0,
+            consol_total,
+            consol_fail
+        )
+    };
+
+    CheckResult {
+        name,
+        status: status.to_string(),
+        message,
+        duration_ms: start.elapsed().as_millis() as u64,
     }
 }
 
