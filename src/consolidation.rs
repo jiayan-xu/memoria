@@ -237,6 +237,74 @@ pub fn auto_entity_id(ns: &str, name: &str) -> String {
     format!("auto-{}", &hex[..16])
 }
 
+use memoria_core::storage::SqlitePool;
+
+/// 把一次整合判定写入 `consolidation_log`（可观测，不阻塞业务——失败只打日志）。
+/// action：ADD | UPDATE | NOOP | FAIL_OPEN | UPDATE_BAD_TARGET
+pub fn record_decision(
+    pool: &SqlitePool,
+    namespace: &str,
+    action: &str,
+    target_id: Option<&str>,
+    reason: &str,
+    content_len: usize,
+    duration_ms: u64,
+) {
+    let Ok(conn) = pool.get() else { return };
+    let _ = conn.execute(
+        "INSERT INTO consolidation_log
+         (namespace, action, target_id, reason, content_len, duration_ms)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        rusqlite::params![
+            namespace,
+            action,
+            target_id,
+            reason.chars().take(200).collect::<String>(),
+            content_len as i64,
+            duration_ms as i64
+        ],
+    );
+}
+
+/// 近 N 小时整合动作分布（默认 24h）。返回 (action, count) 列表，按 count 降序。
+pub fn action_stats(pool: &SqlitePool, namespace: Option<&str>, hours: i64) -> Result<Vec<(String, i64)>, String> {
+    let conn = pool.get().map_err(|e| format!("pool get: {}", e))?;
+    let hours = hours.clamp(1, 24 * 30);
+    if let Some(ns) = namespace {
+        let mut stmt = conn
+            .prepare(
+                "SELECT action, COUNT(*) FROM consolidation_log
+                 WHERE namespace = ?1 AND created_at >= datetime('now', ?2)
+                 GROUP BY action ORDER BY 2 DESC",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(rusqlite::params![ns, format!("-{} hours", hours)], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+            })
+            .map_err(|e| e.to_string())?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(rows)
+    } else {
+        let mut stmt = conn
+            .prepare(
+                "SELECT action, COUNT(*) FROM consolidation_log
+                 WHERE created_at >= datetime('now', ?1)
+                 GROUP BY action ORDER BY 2 DESC",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([format!("-{} hours", hours)], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+            })
+            .map_err(|e| e.to_string())?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(rows)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

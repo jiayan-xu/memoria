@@ -1,5 +1,29 @@
 # 演进日志 / CHANGELOG
 
+## 2026-09-11 — v0.4.0
+
+### 回填 0.3.0 之后未记账的功能（2026-08-17 ~ 08-29）
+- **HyPE 假设问句嵌入 V1**（PR #6）：查询侧 HyDE 双索引，OCR 多轮加固后合入。
+- **LongMemEval 完整集回归 harness**（PR #10）：500 问全评分入库 `eval/longmemeval/`。
+- **SessionWatcher 落点可配置**（PR #11）：`MEMORIA_WATCH_NS`。
+- **重排层近精确语义匹配 boost**（PR #12）：修复完整@5 召回回归。
+- **向量重建守护**（PR #13）：`rebuild_vectors.py` batch 16→8 + 零向量拒绝重试。
+- **HNSW 层级 RNG 种子固定**（PR #14/#15）：根治跨重启召回抖动。
+- **本地嵌入服务** `embed_local_server.py`（:8778）：默认模型 Qwen3-0.6B → **bge-m3 int8**（0.6B 召回不达标，MRR 0.55→0.325）。
+- **`MEMORIA_TRACE=1` 分段计时**：auth / query-embed / spawn_blocking-queue / dispatch-run / hybrid_search。
+- **P1 写入整合（mem0 式）+ P2 Kuzu 时序图**（PR #16）：`consolidation.rs` 判 ADD/UPDATE/NOOP（fail-open）；`graph_kuzu_server.py` :8779 + MCP `memory_graph_query`。
+- **OCR 安全加固**：cypher 只读护栏 v2、NOOP 无目标防丢数据、as_of 时效补全。
+
+### 本轮：运维可观测 + 发版锚点补齐
+- **`memory_backup_verify`**（MCP，admin）：校验备份归档 manifest/sha256/integrity；restore 仍走 CLI `memoria-server backup restore`（fresh-target-only）。
+- **`memory_ops_status`**（MCP，admin）：图谱空名实体 / 整合 ADD·UPDATE·NOOP·FAIL_OPEN 分布 / 向量覆盖 / 备份清单 / `recall_alert.json` 快照一屏可读。
+- **`consolidation_log` 表**：每次写入整合判定落账（含 FAIL_OPEN / UPDATE_BAD_TARGET），支撑 NOOP 率与误 UPDATE 治理。
+- **健康软检查 `graph_consolidation`**：空名实体、向量覆盖率、24h 整合 FAIL_OPEN 率进 `/health`。
+- **`recall_guard.py`**：写 `recall_alert.json`（severity=warn/elevated + 连续劣化次数），可被 `memory_ops_status` / 夜间巡检读取。
+- **chore(release)**：bump 0.3.0 → **0.4.0**。合并后打 annotated tag `v0.4.0`。
+
+---
+
 ## 2026-08-17
 
 ### SessionWatcher 观察落点可配置（MEMORIA_WATCH_NS）

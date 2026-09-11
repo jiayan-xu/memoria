@@ -219,6 +219,101 @@ pub fn backup_verify_cli(archive_dir: &str) -> Result<(), String> {
     }
 }
 
+/// 结构化校验结果（供 MCP `memory_backup_verify` 使用，CLI 仍走 `backup_verify_cli` 打印）。
+#[derive(Debug, Serialize)]
+pub struct BackupVerifyReport {
+    pub ok: bool,
+    pub archive_dir: String,
+    pub schema_version: u32,
+    pub entries: Vec<BackupVerifyEntry>,
+    pub message: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct BackupVerifyEntry {
+    pub name: String,
+    pub role: String,
+    pub ok: bool,
+    pub detail: String,
+}
+
+/// 与 `backup_verify_cli` 同逻辑，但返回 JSON 友好结构而非仅打印。
+/// 不提取、不还原、不写生产库。
+pub fn backup_verify_json(archive_dir: &str) -> Result<BackupVerifyReport, String> {
+    let dir = Path::new(archive_dir);
+    let manifest_path = dir.join("manifest.json");
+    if !manifest_path.exists() {
+        return Err(format!("manifest not found in archive: {}", archive_dir));
+    }
+    let raw =
+        std::fs::read_to_string(&manifest_path).map_err(|e| format!("read manifest: {}", e))?;
+    let manifest: BackupManifest =
+        serde_json::from_str(&raw).map_err(|e| format!("parse manifest: {}", e))?;
+    if manifest.schema_version != BACKUP_MANIFEST_SCHEMA_VERSION {
+        return Err(format!(
+            "unsupported manifest schema_version: {} (expected {})",
+            manifest.schema_version, BACKUP_MANIFEST_SCHEMA_VERSION
+        ));
+    }
+
+    let mut entries = Vec::new();
+    let mut all_ok = true;
+    for entry in &manifest.entries {
+        let detail;
+        let mut ok = true;
+        if !manifest.path_allowlist.contains(&entry.name) {
+            ok = false;
+            detail = "not in path_allowlist".to_string();
+        } else {
+            let fp = dir.join(&entry.name);
+            if !fp.exists() {
+                ok = false;
+                detail = "file missing".to_string();
+            } else {
+                match sha256_file(&fp.to_string_lossy()) {
+                    Ok(hash) if hash == entry.sha256 => {
+                        if check_integrity(&fp.to_string_lossy()) {
+                            detail = "sha256+integrity ok".to_string();
+                        } else {
+                            ok = false;
+                            detail = "integrity_check failed".to_string();
+                        }
+                    }
+                    Ok(_) => {
+                        ok = false;
+                        detail = "sha256 mismatch".to_string();
+                    }
+                    Err(e) => {
+                        ok = false;
+                        detail = e;
+                    }
+                }
+            }
+        }
+        if !ok {
+            all_ok = false;
+        }
+        entries.push(BackupVerifyEntry {
+            name: entry.name.clone(),
+            role: entry.role.clone(),
+            ok,
+            detail,
+        });
+    }
+
+    Ok(BackupVerifyReport {
+        ok: all_ok,
+        archive_dir: archive_dir.to_string(),
+        schema_version: manifest.schema_version,
+        entries,
+        message: if all_ok {
+            "ALL ENTRIES VERIFIED".to_string()
+        } else {
+            "one or more entries failed verification".to_string()
+        },
+    })
+}
+
 /// `memoria-server backup restore <archive_dir> <target_main_db> [target_audit_db]` ——
 /// **仅允许恢复到全新（fresh）目标库**，防止覆盖线上运行库（OpenClaw 缺失、我们自研的补强点）。
 /// 若目标已存在则拒绝，并给出操作步骤。恢复前仍走 `restore_from_backup` 的 integrity_check + 原子替换。

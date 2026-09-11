@@ -281,6 +281,18 @@ pub const PERMISSION_MATRIX: &[Entry] = &[
         note: "列出备份（admin）",
     },
     Entry {
+        tool: "memory_backup_verify",
+        min_role: MinRole::Admin,
+        ns_policy: NsPolicy::None,
+        note: "校验备份归档 manifest/sha256（admin；restore 走 CLI）",
+    },
+    Entry {
+        tool: "memory_ops_status",
+        min_role: MinRole::Admin,
+        ns_policy: NsPolicy::None,
+        note: "运维快照：图谱/整合/向量/备份/recall 告警（admin）",
+    },
+    Entry {
         tool: "memory_health",
         min_role: MinRole::Admin,
         ns_policy: NsPolicy::None,
