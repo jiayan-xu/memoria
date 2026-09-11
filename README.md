@@ -171,6 +171,8 @@ Add Memoria to any MCP-compatible client:
 | `memory_migration_manifest` | Cross-machine migration checksum manifest (admin, P2-4) |
 | `memory_quota_status` | Current quota usage & limits (P2-2) |
 | `memory_backup` / `memory_backup_list` | GFS backup trigger / list |
+| `memory_backup_verify` | Verify backup archive manifest/sha256/integrity (admin; restore stays CLI) |
+| `memory_ops_status` | Ops snapshot: graph pollution, consolidation ADD/UPDATE/NOOP/FAIL_OPEN, vector coverage, recall alert |
 | `memory_health` | Full health check report |
 | `memory_decay` | Run decay loop |
 | `memory_graph` | Build memory relation graph |
