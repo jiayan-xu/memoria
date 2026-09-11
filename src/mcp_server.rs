@@ -838,6 +838,23 @@ pub fn tools_list() -> Vec<serde_json::Value> {
         serde_json::json!({}),
     ));
     tools.push(tool(
+        "memory_backup_verify",
+        "校验备份归档 manifest/sha256/integrity（admin；不提取、不还原）。restore 请用 CLI：memoria-server backup restore <archive> <fresh_target>",
+        serde_json::json!({
+            "archive_dir": {"type": "string", "description": "备份归档目录（含 manifest.json）"},
+            "admin_key": {"type": "string", "description": "Admin Key"}
+        }),
+    ));
+    tools.push(tool(
+        "memory_ops_status",
+        "运维快照：图谱污染 / 整合 ADD·UPDATE·NOOP·FAIL_OPEN 分布 / 向量覆盖 / 最近备份 / recall 告警文件（admin）",
+        serde_json::json!({
+            "namespace": {"type": "string", "description": "可选：仅统计该 ns 的整合动作"},
+            "hours": {"type": "number", "description": "整合统计窗口小时数，默认 24"},
+            "recall_alert_path": {"type": "string", "description": "可选：recall_guard 告警 JSON 路径"}
+        }),
+    ));
+    tools.push(tool(
         "memory_health",
         "完整健康检查报告",
         serde_json::json!({}),
@@ -1235,10 +1252,12 @@ async fn handle_tool_call(
     if (tool == "memory_remember" || tool == "memory") && !state.consolidation_url.is_empty() {
         let content = safe_args.get("content").and_then(|v| v.as_str()).unwrap_or("");
         if !content.is_empty() {
+            let content_len = content.len();
+            let content_owned = content.to_string();
             let t_cons = std::time::Instant::now();
             let ns_owned = ns.to_string();
             let st_cand = state.clone();
-            let qv = state.query_cache.get(content);
+            let qv = state.query_cache.get(&content_owned);
             let candidates = tokio::task::spawn_blocking(move || -> Vec<(String, String)> {
                 let Some(qv) = qv else { return vec![] };
                 let Ok(hits) = st_cand.hnsw.search(&qv, 8) else { return vec![] };
@@ -1267,7 +1286,7 @@ async fn handle_tool_call(
                 &state.consolidation_url,
                 &state.consolidation_model,
                 &state.consolidation_key,
-                content,
+                &content_owned,
                 &candidates,
             )
             .await;
@@ -1283,6 +1302,15 @@ async fn handle_tool_call(
             if let Some(d) = decision {
                 match d.action.as_str() {
                     "NOOP" if d.target_id.is_some() => {
+                        crate::consolidation::record_decision(
+                            &state.pool,
+                            &ns,
+                            "NOOP",
+                            d.target_id.as_deref(),
+                            &d.reason,
+                            content_len,
+                            t_cons.elapsed().as_millis() as u64,
+                        );
                         // 重复：不落库，直接返回既有记忆 id。
                         // 无目标的 NOOP 已在 parse 层拒绝（fail-open ADD），此处双保险
                         let resp = serde_json::json!({
@@ -1320,12 +1348,52 @@ async fn handle_tool_call(
                             .unwrap_or(false);
                             if valid {
                                 safe_args.insert("supersedes_id".into(), serde_json::json!(tid));
+                                crate::consolidation::record_decision(
+                                    &state.pool,
+                                    &ns,
+                                    "UPDATE",
+                                    Some(tid.as_str()),
+                                    &d.reason,
+                                    content_len,
+                                    t_cons.elapsed().as_millis() as u64,
+                                );
+                            } else {
+                                crate::consolidation::record_decision(
+                                    &state.pool,
+                                    &ns,
+                                    "UPDATE_BAD_TARGET",
+                                    Some(tid.as_str()),
+                                    &d.reason,
+                                    content_len,
+                                    t_cons.elapsed().as_millis() as u64,
+                                );
                             }
                         }
                     }
-                    _ => {}
+                    action => {
+                        crate::consolidation::record_decision(
+                            &state.pool,
+                            &ns,
+                            action,
+                            d.target_id.as_deref(),
+                            &d.reason,
+                            content_len,
+                            t_cons.elapsed().as_millis() as u64,
+                        );
+                    }
                 }
                 consolidation_decision = Some(d);
+            } else {
+                // LLM 失败/解析失败 → fail-open 原生 ADD，但必须可观测
+                crate::consolidation::record_decision(
+                    &state.pool,
+                    &ns,
+                    "FAIL_OPEN",
+                    None,
+                    "classify returned None",
+                    content_len,
+                    t_cons.elapsed().as_millis() as u64,
+                );
             }
         }
     }
@@ -2959,6 +3027,154 @@ fn dispatch(
                 Err(e) => format!(r#"{{"status":"error","message":"{}"}}"#, e),
             }
         }
+        "memory_backup_verify" => {
+            let ak = args.get("admin_key").and_then(|v| v.as_str()).unwrap_or("");
+            if !crate::permissions::require_admin(&_auth, ak, &state.admin_key) {
+                return r#"{"status":"error","message":"admin required"}"#.to_string();
+            }
+            let archive_dir = args.get("archive_dir").and_then(|v| v.as_str()).unwrap_or("");
+            if archive_dir.is_empty() {
+                return r#"{"status":"error","message":"missing archive_dir"}"#.to_string();
+            }
+            match memoria_core::backup::backup_verify_json(archive_dir) {
+                Ok(report) => {
+                    let mut v = serde_json::to_value(&report).unwrap_or_default();
+                    if let Some(obj) = v.as_object_mut() {
+                        obj.insert("status".into(), serde_json::json!("ok"));
+                    }
+                    serde_json::to_string(&v).unwrap_or_default()
+                }
+                Err(e) => format!(r#"{{"status":"error","message":"{}"}}"#, e),
+            }
+        }
+        "memory_ops_status" => {
+            let ak = args.get("admin_key").and_then(|v| v.as_str()).unwrap_or("");
+            if !crate::permissions::require_admin(&_auth, ak, &state.admin_key) {
+                return r#"{"status":"error","message":"admin required"}"#.to_string();
+            }
+            let ns_filter = args.get("namespace").and_then(|v| v.as_str());
+            let hours = args.get("hours").and_then(|v| v.as_i64()).unwrap_or(24);
+            let alert_path = args
+                .get("recall_alert_path")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+
+            let mut out = serde_json::Map::new();
+
+            // 图谱 / 向量
+            if let Ok(conn) = state.pool.get() {
+                let empty_entities: i64 = conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM entities WHERE TRIM(COALESCE(name,'')) = ''",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .unwrap_or(0);
+                let active_mem: i64 = conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM memories WHERE superseded_by IS NULL",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .unwrap_or(0);
+                let stored_vec: i64 = conn
+                    .query_row("SELECT COUNT(*) FROM memory_vectors", [], |r| r.get(0))
+                    .unwrap_or(0);
+                let edges_by_type: serde_json::Value = {
+                    let mut m = serde_json::Map::new();
+                    if let Ok(mut stmt) = conn.prepare(
+                        "SELECT relation_type, COUNT(*) FROM memory_relations
+                         GROUP BY relation_type ORDER BY 2 DESC",
+                    ) {
+                        if let Ok(rows) = stmt.query_map([], |r| {
+                            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+                        }) {
+                            for row in rows.flatten() {
+                                m.insert(row.0, serde_json::json!(row.1));
+                            }
+                        }
+                    }
+                    serde_json::Value::Object(m)
+                };
+                out.insert(
+                    "graph".into(),
+                    serde_json::json!({
+                        "empty_entities": empty_entities,
+                        "active_memories": active_mem,
+                        "stored_vectors": stored_vec,
+                        "hnsw_live": state.hnsw.len(),
+                        "relations_by_type": edges_by_type,
+                    }),
+                );
+            }
+
+            // 整合动作分布
+            match crate::consolidation::action_stats(&state.pool, ns_filter, hours) {
+                Ok(rows) => {
+                    let total: i64 = rows.iter().map(|(_, c)| c).sum();
+                    let by_action: serde_json::Map<String, serde_json::Value> = rows
+                        .iter()
+                        .map(|(a, c)| (a.clone(), serde_json::json!(c)))
+                        .collect();
+                    let fail_open = rows
+                        .iter()
+                        .find(|(a, _)| a == "FAIL_OPEN")
+                        .map(|(_, c)| *c)
+                        .unwrap_or(0);
+                    out.insert(
+                        "consolidation".into(),
+                        serde_json::json!({
+                            "window_hours": hours,
+                            "namespace": ns_filter,
+                            "total": total,
+                            "fail_open": fail_open,
+                            "by_action": by_action,
+                        }),
+                    );
+                }
+                Err(e) => {
+                    out.insert(
+                        "consolidation".into(),
+                        serde_json::json!({"error": e}),
+                    );
+                }
+            }
+
+            // 最近备份
+            match memoria_core::backup::list_backups(&state.backup_dir) {
+                Ok(v) => {
+                    out.insert(
+                        "backups".into(),
+                        serde_json::json!({"dir": state.backup_dir, "inventory": v}),
+                    );
+                }
+                Err(e) => {
+                    out.insert("backups".into(), serde_json::json!({"error": e}));
+                }
+            }
+
+            // recall 告警（可选文件）
+            let path = alert_path.unwrap_or_else(|| {
+                std::env::var("MEMORIA_RECALL_ALERT")
+                    .unwrap_or_else(|_| "recall_alert.json".to_string())
+            });
+            if let Ok(raw) = std::fs::read_to_string(&path) {
+                let parsed: serde_json::Value =
+                    serde_json::from_str(&raw).unwrap_or(serde_json::Value::Null);
+                out.insert(
+                    "recall_guard".into(),
+                    serde_json::json!({"path": path, "alert": parsed}),
+                );
+            } else {
+                out.insert(
+                    "recall_guard".into(),
+                    serde_json::json!({"path": path, "alert": null}),
+                );
+            }
+
+            out.insert("status".into(), serde_json::json!("ok"));
+            serde_json::to_string(&serde_json::Value::Object(out)).unwrap_or_default()
+        }
         "memory_health" => {
             // P2-5 修复：备份类操作需 admin 门禁
             let ak = args.get("admin_key").and_then(|v| v.as_str()).unwrap_or("");
@@ -3938,3 +4154,4 @@ mod tests {
         );
     }
 }
+

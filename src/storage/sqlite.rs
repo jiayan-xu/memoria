@@ -257,7 +257,32 @@ pub fn init_core_tables(pool: &SqlitePool) -> Result<(), String> {
     migrate_memory_relation_types(pool)?;
     migrate_access_count(pool)?;
     migrate_hype_vectors(pool)?;
+    migrate_consolidation_log(pool)?;
 
+    Ok(())
+}
+
+/// P1 写入整合可观测：每次 ADD/UPDATE/NOOP/FAIL_OPEN 落一行，供
+/// `memory_ops_status` / 夜间巡检统计 NOOP 率与误 UPDATE。幂等。
+pub fn migrate_consolidation_log(pool: &SqlitePool) -> Result<(), String> {
+    let conn = pool.get().map_err(|e| format!("pool get: {}", e))?;
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS consolidation_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            namespace TEXT NOT NULL DEFAULT 'default',
+            action TEXT NOT NULL,
+            target_id TEXT,
+            reason TEXT,
+            content_len INTEGER,
+            duration_ms INTEGER,
+            created_at TEXT DEFAULT (datetime('now'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_consol_ns_time
+            ON consolidation_log(namespace, created_at);
+        CREATE INDEX IF NOT EXISTS idx_consol_action
+            ON consolidation_log(action, created_at);",
+    )
+    .map_err(|e| format!("create consolidation_log: {}", e))?;
     Ok(())
 }
 
