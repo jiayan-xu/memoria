@@ -10,8 +10,8 @@ There are TWO local checkouts of `jiayan-xu/memoria`. Confusing them is the #1 c
 
 | Directory | Role | Edit code here? | Branch |
 |-----------|------|-----------------|--------|
-| `C:/Users/user/.qclaw/workspace/memoria-open` | **CANONICAL source of truth** (code + built binary) | ✅ YES — always | `main` (= `origin/main`) |
-| `C:/Users/user/.qclaw/workspace/memoria` | **Runtime mirror** — holds the live DB (`data/memoria.db`, ~110k memories), `web/`, `.env`, and launcher scripts | ❌ NEVER | local `master` (mirrors `origin/main`) |
+| `C:/services/memoria-open` | **CANONICAL source of truth** (code + built binary) | ✅ YES — always | `main` (= `origin/main`) |
+| `C:/services/memoria` | **Runtime mirror** — holds the live DB (`data/memoria.db`, ~110k memories), `web/`, `.env`, and launcher scripts | ❌ NEVER | local `master` (mirrors `origin/main`) |
 
 - The running `memoria-server.exe` is **always built from `memoria-open`**
   (`memoria-open/target/release/memoria-server.exe`). The watchdog/launcher
@@ -23,7 +23,7 @@ There are TWO local checkouts of `jiayan-xu/memoria`. Confusing them is the #1 c
 
 ## Canonical source of truth
 - **GitHub repo:** `jiayan-xu/memoria` (default + only publish branch: **`main`**).
-- **Canonical local checkout (edit & push from HERE):** `C:/Users/user/.qclaw/workspace/memoria-open`
+- **Canonical local checkout (edit & push from HERE):** `C:/services/memoria-open`
 - **Remote `origin`:** `https://ghfast.top/https://github.com/jiayan-xu/memoria.git`
   (the `ghfast.top/https://` prefix is a GitHub mirror proxy; treat it as `github.com/jiayan-xu/memoria`).
 
