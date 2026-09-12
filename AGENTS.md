@@ -30,7 +30,7 @@ There are TWO local checkouts of `jiayan-xu/memoria`. Confusing them is the #1 c
 ## Keeping the runtime mirror in sync
 After you push changes to `memoria-open` (main), re-sync the runtime mirror so its checkout matches:
 ```sh
-cd C:/Users/user/.qclaw/workspace/memoria
+cd C:/services/memoria
 git fetch origin
 git reset --hard origin/main      # data/, web/, .env are gitignored → safe; the DB is untouched
 ```
