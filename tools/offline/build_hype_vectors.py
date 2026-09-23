@@ -91,6 +91,41 @@ class DeterministicSkipError(RuntimeError):
     """
 
 
+def is_hyde_worthy(content: str):
+    """HyPE 干净度门（确定性，无 LLM）：过噪/表格/代码不进付费问句生成。
+
+    返回 (worthy, reason)。reason 为空表示可检索。
+    背景：OCR 噪声句、TSV 表格行、纯代码生成的「假设问句」会污染 HyPE 双路召回
+    （research/pure-md-memory-claim 结论：HyPE 只喂干净句）。
+    """
+    s = (content or "").strip()
+    if len(s) < 10:
+        return False, "too_short"
+    n = len(s)
+    # 表格 TSV / 管道表：结构行不适合生成自然问句
+    tabs = s.count("\t")
+    pipes = s.count("|")
+    if tabs >= 8 or (tabs > 0 and tabs / n > 0.02) or pipes >= 12:
+        return False, "tabular"
+    # 可读文本占比（字母/数字/中文）过低 = 符号/坐标/乱码
+    alnum_cjk = sum(1 for c in s if c.isalnum() or "一" <= c <= "鿿")
+    if alnum_cjk / n < 0.35:
+        return False, "low_text_ratio"
+    # OCR 噪声：替换符 / 私用区 / 控制符
+    bad = sum(
+        1
+        for c in s
+        if c == "�" or (0xE000 <= ord(c) <= 0xF8FF) or (ord(c) < 32 and c not in "\n\t")
+    )
+    if bad / n > 0.04:
+        return False, "ocr_noise"
+    # 代码/JSON 形：大括号分号密集
+    code_marks = sum(s.count(ch) for ch in "{};=<>")
+    if code_marks > 40 and code_marks / n > 0.08:
+        return False, "code_like"
+    return True, ""
+
+
 def generate_question(content: str) -> str:
     """LLM 生成「用户会怎么问才能找到这条记忆」的假设问句（与 golden query 独立）。"""
     sys_prompt = (
@@ -590,6 +625,13 @@ def main():
             except OSError as e:
                 print(f"  [warn] 追加 {failed_ids_path} 失败: {e}")
     for i, (mid, content) in enumerate(targets, 1):
+        # HyPE 干净度门：确定性 skip，不付 chat 费、不进 fail_ids
+        worthy, why = is_hyde_worthy(content)
+        if not worthy:
+            print(f"[{i}/{len(targets)}] {mid[:8]} 干净度门跳过（{why}）")
+            skip += 1
+            skip_ids.append(mid)
+            continue
         try:
             q = generate_question(content)
         except DeterministicSkipError as e:
