@@ -152,3 +152,19 @@ ingest
 | 切块 A/B | `eval/chunk_ab_report.md` |
 | 准入契约 | `docs/INGEST_ADMISSION.md` |
 | PR | #21 切块骨架 · #22 表格/HyPE/准入/A/B |
+
+---
+
+## 6. 复验补记（2026-09-23 · 真实语料 + 嵌入余弦）
+
+harness: `eval/eval_chunk_ab_embed.py` · 报告: `eval/chunk_ab_embed_report.md`
+
+| strategy | R@1 | R@5 | intact | chunks |
+|----------|-----|-----|--------|--------|
+| fixed-512 | 0.302 | 0.698 | 0.98 | 22.5 |
+| fixed-3500 | 0.491 | 0.981 | 1.00 | 2.6 |
+| **heading-aligned** | **0.566** | 0.830 | **1.00** | 21.4 |
+
+- heading vs fixed-512：R@1 **+26.4pp**（与离线 +37.5pp 同向）
+- heading vs fixed-3500：R@1 +7.5pp；R@5 −15pp（大块「装得多」，定位仍不如 heading）
+- **结论不变**：文档层默认 heading-aligned；fixed-512 再次证伪
