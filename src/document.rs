@@ -306,7 +306,63 @@ fn split_markdown_sections(text: &str) -> Vec<(Vec<String>, String)> {
     sections
 }
 
-/// 结构感知切块：优先整段（标题边界）保留，段内超长再按字符切。
+fn is_table_row(line: &str) -> bool {
+    line.contains('\t') || (line.contains('|') && line.matches('|').count() >= 2)
+}
+
+/// 超长表格段：按行边界切，每块重复表头，避免字符切撕行。
+fn chunk_preserving_rows(body: &str, chunk_chars: usize) -> Vec<String> {
+    let lines: Vec<&str> = body.lines().collect();
+    if lines.is_empty() {
+        return Vec::new();
+    }
+    let table_rows = lines.iter().filter(|l| is_table_row(l)).count();
+    // 表格占比不足 → 退回字符切
+    if table_rows * 2 < lines.len() {
+        return chunk_text(body, chunk_chars);
+    }
+    // 表头 = 首个表格行（或首行）
+    let header = lines
+        .iter()
+        .find(|l| is_table_row(l))
+        .copied()
+        .unwrap_or(lines[0]);
+    let header_line = format!("{header}\n");
+    let header_len = header_line.chars().count();
+
+    let mut out = Vec::new();
+    let mut current = String::new();
+    for line in lines {
+        if std::ptr::eq(line, header) {
+            // 表头行只在每块开头写一次
+            continue;
+        }
+        let line_len = line.chars().count() + 1;
+        let base = if current.is_empty() {
+            header_len
+        } else {
+            current.chars().count()
+        };
+        if base + line_len > chunk_chars && !current.is_empty() {
+            out.push(std::mem::take(&mut current));
+            current.push_str(&header_line);
+        }
+        if current.is_empty() {
+            current.push_str(&header_line);
+        }
+        current.push_str(line);
+        current.push('\n');
+    }
+    if !current.trim().is_empty() {
+        out.push(current);
+    }
+    if out.is_empty() {
+        out.push(body.to_string());
+    }
+    out
+}
+
+/// 结构感知切块：优先整段（标题边界）保留；表格段按行切；其余段内超长再按字符切。
 /// 返回 (标题面包屑, 分块正文)。
 pub fn chunk_text_structured(text: &str, chunk_chars: usize) -> Vec<(Vec<String>, String)> {
     let sections = split_markdown_sections(text);
@@ -326,7 +382,7 @@ pub fn chunk_text_structured(text: &str, chunk_chars: usize) -> Vec<(Vec<String>
         if n <= chunk_chars {
             out.push((path, body));
         } else {
-            for piece in chunk_text(&body, chunk_chars) {
+            for piece in chunk_preserving_rows(&body, chunk_chars) {
                 out.push((path.clone(), piece));
             }
         }
@@ -634,5 +690,28 @@ mod tests {
         let chunks = chunk_text_structured(md, 10_000);
         assert_eq!(chunks.len(), 1);
         assert!(chunks[0].1.contains("# not a heading"));
+    }
+
+    #[test]
+    fn table_chunks_keep_header_and_rows_intact() {
+        // 模拟 Excel 抽出的 TSV：# Sheet 标题 + 表头 + 数据行
+        let mut md = String::from("# Sheet: 产量\n列A\t列B\t列C\n");
+        for i in 0..80 {
+            md.push_str(&format!("行{i}\t值{i}\t2023\n"));
+        }
+        let chunks = chunk_text_structured(&md, 400);
+        assert!(chunks.len() >= 2);
+        for (path, body) in &chunks {
+            assert_eq!(path, &vec!["Sheet: 产量".to_string()]);
+            // 每块都带表头
+            assert!(body.contains("列A\t列B\t列C"), "missing header in: {}", body);
+            // 行不被撕开（无「行N」被截半后接下一逻辑行的混合体——每行完整以 \n 收）
+            for line in body.lines() {
+                if line.starts_with("行") {
+                    let parts: Vec<&str> = line.split('\t').collect();
+                    assert_eq!(parts.len(), 3, "torn row: {line}");
+                }
+            }
+        }
     }
 }
