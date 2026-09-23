@@ -141,6 +141,39 @@ fn extract_docx(bytes: &[u8]) -> Result<String, String> {
     Ok(result)
 }
 
+/// Excel 序列号 → 可读日期时间（避免 DateTime 单元格输出 `45123.0`）。
+/// 纪元 1899-12-30（含 1900 伪闰日偏移，对 1900-03 后日期正确）。
+fn format_excel_serial(serial: f64) -> String {
+    if !serial.is_finite() {
+        return String::new();
+    }
+    let days = serial.floor() as i64;
+    let frac = serial - serial.floor();
+    let total_secs = (frac * 86_400.0).round() as i64;
+
+    let date_str = if days == 0 {
+        String::new()
+    } else {
+        chrono::NaiveDate::from_ymd_opt(1899, 12, 30)
+            .and_then(|epoch| epoch.checked_add_signed(chrono::Duration::days(days)))
+            .map(|d| d.format("%Y-%m-%d").to_string())
+            .unwrap_or_else(|| format!("serial:{serial}"))
+    };
+
+    let time_str = {
+        let s = total_secs.rem_euclid(86_400) as u32;
+        format!("{:02}:{:02}:{:02}", s / 3600, (s % 3600) / 60, s % 60)
+    };
+
+    if date_str.is_empty() {
+        time_str
+    } else if frac.abs() < 1e-9 || total_secs == 0 {
+        date_str
+    } else {
+        format!("{date_str} {time_str}")
+    }
+}
+
 fn extract_spreadsheet(bytes: &[u8]) -> Result<String, String> {
     use calamine::{DataType, Reader, open_workbook_auto_from_rs};
     let cursor = std::io::Cursor::new(bytes);
@@ -159,7 +192,10 @@ fn extract_spreadsheet(bytes: &[u8]) -> Result<String, String> {
                         DataType::Float(f) => format!("{}", f),
                         DataType::Int(i) => i.to_string(),
                         DataType::Bool(b) => b.to_string(),
-                        DataType::DateTime(f) => format!("{}", f),
+                        // calamine 0.23: DateTime 是 Excel 序列号 f64，直接 format 会输出 45123.0
+                        DataType::DateTime(serial) => format_excel_serial(*serial),
+                        DataType::DateTimeIso(s) => s.clone(),
+                        DataType::DurationIso(s) => s.clone(),
                         other => other.to_string(),
                     })
                     .collect::<Vec<_>>()
@@ -194,6 +230,116 @@ pub fn chunk_text(text: &str, chunk_chars: usize) -> Vec<String> {
         i = end.saturating_sub(200).max(i + 1);
     }
     out
+}
+
+/// ATX 标题：`#`–`####`（含可选闭合 #）。返回 (level, title)。
+fn parse_atx_heading(line: &str) -> Option<(usize, String)> {
+    let t = line.trim_end();
+    if !t.starts_with('#') {
+        return None;
+    }
+    let level = t.chars().take_while(|c| *c == '#').count();
+    if level == 0 || level > 4 {
+        return None;
+    }
+    let rest = t[level..].trim();
+    if rest.is_empty() {
+        return None;
+    }
+    // 避免把代码块里的 # 当标题：行内若以 ``` 开头则跳过由调用方处理
+    let title = rest.trim_end_matches('#').trim().to_string();
+    if title.is_empty() {
+        return None;
+    }
+    Some((level, title))
+}
+
+/// 按 Markdown 标题切段，并维护标题路径面包屑。
+/// 每段含自身标题行 + 正文；无标题前言 path 为空。
+fn split_markdown_sections(text: &str) -> Vec<(Vec<String>, String)> {
+    let mut sections: Vec<(Vec<String>, String)> = Vec::new();
+    let mut stack: Vec<(usize, String)> = Vec::new();
+    let mut current = String::new();
+    let mut in_fence = false;
+
+    let path_of = |stack: &[(usize, String)]| -> Vec<String> {
+        stack.iter().map(|(_, t)| t.clone()).collect()
+    };
+
+    let flush = |path: &Vec<String>, buf: &mut String, sections: &mut Vec<(Vec<String>, String)>| {
+        if !buf.trim().is_empty() {
+            sections.push((path.clone(), std::mem::take(buf)));
+        } else {
+            buf.clear();
+        }
+    };
+
+    for line in text.lines() {
+        if line.trim_start().starts_with("```") {
+            in_fence = !in_fence;
+            current.push_str(line);
+            current.push('\n');
+            continue;
+        }
+        if !in_fence {
+            if let Some((level, title)) = parse_atx_heading(line) {
+                let path = path_of(&stack);
+                flush(&path, &mut current, &mut sections);
+                while let Some(&(l, _)) = stack.last() {
+                    if l >= level {
+                        stack.pop();
+                    } else {
+                        break;
+                    }
+                }
+                stack.push((level, title));
+                current.push_str(line);
+                current.push('\n');
+                continue;
+            }
+        }
+        current.push_str(line);
+        current.push('\n');
+    }
+    let path = path_of(&stack);
+    flush(&path, &mut current, &mut sections);
+    sections
+}
+
+/// 结构感知切块：优先整段（标题边界）保留，段内超长再按字符切。
+/// 返回 (标题面包屑, 分块正文)。
+pub fn chunk_text_structured(text: &str, chunk_chars: usize) -> Vec<(Vec<String>, String)> {
+    let sections = split_markdown_sections(text);
+    if sections.is_empty() {
+        return Vec::new();
+    }
+    // 无标题长文 → 退回纯字符切块（path 空）
+    if sections.len() == 1 && sections[0].0.is_empty() {
+        return chunk_text(text, chunk_chars)
+            .into_iter()
+            .map(|c| (Vec::new(), c))
+            .collect();
+    }
+    let mut out: Vec<(Vec<String>, String)> = Vec::new();
+    for (path, body) in sections {
+        let n = body.chars().count();
+        if n <= chunk_chars {
+            out.push((path, body));
+        } else {
+            for piece in chunk_text(&body, chunk_chars) {
+                out.push((path.clone(), piece));
+            }
+        }
+    }
+    out
+}
+
+fn breadcrumb_join(path: &[String]) -> String {
+    if path.is_empty() {
+        String::new()
+    } else {
+        format!(" · {}", path.join(" › "))
+    }
 }
 
 fn safe_filename(name: &str) -> String {
@@ -251,7 +397,7 @@ pub fn ingest_bytes(
     fs::write(&abs_file, bytes).map_err(|e| format!("write file: {e}"))?;
     let raw_ref = format!("{rel_dir}/{safe_name}");
 
-    let chunks = chunk_text(&text, CHUNK_CHARS);
+    let chunks = chunk_text_structured(&text, CHUNK_CHARS);
     if chunks.is_empty() {
         return Err("抽取文本为空".into());
     }
@@ -285,33 +431,17 @@ pub fn ingest_bytes(
     )
     .map_err(|e| format!("manifest remember: {e}"))?;
 
-    let mut chunk_ids = Vec::new();
-    let total = chunks.len();
-    for (i, chunk) in chunks.iter().enumerate() {
-        let body = format!("[文档块 {}/{}] {filename}\n\n{chunk}", i + 1, total);
-        let tags = format!(r#"["document","{kind}","dept-share","chunk","file:{safe_name}"]"#);
-        let r = remember::remember_with_dedup(
-            pool,
-            &body,
-            "document",
-            6,
-            actor,
-            namespace,
-            &tags,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            Some(actor),
-            Some("document"),
-            Some(&man.id),
-            Some(&raw_ref),
-        )
-        .map_err(|e| format!("chunk {} remember: {e}", i + 1))?;
-        chunk_ids.push(r.id);
-    }
+    let chunk_ids = write_chunk_memories(
+        pool,
+        &man.id,
+        &chunks,
+        filename,
+        kind,
+        &safe_name,
+        actor,
+        namespace,
+        &raw_ref,
+    )?;
 
     Ok(IngestOutcome {
         doc_id,
@@ -342,7 +472,7 @@ pub fn ingest_plain_text(
     let doc_id = content_hash16(text.as_bytes());
     let safe_name = safe_filename(filename);
     let raw_ref = format!("text-only/{}/{safe_name}", ns_dir_component(namespace));
-    let chunks = chunk_text(text, CHUNK_CHARS);
+    let chunks = chunk_text_structured(text, CHUNK_CHARS);
     let preview: String = text.chars().take(400).collect();
     let manifest = format!(
         "[文档] {filename}\n类型: {kind}\n字符: {}\n分块: {}\n路径: {raw_ref}\n---\n{preview}",
@@ -371,10 +501,48 @@ pub fn ingest_plain_text(
     )
     .map_err(|e| format!("manifest remember: {e}"))?;
 
+    let chunk_ids = write_chunk_memories(
+        pool,
+        &man.id,
+        &chunks,
+        filename,
+        kind,
+        &safe_name,
+        actor,
+        namespace,
+        &raw_ref,
+    )?;
+
+    Ok(IngestOutcome {
+        doc_id,
+        namespace: namespace.to_string(),
+        filename: filename.to_string(),
+        kind: kind.to_string(),
+        raw_ref,
+        chars: text.chars().count(),
+        chunk_count: chunk_ids.len(),
+        manifest_id: man.id,
+        chunk_ids,
+    })
+}
+
+/// 分块写入：`[文档块 i/N] 文件名 · 标题路径` 面包屑 + 正文。
+fn write_chunk_memories(
+    pool: &SqlitePool,
+    manifest_id: &str,
+    chunks: &[(Vec<String>, String)],
+    filename: &str,
+    kind: &str,
+    safe_name: &str,
+    actor: &str,
+    namespace: &str,
+    raw_ref: &str,
+) -> Result<Vec<String>, String> {
     let mut chunk_ids = Vec::new();
     let total = chunks.len();
-    for (i, chunk) in chunks.iter().enumerate() {
-        let body = format!("[文档块 {}/{}] {filename}\n\n{chunk}", i + 1, total);
+    for (i, (path, chunk)) in chunks.iter().enumerate() {
+        let crumb = breadcrumb_join(path);
+        let body = format!("[文档块 {}/{}] {filename}{crumb}\n\n{chunk}", i + 1, total);
         let tags = format!(r#"["document","{kind}","dept-share","chunk","file:{safe_name}"]"#);
         let r = remember::remember_with_dedup(
             pool,
@@ -392,24 +560,13 @@ pub fn ingest_plain_text(
             None,
             Some(actor),
             Some("document"),
-            Some(&man.id),
-            Some(&raw_ref),
+            Some(manifest_id),
+            Some(raw_ref),
         )
         .map_err(|e| format!("chunk {} remember: {e}", i + 1))?;
         chunk_ids.push(r.id);
     }
-
-    Ok(IngestOutcome {
-        doc_id,
-        namespace: namespace.to_string(),
-        filename: filename.to_string(),
-        kind: kind.to_string(),
-        raw_ref,
-        chars: text.chars().count(),
-        chunk_count: chunk_ids.len(),
-        manifest_id: man.id,
-        chunk_ids,
-    })
+    Ok(chunk_ids)
 }
 
 pub fn resolve_doc_root(db_path: &str) -> PathBuf {
@@ -441,5 +598,41 @@ mod tests {
         assert_eq!(detect_kind("c.xlsx", None), Some("xlsx"));
         assert_eq!(detect_kind("d.xls", None), Some("xls"));
         assert_eq!(detect_kind("e.txt", None), None);
+    }
+
+    #[test]
+    fn excel_serial_formats_date_not_float() {
+        // 2023-07-01 12:00:00 ≈ serial 45108.5（1899-12-30 纪元）
+        let s = format_excel_serial(45108.5);
+        assert!(!s.contains('.'), "got {s}");
+        assert!(s.starts_with("2023-07-01"), "got {s}");
+        assert!(s.contains("12:00:00"), "got {s}");
+        // 纯日期
+        let d = format_excel_serial(45108.0);
+        assert_eq!(d, "2023-07-01");
+    }
+
+    #[test]
+    fn structured_chunks_respect_headings() {
+        let md = "# A\nintro\n\n## B\nbody-b\n\n## C\nbody-c\n";
+        let chunks = chunk_text_structured(md, 10_000);
+        assert_eq!(chunks.len(), 3);
+        assert_eq!(chunks[0].0, vec!["A".to_string()]);
+        assert_eq!(chunks[1].0, vec!["A".to_string(), "B".to_string()]);
+        assert_eq!(chunks[2].0, vec!["A".to_string(), "C".to_string()]);
+        assert!(chunks[1].1.contains("body-b"));
+        // 大节再切时保留同一面包屑
+        let big = format!("# T\n{}", "x".repeat(5000));
+        let parts = chunk_text_structured(&big, 2000);
+        assert!(parts.len() >= 2);
+        assert!(parts.iter().all(|(p, _)| p == &vec!["T".to_string()]));
+    }
+
+    #[test]
+    fn structured_chunks_ignore_code_fence_headings() {
+        let md = "# R\n```\n# not a heading\n```\nreal\n";
+        let chunks = chunk_text_structured(md, 10_000);
+        assert_eq!(chunks.len(), 1);
+        assert!(chunks[0].1.contains("# not a heading"));
     }
 }
