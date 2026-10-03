@@ -50,14 +50,24 @@ ENV_PATH = resolve_env_path()
 MCP_URL = "http://127.0.0.1:9003/mcp"
 NS = os.environ.get("MEMORIA_GUARD_NS", "agent/xujiayan")
 K = 10                       # 拉取条数（判定 top-5 命中，多取几条便于诊断）
-SAMPLE_N = int(os.environ.get("RECALL_SAMPLE_N", "40"))
-# 全局墙钟上限：整个守护最多跑 10 分钟。单条 recall 已 timeout=90，但 40×2 条在 memoria
-# 极端卡顿时会逼近 2 小时；加此硬上限，超时即提前结束并据已测样本出结论，避免 run 拖死。
-GLOBAL_CAP = int(os.environ.get("RECALL_GLOBAL_CAP", "600"))
+# 样本量：2026-10-03 由 40 提到 80。理由——每轮抽取的是**不同记忆**，记忆间召回难度
+# 异质性使实际方差远大于二项理论值（实测同一健康实例 3 轮 45%/65%/55%，摆幅 20pp）。
+# 40 样本下 n=40,p≈0.55 的二项标准差约 7.9pp，40% 阈值距均值仅 1.9σ，单轮误报率约 3%
+# ——2026-10-03 03:01 即因此报出 severity=warn 假阳性。n 翻倍后 σ≈5.6pp、阈值升到 2.7σ，
+# 误报率降到约 0.4%，且**不牺牲灵敏度**：真实劣化（如 2026-10-01 嵌入宕机 32.5%）仍被稳定捕获。
+# 代价：健康态单轮耗时约 30s→60s，仍远低于 GLOBAL_CAP。
+SAMPLE_N = int(os.environ.get("RECALL_SAMPLE_N", "80"))
+# 全局墙钟上限：整个守护最多跑 20 分钟。单条 recall 已 timeout=90，但 80×2 条在 memoria
+# 极端卡顿时会逼近 4 小时；加此硬上限，超时即提前结束并据已测样本出结论，避免 run 拖死。
+# 2026-10-03 由 600 提到 1200：样本量翻倍后，降级态（约 545s/40 条）需约 1090s，
+# 若仍用 600s 会在 n≈27 处被截断，样本量优势荡然无存、方差回到调参前水平。
+GLOBAL_CAP = int(os.environ.get("RECALL_GLOBAL_CAP", "1200"))
 TREND = os.environ.get("RECALL_TREND_CSV", os.path.join(HERE, "recall_trend.csv"))
 ALERT = os.environ.get("RECALL_ALERT_JSON", os.path.join(HERE, "recall_alert.json"))
-# 连续劣化达到该次数才写 elevated 告警（单次尖峰写 warn，供 memory_ops_status 读取）
-CONSEC_WARN = int(os.environ.get("RECALL_CONSEC_WARN", "2"))
+# 连续劣化达到该次数才写 elevated 告警（单次尖峰写 warn，供 memory_ops_status 读取）。
+# 2026-10-03 由 2 提到 3。注意：本项**只决定 severity 标签，不影响退出码**——status 一旦
+# 跌破阈值就直接 exit 1（见下方分诊逻辑），故它只能软化告警、无法降误报。降误报靠 SAMPLE_N。
+CONSEC_WARN = int(os.environ.get("RECALL_CONSEC_WARN", "3"))
 EXPECTED_HEADER = "timestamp,full_r5,kw_r5,n_full,n_kw,status\n"
 
 # 双口径基线/阈值 —— 2026-08-02 重订，基于清理 LoCoMo 后 Qwen3-VL 生产实测（40 抽样 @5）

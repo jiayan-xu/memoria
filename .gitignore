@@ -83,6 +83,8 @@ eval/hyde_on.json
 # 召回回归守护生成物（运行期趋势日志，不入库）
 recall_trend.csv
 recall_guard_detail.json
+# recall_guard 每次运行覆写的告警快照（运行期产物，非源码）
+recall_alert.json
 
 # 本地工具/记忆目录（Agent 工作区状态，不进公开仓）
 .workbuddy/
