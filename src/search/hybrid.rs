@@ -14,6 +14,10 @@ use crate::vector::{HnswIndex, QueryCache};
 ///   （valid_from <= as_of 且 (valid_to IS NULL 或 valid_to >= as_of)），不查 superseded_by（时序真值优先）。
 /// - `None`（默认）→ `is_latest_now`：superseded_by IS NULL 且当前(now)有效（§14.1 Q2）。
 /// `include_superseded=true`（F2）` 不跳过过滤，而是把「仍有效(valid_at now)但被取代」的历史真值降权补回（标 time_status="superseded"）。
+/// `include_pending=true`（P1-b）：补回 confirm_status='pending' 的待确认记忆；
+/// 默认仅 active（NULL 视同 active）；rejected 永不出（软删除）。
+///
+/// 兼容包装：丢弃降级报告。新调用方应优先 `hybrid_search_reported`。
 pub fn hybrid_search(
     pool: &SqlitePool,
     query: &str,
@@ -25,6 +29,54 @@ pub fn hybrid_search(
     as_of: Option<&str>,
     include_superseded: bool,
 ) -> Result<Vec<FusedResult>, String> {
+    let (fused, _report) = hybrid_search_reported(
+        pool,
+        query,
+        namespace,
+        max_results,
+        hnsw,
+        hype_hnsw,
+        query_cache,
+        as_of,
+        include_superseded,
+        false,
+    )?;
+    Ok(fused)
+}
+
+/// Phase A P0-2（WeKnora 吸收）：召回降级可观测契约。
+/// 「为什么结果是空的」必须是一等公民数据，而不是日志里一行 eprintln。
+/// outcome 取值（对齐 WeKnora RerankOutcome 的降级枚举思路，映射到 memoria 5 信号）：
+/// - `ok`              全主通道健康（semantic + keyword 均参与）或有结果
+/// - `keyword_only`    semantic 缺失/被丢弃，仅关键词通道
+/// - `semantic_only`   keyword 空结果，仅语义通道
+/// - `no_signals`      所有通道均无结果（含命名空间为空的情形）
+/// - `no_candidates`   通道有结果但融合/时序过滤后为空
+/// `dropped` 携带结构化降级明细（与 eprintln 故障分桶同 key），
+/// MCP 层可追加 stage-2 重排失败（`rerank_model_error`）。
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct RecallReport {
+    pub outcome: String,
+    pub dropped: Vec<String>,
+    pub signals: Vec<String>,
+}
+
+/// RRF 常数 k（原调用点字面量 60.0，理论 maxRRF 需同一来源）。
+const RRF_K: f64 = 60.0;
+
+pub fn hybrid_search_reported(
+    pool: &SqlitePool,
+    query: &str,
+    namespace: &str,
+    max_results: u32,
+    hnsw: Option<&HnswIndex>,
+    hype_hnsw: Option<&HnswIndex>,
+    query_cache: Option<&QueryCache>,
+    as_of: Option<&str>,
+    include_superseded: bool,
+    include_pending: bool,
+) -> Result<(Vec<FusedResult>, RecallReport), String> {
+    let mut report = RecallReport::default();
     // A+C 配置（均可经 env 覆盖）
     let recall_depth = env_u32("MEMORIA_RECALL_DEPTH", 50).max(8);
     let w_keyword = env_f64("MEMORIA_WEIGHT_KEYWORD", 1.0);
@@ -59,7 +111,12 @@ pub fn hybrid_search(
             kw_res = Some(kw.clone());
             signals.push(kw);
             weights.push(w_keyword);
+            report.signals.push("keyword".to_string());
+        } else {
+            report.dropped.push("keyword_empty".to_string());
         }
+    } else {
+        report.dropped.push("keyword_error".to_string());
     }
 
     // S2: Semantic (HNSW vector) — 宽召回（V1：可选 HyPE 问句索引双路合并）。
@@ -82,6 +139,9 @@ pub fn hybrid_search(
                         sem_res = Some(sem.clone());
                         signals.push(sem);
                         weights.push(w_semantic);
+                        report.signals.push("semantic".to_string());
+                    } else {
+                        report.dropped.push("semantic_empty".to_string());
                     }
                 }
                 // #R35 maintainability/low：semantic_search 在"全部 HNSW 路失败"
@@ -110,9 +170,16 @@ pub fn hybrid_search(
                     // semantic::bump_semantic_drops doc）。
                     bump_semantic_drops();
                     throttled_eprintln(key, || format!("[hybrid] semantic signal dropped: {e}"));
+                    report
+                        .dropped
+                        .push(format!("semantic_dropped_{}", key.trim_start_matches("hybrid_")));
                 }
             }
+        } else {
+            report.dropped.push("semantic_missing_index".to_string());
         }
+    } else {
+        report.dropped.push("semantic_no_query_cache".to_string());
     }
 
     // S3: Temporal (recency bias)
@@ -120,6 +187,7 @@ pub fn hybrid_search(
         if !temp.is_empty() {
             signals.push(temp);
             weights.push(w_temporal);
+            report.signals.push("temporal".to_string());
         }
     }
 
@@ -128,6 +196,7 @@ pub fn hybrid_search(
         if !imp.is_empty() {
             signals.push(imp);
             weights.push(w_importance);
+            report.signals.push("importance".to_string());
         }
     }
 
@@ -136,13 +205,18 @@ pub fn hybrid_search(
         if !cat.is_empty() {
             signals.push(cat);
             weights.push(w_category);
+            report.signals.push("category".to_string());
         }
     }
+
+    // Phase A P0-2（WeKnora 吸收）：理论 maxRRF = Σ通道权重/(k+1)——全部通道
+    // rank-0 命中的理想分数。供 two_stage_rerank 作归一化分母（见其注释）。
+    let rrf_theoretical_max = weights.iter().sum::<f64>() / (RRF_K + 1.0);
 
     let mut fused = if signals.is_empty() {
         Vec::new()
     } else {
-        search::rrf::rrf_merge(&signals, &weights, 60.0)
+        search::rrf::rrf_merge(&signals, &weights, RRF_K)
     };
 
     // 2-hop graph expansion —— 2026-07-26 图召回定论：默认关闭（max_hops=0）。
@@ -175,13 +249,18 @@ pub fn hybrid_search(
             let ids: Vec<String> = unique.iter().map(|r| r.memory_id.clone()).collect();
             let ph = vec!["?"; ids.len()].join(",");
             let sql = format!(
-                "SELECT id, superseded_by, valid_from, valid_to FROM memories WHERE id IN ({})",
+                "SELECT id, superseded_by, valid_from, valid_to, confirm_status FROM memories WHERE id IN ({})",
                 ph
             );
             if let Ok(mut stmt) = conn.prepare(&sql) {
                 let info: std::collections::HashMap<
                     String,
-                    (Option<String>, Option<String>, Option<String>),
+                    (
+                        Option<String>,
+                        Option<String>,
+                        Option<String>,
+                        Option<String>,
+                    ),
                 > = stmt
                     .query_map(rusqlite::params_from_iter(ids.iter()), |row| {
                         Ok((
@@ -190,6 +269,7 @@ pub fn hybrid_search(
                                 row.get::<_, Option<String>>(1)?,
                                 row.get::<_, Option<String>>(2)?,
                                 row.get::<_, Option<String>>(3)?,
+                                row.get::<_, Option<String>>(4)?,
                             ),
                         ))
                     })
@@ -200,22 +280,39 @@ pub fn hybrid_search(
                 let downweight = env_f64("MEMORIA_HISTORY_DOWNWEIGHT", 0.5).clamp(0.0, 1.0);
                 // 先算 keep 标记（与 unique 顺序一致）
                 let mut keep: Vec<bool> = Vec::with_capacity(unique.len());
+                // P1-b：因 pending 被滤掉的数量（可观测——「为什么结果是空的」）
+                let mut pending_filtered: usize = 0;
                 for r in unique.iter() {
                     match info.get(&r.memory_id) {
-                        Some((sup, vf, vt)) => {
+                        Some((sup, vf, vt, cstat)) => {
+                            // P1-b 确认状态门：active/NULL 可见；pending 仅
+                            // include_pending=true 补回；rejected 永不出（软删除）。
+                            // 与时序过滤正交：curation 状态不因 as_of/F2 回溯而失效。
+                            let cstat_ok = match cstat.as_deref() {
+                                None | Some("active") => true,
+                                Some("pending") => include_pending,
+                                Some(_) => false,
+                            };
                             let valid = valid_at(vf.as_deref(), vt.as_deref(), ref_time);
-                            if include_superseded {
-                                keep.push(true); // F2：跳过整段时序/superseded 过滤，全部补回
+                            let temporal_ok = if include_superseded {
+                                true // F2：跳过整段时序/superseded 过滤，全部补回
                             } else if as_of.is_some() {
-                                keep.push(valid); // 时序真值：仅看 valid_*, 忽略 superseded_by
-                            } else if sup.is_none() && valid {
-                                keep.push(true); // is_latest_now
+                                valid // 时序真值：仅看 valid_*, 忽略 superseded_by
                             } else {
-                                keep.push(false);
+                                sup.is_none() && valid // is_latest_now
+                            };
+                            if temporal_ok && !cstat_ok && cstat.as_deref() == Some("pending") {
+                                pending_filtered += 1;
                             }
+                            keep.push(temporal_ok && cstat_ok);
                         }
                         None => keep.push(false),
                     }
+                }
+                if pending_filtered > 0 {
+                    report
+                        .dropped
+                        .push(format!("pending_filtered:{pending_filtered}"));
                 }
                 // 应用 time_status + 降权（仅对保留项）
                 let mut idx = 0;
@@ -226,7 +323,7 @@ pub fn hybrid_search(
                         continue;
                     }
                     match info.get(&r.memory_id) {
-                        Some((sup, vf, vt)) => {
+                        Some((sup, vf, vt, _cstat)) => {
                             let valid = valid_at(vf.as_deref(), vt.as_deref(), ref_time);
                             if as_of.is_some() {
                                 r.time_status = if valid {
@@ -324,7 +421,7 @@ pub fn hybrid_search(
     // 第一阶=RRF 位置融合（rrf_merge 完成）；第二阶=对候选池用
     // 归一化 RRF + 原始 cosine(sem_cos) + 原始 BM25(kw_bm25) 混合重排，显著降误召。
     // cooccur/text_signals 加成已折入 rrf_score，归一化后相对序保留，不丢前序成果。
-    two_stage_rerank(&mut unique, rrf_w, sem_w, kw_w);
+    two_stage_rerank(&mut unique, rrf_w, sem_w, kw_w, rrf_theoretical_max);
 
     // 主通道保底（P0 召回修复，2026-07-26）：semantic/keyword 是核心召回通道，
     // 但 rrf_merge 把 temporal/importance/category 也作平等召回通道累加，而这三个软信号
@@ -362,7 +459,28 @@ pub fn hybrid_search(
 
     let unique: Vec<FusedResult> = unique.into_iter().take(max_results as usize).collect();
 
-    Ok(unique)
+    // Phase A P0-2：主结论判定（语义见 RecallReport doc）。
+    let sem_ok = report.signals.iter().any(|s| s == "semantic");
+    let kw_ok = report.signals.iter().any(|s| s == "keyword");
+    report.outcome = if unique.is_empty() {
+        if report.signals.is_empty() {
+            "no_signals"
+        } else {
+            "no_candidates"
+        }
+    } else if sem_ok && kw_ok {
+        "ok"
+    } else if kw_ok {
+        "keyword_only"
+    } else if sem_ok {
+        "semantic_only"
+    } else {
+        // 仅软信号（temporal/importance/category）有结果
+        "ok"
+    }
+    .to_string();
+
+    Ok((unique, report))
 }
 
 /// P1-5: 判断记忆在 `as_of` 时刻是否有效。
@@ -398,11 +516,26 @@ fn pending_downweight() -> f64 {
 /// 2026-08-22 追加「近精确语义匹配 boost」：sem_cos ≥ `MEMORIA_SEM_EXACT_T`(默认0.9)
 /// 时线性加成 `MEMORIA_SEM_EXACT_BOOST`(默认1.0)，把自匹配/近自匹配恒定顶进 top-k
 /// （修复 RRF k=60 压平 + kw_w>sem_w 导致语义 #1 被埋到 rank 10+ 的回归）。
-fn two_stage_rerank(results: &mut Vec<FusedResult>, w_rrf: f64, w_sem: f64, w_kw: f64) {
+fn two_stage_rerank(
+    results: &mut Vec<FusedResult>,
+    w_rrf: f64,
+    w_sem: f64,
+    w_kw: f64,
+    rrf_theoretical_max: f64,
+) {
     if results.is_empty() {
         return;
     }
-    let rrf_max = results.iter().map(|r| r.rrf_score).fold(0.0_f64, f64::max);
+    // Phase A P0-2（WeKnora 吸收）：RRF 归一化分母从「观测 max」升级为
+    // max(理论 maxRRF, 观测 max)。观测 max 依赖结果集分布——弱命中查询里
+    // 第一名也被抬到 1.0，rrf_n 在混合分中虚高、跨查询不可比；理论分母
+    // Σweights/(k+1) 保留绝对强度语义（仅单通道弱命中不再顶满）。但
+    // cooccur/text_signals 的加成会折入 rrf_score 使观测值可能超过理论值，
+    // 取 max 保证不触发 clamp-1.0 同分退化（WeKnora rescaleUnboundedScores
+    // 记录的陷阱：无界分数把所有候选 clamp 到同分，MMR/混合重排退化为
+    // 纯位置序）。
+    let rrf_observed_max = results.iter().map(|r| r.rrf_score).fold(0.0_f64, f64::max);
+    let rrf_max = rrf_observed_max.max(rrf_theoretical_max.max(0.0));
     let sem_max = results
         .iter()
         .map(|r| r.sem_cos.unwrap_or(0.0))
@@ -432,22 +565,31 @@ fn two_stage_rerank(results: &mut Vec<FusedResult>, w_rrf: f64, w_sem: f64, w_kw
     let k_freq = env_f64("MEMORIA_FREQ_K", 10.0).max(1.0);
     let lambda = env_f64("MEMORIA_RECENCY_LAMBDA", 0.01).max(0.0);
     let now_secs = chrono::Utc::now().timestamp();
+    // Phase A P0-2（WeKnora 吸收）：clamp01 显式处理 NaN/±Inf——非有限分数破坏
+    // sort 全序关系，稳定排序下表现为同分顺序不可复现而非 panic，极难定位。
+    fn clamp01(x: f64) -> f64 {
+        if x.is_finite() {
+            x.clamp(0.0, 1.0)
+        } else {
+            0.0
+        }
+    }
     for r in results.iter_mut() {
-        let rrf_n = if rrf_max > 0.0 {
+        let rrf_n = clamp01(if rrf_max > 0.0 {
             r.rrf_score / rrf_max
         } else {
             0.0
-        };
-        let sem_n = if sem_max > 0.0 {
+        });
+        let sem_n = clamp01(if sem_max > 0.0 {
             r.sem_cos.unwrap_or(0.0) / sem_max
         } else {
             0.0
-        };
-        let kw_n = if kw_max > 0.0 {
+        });
+        let kw_n = clamp01(if kw_max > 0.0 {
             r.kw_bm25.unwrap_or(0.0) / kw_max
         } else {
             0.0
-        };
+        });
         let graph_n = if graph_max > 0.0 {
             r.graph_signal.unwrap_or(0.0) / graph_max
         } else {
