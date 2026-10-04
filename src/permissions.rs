@@ -80,6 +80,18 @@ pub const PERMISSION_MATRIX: &[Entry] = &[
         note: "memory_remember 薄别名",
     },
     Entry {
+        tool: "memory_confirm",
+        min_role: MinRole::Agent,
+        ns_policy: NsPolicy::NamespaceArg,
+        note: "P1(WeKnora 吸收)：pending → active 确认（写配额）",
+    },
+    Entry {
+        tool: "memory_reject",
+        min_role: MinRole::Agent,
+        ns_policy: NsPolicy::NamespaceArg,
+        note: "P1(WeKnora 吸收)：→ rejected 软删除（写配额；仅同 ns）",
+    },
+    Entry {
         tool: "memory_profile",
         min_role: MinRole::Agent,
         ns_policy: NsPolicy::NamespaceArg,

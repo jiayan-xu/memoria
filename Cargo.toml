@@ -31,6 +31,8 @@ chrono = "0.4"
 lru = "0.12"
 sha2 = "0.10"
 base64 = "0.22"
+# 写路径敏感信息脱敏（WeKnora MIT 吸收，Phase A P0-1）
+regex = "1"
 getrandom = "0.2"
 axum = { version = "0.7", features = ["multipart"] }
 tokio = { version = "1", features = ["full"] }

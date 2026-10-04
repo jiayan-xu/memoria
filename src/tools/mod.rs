@@ -1,6 +1,7 @@
 //! Tool implementations mapped to MCP tool names
 //! Phase 2: write operations
 pub mod compress;
+pub mod cn_topic;
 pub mod decay;
 pub mod evolve;
 pub mod graph;
@@ -9,5 +10,6 @@ pub mod ledger;
 pub mod observe;
 pub mod prefs;
 pub mod profile;
+pub mod redact;
 pub mod remember;
 pub mod self_evolution;
