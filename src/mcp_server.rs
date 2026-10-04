@@ -494,6 +494,7 @@ pub fn tools_list() -> Vec<serde_json::Value> {
                 "tags": {"type": "string", "description": "标签过滤，JSON 数组字符串"},
                 "as_of": {"type": "string", "description": "P1-5 时序真值：仅返回该 ISO-8601 时刻有效的记忆；不传则默认返回「当前真值」（superseded_by IS NULL 且未失效）"},
                 "include_superseded": {"type": "boolean", "description": "P0: 是否包含已被取代的历史记忆（默认 false，仅看当前真值）"},
+                "include_pending": {"type": "boolean", "description": "P1(WeKnora 吸收)：是否包含 confirm_status=pending 的待确认记忆（默认 false）；rejected 永不返回"},
                 "enrich_ledger": {"type": "boolean", "description": "O6：可选账本富化，默认 false；ledger 主路径在 memory_context"}
             }),
         ),
@@ -515,7 +516,9 @@ pub fn tools_list() -> Vec<serde_json::Value> {
                 "actor": {"type": "string", "description": "PR1(Phase B 前置)：事实作者/来源主体；NULL 视为 agent_inferred"},
                 "memory_type": {"type": "string", "description": "PR1：记忆类型 declarative/procedural/episodic/...；NULL 视为 declarative"},
                 "parent_id": {"type": "string", "description": "PR1：原子事实挂回的原始记忆 id（1 raw→N 原子事实时用）"},
-                "raw_ref": {"type": "string", "description": "PR1：原文旁路存储引用（避免整段 raw 入库）"}
+                "raw_ref": {"type": "string", "description": "PR1：原文旁路存储引用（避免整段 raw 入库）"},
+                "topic_key": {"type": "string", "description": "P1(WeKnora 吸收)：主题身份键（如「生产数据库」）。显式传入时同主题旧记忆自动被本条取代（词序无关）；与近重复互补"},
+                "confirm": {"type": "boolean", "description": "P1(WeKnora 吸收)：false → 写入为 pending（默认召回不可见，待 memory_confirm）；默认 true=active"}
             }),
         ),
         tool(
@@ -545,7 +548,25 @@ pub fn tools_list() -> Vec<serde_json::Value> {
                 "actor": {"type": "string", "description": "PR1(Phase B 前置)：事实作者/来源主体；NULL 视为 agent_inferred"},
                 "memory_type": {"type": "string", "description": "PR1：记忆类型 declarative/procedural/episodic/...；NULL 视为 declarative"},
                 "parent_id": {"type": "string", "description": "PR1：原子事实挂回的原始记忆 id（1 raw→N 原子事实时用）"},
-                "raw_ref": {"type": "string", "description": "PR1：原文旁路存储引用（避免整段 raw 入库）"}
+                "raw_ref": {"type": "string", "description": "PR1：原文旁路存储引用（避免整段 raw 入库）"},
+                "topic_key": {"type": "string", "description": "P1(WeKnora 吸收)：主题身份键；显式传入时同主题旧记忆自动被本条取代"},
+                "confirm": {"type": "boolean", "description": "P1(WeKnora 吸收)：false → 写入为 pending（待确认，默认召回不可见）；默认 true=active"}
+            }),
+        ),
+        tool(
+            "memory_confirm",
+            "P1(WeKnora 吸收)：确认一条 pending 记忆 → active（进入默认召回）",
+            serde_json::json!({
+                "memory_id": {"type": "string", "description": "目标记忆 id（必填）"},
+                "namespace": {"type": "string", "description": "命名空间（必填，须与记忆归属一致）"}
+            }),
+        ),
+        tool(
+            "memory_reject",
+            "P1(WeKnora 吸收)：拒绝一条记忆 → rejected（软删除：数据保留，召回永不出；仅同 ns 可操作）",
+            serde_json::json!({
+                "memory_id": {"type": "string", "description": "目标记忆 id（必填）"},
+                "namespace": {"type": "string", "description": "命名空间（必填，须与记忆归属一致）"}
             }),
         ),
         tool(
@@ -1680,6 +1701,11 @@ fn dispatch(
                 .get("include_superseded")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
+            // P1-b：待确认记忆默认不可见，显式 include_pending=true 补回
+            let include_pending = args
+                .get("include_pending")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
             // P0-stage2：cross-encoder 重排（env MEMORIA_RERANK_ENABLED）。
             // 开启时用更大候选池(rerank_pool)调 hybrid，重排后再截断到 max_results。
             let rerank_on = rerank_enabled();
@@ -1689,7 +1715,9 @@ fn dispatch(
                 max_results
             };
             let t_hybrid = std::time::Instant::now();
-            let mut fused = search::hybrid::hybrid_search(
+            // Phase A P0-2（WeKnora 吸收）：带降级报告的召回——outcome/dropped
+            // 随响应透传，「为什么结果是空的」不再只活在日志里。
+            let (mut fused, mut recall_report) = match search::hybrid::hybrid_search_reported(
                 &state.pool,
                 query,
                 ns,
@@ -1699,35 +1727,47 @@ fn dispatch(
                 Some(&state.query_cache),
                 as_of,
                 include_superseded,
-            )
-            .unwrap_or_default();
+                include_pending,
+            ) {
+                Ok(v) => v,
+                Err(e) => {
+                    let mut rep = search::hybrid::RecallReport::default();
+                    rep.outcome = "no_candidates".to_string();
+                    rep.dropped.push(format!("hybrid_error: {e}"));
+                    (Vec::new(), rep)
+                }
+            };
             if std::env::var("MEMORIA_TRACE").as_deref() == Ok("1") {
                 eprintln!("[trace] {} hybrid_search +{:?} (fused={})",
                     tool, t_hybrid.elapsed(), fused.len());
             }
 
             // stage-2 重排：在宽候选池上用 cross-encoder 重排，再交回 tags 过滤 + take(max_results)。
-            // 仅改变相对序，不增删候选；失败则保留 hybrid 原序（优雅降级）。
+            // 仅改变相对序，不增删候选；失败则保留 hybrid 原序（优雅降级）——
+            // Phase A P0-2：降级同时写入 recall_report（可观测，不再只影响顺序）。
             if rerank_on && fused.len() > 1 {
                 let docs: Vec<String> = fused.iter().map(|r| r.content.clone()).collect();
-                if let Some(scored) =
-                    block_on_rerank(&state.http_client, &rerank_url(), query, &docs)
-                {
-                    let mut order_score: Vec<f64> = vec![0.0; fused.len()];
-                    for (i, s) in scored {
-                        if i < order_score.len() {
-                            order_score[i] = s;
+                match block_on_rerank(&state.http_client, &rerank_url(), query, &docs) {
+                    Some(scored) => {
+                        let mut order_score: Vec<f64> = vec![0.0; fused.len()];
+                        for (i, s) in scored {
+                            if i < order_score.len() {
+                                order_score[i] = s;
+                            }
                         }
+                        let mut idxs: Vec<usize> = (0..fused.len()).collect();
+                        idxs.sort_by(|&a, &b| {
+                            order_score[b]
+                                .partial_cmp(&order_score[a])
+                                .unwrap_or(std::cmp::Ordering::Equal)
+                        });
+                        let reord: Vec<search::rrf::FusedResult> =
+                            idxs.into_iter().map(|i| fused[i].clone()).collect();
+                        fused = reord;
                     }
-                    let mut idxs: Vec<usize> = (0..fused.len()).collect();
-                    idxs.sort_by(|&a, &b| {
-                        order_score[b]
-                            .partial_cmp(&order_score[a])
-                            .unwrap_or(std::cmp::Ordering::Equal)
-                    });
-                    let reord: Vec<search::rrf::FusedResult> =
-                        idxs.into_iter().map(|i| fused[i].clone()).collect();
-                    fused = reord;
+                    None => {
+                        recall_report.dropped.push("rerank_model_error".to_string());
+                    }
                 }
             }
 
@@ -1799,6 +1839,11 @@ fn dispatch(
             serde_json::to_string(&serde_json::json!({
                 "status": "ok",
                 "total_results": filtered.len(),
+                "recall": {
+                    "outcome": recall_report.outcome,
+                    "dropped": recall_report.dropped,
+                    "signals": recall_report.signals,
+                },
                 "results": results,
             }))
             .unwrap_or_default()
@@ -1849,8 +1894,11 @@ fn dispatch(
             let memory_type = args.get("memory_type").and_then(|v| v.as_str());
             let parent_id = args.get("parent_id").and_then(|v| v.as_str());
             let raw_ref = args.get("raw_ref").and_then(|v| v.as_str());
+            // P1（WeKnora 吸收）：topic_key 主题收敛 + 确认状态机参数
+            let topic_key = args.get("topic_key").and_then(|v| v.as_str());
+            let confirm = args.get("confirm").and_then(|v| v.as_bool());
             // P0: 带近义重复检测的 remember
-            let body = match tools::remember::remember_with_dedup(
+            let body = match tools::remember::remember_with_dedup_ex(
                 &state.pool,
                 content,
                 cat,
@@ -1868,9 +1916,29 @@ fn dispatch(
                 memory_type,
                 parent_id,
                 raw_ref,
+                tools::remember::WriteExtras {
+                    topic_key,
+                    confirm,
+                },
             ) {
                 Ok(result) => {
-                    if result.action == "superseded_near_dup" && !result.superseded_ids.is_empty() {
+                    if result.action == "superseded_topic_key" && !result.superseded_ids.is_empty()
+                    {
+                        // P1-a：主题收敛的 supersede 无相似度语义（key 精确匹配），只列 id
+                        let ids: Vec<String> = result
+                            .superseded_ids
+                            .iter()
+                            .map(|id| format!("{{\"id\":\"{id}\"}}"))
+                            .collect();
+                        format!(
+                            r#"{{"status":"remembered","id":"{}","action":"{}","superseded":[{}]}}"#,
+                            result.id,
+                            result.action,
+                            ids.join(",")
+                        )
+                    } else if result.action == "superseded_near_dup"
+                        && !result.superseded_ids.is_empty()
+                    {
                         let pairs: Vec<String> = result
                             .superseded_ids
                             .iter()
@@ -1913,6 +1981,72 @@ fn dispatch(
                 }
             };
             body
+        }
+        "memory_confirm" | "memory_reject" => {
+            // P1-b（WeKnora 吸收）：确认状态机。confirm → active（进默认召回）；
+            // reject → rejected（软删除：数据保留、召回永不出）。仅同 ns 可操作。
+            if let Some(err) = quota_gate(state, ns, memoria_core::quota::KIND_WRITE, &_auth.role)
+            {
+                return err;
+            }
+            let memory_id = args.get("memory_id").and_then(|v| v.as_str()).unwrap_or("");
+            if memory_id.is_empty() {
+                return r#"{"status":"error","message":"memory_id required"}"#.to_string();
+            }
+            let target_status = if tool == "memory_confirm" { "active" } else { "rejected" };
+            let conn = match state.pool.get() {
+                Ok(c) => c,
+                Err(e) => return format!(r#"{{"error":"pool: {}"}}"#, e),
+            };
+            // 先验归属 + 存在性（404/403 语义对齐 supersedes_id 的失败模式）
+            let owner: Option<(String, Option<String>)> = conn
+                .query_row(
+                    "SELECT namespace, confirm_status FROM memories WHERE id = ?",
+                    rusqlite::params![memory_id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .ok();
+            match owner {
+                None => format!(
+                    r#"{{"status":"error","code":404,"message":"memory not found: {}"}}"#,
+                    memory_id
+                ),
+                Some((mem_ns, cstat)) if mem_ns != ns => format!(
+                    r#"{{"status":"error","code":403,"message":"cross-namespace: {} not in {}"}}"#,
+                    memory_id, ns
+                ),
+                Some((_, cstat)) => {
+                    // 2026-10-04 审查修复：状态机守卫——confirm 仅从 pending 出发，
+                    // reject 从 pending/active（含 NULL 视同 active）出发，rejected 为
+                    // 终态。此前无守卫：confirm 可复活 rejected（违背"软删除、召回
+                    // 永不出"承诺）、可确认已 superseded 的记忆造成状态自相矛盾。
+                    let cur = cstat.as_deref().unwrap_or("active");
+                    let allowed = match target_status {
+                        "active" => cur == "pending",
+                        _ => cur == "pending" || cur == "active",
+                    };
+                    if !allowed {
+                        return format!(
+                            r#"{{"status":"error","code":409,"message":"confirm_status transition not allowed: {} -> {} (current='{}')"}}"#,
+                            cur, target_status, cur
+                        );
+                    }
+                    match conn.execute(
+                        "UPDATE memories SET confirm_status = ?1 WHERE id = ?2 AND confirm_status IS ?3",
+                        rusqlite::params![target_status, memory_id, cstat],
+                    ) {
+                        Ok(n) if n > 0 => format!(
+                            r#"{{"status":"ok","memory_id":"{}","confirm_status":"{}"}}"#,
+                            memory_id, target_status
+                        ),
+                        Ok(_) => format!(
+                            r#"{{"status":"error","code":409,"message":"confirm_status changed concurrently for {}"}}"#,
+                            memory_id
+                        ),
+                        Err(e) => format!(r#"{{"status":"error","message":"{}"}}"#, e),
+                    }
+                }
+            }
         }
         "ingest_document" => {
             if let Some(err) = quota_gate(state, ns, memoria_core::quota::KIND_WRITE, &_auth.role) {
@@ -2519,6 +2653,17 @@ fn dispatch(
                     r#"{{"status":"error","message":"无权向该 Agent 发送消息（超出命名空间授权范围）"}}"#
                 );
             }
+            // Phase A P0-1（WeKnora 吸收）：a2a 消息同样入 memories 表、会被召回
+            // 重发到模型，写入前过同一道脱敏门。
+            let raw_content = if tools::redact::redact_enabled() {
+                let (redacted, changed) = tools::redact::redact_sensitive(&raw_content);
+                if changed {
+                    eprintln!("[a2a_send] sensitive content redacted (to={to})");
+                }
+                redacted
+            } else {
+                raw_content
+            };
             match state.pool.get() {
                 Ok(conn) => {
                     let _ = conn.execute(
@@ -3528,10 +3673,62 @@ fn dispatch(
             let name = name_trimmed.to_string();
             let aliases = args.get("aliases").and_then(|v| v.as_str()).unwrap_or("[]");
             let summary = args.get("summary").and_then(|v| v.as_str()).unwrap_or("");
+            // Phase A P0-3（WeKnora 吸收）：显式 entity_id = 调用方指定目标实体，尊重之；
+            // 自动生成 id 时先做 topic 身份判定——同命名空间内已有实体（含其别名）
+            // 的 normalize_topic_key 与新名相同 → 同一主题，合并别名而非再建一行
+            // （「门店排班管理」与「门店的排班管理」不再裂成两个实体）。
+            let explicit_id = args.get("entity_id").and_then(|v| v.as_str()).is_some();
             let conn = match state.pool.get() {
                 Ok(c) => c,
                 Err(e) => return format!(r#"{{"error":"pool: {}"}}"#, e),
             };
+            if !explicit_id {
+                let nk = tools::cn_topic::normalize_topic_key(&name);
+                if !nk.is_empty() {
+                    let existing: Vec<(String, String, String)> = conn
+                        .prepare("SELECT id, name, aliases FROM entities WHERE namespace = ?1")
+                        .and_then(|mut stmt| {
+                            stmt.query_map(rusqlite::params![ns], |row| {
+                                Ok((
+                                    row.get::<_, String>(0)?,
+                                    row.get::<_, String>(1)?,
+                                    row.get::<_, String>(2)?,
+                                ))
+                            })
+                            .map(|rows| rows.flatten().collect())
+                        })
+                        .unwrap_or_default();
+                    for (eid, ename, ealiases) in existing {
+                        let mut labels: Vec<String> =
+                            serde_json::from_str(&ealiases).unwrap_or_default();
+                        labels.push(ename);
+                        if labels
+                            .iter()
+                            .any(|l| tools::cn_topic::normalize_topic_key(l) == nk)
+                        {
+                            labels.pop(); // 去掉刚 push 的 ename
+                            let mut alias_list: Vec<String> =
+                                serde_json::from_str(&ealiases).unwrap_or_default();
+                            if !alias_list.contains(&name) {
+                                alias_list.push(name.clone());
+                            }
+                            let merged = serde_json::to_string(&alias_list)
+                                .unwrap_or_else(|_| ealiases.clone());
+                            let _ = conn.execute(
+                                "UPDATE entities SET aliases = ?1 WHERE id = ?2",
+                                rusqlite::params![merged, eid],
+                            );
+                            return serde_json::to_string(&serde_json::json!({
+                                "status": "ok",
+                                "entity_id": eid,
+                                "merged_by": "topic_key",
+                                "alias_added": name,
+                            }))
+                            .unwrap_or_default();
+                        }
+                    }
+                }
+            }
             match conn.execute(
                 "INSERT INTO entities(id, namespace, entity_type, name, aliases, summary)
                  VALUES(?1, ?2, ?3, ?4, ?5, ?6)
@@ -3808,6 +4005,7 @@ mod tests {
         memoria_core::storage::migrate_temporal(&pool).expect("migrate temporal");
         memoria_core::storage::migrate_extract_fields(&pool).expect("migrate extract fields");
         memoria_core::storage::migrate_evolution(&pool).expect("migrate evolution");
+        memoria_core::storage::migrate_phasea_p1(&pool).expect("migrate phasea p1");
         memoria_core::storage::migrate_memory_relation_types(&pool)
             .expect("migrate relation types");
         memoria_core::quota::init_quota_table(&pool).expect("quota table");
@@ -4108,6 +4306,72 @@ mod tests {
         assert!(out.contains(r#""status":"ok""#), "db_stats 响应: {}", out);
         let out = dispatch(&state, "memory_health", &serde_json::Map::new(), &auth);
         assert!(out.contains(r#""status":"ok""#), "memory_health 响应: {}", out);
+    }
+
+    /// 2026-10-04 审查修复回归：确认状态机守卫——confirm 仅 pending→active；
+    /// reject 可 pending/active→rejected；rejected 为终态，confirm 不得复活（409）。
+    #[test]
+    fn test_confirm_state_machine_guards() {
+        let state = build_test_state();
+        let auth = memoria_core::auth::AuthResult {
+            agent_id: "tester".to_string(),
+            allowed_ns: vec!["agent/test".to_string()],
+            role: "admin".to_string(),
+        };
+        let ns = "agent/test";
+
+        let mut pend_args = serde_json::Map::new();
+        pend_args.insert(
+            "content".into(),
+            serde_json::Value::String("守卫测试待确认观察 PENDING99".into()),
+        );
+        pend_args.insert("namespace".into(), serde_json::Value::String(ns.into()));
+        pend_args.insert("confirm".into(), serde_json::Value::Bool(false));
+        let out = dispatch(&state, "memory_remember", &pend_args, &auth);
+        let v: serde_json::Value = serde_json::from_str(&out).expect("JSON");
+        assert_eq!(v["status"], "remembered", "pending 写入: {out}");
+        let pend_id = v["id"].as_str().unwrap().to_string();
+
+        let mut act_args = serde_json::Map::new();
+        act_args.insert(
+            "content".into(),
+            serde_json::Value::String("守卫测试已确认事实 ACTIVE88".into()),
+        );
+        act_args.insert("namespace".into(), serde_json::Value::String(ns.into()));
+        let out = dispatch(&state, "memory_remember", &act_args, &auth);
+        let v: serde_json::Value = serde_json::from_str(&out).expect("JSON");
+        assert_eq!(v["status"], "remembered", "active 写入: {out}");
+        let act_id = v["id"].as_str().unwrap().to_string();
+
+        let mut call = |tool: &str, id: &str| -> serde_json::Value {
+            let mut m = serde_json::Map::new();
+            m.insert("namespace".into(), serde_json::Value::String(ns.into()));
+            m.insert("memory_id".into(), serde_json::Value::String(id.into()));
+            let out = dispatch(&state, tool, &m, &auth);
+            serde_json::from_str(&out).expect("JSON")
+        };
+
+        // active 记忆再 confirm → 409（confirm 仅从 pending 出发）
+        let v = call("memory_confirm", &act_id);
+        assert_eq!(v["code"], 409, "confirm(active) 应 409: {v}");
+        // pending → confirm → ok
+        let v = call("memory_confirm", &pend_id);
+        assert_eq!(v["status"], "ok", "confirm(pending) 应成功: {v}");
+        // 已 active 再 confirm → 409（幂等区分）
+        let v = call("memory_confirm", &pend_id);
+        assert_eq!(v["code"], 409, "重复 confirm 应 409: {v}");
+        // active → reject → ok
+        let v = call("memory_reject", &act_id);
+        assert_eq!(v["status"], "ok", "reject(active) 应成功: {v}");
+        // rejected → confirm 复活 → 409（终态）
+        let v = call("memory_confirm", &act_id);
+        assert_eq!(v["code"], 409, "rejected 复活应 409: {v}");
+        // rejected → 再 reject → 409
+        let v = call("memory_reject", &act_id);
+        assert_eq!(v["code"], 409, "重复 reject 应 409: {v}");
+        // 不存在 → 404
+        let v = call("memory_confirm", "deadbeef00000000");
+        assert_eq!(v["code"], 404, "不存在应 404: {v}");
     }
 
     #[test]

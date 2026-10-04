@@ -287,7 +287,106 @@ pub fn remember_with_dedup(
     parent_id: Option<&str>,
     raw_ref: Option<&str>,
 ) -> Result<RememberResult, String> {
+    remember_with_dedup_ex(
+        pool,
+        content,
+        category,
+        importance,
+        source,
+        namespace,
+        tags,
+        hnsw,
+        query_cache,
+        valid_from,
+        valid_to,
+        supersedes_id,
+        relation,
+        actor,
+        memory_type,
+        parent_id,
+        raw_ref,
+        WriteExtras::default(),
+    )
+}
+
+/// WeKnora 吸收 P1 新增写入参数（收结构体避免 18+ 位置参数继续膨胀；
+/// 既有调用方经 [`remember_with_dedup`] 走默认值，行为不变）。
+#[derive(Default)]
+pub struct WriteExtras<'a> {
+    /// 主题身份键（自然语言，如「生产数据库」）。**显式提供才参与收敛**：
+    /// 归一（词序无关 token 集合）后同 ns 同 key 的旧 tip 在本事务内自动
+    /// supersede。与 cosine 近重复互补：key 抓「同主题不同值」，向量抓
+    /// 「同句不同措辞」。
+    pub topic_key: Option<&'a str>,
+    /// `Some(false)` → 写入为 pending（默认召回不可见，待 memory_confirm）；
+    /// 其余值 → active。`memory_reject` 置 rejected（软删除）。
+    pub confirm: Option<bool>,
+}
+
+pub fn remember_with_dedup_ex(
+    pool: &SqlitePool,
+    content: &str,
+    category: &str,
+    importance: i64,
+    source: &str,
+    namespace: &str,
+    tags: &str,
+    hnsw: Option<&HnswIndex>,
+    query_cache: Option<&QueryCache>,
+    valid_from: Option<&str>,
+    valid_to: Option<&str>,
+    supersedes_id: Option<&str>,
+    relation: Option<&str>,
+    actor: Option<&str>,
+    memory_type: Option<&str>,
+    parent_id: Option<&str>,
+    raw_ref: Option<&str>,
+    extras: WriteExtras<'_>,
+) -> Result<RememberResult, String> {
     let relation_type = normalize_memory_relation(relation)?;
+
+    // Phase A P0-1（WeKnora 吸收）：写路径第一道脱敏。记忆会被每轮召回重发到
+    // 模型，凭据落库即持续外发。在 content_hash 之前执行——同一密文两次写入
+    // 仍落同一 id，去重语义不因脱敏漂移。memory_type=document 的文档分块不经
+    // 此门：文档是用户自有文件（raw_ref 旁路保真原件），按需召回而非每轮注入，
+    // 且 40+ 高熵规则会搅碎正常技术文档（代码块/长哈希），召回质量损失大于收益。
+    let redacted_content: std::borrow::Cow<'_, str> =
+        if crate::tools::redact::redact_enabled() && memory_type != Some("document") {
+            let (redacted, changed) = crate::tools::redact::redact_sensitive(content);
+            if changed {
+                eprintln!(
+                    "[remember] sensitive content redacted on write (ns={namespace}, type={})",
+                    memory_type.unwrap_or("memory")
+                );
+                // 仅对「真的被剥过」的内容做占位符拒绝——短记忆本身合法
+                //（near_dup 等测试用「句子A」三级内容），不能因长度误杀。
+                if crate::tools::redact::is_mostly_redacted(&redacted) {
+                    return Err(
+                        "400: content_redacted_to_placeholder: 内容几乎全部命中敏感信息规则，\
+                         拒绝写入占位符记忆（可拆分非敏感部分重试）"
+                            .to_string(),
+                    );
+                }
+            }
+            std::borrow::Cow::Owned(redacted)
+        } else {
+            std::borrow::Cow::Borrowed(content)
+        };
+    let content: &str = &redacted_content;
+
+    // P1-a：显式 topic_key 归一后参与主题收敛；未提供/空白 → 不参与（默认行为不变）。
+    let topic_key_norm: Option<String> = extras
+        .topic_key
+        .map(str::trim)
+        .filter(|k| !k.is_empty())
+        .map(|k| crate::tools::cn_topic::normalize_memory_key(k, content));
+    // P1-b：确认状态。默认 active；显式 confirm=false → pending（默认召回不可见）。
+    let confirm_status_val = if extras.confirm == Some(false) {
+        "pending"
+    } else {
+        "active"
+    };
+
     let conn = pool.get().map_err(|e| format!("pool: {}", e))?;
 
     // SHA-256 hash matching Python's hashlib.sha256(content.encode()).hexdigest()[:16]
@@ -401,8 +500,8 @@ pub fn remember_with_dedup(
         // 无 supersedes_id：常规精确去重 boost
         conn.execute(
             "UPDATE memories SET importance = MAX(importance, ?), confidence = MAX(confidence, 0.8),
-             recall_count = recall_count + 1, last_recalled = ? WHERE id = ?",
-            rusqlite::params![importance, now, mem_id],
+             recall_count = recall_count + 1, last_recalled = ?, confirm_status = ? WHERE id = ?",
+            rusqlite::params![importance, now, confirm_status_val, mem_id],
         )
         .map_err(|e| format!("update: {}", e))?;
         if tags_safe != "[]" {
@@ -456,8 +555,8 @@ pub fn remember_with_dedup(
     tx.execute(
         "INSERT INTO memories (id, namespace, source, content, category, confidence,
          recall_count, created_at, tier, importance, decay_factor, tags, valid_from, valid_to,
-         actor, memory_type, parent_id, raw_ref)
-         VALUES (?, ?, ?, ?, ?, 0.8, 0, ?, 'hot', ?, 1.0, ?, ?, ?, ?, ?, ?, ?)",
+         actor, memory_type, parent_id, raw_ref, topic_key, confirm_status)
+         VALUES (?, ?, ?, ?, ?, 0.8, 0, ?, 'hot', ?, 1.0, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         rusqlite::params![
             mem_id,
             namespace,
@@ -472,7 +571,9 @@ pub fn remember_with_dedup(
             actor,
             memory_type,
             parent_id,
-            raw_ref_to_store
+            raw_ref_to_store,
+            topic_key_norm,
+            confirm_status_val
         ],
     )
     .map_err(|e| format!("insert: {}", e))?;
@@ -480,6 +581,7 @@ pub fn remember_with_dedup(
     let mut superseded_ids = Vec::new();
     let mut similarities = Vec::new();
     let mut explicit_superseded = false;
+    let mut topic_superseded = false;
 
     // 近义重复检测（同事务内 stamp，边写 updates）
     if near_dup_enabled() {
@@ -564,6 +666,41 @@ pub fn remember_with_dedup(
         explicit_superseded = true;
     }
 
+    // P1-a（WeKnora §3.5 吸收）：NormalizedKey 主题收敛——同 ns 同 key 的旧 tip
+    // 在本事务内自动 supersede，读路径零模型调用。仅显式传 topic_key 时生效；
+    // 与上方 cosine 近重复互补（key 抓「同主题不同值」，向量抓「同句异措辞」）。
+    if let Some(nk) = &topic_key_norm {
+        let tips: Vec<String> = {
+            let mut stmt = tx
+                .prepare(
+                    "SELECT id FROM memories
+                     WHERE namespace = ?1 AND topic_key = ?2 AND superseded_by IS NULL
+                       AND id != ?3",
+                )
+                .map_err(|e| format!("topic tips prepare: {}", e))?;
+            stmt.query_map(rusqlite::params![namespace, nk, mem_id], |r| r.get(0))
+                .map(|rows| rows.flatten().collect())
+                .unwrap_or_default()
+        };
+        for cid in tips {
+            if supersedes_id == Some(cid.as_str()) {
+                continue; // 显式 supersede 已覆盖同一目标，防重复边
+            }
+            apply_supersede_in_tx(
+                &tx,
+                &mem_id,
+                &cid,
+                namespace,
+                &now,
+                "updates",
+                "topic_key_normalized",
+                Some(valid_from_val),
+            )?;
+            superseded_ids.push(cid);
+            topic_superseded = true;
+        }
+    }
+
     tx.commit().map_err(|e| format!("commit: {}", e))?;
 
     // 向量持久化在事务外（非 tip 权威）；失败不回滚记忆写入
@@ -596,6 +733,8 @@ pub fn remember_with_dedup(
         "created".to_string()
     } else if explicit_superseded {
         "superseded_explicit".to_string()
+    } else if topic_superseded {
+        "superseded_topic_key".to_string()
     } else {
         "superseded_near_dup".to_string()
     };
