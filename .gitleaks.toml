@@ -13,8 +13,9 @@ paths = [
   '''.*/test_.*\.rs''',
   '''.*_test\.rs''',
   # 脱敏模块的内联测试：夹具天然是假凭据（redact_sensitive 断言其被遮蔽），
-  # 形如 sk-xxxx 的占位串正是被测对象本身
-  '''.*/src/tools/redact\.rs''',
+  # 形如 sk-xxxx / API_KEY=xxx 的占位串正是被测对象本身。注意正则按仓库相对
+  # 路径无前导斜杠匹配（.*/x 对 src 下的文件不命中——已实测）。
+  '''src/tools/redact\.rs''',
 ]
 regexes = [
   # 单元测试用的 deadbeef 占位 admin key
