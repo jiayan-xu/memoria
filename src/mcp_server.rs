@@ -1999,11 +1999,11 @@ fn dispatch(
                 Err(e) => return format!(r#"{{"error":"pool: {}"}}"#, e),
             };
             // 先验归属 + 存在性（404/403 语义对齐 supersedes_id 的失败模式）
-            let owner: Option<String> = conn
+            let owner: Option<(String, Option<String>)> = conn
                 .query_row(
-                    "SELECT namespace FROM memories WHERE id = ?",
+                    "SELECT namespace, confirm_status FROM memories WHERE id = ?",
                     rusqlite::params![memory_id],
-                    |r| r.get(0),
+                    |r| Ok((r.get(0)?, r.get(1)?)),
                 )
                 .ok();
             match owner {
@@ -2011,21 +2011,36 @@ fn dispatch(
                     r#"{{"status":"error","code":404,"message":"memory not found: {}"}}"#,
                     memory_id
                 ),
-                Some(mem_ns) if mem_ns != ns => format!(
+                Some((mem_ns, cstat)) if mem_ns != ns => format!(
                     r#"{{"status":"error","code":403,"message":"cross-namespace: {} not in {}"}}"#,
                     memory_id, ns
                 ),
-                Some(_) => {
+                Some((_, cstat)) => {
+                    // 2026-10-04 审查修复：状态机守卫——confirm 仅从 pending 出发，
+                    // reject 从 pending/active（含 NULL 视同 active）出发，rejected 为
+                    // 终态。此前无守卫：confirm 可复活 rejected（违背"软删除、召回
+                    // 永不出"承诺）、可确认已 superseded 的记忆造成状态自相矛盾。
+                    let cur = cstat.as_deref().unwrap_or("active");
+                    let allowed = match target_status {
+                        "active" => cur == "pending",
+                        _ => cur == "pending" || cur == "active",
+                    };
+                    if !allowed {
+                        return format!(
+                            r#"{{"status":"error","code":409,"message":"confirm_status transition not allowed: {} -> {} (current='{}')"}}"#,
+                            cur, target_status, cur
+                        );
+                    }
                     match conn.execute(
-                        "UPDATE memories SET confirm_status = ?1 WHERE id = ?2",
-                        rusqlite::params![target_status, memory_id],
+                        "UPDATE memories SET confirm_status = ?1 WHERE id = ?2 AND confirm_status IS ?3",
+                        rusqlite::params![target_status, memory_id, cstat],
                     ) {
                         Ok(n) if n > 0 => format!(
                             r#"{{"status":"ok","memory_id":"{}","confirm_status":"{}"}}"#,
                             memory_id, target_status
                         ),
                         Ok(_) => format!(
-                            r#"{{"status":"error","code":404,"message":"memory not found: {}"}}"#,
+                            r#"{{"status":"error","code":409,"message":"confirm_status changed concurrently for {}"}}"#,
                             memory_id
                         ),
                         Err(e) => format!(r#"{{"status":"error","message":"{}"}}"#, e),
@@ -4291,6 +4306,72 @@ mod tests {
         assert!(out.contains(r#""status":"ok""#), "db_stats 响应: {}", out);
         let out = dispatch(&state, "memory_health", &serde_json::Map::new(), &auth);
         assert!(out.contains(r#""status":"ok""#), "memory_health 响应: {}", out);
+    }
+
+    /// 2026-10-04 审查修复回归：确认状态机守卫——confirm 仅 pending→active；
+    /// reject 可 pending/active→rejected；rejected 为终态，confirm 不得复活（409）。
+    #[test]
+    fn test_confirm_state_machine_guards() {
+        let state = build_test_state();
+        let auth = memoria_core::auth::AuthResult {
+            agent_id: "tester".to_string(),
+            allowed_ns: vec!["agent/test".to_string()],
+            role: "admin".to_string(),
+        };
+        let ns = "agent/test";
+
+        let mut pend_args = serde_json::Map::new();
+        pend_args.insert(
+            "content".into(),
+            serde_json::Value::String("守卫测试待确认观察 PENDING99".into()),
+        );
+        pend_args.insert("namespace".into(), serde_json::Value::String(ns.into()));
+        pend_args.insert("confirm".into(), serde_json::Value::Bool(false));
+        let out = dispatch(&state, "memory_remember", &pend_args, &auth);
+        let v: serde_json::Value = serde_json::from_str(&out).expect("JSON");
+        assert_eq!(v["status"], "remembered", "pending 写入: {out}");
+        let pend_id = v["id"].as_str().unwrap().to_string();
+
+        let mut act_args = serde_json::Map::new();
+        act_args.insert(
+            "content".into(),
+            serde_json::Value::String("守卫测试已确认事实 ACTIVE88".into()),
+        );
+        act_args.insert("namespace".into(), serde_json::Value::String(ns.into()));
+        let out = dispatch(&state, "memory_remember", &act_args, &auth);
+        let v: serde_json::Value = serde_json::from_str(&out).expect("JSON");
+        assert_eq!(v["status"], "remembered", "active 写入: {out}");
+        let act_id = v["id"].as_str().unwrap().to_string();
+
+        let mut call = |tool: &str, id: &str| -> serde_json::Value {
+            let mut m = serde_json::Map::new();
+            m.insert("namespace".into(), serde_json::Value::String(ns.into()));
+            m.insert("memory_id".into(), serde_json::Value::String(id.into()));
+            let out = dispatch(&state, tool, &m, &auth);
+            serde_json::from_str(&out).expect("JSON")
+        };
+
+        // active 记忆再 confirm → 409（confirm 仅从 pending 出发）
+        let v = call("memory_confirm", &act_id);
+        assert_eq!(v["code"], 409, "confirm(active) 应 409: {v}");
+        // pending → confirm → ok
+        let v = call("memory_confirm", &pend_id);
+        assert_eq!(v["status"], "ok", "confirm(pending) 应成功: {v}");
+        // 已 active 再 confirm → 409（幂等区分）
+        let v = call("memory_confirm", &pend_id);
+        assert_eq!(v["code"], 409, "重复 confirm 应 409: {v}");
+        // active → reject → ok
+        let v = call("memory_reject", &act_id);
+        assert_eq!(v["status"], "ok", "reject(active) 应成功: {v}");
+        // rejected → confirm 复活 → 409（终态）
+        let v = call("memory_confirm", &act_id);
+        assert_eq!(v["code"], 409, "rejected 复活应 409: {v}");
+        // rejected → 再 reject → 409
+        let v = call("memory_reject", &act_id);
+        assert_eq!(v["code"], 409, "重复 reject 应 409: {v}");
+        // 不存在 → 404
+        let v = call("memory_confirm", "deadbeef00000000");
+        assert_eq!(v["code"], 404, "不存在应 404: {v}");
     }
 
     #[test]

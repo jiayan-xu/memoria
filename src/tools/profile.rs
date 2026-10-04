@@ -57,6 +57,9 @@ pub fn memory_profile(
     };
 
     // ── static：稳定偏好/身份 ──
+    // 2026-10-04 审查补充：confirm_status 门与召回路径（hybrid keep 逻辑）对齐——
+    // pending/rejected 不得经 profile 进入会话注入（memory_profile/memory_context
+    // 是每轮 prompt 面，泄入即绕过确认状态机）。
     let conn = pool.get().map_err(|e| format!("pool: {}", e))?;
     let static_sql = format!(
         "SELECT id, content, category, importance, tags, created_at FROM memories \
@@ -67,6 +70,7 @@ pub fn memory_profile(
            {tip} \
            AND (valid_from IS NULL OR valid_from <= ?) \
            AND (valid_to IS NULL OR valid_to >= ?) \
+           AND (confirm_status IS NULL OR confirm_status = 'active') \
          ORDER BY (tags LIKE '%\"hard_rule\"%') DESC, importance DESC, created_at DESC \
          LIMIT ?",
         tip = tip_clause
@@ -105,6 +109,7 @@ pub fn memory_profile(
     }
 
     // ── dynamic：近期仍有效的决策/事实/模式（排除 insight）──
+    // 2026-10-04 审查补充：同 static——confirm_status 门（pending/rejected 不入）。
     let dyn_sql = format!(
         "SELECT id, content, category, importance, tags, created_at FROM memories \
          WHERE namespace = ? \
@@ -114,6 +119,7 @@ pub fn memory_profile(
            AND (category IN ('decision','fact','pattern') \
                 OR tags LIKE '%\"decision\"%' OR tags LIKE '%\"fact\"%' OR tags LIKE '%\"pattern\"%') \
            AND NOT (tags LIKE '%\"insight\"%' OR tags LIKE '%\"auto_insight\"%') \
+           AND (confirm_status IS NULL OR confirm_status = 'active') \
          ORDER BY importance DESC, created_at DESC \
          LIMIT ?",
         tip = tip_clause

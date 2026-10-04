@@ -102,22 +102,35 @@ fn topic_bigrams(topic: &str) -> Vec<String> {
 }
 
 /// 两个 topic 标签的 bigram Dice 相似度 ∈ [0,1]。
+/// 交集按**双侧多重集**计（每个 bigram 的重数取两侧出现次数的匹配消耗）——
+/// 2026-10-04 审查修复：原实现 left 按重数累加而 right.contains 是集合判定，
+/// 「aaaa」×「aa」会得 1.5 越界（自反性也随重复 bigram 破坏）。
 pub fn topic_similarity(a: &str, b: &str) -> f64 {
     let left = topic_bigrams(a);
     let right = topic_bigrams(b);
     if left.is_empty() || right.is_empty() {
         return 0.0;
     }
-    let mut shared = 0usize;
+    let mut counts: std::collections::HashMap<&str, i32> = std::collections::HashMap::new();
     for g in &left {
-        if right.contains(g) {
-            shared += 1;
+        *counts.entry(g.as_str()).or_insert(0) += 1;
+    }
+    let mut shared = 0usize;
+    for g in &right {
+        if let Some(c) = counts.get_mut(g.as_str()) {
+            if *c > 0 {
+                shared += 1;
+                *c -= 1;
+            }
         }
     }
     2.0 * shared as f64 / (left.len() + right.len()) as f64
 }
 
 /// 低熵门控：归一后不足 4 字的标签不做模糊匹配（假合并主要来源）。
+/// 决策（2026-10-04 代码审查）：实体合并刻意只用**精确** topic_key 匹配
+/// （`mcp_server.rs` entity_upsert），模糊匹配与低熵门控一并搁置——待真实
+/// 实体语料验证假合并率后再启用；接线时必须先用上述多重集版 Dice。
 pub fn topic_is_specific_enough(topic: &str) -> bool {
     normalize_topic_key(topic).chars().count() >= 4
 }
@@ -167,6 +180,21 @@ mod tests {
         let s2 = topic_similarity("排班管理", "固废清运");
         assert!(s2 < 0.2, "sim={s2}");
         assert_eq!(topic_similarity("", "任意"), 0.0);
+    }
+
+    /// 2026-10-04 审查修复回归：重复 bigram 不得使 Dice 越界或破坏自反性
+    /// （原实现「aaaa」×「aa」=1.5）。
+    #[test]
+    fn dice_bounded_and_reflexive_on_repeated_bigrams() {
+        assert!(topic_similarity("aaaa", "aa") <= 1.0);
+        assert!(topic_similarity("排排排排", "排排") <= 1.0);
+        for x in ["aaaa", "排排排排", "门店排班管理", "aa", "abc"] {
+            let r = topic_similarity(x, x);
+            assert!(
+                (r - 1.0).abs() < 1e-9,
+                "自反性破坏：dice({x},{x})={r}"
+            );
+        }
     }
 
     #[test]
