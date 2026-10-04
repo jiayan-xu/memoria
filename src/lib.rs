@@ -60,6 +60,7 @@ impl MemoriaEngine {
         storage::migrate_temporal(&pool)?;
         storage::migrate_extract_fields(&pool)?;
         storage::migrate_evolution(&pool)?;
+        storage::migrate_phasea_p1(&pool)?;
         storage::migrate_memory_relation_types(&pool)?;
         // P2-2：配额计数表随引擎自洽（与 main.rs 一致，避免 lib/MemoriaEngine 路径缺表）
         quota::init_quota_table(&pool)?;

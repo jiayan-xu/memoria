@@ -74,6 +74,16 @@ pub fn observe(
     let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S").to_string();
 
     let (content, raw_ref) = distill(dialog);
+    // Phase A P0-1（WeKnora 吸收）：观察流写入同过脱敏门（记忆每轮召回重发到模型）。
+    let content = if crate::tools::redact::redact_enabled() {
+        let (redacted, changed) = crate::tools::redact::redact_sensitive(&content);
+        if changed {
+            eprintln!("[observe] sensitive content redacted on write (ns={namespace})");
+        }
+        redacted
+    } else {
+        content
+    };
     conn.execute(
         "INSERT OR IGNORE INTO memories (id, namespace, source, content, category, confidence,
          recall_count, created_at, tier, importance, decay_factor, raw_ref)

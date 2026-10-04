@@ -254,6 +254,7 @@ pub fn init_core_tables(pool: &SqlitePool) -> Result<(), String> {
     migrate_temporal(pool)?;
     migrate_extract_fields(pool)?;
     migrate_evolution(pool)?;
+    migrate_phasea_p1(pool)?;
     migrate_memory_relation_types(pool)?;
     migrate_access_count(pool)?;
     migrate_hype_vectors(pool)?;
@@ -603,6 +604,48 @@ pub fn migrate_evolution(pool: &SqlitePool) -> Result<(), String> {
         )
         .map_err(|e| format!("add evolution_log.namespace: {}", e))?;
     }
+    Ok(())
+}
+
+/// WeKnora 吸收 Phase A P1（2026-10-04）：记忆主题身份 + 确认状态机。
+/// - `topic_key`：NormalizedKey 主题身份（`cn_topic::normalize_memory_key` 产物，
+///   词序无关 token 集合）。**仅当调用方显式传 topic_key 时参与收敛**；同 ns
+///   同 key 的旧 tip 在新记忆写入事务内自动 supersede——「生产库用 MySQL」vs
+///   「生产库已迁到 PostgreSQL」同主题不同值，读路径零模型调用即可收敛（§3.5）。
+///   与 cosine>0.92 近重复互补：key 抓「同题异值」（向量相似度反而低），
+///   向量抓「同句异措辞」（key 抓不到）。
+/// - `confirm_status`：active / pending / rejected。NULL 与 'active' 等价（旧行
+///   兜底）；显式 `confirm=false` 写入为 pending——默认召回不可见，
+///   `memory_confirm` / `memory_reject` 工具切换；rejected 为软删除（数据
+///   保留，召回永不出）。
+/// 幂等：列已存在则跳过。附 (namespace, topic_key) 部分索引加速 supersede 探测。
+pub fn migrate_phasea_p1(pool: &SqlitePool) -> Result<(), String> {
+    let conn = pool.get().map_err(|e| format!("pool get: {}", e))?;
+    for (col, ctype) in [("topic_key", "TEXT"), ("confirm_status", "TEXT")] {
+        let has: i64 = conn
+            .query_row(
+                &format!(
+                    "SELECT COUNT(*) FROM pragma_table_info('memories') WHERE name = '{}'",
+                    col
+                ),
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        if has == 0 {
+            conn.execute_batch(&format!(
+                "ALTER TABLE memories ADD COLUMN {} {};",
+                col, ctype
+            ))
+            .map_err(|e| format!("add memories.{}: {}", col, e))?;
+            println!("[Memoria] Migration: added memories.{} column", col);
+        }
+    }
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_memories_ns_topic
+         ON memories(namespace, topic_key) WHERE topic_key IS NOT NULL;",
+    )
+    .map_err(|e| format!("create idx_memories_ns_topic: {}", e))?;
     Ok(())
 }
 

@@ -171,6 +171,8 @@ fn main() {
     // PR1（Phase B 前置）：memories 增加 actor/memory_type/parent_id/raw_ref 提取元数据列
     storage::migrate_extract_fields(&pool).expect("migration: extract fields");
     storage::migrate_evolution(&pool).expect("migration: evolution");
+    // WeKnora 吸收 P1：topic_key（NormalizedKey 主题收敛）+ confirm_status（确认状态机）
+    storage::migrate_phasea_p1(&pool).expect("migration: phasea p1");
     // P0/P1: memory_relations CHECK 扩展 updates|extends|derives
     storage::migrate_memory_relation_types(&pool).expect("migration: relation types");
     // P2-2: 配额计数表（滥用防护，按 ns 限额）

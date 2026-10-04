@@ -11,5 +11,6 @@ pub const MEMORY_HYPE_VECTORS_TABLE: &str = "memory_hype_vectors";
 pub use sqlite::{
     SqlitePool, create_pool, init_core_tables, init_schema, migrate_dream_state_ns,
     migrate_event_time, migrate_evolution, migrate_extract_fields, migrate_memory_relation_types,
-    migrate_superseded_by, migrate_temporal, migrate_user_prefs_namespace, wal_checkpoint,
+    migrate_phasea_p1, migrate_superseded_by, migrate_temporal, migrate_user_prefs_namespace,
+    wal_checkpoint,
 };

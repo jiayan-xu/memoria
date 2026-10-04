@@ -2,8 +2,8 @@
 # 正确设置 MEMORIA_DB_PATH 等环境变量，避免看护器死后失忆
 # ASCII only (PS5.1 + UTF8-no-BOM trap)
 
-$exe = "C:\Users\user\.qclaw\workspace\memoria-open\target\release\memoria-server.exe"
-$cwd = "C:\Users\user\.qclaw\workspace\memoria-open"
+$exe = "C:\services\memoria-open\target\release\memoria-server.exe"
+$cwd = "C:\services\memoria-open"
 
 # kill existing
 Get-Process -Name memoria-server -ErrorAction SilentlyContinue | Stop-Process -Force
@@ -21,8 +21,9 @@ if (Test-Path $envFile) {
     }
 }
 
-# always set the correct DB path
-$env:MEMORIA_DB_PATH = "C:\Users\user\.qclaw\workspace\memoria\data\memoria.db"
+# always set the correct DB path (2026-10-04: 与托盘看门狗 start_both_tray.ps1 的
+# Start-Svc("mem") 对齐——服务实际运行于 C:\services\memoria-open，DB 在 C:\services\memoria\data)
+$env:MEMORIA_DB_PATH = "C:\services\memoria\data\memoria.db"
 
 Start-Process -FilePath $exe -WorkingDirectory $cwd -WindowStyle Hidden
 
