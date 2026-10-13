@@ -15,6 +15,7 @@ use memoria_core::auth::{self, AuthResult};
 use memoria_core::search;
 use memoria_core::storage;
 use memoria_core::tools;
+use memoria_core::vector::embedding::{block_on_embed, embed_query};
 
 /// 不认识的 MCP 工具调用转发到 A2A Bridge
 const BRIDGE_TOOLS: &[&str] = &[
@@ -85,15 +86,6 @@ pub fn spawn_audit_worker(
     });
 }
 
-/// P3-0: 查询时生成 query embedding —— 修复「HNSW 语义搜索从未生效」的根因。
-///
-/// 独立 MCP 服务（memoria-server）在查询时调用本地嵌入服务（默认 127.0.0.1:8777/embed）
-/// 将 query 文本转为向量，写入 QueryCache 后 `semantic_search` 即可参与融合排序。
-///
-/// 任何错误（未配置 / 服务不可用 / 超时 / 解析失败）均返回 `None` —— 优雅降级，
-/// 不影响既有 FTS5 + temporal + importance + category 信号。绝不抛错、绝不阻塞主链路。
-/// 云端嵌入服务（SiliconFlow）存在偶发超时/限流，故加 3 次重试 + 指数退避 + 更长超时，
-/// 避免单发失败导致语义通道整条查询恒空（本机 text2vec 不会触发，但云端会）。
 /// P1-HyDE：是否对查询启用假设文档嵌入（env MEMORIA_HYDE）。
 /// 默认关闭；开启后 embed_query 会让 embed_server 先把查询改写成假设答案文档再嵌入，
 /// 缩小「问句 vs 知识库文档」的措辞 gap（仅对查询侧生效，写入侧恒为 false）。
@@ -105,78 +97,6 @@ fn hyde_enabled() -> bool {
         }
         Err(_) => false,
     }
-}
-
-async fn embed_query(
-    client: &reqwest::Client,
-    url: &str,
-    query: &str,
-    hyde: bool,
-) -> Option<Vec<f32>> {
-    let body = if hyde {
-        serde_json::json!({ "texts": [query], "hyde": true })
-    } else {
-        serde_json::json!({ "texts": [query] })
-    };
-    let mut last_err: Option<String> = None;
-    for attempt in 0..3 {
-        if attempt > 0 {
-            tokio::time::sleep(std::time::Duration::from_millis(200 * (1 << (attempt - 1)))).await;
-        }
-        let resp = match client
-            .post(url)
-            .timeout(std::time::Duration::from_secs(60))
-            .json(&body)
-            .send()
-            .await
-        {
-            Ok(r) => r,
-            Err(e) => {
-                last_err = Some(format!("send#{attempt}: {e}"));
-                continue;
-            }
-        };
-        if !resp.status().is_success() {
-            last_err = Some(format!("http{}", resp.status().as_u16()));
-            continue;
-        }
-        match resp.json::<serde_json::Value>().await {
-            Ok(v) => {
-                let arr = match v.get("embeddings").and_then(|a| a.as_array()) {
-                    Some(a) => a,
-                    None => {
-                        last_err = Some("no embeddings field".into());
-                        continue;
-                    }
-                };
-                let first = match arr.first().and_then(|f| f.as_array()) {
-                    Some(f) => f,
-                    None => {
-                        last_err = Some("embeddings[0] not array".into());
-                        continue;
-                    }
-                };
-                let vec: Vec<f32> = first
-                    .iter()
-                    .filter_map(|x| x.as_f64().map(|f| f as f32))
-                    .collect();
-                if vec.is_empty() {
-                    last_err = Some("empty vec".into());
-                    continue;
-                }
-                return Some(vec);
-            }
-            Err(e) => {
-                last_err = Some(format!("json#{attempt}: {e}"));
-                continue;
-            }
-        }
-    }
-    eprintln!(
-        "[embed_query] FAILED after retries for q={:?}: {:?}",
-        query, last_err
-    );
-    None
 }
 
 /// P0-stage2：是否启用 cross-encoder 重排（env MEMORIA_RERANK_ENABLED）。
@@ -2060,12 +1980,23 @@ fn dispatch(
             if text.trim().is_empty() {
                 return r#"{"status":"error","code":400,"message":"text required"}"#.to_string();
             }
+            // P0-1（2026-10-13）：文档 ingestion 事后嵌。dispatch 是同步函数
+            // （spawn_blocking 上下文），用 block_on_embed 阻塞包装调嵌入服务；
+            // 每次 ingest 只建一次运行时，块级嵌在闭包内复用。未配置 embed
+            // （embedding_url 空）= 降级不嵌，记忆照常写入（fail-open）。
+            let emb_url = state.embedding_url.clone();
+            let emb_client = state.http_client.clone();
+            let embed_fn = move |s: &str| -> Option<Vec<f32>> {
+                block_on_embed(&emb_client, &emb_url, s)
+            };
             match memoria_core::document::ingest_plain_text(
                 &state.pool,
                 ns,
                 filename,
                 text,
                 &_auth.agent_id,
+                Some(&embed_fn),
+                Some(&state.hnsw),
             ) {
                 Ok(out) => serde_json::to_string(&serde_json::json!({
                     "status": "ok",
