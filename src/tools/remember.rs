@@ -198,7 +198,10 @@ pub fn set_event_time(pool: &SqlitePool, memory_id: &str, event_time: &str) -> R
 /// 存在为准**，put 成功即建边，add 失败由重启 rebuild 对齐；此前注释残留
 /// "返回 ()"与 "返回 put+add 是否都成功" 均不准确）。created 路径用返回值
 /// 跳过 edge_refresh 的冗余存在性探测（刚 put 过必存在，见 #R69 perf/medium）。
-fn persist_and_index(
+/// P0-1（2026-10-13）：`pub(crate)` —— 文档 ingestion（document.rs）事后嵌复用
+/// 本 helper（manifest + 每块 remember 返回 id 后嵌 body → put + add），
+/// 与 MCP 写入侧共享同一失败语义（put 失败短路 add、失败可见）。
+pub(crate) fn persist_and_index(
     pool: &SqlitePool,
     hnsw: &HnswIndex,
     id: &str,

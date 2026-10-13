@@ -7,6 +7,7 @@
 
 use crate::storage::SqlitePool;
 use crate::tools::remember::{self, RememberResult};
+use crate::vector::HnswIndex;
 use sha2::{Digest, Sha256};
 use std::borrow::Cow;
 use std::fs;
@@ -17,6 +18,21 @@ use std::path::{Path, PathBuf};
 pub const MAX_DOC_BYTES: u64 = 20 * 1024 * 1024; // 20 MiB
 pub const CHUNK_CHARS: usize = 3500;
 pub const DEFAULT_DEPT_NS: &str = "org/cs-pufa-2nd-thermal/dept/gufei";
+
+/// 嵌入回调：文本 → 向量（None = 降级不嵌）。
+///
+/// P0-1（2026-10-13）：文档 ingestion 的向量注入口。此前 ingest 路径调
+/// `remember_with_dedup` 时 hnsw/query_cache 恒传 None → candidate_vector
+/// 结构上恒空 → 文档记忆（清单 + 全部块）永不落 memory_vectors、不进 HNSW，
+/// 语义召回完全不可见（仅 FTS 可捞）。生产库实测 995 条无向量记忆中 602 条
+/// 即此路径产物（2026-09/10 的 [文档]/[文档块]）。
+///
+/// 调用方在**同步阻塞上下文**内提供（MCP dispatch 的 spawn_blocking /
+/// web_api 上传的 spawn_blocking），典型实现用临时 current-thread 运行时
+/// block_on 异步嵌入请求（见 `mcp_server::block_on_embed`，与 block_on_rerank
+/// 同款范式）。回调返回 None（未配置 embed 服务 / 请求失败）= fail-open 降级：
+/// 记忆照常写入可用 FTS 召回，向量留待补嵌脚本（rebuild_vectors.py 扩展版）。
+pub type EmbedFn<'a> = &'a dyn Fn(&str) -> Option<Vec<f32>>;
 
 #[derive(Debug, Clone)]
 pub struct IngestOutcome {
@@ -428,6 +444,10 @@ fn content_hash16(bytes: &[u8]) -> String {
 }
 
 /// 保存二进制 + 写入清单记忆与分块记忆。
+///
+/// P0-1（2026-10-13）：`embed`/`hnsw` 为 None 时退化为历史行为（不嵌向量，
+/// 仅 FTS 可召回）；两者齐备时清单行与每个分块在 remember 返回 id 后
+/// 事后嵌（见 `EmbedFn` 文档）。
 pub fn ingest_bytes(
     pool: &SqlitePool,
     doc_root: &Path,
@@ -436,6 +456,8 @@ pub fn ingest_bytes(
     kind: &str,
     bytes: &[u8],
     actor: &str,
+    embed: Option<EmbedFn<'_>>,
+    hnsw: Option<&HnswIndex>,
 ) -> Result<IngestOutcome, String> {
     if bytes.len() as u64 > MAX_DOC_BYTES {
         return Err(format!(
@@ -487,6 +509,14 @@ pub fn ingest_bytes(
     )
     .map_err(|e| format!("manifest remember: {e}"))?;
 
+    // P0-1（2026-10-13）：清单行事后嵌——embed/hnsw 缺失或失败 = fail-open 降级
+    // （记忆仍写入、无向量），与 remember_with_dedup 创建路径同款失败语义。
+    if let (Some(embed), Some(h)) = (embed, hnsw) {
+        if let Some(v) = embed(&manifest) {
+            remember::persist_and_index(pool, h, &man.id, namespace, &v);
+        }
+    }
+
     let chunk_ids = write_chunk_memories(
         pool,
         &man.id,
@@ -497,6 +527,8 @@ pub fn ingest_bytes(
         actor,
         namespace,
         &raw_ref,
+        embed,
+        hnsw,
     )?;
 
     Ok(IngestOutcome {
@@ -513,12 +545,16 @@ pub fn ingest_bytes(
 }
 
 /// 已抽好文本时入库（MCP / 外部解析器）。仍要求提供旁路文件名；无二进制则 raw_ref=text-only:…
+///
+/// P0-1（2026-10-13）：`embed`/`hnsw` 语义同 `ingest_bytes`。
 pub fn ingest_plain_text(
     pool: &SqlitePool,
     namespace: &str,
     filename: &str,
     text: &str,
     actor: &str,
+    embed: Option<EmbedFn<'_>>,
+    hnsw: Option<&HnswIndex>,
 ) -> Result<IngestOutcome, String> {
     let meaningful = text.chars().filter(|c| !c.is_whitespace()).count();
     if meaningful < 10 {
@@ -557,6 +593,13 @@ pub fn ingest_plain_text(
     )
     .map_err(|e| format!("manifest remember: {e}"))?;
 
+    // P0-1（2026-10-13）：清单行事后嵌（同 ingest_bytes，fail-open 降级）。
+    if let (Some(embed), Some(h)) = (embed, hnsw) {
+        if let Some(v) = embed(&manifest) {
+            remember::persist_and_index(pool, h, &man.id, namespace, &v);
+        }
+    }
+
     let chunk_ids = write_chunk_memories(
         pool,
         &man.id,
@@ -567,6 +610,8 @@ pub fn ingest_plain_text(
         actor,
         namespace,
         &raw_ref,
+        embed,
+        hnsw,
     )?;
 
     Ok(IngestOutcome {
@@ -583,6 +628,9 @@ pub fn ingest_plain_text(
 }
 
 /// 分块写入：`[文档块 i/N] 文件名 · 标题路径` 面包屑 + 正文。
+///
+/// P0-1（2026-10-13）：`embed`/`hnsw` 齐备时每块 remember 返回 id 后事后嵌
+/// （body 文本 → 向量 → put_stored_vector + hnsw.add）；缺失 = 历史行为。
 fn write_chunk_memories(
     pool: &SqlitePool,
     manifest_id: &str,
@@ -593,6 +641,8 @@ fn write_chunk_memories(
     actor: &str,
     namespace: &str,
     raw_ref: &str,
+    embed: Option<EmbedFn<'_>>,
+    hnsw: Option<&HnswIndex>,
 ) -> Result<Vec<String>, String> {
     let mut chunk_ids = Vec::new();
     let total = chunks.len();
@@ -620,7 +670,14 @@ fn write_chunk_memories(
             Some(raw_ref),
         )
         .map_err(|e| format!("chunk {} remember: {e}", i + 1))?;
-        chunk_ids.push(r.id);
+        chunk_ids.push(r.id.clone());
+        // P0-1（2026-10-13）：分块事后嵌——每块独立嵌（块才是语义召回的主体），
+        // 单块失败不影响其它块与记忆写入（fail-open）。
+        if let (Some(embed), Some(h)) = (embed, hnsw) {
+            if let Some(v) = embed(&body) {
+                remember::persist_and_index(pool, h, &r.id, namespace, &v);
+            }
+        }
     }
     Ok(chunk_ids)
 }
@@ -713,5 +770,103 @@ mod tests {
                 }
             }
         }
+    }
+
+    // ── P0-1（2026-10-13）：ingestion 事后嵌回归 ──
+    // 背景：ingest 路径曾恒传 hnsw/query_cache=None → 文档记忆永不进 HNSW，
+    // 生产库 995 条无向量记忆中 602 条是此路径产物。以下两测锁死修复契约。
+
+    fn test_engine(tag: &str) -> (crate::MemoriaEngine, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("memoria_doc_emb_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("mem.db");
+        let engine = crate::MemoriaEngine::new(db.to_str().unwrap()).expect("engine");
+        (engine, dir)
+    }
+
+    /// 确定性假嵌入：非零、依文本长度微变（模拟"不同块不同向量"）。
+    fn fake_embed(s: &str) -> Option<Vec<f32>> {
+        let mut v = vec![0.0f32; crate::vector::DIM];
+        v[0] = 1.0;
+        v[1] = (s.len() % 11) as f32 * 0.01;
+        Some(v)
+    }
+
+    #[test]
+    fn ingest_persists_vectors_when_embed_provided() {
+        let (engine, _dir) = test_engine("ok");
+        let out = ingest_plain_text(
+            &engine.pool,
+            "agent/doctest",
+            "t.md",
+            "# 标题一\n\n正文内容足够长度通过最小校验。\n\n## 标题二\n\n更多正文内容。",
+            "test",
+            Some(&fake_embed),
+            Some(&engine.hnsw),
+        )
+        .expect("ingest");
+
+        let expected = 1 + out.chunk_count; // manifest + 每块
+        let conn = engine.pool.get().unwrap();
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM memory_vectors", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, expected as i64, "manifest + 每块都应落 memory_vectors");
+        assert_eq!(engine.hnsw.len(), expected, "HNSW 应含全部向量");
+        // 幂等：manifest id 有持久向量
+        assert!(
+            crate::vector::persist::get_stored_vector(&engine.pool, &out.manifest_id).is_some(),
+            "manifest 向量必须可查"
+        );
+    }
+
+    #[test]
+    fn ingest_degrades_without_embed() {
+        // fail-open：embed/hnsw 缺失 → 记忆照常写入、无向量（历史行为保持）
+        let (engine, _dir) = test_engine("degrade");
+        let out = ingest_plain_text(
+            &engine.pool,
+            "agent/doctest",
+            "t.md",
+            "# 标题一\n\n正文内容足够长度通过最小校验。\n\n## 标题二\n\n更多正文内容。",
+            "test",
+            None,
+            None,
+        )
+        .expect("ingest 不应因缺 embed 而失败");
+
+        let conn = engine.pool.get().unwrap();
+        let nv: i64 = conn
+            .query_row("SELECT COUNT(*) FROM memory_vectors", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(nv, 0, "无 embed 时不应有向量");
+        let nm: i64 = conn
+            .query_row("SELECT COUNT(*) FROM memories", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(nm, (1 + out.chunk_count) as i64, "记忆必须全部写入");
+    }
+
+    #[test]
+    fn ingest_embed_fn_none_also_degrades() {
+        // 回调返回 None（嵌入服务故障）= 单条降级，不阻断 ingestion
+        let (engine, _dir) = test_engine("none");
+        let broken = |_s: &str| -> Option<Vec<f32>> { None };
+        let out = ingest_plain_text(
+            &engine.pool,
+            "agent/doctest",
+            "t.md",
+            "# 标题一\n\n正文内容足够长度通过最小校验。\n\n## 标题二\n\n更多正文内容。",
+            "test",
+            Some(&broken),
+            Some(&engine.hnsw),
+        )
+        .expect("ingest 不应因 embed 失败而失败");
+        let conn = engine.pool.get().unwrap();
+        let nv: i64 = conn
+            .query_row("SELECT COUNT(*) FROM memory_vectors", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(nv, 0);
+        assert_eq!(out.chunk_count, 2, "分块数不受 embed 影响");
     }
 }

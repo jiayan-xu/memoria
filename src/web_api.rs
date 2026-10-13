@@ -19,6 +19,7 @@ use std::sync::Arc;
 use crate::auth::{self, AuthResult};
 use crate::document::{self, DEFAULT_DEPT_NS};
 use crate::storage::SqlitePool;
+use crate::vector::HnswIndex;
 
 /// App state shared across web API handlers
 pub struct WebApiState {
@@ -26,6 +27,12 @@ pub struct WebApiState {
     pub auth_pool: SqlitePool,
     /// 文档二进制根目录（通常为 data/，其下 documents/…）
     pub doc_dir: PathBuf,
+    /// P0-1（2026-10-13）：语义索引 + 嵌入通道——上传文档事后嵌用
+    /// （与 MCP dispatch 的 AppState 同源 clone）。缺了它们，Web UI 上传的
+    /// 文档结构上永远不进 HNSW（602 条历史缺口的来源之一）。
+    pub hnsw: Arc<HnswIndex>,
+    pub embedding_url: String,
+    pub http_client: reqwest::Client,
 }
 
 fn json_err(status: StatusCode, detail: impl Into<String>) -> Response {
@@ -215,9 +222,28 @@ async fn api_upload_document(
     let ns = namespace.clone();
     let fname = filename.clone();
     let kind_owned = kind.to_string();
+    // P0-1（2026-10-13）：语义索引 + 嵌入通道随闭包进 spawn_blocking——
+    // ingest_bytes 在同步上下文内对 manifest + 每块做事后嵌（block_on_embed
+    // 阻塞包装，同 MCP dispatch）。embedding_url 空 = 降级不嵌（fail-open）。
+    let hnsw = state.hnsw.clone();
+    let emb_url = state.embedding_url.clone();
+    let emb_client = state.http_client.clone();
 
     let result = tokio::task::spawn_blocking(move || {
-        document::ingest_bytes(&pool, &doc_dir, &ns, &fname, &kind_owned, &bytes, &actor)
+        let embed_fn = move |s: &str| -> Option<Vec<f32>> {
+            crate::vector::embedding::block_on_embed(&emb_client, &emb_url, s)
+        };
+        document::ingest_bytes(
+            &pool,
+            &doc_dir,
+            &ns,
+            &fname,
+            &kind_owned,
+            &bytes,
+            &actor,
+            Some(&embed_fn),
+            Some(&hnsw),
+        )
     })
     .await;
 

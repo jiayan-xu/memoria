@@ -1,5 +1,37 @@
 # 演进日志 / CHANGELOG
 
+## 2026-10-13 — 文档 ingestion 事后嵌（P0-1）
+
+### 背景：检索故障双线诊断的写侧缺口
+10-13 检索空结果事故（ZCODE 闭环：提权 rogue 实例）之外，并行诊断发现**写侧向量缺口**：生产库 9749 条记忆中 995 条（10.2%）无向量、语义召回完全不可见（仅 FTS 可捞），其中 602 条为文档 ingestion 产物（2026-09/10 的 `[文档]/[文档块]`，集中于 hot tier document）——ingest 路径调 `remember_with_dedup` 时 hnsw/query_cache 恒传 None，candidate_vector 结构上恒空。
+
+### 改动
+- **`document.rs` 事后嵌**：`ingest_bytes` / `ingest_plain_text` / `write_chunk_memories` 新增 `embed: Option<EmbedFn>` + `hnsw: Option<&HnswIndex>` 参数；manifest 与每个分块在 remember 返回 id 后嵌 body 文本 → `persist_and_index`（put_stored_vector + hnsw.add，与 MCP 写入侧共享 helper）。fail-open：回调缺失/返回 None（嵌入服务故障）= 降级不嵌，记忆照常写入可 FTS 召回，向量留待补嵌脚本。
+- **嵌入桥下沉 lib**：`embed_query` / `block_on_embed` 从 mcp_server（bin 专享）迁至 `vector/embedding.rs`——web_api（lib）与 mcp_server（bin）共用同一 HTTP 嵌入桥，杜绝双路径复制漂移。`block_on_embed` 用临时 current-thread 运行时 block_on（dispatch/web 均在 spawn_blocking 同步上下文，与 block_on_rerank 同款范式）。
+- **Web UI 上传路径打通**：`WebApiState` 增加 hnsw / embedding_url / http_client（main.rs 与 AppState 同源 clone）——此前上传的文档结构上永远不进 HNSW。
+- **回归测试**：`ingest_persists_vectors_when_embed_provided`（manifest+每块落 memory_vectors + HNSW）、`ingest_degrades_without_embed`（fail-open 记忆照常）、`ingest_embed_fn_none_also_degrades`（单条故障不阻断）。
+- **ops**：restart.ps1 显式注入 `MEMORIA_EMBEDDING_URL=8778`（exe 默认 8777 死端口，10-02 同款坑）+ `MEMORIA_RERANK_ENABLED=0`（10-13 事故处置，ZCODE）。
+
+### 补嵌脚本（本 PR 提供，为独立运维动作）
+- **`scripts/backfill_missing_vectors.py`**：清存量——跨全部 ns 的缺失向量记忆补嵌（含文档块），
+  与 `rebuild_vectors.py`（指定 ns 活跃记忆全量重嵌，修污染向量）分工明确。沿用退化拒收整批
+  重试 + 维度校验 + 抽样一致性安全闸 + 单事务写回。嵌全文不截断（与 P0-1 后写入侧一致，
+  避免向量空间分裂）。跑完需重启服务让新向量进内存 HNSW。
+
+### 线上执行结果（2026-10-13）
+- 补嵌 1001 条，安全闸 20/20 一致性 >=0.9 通过，覆盖率 9766/9767 = **100.0%**
+  （余 1 条为空内容记忆 `e3b0c442…`，脚本按 `length(content)>0` 正确排除）。
+- 语义召回实证：改写问句「迁移到新机器后怎么保证监控还能正常告警？」命中 5 条，
+  全部为此前无向量的文档块（2026-10-13_运维及迁移可靠性方案_v1.md 的分块）。
+- 根因 B 复核：正本实例普通 `memory_remember` 写入记忆同时落向量 → 10-09~10-11 那批
+  352 条缺失确系 rogue 实例嵌入通道环境问题，非写入路径缺陷。
+
+### 待办（未含本 PR）
+- **写侧覆盖金丝雀**：`memories` vs `memory_vectors` 缺口率 >2% 持续 1h 报警。现 recall_guard
+  关键词查询打 FTS，对语义退化全盲——本次故障 10-09 间歇出现、10-13 才确诊，正是缺该探针。
+
+---
+
 ## 2026-09-11 — v0.4.0
 
 ### 回填 0.3.0 之后未记账的功能（2026-08-17 ~ 08-29）
