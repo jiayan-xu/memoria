@@ -136,6 +136,24 @@ def reset_cold(db):
     return False
 
 
+def _results_of(inner):
+    """双 schema 兼容解析 results（2026-10-13，与 scripts/retrieval_canary.py 同款）。
+
+    历史：`results` 曾挂在 `recall` 子对象下，后挪到顶层。单 schema 解析在跨构建
+    调用时会把「服务器正常返回（fused=5）」误读成「全空」，把诊断方向带偏成
+    「环境毒化 / 索引损坏」——2026-10-13 事故复盘时真实发生过（连发 12 次全绿
+    + raw 复核才戳穿）。两级都试，缺失即 []。
+    """
+    if not isinstance(inner, dict):
+        return []
+    r = inner.get("results")
+    if r is None:
+        rec = inner.get("recall")
+        if isinstance(rec, dict):
+            r = rec.get("results")
+    return r if isinstance(r, list) else []
+
+
 def recall_topk(query, admin_key, k=K):
     payload = {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
                "params": {"name": "memory_recall",
@@ -146,8 +164,10 @@ def recall_topk(query, admin_key, k=K):
                                           "X-Agent-Id": "admin",
                                           "X-Agent-Key": admin_key}, method="POST")
     d = json.loads(urllib.request.urlopen(req, timeout=90).read())
-    txt = d["result"]["content"][0]["text"]
-    return json.loads(txt).get("results", [])
+    txt = "".join(c.get("text", "")
+                  for c in (d.get("result") or {}).get("content", []))
+    inner = json.loads(txt) if txt.strip().startswith(("{", "[")) else {}
+    return _results_of(inner)
 
 
 def extract_keywords(content, tags):
