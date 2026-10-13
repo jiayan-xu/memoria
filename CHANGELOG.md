@@ -12,9 +12,23 @@
 - **回归测试**：`ingest_persists_vectors_when_embed_provided`（manifest+每块落 memory_vectors + HNSW）、`ingest_degrades_without_embed`（fail-open 记忆照常）、`ingest_embed_fn_none_also_degrades`（单条故障不阻断）。
 - **ops**：restart.ps1 显式注入 `MEMORIA_EMBEDDING_URL=8778`（exe 默认 8777 死端口，10-02 同款坑）+ `MEMORIA_RERANK_ENABLED=0`（10-13 事故处置，ZCODE）。
 
-### 后续（未含本 PR）
-- 存量 995 条补嵌（rebuild_vectors.py 扩展全 ns/tier + 文档块）。
-- 写侧覆盖金丝雀（memories vs memory_vectors 缺口率 >2% 持续 1h 报警）——现 recall_guard 关键词查询打 FTS，对语义退化全盲。
+### 补嵌脚本（本 PR 提供，为独立运维动作）
+- **`scripts/backfill_missing_vectors.py`**：清存量——跨全部 ns 的缺失向量记忆补嵌（含文档块），
+  与 `rebuild_vectors.py`（指定 ns 活跃记忆全量重嵌，修污染向量）分工明确。沿用退化拒收整批
+  重试 + 维度校验 + 抽样一致性安全闸 + 单事务写回。嵌全文不截断（与 P0-1 后写入侧一致，
+  避免向量空间分裂）。跑完需重启服务让新向量进内存 HNSW。
+
+### 线上执行结果（2026-10-13）
+- 补嵌 1001 条，安全闸 20/20 一致性 >=0.9 通过，覆盖率 9766/9767 = **100.0%**
+  （余 1 条为空内容记忆 `e3b0c442…`，脚本按 `length(content)>0` 正确排除）。
+- 语义召回实证：改写问句「迁移到新机器后怎么保证监控还能正常告警？」命中 5 条，
+  全部为此前无向量的文档块（2026-10-13_运维及迁移可靠性方案_v1.md 的分块）。
+- 根因 B 复核：正本实例普通 `memory_remember` 写入记忆同时落向量 → 10-09~10-11 那批
+  352 条缺失确系 rogue 实例嵌入通道环境问题，非写入路径缺陷。
+
+### 待办（未含本 PR）
+- **写侧覆盖金丝雀**：`memories` vs `memory_vectors` 缺口率 >2% 持续 1h 报警。现 recall_guard
+  关键词查询打 FTS，对语义退化全盲——本次故障 10-09 间歇出现、10-13 才确诊，正是缺该探针。
 
 ---
 
