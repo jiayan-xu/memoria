@@ -25,6 +25,11 @@ if (Test-Path $envFile) {
 # Start-Svc("mem") 对齐——服务实际运行于 C:\services\memoria-open，DB 在 C:\services\memoria\data)
 $env:MEMORIA_DB_PATH = "C:\services\memoria\data\memoria.db"
 
+# 2026-10-13: embed 端口 8778 必须显式注入（exe 默认 8777 是死端口，10-02 事故同款坑）；
+# rerank 显式关闭（10-02 实测裁决；默认虽 off，但实验启动器 start_memoria_* 会开它）
+$env:MEMORIA_EMBEDDING_URL = "http://127.0.0.1:8778/embed"
+$env:MEMORIA_RERANK_ENABLED = "0"
+
 Start-Process -FilePath $exe -WorkingDirectory $cwd -WindowStyle Hidden
 
 # wait for health

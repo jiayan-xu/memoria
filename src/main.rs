@@ -329,6 +329,10 @@ fn main() {
             pool: state.pool.clone(),
             auth_pool: state.auth_pool.clone(),
             doc_dir,
+            // P0-1（2026-10-13）：与 AppState 同源——上传文档事后嵌的语义索引 + 嵌入通道
+            hnsw: state.hnsw.clone(),
+            embedding_url: state.embedding_url.clone(),
+            http_client: state.http_client.clone(),
         });
         app = app.merge(web_api::build_web_api_routes(ws));
     }
