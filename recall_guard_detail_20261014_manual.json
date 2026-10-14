@@ -1,0 +1,482 @@
+[
+  {
+    "id": "3a240261dd483cb3",
+    "kw_query": "signal:num:1.0 signal:num:16 signal:num:2026 signal:num:08 signal:num:26 signal:num:90 signal:date:2026-08-26 signal:update:升级",
+    "full_rank": 1,
+    "kw_rank": null
+  },
+  {
+    "id": "e20da3e18d865e43",
+    "kw_query": "我看到 `\"GET /api/unload HTTP/1.1\" 404 Not ",
+    "full_rank": 1,
+    "kw_rank": 1
+  },
+  {
+    "id": "0962963109babc71",
+    "kw_query": "用户：你好么 助手：用户再次重复了同样的问候\"你好么\"，这已经是第四次了。之前我",
+    "full_rank": 1,
+    "kw_rank": 6
+  },
+  {
+    "id": "b5f890792f4834c3",
+    "kw_query": "There's msg#47607 showing a 200 response",
+    "full_rank": 1,
+    "kw_rank": 1
+  },
+  {
+    "id": "af8739fff317e19d",
+    "kw_query": "The file already has extensive content f",
+    "full_rank": 1,
+    "kw_rank": 2
+  },
+  {
+    "id": "285d2c0e6a967fe8",
+    "kw_query": "用户抱歉，让我看看。root原因是那个杀不掉的旧进程（PID 28920）还在跑",
+    "full_rank": 1,
+    "kw_rank": 1
+  },
+  {
+    "id": "bfa5a9cc1f271895",
+    "kw_query": "signal:num:2026 signal:num:09 signal:num:12 signal:num:06 signal:num:15 signal:num:02 signal:num:19 signal:num:7",
+    "full_rank": 1,
+    "kw_rank": null
+  },
+  {
+    "id": "060d0a903af9e880",
+    "kw_query": "[media attached: C:\\Users\\user\\.qclaw\\me",
+    "full_rank": 1,
+    "kw_rank": 1
+  },
+  {
+    "id": "a464ad3686b0bf25",
+    "kw_query": "刚才是直接从命令行跑的，把新进程的缓存清了，所以这次补拉成功了。 但Web界面里",
+    "full_rank": 1,
+    "kw_rank": 1
+  },
+  {
+    "id": "06b3a9bcbf537b57",
+    "kw_query": "所有必要的函数都存在。现在我来检查 `manifest.html`，以确保 AP",
+    "full_rank": 1,
+    "kw_rank": 1
+  },
+  {
+    "id": "077c930907975a5e",
+    "kw_query": "[media attached: C:\\Users\\user\\.qclaw\\me",
+    "full_rank": 1,
+    "kw_rank": null
+  },
+  {
+    "id": "409aa515d53086df",
+    "kw_query": "document text dept-share chunk file:oncall-2026-10-12-0929.md signal:num:1 signal:num:5 signal:num:2026",
+    "full_rank": 1,
+    "kw_rank": null
+  },
+  {
+    "id": "1c0ea795ed2b506e",
+    "kw_query": "pattern auto_consolidated signal:num:5 signal:num:15",
+    "full_rank": 1,
+    "kw_rank": null
+  },
+  {
+    "id": "85d1a52ad27b6303",
+    "kw_query": "DB **738 车**，指标 **748 车**，差 10 车。指标（748）",
+    "full_rank": 1,
+    "kw_rank": 2
+  },
+  {
+    "id": "6e254e4620a02722",
+    "kw_query": "pattern auto_consolidated signal:update:调整",
+    "full_rank": 1,
+    "kw_rank": null
+  },
+  {
+    "id": "9cf828699982ef00",
+    "kw_query": "现在清楚了。当前的流程是： ``` 用户 → bot → /api/agent/",
+    "full_rank": 1,
+    "kw_rank": 2
+  },
+  {
+    "id": "fde77c7cce42f346",
+    "kw_query": "signal:num:2026 signal:num:10 signal:num:01 signal:num:14 signal:num:15 signal:num:19 signal:num:12 signal:num:6",
+    "full_rank": 1,
+    "kw_rank": null
+  },
+  {
+    "id": "9a492efd71d95bed",
+    "kw_query": "问题找到了！Dashboard 把 `/models/...` 路由返回了 HT",
+    "full_rank": 1,
+    "kw_rank": 1
+  },
+  {
+    "id": "912525c2f37edb8e",
+    "kw_query": "signal:num:2026 signal:num:10 signal:num:13 signal:num:16 signal:num:45 signal:num:02 signal:num:19 signal:num:11",
+    "full_rank": 1,
+    "kw_rank": null
+  },
+  {
+    "id": "83c7473927839415",
+    "kw_query": "[media attached: C:\\Users\\user\\.qclaw\\me",
+    "full_rank": 1,
+    "kw_rank": null
+  },
+  {
+    "id": "b04c587475427d27",
+    "kw_query": "已为您打开台账目录，直接查看 `固废入厂取样抽查记录台账.xlsx` 的 **2",
+    "full_rank": 1,
+    "kw_rank": 1
+  },
+  {
+    "id": "edf78574c8566c85",
+    "kw_query": "signal:num:2026 signal:num:09 signal:num:16 signal:num:10 signal:num:15 signal:num:02 signal:num:19 signal:num:13",
+    "full_rank": 1,
+    "kw_rank": null
+  },
+  {
+    "id": "2c62ef192be802bc",
+    "kw_query": "用户：{\"type\":\"tool-result\",\"toolCallId\":\"c",
+    "full_rank": 1,
+    "kw_rank": null
+  },
+  {
+    "id": "28667a5ad584e2e8",
+    "kw_query": "[cron:42550521-b62f-48aa-b04e-3ee94deace",
+    "full_rank": 1,
+    "kw_rank": 4
+  },
+  {
+    "id": "e9f2a7688761c7aa",
+    "kw_query": "日志看起来是正常的，流程在走： ``` 12:58:21 → Agent 开始处",
+    "full_rank": 1,
+    "kw_rank": 1
+  },
+  {
+    "id": "6d9f49f59c0a6277",
+    "kw_query": "不是。你系统的 sub-agent 通信走的是 **Hermes/OpenCla",
+    "full_rank": 1,
+    "kw_rank": 1
+  },
+  {
+    "id": "f18662334319c1a9",
+    "kw_query": "Write a dream diary entry from these mem",
+    "full_rank": null,
+    "kw_rank": null
+  },
+  {
+    "id": "7078bde9fd5577d3",
+    "kw_query": "signal:num:2026 signal:num:10 signal:num:11 signal:num:22 signal:num:15 signal:num:02 signal:num:19 signal:num:7",
+    "full_rank": 1,
+    "kw_rank": null
+  },
+  {
+    "id": "e1f32e0eb68a48c0",
+    "kw_query": "pattern auto_consolidated",
+    "full_rank": 1,
+    "kw_rank": null
+  },
+  {
+    "id": "419dffee47dc3479",
+    "kw_query": "pattern auto_consolidated",
+    "full_rank": 1,
+    "kw_rank": null
+  },
+  {
+    "id": "cd0221ec1c59966e",
+    "kw_query": "现在让我检查 `server.py` 中关于 `memory_relations",
+    "full_rank": 1,
+    "kw_rank": 1
+  },
+  {
+    "id": "e673cf72bce31a32",
+    "kw_query": "security-audit mimosa occurred:2026-10-04 signal:num:2026 signal:num:10 signal:num:04 signal:num:18 signal:num:4583519",
+    "full_rank": 1,
+    "kw_rank": null
+  },
+  {
+    "id": "571c1e49d838ca80",
+    "kw_query": "数据很清楚了。这5条00:00记录的出场时间全为None，而且注意5月1日序号8",
+    "full_rank": 1,
+    "kw_rank": 1
+  },
+  {
+    "id": "ed89d1c8d5a8730e",
+    "kw_query": "Dashboard files are outside the workspac",
+    "full_rank": 1,
+    "kw_rank": 2
+  },
+  {
+    "id": "378fbd2adc864000",
+    "kw_query": "Host final-answer readiness check failed",
+    "full_rank": 1,
+    "kw_rank": 2
+  },
+  {
+    "id": "653fa106cc550c49",
+    "kw_query": "signal:num:2026 signal:num:09 signal:num:26 signal:num:120 signal:num:6.1 signal:num:6.2 signal:num:6808 signal:num:10587",
+    "full_rank": 1,
+    "kw_rank": null
+  },
+  {
+    "id": "14800fe5d3d69603",
+    "kw_query": "pattern auto_consolidated signal:update:变更",
+    "full_rank": 1,
+    "kw_rank": null
+  },
+  {
+    "id": "1474ebf13c533388",
+    "kw_query": "pattern auto_consolidated",
+    "full_rank": 1,
+    "kw_rank": null
+  },
+  {
+    "id": "4d41c10c0b6777c3",
+    "kw_query": "signal:num:2026 signal:num:09 signal:num:21 signal:num:1 signal:num:276 signal:num:35 signal:num:2 signal:num:0.4",
+    "full_rank": 1,
+    "kw_rank": null
+  },
+  {
+    "id": "ba3365e31dc8f2df",
+    "kw_query": "dashboard snmis gbk bugfix occurred:2026-08-23 signal:num:2026 signal:num:08 signal:num:23",
+    "full_rank": 1,
+    "kw_rank": 1
+  },
+  {
+    "id": "11fc5ec671c45e80",
+    "kw_query": "Now I have all the information I need. L",
+    "full_rank": 1,
+    "kw_rank": 1
+  },
+  {
+    "id": "46f95ddceefe7323",
+    "kw_query": "目前**不能直接处理**。Agent 有6个工具（SQL查询、车牌匹配、指标查询",
+    "full_rank": 1,
+    "kw_rank": 1
+  },
+  {
+    "id": "012ccbcce86b0850",
+    "kw_query": "document text dept-share chunk file:oncall-2026-10-13-0729.md signal:num:2 signal:num:5 signal:num:2026",
+    "full_rank": 1,
+    "kw_rank": null
+  },
+  {
+    "id": "880c5492cfdfff5e",
+    "kw_query": "The archives whispered their secrets tod",
+    "full_rank": 1,
+    "kw_rank": 1
+  },
+  {
+    "id": "6a2a0745c7d19d52",
+    "kw_query": "signal:num:2026 signal:num:09 signal:num:16 signal:num:02 signal:num:15 signal:num:19 signal:num:12 signal:num:7",
+    "full_rank": 1,
+    "kw_rank": null
+  },
+  {
+    "id": "d887a22895687046",
+    "kw_query": "dashboard 抽样 数据修复 agent 大小样 signal:num:2026 signal:num:08 signal:num:27",
+    "full_rank": 1,
+    "kw_rank": 2
+  },
+  {
+    "id": "4d95df3f951771a0",
+    "kw_query": "您说的是主进程里什么操作会导致弹窗？我排查了一圈没找到明显的点，您具体看到黑框上",
+    "full_rank": 1,
+    "kw_rank": 1
+  },
+  {
+    "id": "58f0805d483f096c",
+    "kw_query": "清楚了。Loop Engineering 是一种设计方法论，核心思想是： > *",
+    "full_rank": 1,
+    "kw_rank": 1
+  },
+  {
+    "id": "4044921af38711a4",
+    "kw_query": "看完三个桥的代码后情况很清楚了。给你一个完整的现状分析和设计方案： --- ##",
+    "full_rank": 1,
+    "kw_rank": 1
+  },
+  {
+    "id": "7c4344ffe322d7de",
+    "kw_query": "ocr-review 插件 PR38 重启 完成 signal:num:38 signal:num:2026 signal:num:08",
+    "full_rank": 1,
+    "kw_rank": 1
+  },
+  {
+    "id": "a6bd0cd6d116b6ab",
+    "kw_query": "signal:num:2026 signal:num:10 signal:num:09 signal:num:1 signal:num:2 signal:num:3 signal:num:1.1 signal:num:105",
+    "full_rank": 1,
+    "kw_rank": null
+  },
+  {
+    "id": "eead4911da171daa",
+    "kw_query": "pattern auto_consolidated",
+    "full_rank": 1,
+    "kw_rank": null
+  },
+  {
+    "id": "23c93f15318a43a7",
+    "kw_query": "signal:num:2026 signal:num:09 signal:num:21 signal:num:124.223 signal:num:188.126 signal:num:9.6 signal:num:00 signal:num:50",
+    "full_rank": 1,
+    "kw_rank": null
+  },
+  {
+    "id": "83c520f28ffb0ce3",
+    "kw_query": "document text dept-share chunk file:session-2026-10-08-f-drive-restore.md signal:num:2 signal:num:4 signal:num:2026",
+    "full_rank": 1,
+    "kw_rank": 7
+  },
+  {
+    "id": "9498811dc82b521d",
+    "kw_query": "signal:num:2026 signal:num:10 signal:num:2.0 signal:num:3 signal:num:4 signal:num:5 signal:num:95 signal:num:0.28",
+    "full_rank": 1,
+    "kw_rank": null
+  },
+  {
+    "id": "c69cc9affcf70004",
+    "kw_query": "signal:num:2026 signal:num:09 signal:num:23 signal:num:21 signal:num:45 signal:num:14 signal:num:19 signal:num:12",
+    "full_rank": 1,
+    "kw_rank": null
+  },
+  {
+    "id": "bccfb37fdd4c569c",
+    "kw_query": "document text dept-share chunk file:oncall-2026-10-11-2129.md signal:num:3 signal:num:5 signal:num:2026",
+    "full_rank": 1,
+    "kw_rank": null
+  },
+  {
+    "id": "32a7941fe7c323e9",
+    "kw_query": "document text dept-share chunk file:oncall-2026-10-13-0129.md signal:num:5 signal:num:2026 signal:num:10",
+    "full_rank": 1,
+    "kw_rank": null
+  },
+  {
+    "id": "3fc5315143edf2f7",
+    "kw_query": "signal:num:2026 signal:num:09 signal:num:29 signal:num:06 signal:num:45 signal:num:00 signal:num:19 signal:num:11",
+    "full_rank": 1,
+    "kw_rank": null
+  },
+  {
+    "id": "f9f9280e2b71efa1",
+    "kw_query": "[cron:2679d01b-b53c-4f17-b0a0-0904d4a5f6",
+    "full_rank": 1,
+    "kw_rank": 3
+  },
+  {
+    "id": "00a49c5ab31c39eb",
+    "kw_query": "明白，主人不想要那种\"方块拼一拼\"的廉价感。 那核心问题就是：**怎么在不用专业",
+    "full_rank": 1,
+    "kw_rank": 4
+  },
+  {
+    "id": "4f51d31ba75a2d9d",
+    "kw_query": "弹窗原本依赖 `未识别联单` 目录，但归档成功后文件被重命名了，不会进`未识别`",
+    "full_rank": 1,
+    "kw_rank": 1
+  },
+  {
+    "id": "bc998a4e86602ddf",
+    "kw_query": "哈哈好的，不花钱也能做出质感。让我重新想一下路线。 --- ## 免费且有质感的",
+    "full_rank": 1,
+    "kw_rank": 1
+  },
+  {
+    "id": "b0632c9798ae0337",
+    "kw_query": "signal:num:1 signal:num:2026 signal:num:08 signal:num:22 signal:num:53 signal:num:8 signal:num:09 signal:num:61",
+    "full_rank": 1,
+    "kw_rank": null
+  },
+  {
+    "id": "3d41450f860d1840",
+    "kw_query": "等一下——`paddleocr 3.4.1` 和 `paddlex 3.4.3`",
+    "full_rank": 1,
+    "kw_rank": 1
+  },
+  {
+    "id": "283eebfc1f0ffc90",
+    "kw_query": "signal:num:2026 signal:num:09 signal:num:07 signal:num:19 signal:num:45 signal:num:02 signal:num:13 signal:num:6",
+    "full_rank": 1,
+    "kw_rank": 8
+  },
+  {
+    "id": "1261cfd7cd56bdb6",
+    "kw_query": "pattern auto_consolidated",
+    "full_rank": 1,
+    "kw_rank": null
+  },
+  {
+    "id": "6d3926aec9cccbf3",
+    "kw_query": "The expansion was truncated. Let me look",
+    "full_rank": 1,
+    "kw_rank": 1
+  },
+  {
+    "id": "f73971dc6b57db71",
+    "kw_query": "数据模型 五项加固 完成 遗留 signal:num:2026 signal:num:09 signal:num:08 signal:num:9039",
+    "full_rank": 1,
+    "kw_rank": 1
+  },
+  {
+    "id": "c54f5ab7c1ce5320",
+    "kw_query": "这个问题关键。我先说结论，再讲理由。 ## 结论：需要，但要限定范围 Memor",
+    "full_rank": 1,
+    "kw_rank": null
+  },
+  {
+    "id": "889631a1cdadf37a",
+    "kw_query": "你说得对，QClaw 没云服务器。那就两个最实际的方案： ## 实际可行的方案 ",
+    "full_rank": 1,
+    "kw_rank": 1
+  },
+  {
+    "id": "dae9920f6505993d",
+    "kw_query": "signal:num:2026 signal:num:09 signal:num:07 signal:num:08 signal:num:45 signal:num:00 signal:num:19 signal:num:12",
+    "full_rank": 1,
+    "kw_rank": null
+  },
+  {
+    "id": "a354dc144a319461",
+    "kw_query": "PFAiX 1.0.48 WebView缓存 事故复盘 signal:num:1.0 signal:num:48 signal:num:2026 signal:num:08",
+    "full_rank": 1,
+    "kw_rank": 4
+  },
+  {
+    "id": "4889ba33eac0b373",
+    "kw_query": "document text dept-share chunk file:oncall-2026-10-13-1945.md signal:num:4 signal:num:5 signal:num:2026",
+    "full_rank": 1,
+    "kw_rank": null
+  },
+  {
+    "id": "5ddeba7bcd082b4a",
+    "kw_query": "你说得对，我不能凭空推测 13:31 是 DB 时间。但日志里 Agent 只拿",
+    "full_rank": 1,
+    "kw_rank": 1
+  },
+  {
+    "id": "38075e49ddf88876",
+    "kw_query": "pattern auto_consolidated",
+    "full_rank": 1,
+    "kw_rank": null
+  },
+  {
+    "id": "bce9c3f0b29da689",
+    "kw_query": "signal:num:2026 signal:num:10 signal:num:11 signal:num:222 signal:num:450 signal:num:202610 signal:num:9 signal:num:28",
+    "full_rank": 1,
+    "kw_rank": null
+  },
+  {
+    "id": "6fc5d2b05dafca49",
+    "kw_query": "document text dept-share chunk file:oncall-2026-10-13-1945.md signal:num:5 signal:num:2026 signal:num:10",
+    "full_rank": 1,
+    "kw_rank": null
+  },
+  {
+    "id": "5be8197b7cfa7656",
+    "kw_query": "<think>The path is correct but Excel say",
+    "full_rank": 1,
+    "kw_rank": 1
+  },
+  {
+    "id": "4b7fab373f18d3d3",
+    "kw_query": "Host final-answer readiness check failed",
+    "full_rank": 1,
+    "kw_rank": null
+  }
+]
