@@ -109,3 +109,6 @@ eval/longmemeval/*.err
 
 # 本地测试产物
 detail_*.json
+
+# 本机 exe 版本备份（backups/，~32MB 二进制，仅本地留存，不入库）
+backups/
