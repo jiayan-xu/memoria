@@ -1,5 +1,30 @@
 # 演进日志 / CHANGELOG
 
+## 2026-10-28 — env 权威源切换 + 备份 E1 多目标/manifest（家机改动收口推送）
+
+### ① guard/canary env 解析切换 `~/.svc-secrets`（R0 密钥归位收尾）
+- `recall_guard.py` / `scripts/retrieval_canary.py`：env 定位顺序改为
+  `MEMORIA_ENV_PATH` → `~/.svc-secrets/agent-core.env`（restart.ps1/托盘的权威源）→
+  `memoria.env` → 旧项目内 `.env` 兜底（2026-10-19 已退役）。裸 shell 运行时不再静默
+  找错配置。
+- `MCP_URL` 支持 `MEMORIA_MCP_URL` 环境变量覆盖，默认仍 `:9003`。
+
+### ② `daily_memoria_backup.py` E1：多目标 + sha256 manifest
+- 覆盖面按 D9 分级（2026-10-19 拍板）扩到三系统：memoria（memoria.db / audit.db 必备）、
+  agent-core（audit_events / checkpoints 必备；harness 建议；meta_evolution 可选；
+  boot.db **备份但不恢复**——启动熔断锁存，恢复=恢复故障态）、
+  dashboard（dashboard.db / event_bus.db 必备；harness_store 建议）。
+- 全部成功后写 `manifest_<stamp>.json` + `latest_manifest.json`
+  （sha256 / size / source_mtime / DB user_version / role / restore / 三系统源版本戳），
+  供 `svc verify-backup` 校验。
+- 失败产物即删（损坏副本不得混入备份目录被误当可用备份）；非必备库损坏仅隔离
+  告警不阻塞，必备库缺失/失败即退出码 1。
+
+### 其他
+- `backups/`（本机 exe 版本备份，~32MB 二进制）加入 .gitignore，不入库。
+
+---
+
 ## 2026-10-13 — 运维卫生 + R0 检索金丝雀（事故复盘第二轮）
 
 ### ① 实验启动器归位 + 正本启动自检
