@@ -86,6 +86,10 @@ recall_guard_detail.json
 # recall_guard 每次运行覆写的告警快照（运行期产物，非源码）
 recall_alert.json
 
+# R0 检索金丝雀生成物（每次运行覆写：告警快照 + 探针B 持续时长状态）
+scripts/canary_alert.json
+scripts/canary_state.json
+
 # 本地工具/记忆目录（Agent 工作区状态，不进公开仓）
 .workbuddy/
 
@@ -105,3 +109,6 @@ eval/longmemeval/*.err
 
 # 本地测试产物
 detail_*.json
+
+# 本机 exe 版本备份（backups/，~32MB 二进制，仅本地留存，不入库）
+backups/

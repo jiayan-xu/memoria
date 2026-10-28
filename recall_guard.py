@@ -35,19 +35,22 @@ DB = os.environ.get("MEMORIA_DB_PATH",
 
 
 def resolve_env_path():
-    """定位运行时 .env（避免硬编码用户名路径）：优先 MEMORIA_ENV_PATH 环境变量，
-    其次同级的 ../memoria/.env（本机运行时镜像），最后 ./env。"""
+    """定位运行时 env：优先 MEMORIA_ENV_PATH；其次 ~/.svc-secrets/agent-core.env
+    （restart.ps1/托盘的权威源）；再其次 memoria.env；最后兼容旧项目内 .env
+    （2026-10-19 已退役，仅作兜底）。"""
     if os.environ.get("MEMORIA_ENV_PATH"):
         return os.environ["MEMORIA_ENV_PATH"]
-    for cand in (os.path.join(HERE, "..", "memoria", ".env"),
-                 os.path.join(HERE, ".env")):
+    home = os.environ.get("USERPROFILE") or os.path.expanduser("~")
+    for cand in (os.path.join(home, ".svc-secrets", "agent-core.env"),
+                 os.path.join(home, ".svc-secrets", "memoria.env"),
+                 os.path.join(HERE, "..", "memoria", ".env")):
         if os.path.exists(cand):
             return cand
-    return os.path.join(HERE, ".env")
+    return os.path.join(home, ".svc-secrets", "agent-core.env")
 
 
 ENV_PATH = resolve_env_path()
-MCP_URL = "http://127.0.0.1:9003/mcp"
+MCP_URL = os.environ.get("MEMORIA_MCP_URL", "http://127.0.0.1:9003/mcp")
 NS = os.environ.get("MEMORIA_GUARD_NS", "agent/xujiayan")
 K = 10                       # 拉取条数（判定 top-5 命中，多取几条便于诊断）
 # 样本量：2026-10-03 由 40 提到 80。理由——每轮抽取的是**不同记忆**，记忆间召回难度
@@ -136,6 +139,24 @@ def reset_cold(db):
     return False
 
 
+def _results_of(inner):
+    """双 schema 兼容解析 results（2026-10-13，与 scripts/retrieval_canary.py 同款）。
+
+    历史：`results` 曾挂在 `recall` 子对象下，后挪到顶层。单 schema 解析在跨构建
+    调用时会把「服务器正常返回（fused=5）」误读成「全空」，把诊断方向带偏成
+    「环境毒化 / 索引损坏」——2026-10-13 事故复盘时真实发生过（连发 12 次全绿
+    + raw 复核才戳穿）。两级都试，缺失即 []。
+    """
+    if not isinstance(inner, dict):
+        return []
+    r = inner.get("results")
+    if r is None:
+        rec = inner.get("recall")
+        if isinstance(rec, dict):
+            r = rec.get("results")
+    return r if isinstance(r, list) else []
+
+
 def recall_topk(query, admin_key, k=K):
     payload = {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
                "params": {"name": "memory_recall",
@@ -146,8 +167,10 @@ def recall_topk(query, admin_key, k=K):
                                           "X-Agent-Id": "admin",
                                           "X-Agent-Key": admin_key}, method="POST")
     d = json.loads(urllib.request.urlopen(req, timeout=90).read())
-    txt = d["result"]["content"][0]["text"]
-    return json.loads(txt).get("results", [])
+    txt = "".join(c.get("text", "")
+                  for c in (d.get("result") or {}).get("content", []))
+    inner = json.loads(txt) if txt.strip().startswith(("{", "[")) else {}
+    return _results_of(inner)
 
 
 def extract_keywords(content, tags):

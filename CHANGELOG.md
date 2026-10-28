@@ -1,5 +1,64 @@
 # 演进日志 / CHANGELOG
 
+## 2026-10-28 — env 权威源切换 + 备份 E1 多目标/manifest（家机改动收口推送）
+
+### ① guard/canary env 解析切换 `~/.svc-secrets`（R0 密钥归位收尾）
+- `recall_guard.py` / `scripts/retrieval_canary.py`：env 定位顺序改为
+  `MEMORIA_ENV_PATH` → `~/.svc-secrets/agent-core.env`（restart.ps1/托盘的权威源）→
+  `memoria.env` → 旧项目内 `.env` 兜底（2026-10-19 已退役）。裸 shell 运行时不再静默
+  找错配置。
+- `MCP_URL` 支持 `MEMORIA_MCP_URL` 环境变量覆盖，默认仍 `:9003`。
+
+### ② `daily_memoria_backup.py` E1：多目标 + sha256 manifest
+- 覆盖面按 D9 分级（2026-10-19 拍板）扩到三系统：memoria（memoria.db / audit.db 必备）、
+  agent-core（audit_events / checkpoints 必备；harness 建议；meta_evolution 可选；
+  boot.db **备份但不恢复**——启动熔断锁存，恢复=恢复故障态）、
+  dashboard（dashboard.db / event_bus.db 必备；harness_store 建议）。
+- 全部成功后写 `manifest_<stamp>.json` + `latest_manifest.json`
+  （sha256 / size / source_mtime / DB user_version / role / restore / 三系统源版本戳），
+  供 `svc verify-backup` 校验。
+- 失败产物即删（损坏副本不得混入备份目录被误当可用备份）；非必备库损坏仅隔离
+  告警不阻塞，必备库缺失/失败即退出码 1。
+
+### 其他
+- `backups/`（本机 exe 版本备份，~32MB 二进制）加入 .gitignore，不入库。
+
+---
+
+## 2026-10-13 — 运维卫生 + R0 检索金丝雀（事故复盘第二轮）
+
+### ① 实验启动器归位 + 正本启动自检
+- **实验启动器归位**：`C:\services\memoria\` 根目录下 6 个 `start_memoria_*` 启动器（2026-08 遗留、
+  未纳入 git）全部移入 `experiments/`。危害点：它们用的是**与生产同一个 exe 和同一个生产库**
+  （`MEMORIA_DB_PATH = data\memoria.db`），却带着 `RERANK_ENABLED=1` + `RERANK_URL=:8777/rerank`
+  （死端口）等实验配置——10-06 的提权 rogue 实例即由此而来。除一条已失效的 qclaw 路径外，
+  无任何现行引用，移入子目录不影响现有流程。
+- **正本 `restart.ps1` 启动自检**：起服务前断言 `MEMORIA_EMBEDDING_URL` 非空 + 嵌入端点 `/health`
+  探活，**任一不过直接拒启**（exit 2），并打印生效配置（EMBEDDING_URL / RERANK_ENABLED / DB）
+  便于事后归因"当时到底带了什么环境"。原则：宁可起不来，不要带病上线——10-02 / 10-13 两次事故
+  都是"服务起来了、health 也 200，但语义通道是死的"且不落日志。逃生舱：`-SkipEmbedCheck`。
+
+### ② R0 检索金丝雀（`scripts/retrieval_canary.py`）
+双探针，补既有监控的两个盲区：
+- **探针 A 读侧空结果**（10-13 事故型）：取 N 条库里确实存在的记忆，用原文片段查 MCP；
+  **仅当 SQLite 侧有命中而 MCP 返回 0 条**才计为引擎层空结果——即事故当时的人工判定法
+  （"库里有、接口不给"）。≥2 条（或有命中探针的 ≥50%）才报警，避免冷门查询误报。
+- **探针 B 写侧覆盖**（本次故障型）：`memories` vs `memory_vectors` 缺口率 >2% 且**持续**
+  >60min 才报警（状态文件记首次超阈时间，防补嵌/批量写入期间抖动误报）。
+  现 `recall_guard` 用关键词查询打 FTS，而 FTS 覆盖恒为 100% → 对语义退化**完全全盲**。
+- **解析契约**：`_results_of()` 双 schema 兼容（`results` 顶层 / `recall.results`）。
+- 退出码 0/1/2（正常/告警/运行错误），告警落 `canary_alert.json`，可被 `memory_ops_status` / 巡检读取。
+- **负向验证**：越界阈值强制触发 → exit 1 且 severity=warn；双 schema 三种结构解析均正确。
+- 同轮把该教训落到 `recall_guard.py`——其 `recall_topk` 原为单 schema 解析，一并双 schema 化
+  （改后回归：完整内容@5 95.0% / 关键词@5 65.0%，均高于基线，severity=ok）。
+
+### 待办
+- 金丝雀尚未挂调度（30 分钟一次）。挂法与 `recall_guard.py` 一致，需提权创建计划任务。
+- `memoria_stack_launcher.py`（管 Memoria :9003 + A2A Bridge :9000）因换 exe 被停，
+  恢复需提权创建计划任务，暂未恢复——:9000 目前无人看护（:9003 由托盘看门狗覆盖）。
+
+---
+
 ## 2026-10-13 — 文档 ingestion 事后嵌（P0-1）
 
 ### 背景：检索故障双线诊断的写侧缺口

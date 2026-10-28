@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 memoria 时序知识图谱服务（Kuzu 嵌入式图库，端口 8779）
@@ -7,7 +7,7 @@ P2：把写入整合时抽取的实体/关系落到真图库，支持多跳遍�
 由 memoria-server 的 consolidation 路径 fire-and-forget 写入；MCP 工具 memory_graph_query 代理查询。
 
 运行：WorkBuddy Python 3.13（kuzu 无 cp314 wheel）：
-  C:\\Users\\user\\.workbuddy\\binaries\\python\\versions\\3.13.12\\python.exe graph_kuzu_server.py
+  C:\\services\\python313\\python.exe graph_kuzu_server.py
 
 接口（仅回环，与 embed 服务同纪律）：
   GET  /health    -> {status, entities, relations}
