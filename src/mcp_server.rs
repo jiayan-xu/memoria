@@ -311,6 +311,25 @@ async fn health_check_full(
     })))
 }
 
+/// 交接协议 v1 —— 跨智能体任务级接力（server instructions 全文）
+///
+/// 目标形态：用户在任意客户端工作后切换到另一个客户端，新会话开场自动
+/// 拉取「刚定了什么 / 卡在哪 / 下一步」，实现任务级无缝接续。
+/// 协议全部住在服务端：改这里 = 全端生效，客户端无需发版。
+/// 注意：instructions 会进入每个客户端的系统提示词，保持精炼（<200 词）。
+const SERVER_INSTRUCTIONS: &str = "\
+memoria 交接协议（跨智能体任务接力）：
+1. 会话开场：先调用一次 memory_context（namespace 用你的主命名空间）拉取
+   交接状态——上一个会话/上一个智能体刚定了什么、卡在哪、下一步是什么；
+   有结果就自然接续工作，不要装作初次接触。
+2. 会话中：需要背景（用户偏好、项目历史、既往决策）时用 memory_search 检索，
+   不要凭空猜。
+3. 每轮结束前：若本轮产生了任务状态变化（新决定/新卡点/下一步变化），调用
+   memory_observe 写一条交接记录，内容用三段式——
+   [定了什么] … [卡在哪] … [下一步] …
+   并在 source 里带上你的 agent 标识。
+只做任务级状态接力，不逐字复述对话。";
+
 /// MCP 主入口
 async fn handle_mcp(
     State(state): State<Arc<AppState>>,
@@ -354,6 +373,9 @@ async fn handle_mcp(
                     "protocolVersion": requested,
                     "serverInfo": {"name": "memoria", "version": "0.3.0"},
                     "capabilities": {"tools": {}},
+                    // 交接协议（v1）：跨智能体任务级接力。协议住在服务端，全部
+                    // 已连接客户端在下次握手时自动收到最新版本，无需改客户端。
+                    "instructions": SERVER_INSTRUCTIONS,
                 }),
             )
         }
@@ -505,7 +527,8 @@ pub fn tools_list() -> Vec<serde_json::Value> {
             // Some(&state.hype_hnsw)——HyPE 启动快照限制同样适用。
             // #R69 documentation/low：公开描述同步披露（同 memory_search_v2——
             // memory_context 的 query recall 正是会话开场检索，最需要声明）。
-            "会话开场注入：memory_profile + 可选 query 追加 top-k recall，产出 prompt_block（query recall 的 HyPE 问句路仅覆盖启动时已建索引的记忆；重启后全量生效）",
+            // 交接协议 v1：本工具是开场拉取入口，描述内嵌行为指令。
+            "【会话开场必须先调我】拉取交接状态：上一个会话/智能体刚定了什么、卡在哪、下一步是什么（memory_profile + 可选 query 追加 top-k recall，产出 prompt_block；query recall 的 HyPE 问句路仅覆盖启动时已建索引的记忆，重启后全量生效）",
             serde_json::json!({
                 "namespace": {"type": "string", "description": "命名空间，默认 default"},
                 "query": {"type": "string", "description": "可选：本轮用户首句，用于追加 recall"},
@@ -533,7 +556,8 @@ pub fn tools_list() -> Vec<serde_json::Value> {
         ),
         tool(
             "memory_observe",
-            "记录观察（低优先级）",
+            // 交接协议 v1：轮末状态写入入口，描述内嵌三段式格式指令。
+            "【每轮结束有状态变化就调我】写入交接记录，让下一个会话/智能体能接续。dialog 用三段式：[定了什么] … [卡在哪] … [下一步] …（低优先级观察；也用于日常对话流水沉淀）",
             serde_json::json!({
                 "dialog": {"type": "string", "description": "对话/观察内容"},
                 "role": {"type": "string", "description": "角色，默认 user"},

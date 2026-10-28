@@ -1,5 +1,41 @@
 # 演进日志 / CHANGELOG
 
+## 2026-10-28 — 交接协议 v1（跨智能体任务接力）
+
+### 背景：无缝切换卖点的最后一公里
+memoria 卖点「智能体无缝切换」实测卡在接入侧：客户端各自为战、无统一开场/收尾行为。
+结论：协议应住服务端——MCP `initialize.instructions` + 工具描述两个通道都由服务端下发，
+改协议全端生效，客户端零改动。
+
+### 改动（`src/mcp_server.rs`，+26 行）
+- **initialize 注入 `SERVER_INSTRUCTIONS`**：开场调 `memory_context` 拉交接状态（上一个
+  会话/智能体刚定了什么、卡在哪、下一步）、会话中用 `memory_search` 查背景、轮末用
+  `memory_observe` 写三段式交接记录（`[定了什么][卡在哪][下一步]`，source 带 agent 标识）。
+- **`memory_context` / `memory_observe` 描述升级**：内嵌行为指令（"【会话开场必须先调我】"/
+  "【每轮结束有状态变化就调我】"），兜底不渲染 instructions 的客户端——工具描述每次
+  请求必注入模型，是第二通道。
+- 明确边界：只做任务级状态接力，不逐字复述对话。
+
+### 线上验证（2026-10-28，工作机生产）
+- 版本 `0.4.0-ge2c0a1f`；initialize 下发 instructions、双工具描述已升级、health ok
+  （embed pass）、数据完好（12,762 条）、家端隧道（127.0.0.1:9003）同样取到协议。
+- 首条狗粮交接记录 `f81c4fba` 已按三段式写入 `agent/xujiayan`。
+
+### 顺带排雷（部署时发现）
+- **agent-core 编排缺 `MEMORIA_HOST=0.0.0.0`**：P2 迁移（10-22）后 memoria 由 agent-core
+  Windows 服务编排，`agent.toml`/`services.json` 均未设 HOST → 任何重启都会绑回默认
+  127.0.0.1、断掉 Tailscale 远程访问（潜伏 bug，重启机必炸）。两处均已补 0.0.0.0
+  （备份 `.bak-20261028`），经重启 agent-core 服务生效，现绑 `0.0.0.0:9003`。
+- ssh 跑 `restart.ps1` 的进程会被会话作业回收（AGENTS.md 已有教训，再次实证）；
+  生产重启走 schtasks `MemoriaStackBoot` 或 agent-core 服务。
+
+### 待办
+- ZCode / WorkBuddy 真实会话验证 instructions 渲染（服务端已确认下发）。
+- `memoria connect <client>` 一键接入（注册身份+发钥+按客户端格式生成配置）。
+- WorkBuddy memoria 连接器装而未用（工具快照零 memoria 工具），待修。
+
+---
+
 ## 2026-10-28 — env 权威源切换 + 备份 E1 多目标/manifest（家机改动收口推送）
 
 ### ① guard/canary env 解析切换 `~/.svc-secrets`（R0 密钥归位收尾）
@@ -58,7 +94,6 @@
   恢复需提权创建计划任务，暂未恢复——:9000 目前无人看护（:9003 由托盘看门狗覆盖）。
 
 ---
-
 ## 2026-10-13 — 文档 ingestion 事后嵌（P0-1）
 
 ### 背景：检索故障双线诊断的写侧缺口
