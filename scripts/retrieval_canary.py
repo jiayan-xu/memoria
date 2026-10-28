@@ -54,7 +54,7 @@ DB = os.environ.get(
     "MEMORIA_DB_PATH",
     os.path.join(HERE, "..", "..", "memoria", "data", "memoria.db"),
 )
-MCP_URL = "http://127.0.0.1:9003/mcp"
+MCP_URL = os.environ.get("MEMORIA_MCP_URL", "http://127.0.0.1:9003/mcp")
 NS = os.environ.get("MEMORIA_GUARD_NS", "agent/xujiayan")
 
 # 探针 A
@@ -72,15 +72,18 @@ TIMEOUT = 30  # 单条 MCP 查询超时（金丝雀要快，不作长尾等待�
 
 
 def resolve_env_path():
-    """定位运行时 .env（与 recall_guard.py 同款，避免硬编码用户名路径）。"""
+    """定位运行时 env：优先 MEMORIA_ENV_PATH；其次 ~/.svc-secrets/agent-core.env
+    （restart.ps1/托盘的权威源）；再其次 memoria.env；最后兼容旧项目内 .env
+    （2026-10-19 已退役，仅作兜底）。"""
     if os.environ.get("MEMORIA_ENV_PATH"):
         return os.environ["MEMORIA_ENV_PATH"]
-    for cand in (os.path.join(HERE, "..", "..", "memoria", ".env"),
-                 os.path.join(HERE, "..", "memoria", ".env"),
-                 os.path.join(HERE, ".env")):
+    home = os.environ.get("USERPROFILE") or os.path.expanduser("~")
+    for cand in (os.path.join(home, ".svc-secrets", "agent-core.env"),
+                 os.path.join(home, ".svc-secrets", "memoria.env"),
+                 os.path.join(HERE, "..", "..", "memoria", ".env")):
         if os.path.exists(cand):
             return cand
-    return os.path.join(HERE, ".env")
+    return os.path.join(home, ".svc-secrets", "agent-core.env")
 
 
 def load_env(p):
