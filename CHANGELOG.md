@@ -48,7 +48,14 @@ memoria 卖点「智能体无缝切换」实测卡在接入侧：客户端各自
   生产重启走 schtasks `MemoriaStackBoot` 或 agent-core 服务。
 
 ### 待办
-- ZCode / WorkBuddy 真实会话验证 instructions 渲染（服务端已确认下发）。
+- ~~ZCode / WorkBuddy 真实会话验证 instructions 渲染（服务端已确认下发）~~
+  **ZCode 侧已验证（2026-10-29）**：无头实弹测试（zcode -p）证实——①ZCode 0.17.0 的 MCP SDK
+  Client 会解析并缓存 `initialize.instructions`（bundle 内 `getInstructions` 仅 SDK 定义、
+  零调用点），**不注入模型系统提示**；②协议照常生效，走的是第二通道（工具描述
+  【会话开场必须先调我】）+ AGENTS.md 双保险：新会话第一个工具调用即
+  `memory_context`，最新锚点全文拉回。验证过程中顺带修复 ZCode 配置问题：memoria
+  MCP 条目含 schema 外键 `transport`，被客户端严格 schema 静默丢弃（移除后恢复加载）。
+  WorkBuddy 渲染仍待验（其 memoria 连接器装而未用，见下）。
 - `memoria connect <client>` 一键接入（注册身份+发钥+按客户端格式生成配置）。
 - WorkBuddy memoria 连接器装而未用（工具快照零 memoria 工具），待修。
 
