@@ -405,7 +405,7 @@ pub fn remember_with_dedup_ex(
         None
     };
 
-    let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S").to_string();
+    let now = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string();
     let tags_safe = if tags.is_empty() || tags == "[]" {
         "[]".to_string()
     } else {
@@ -784,7 +784,7 @@ pub fn get_supersession_chain(
 /// 手动合并两条近义记忆（管理员操作）
 pub fn merge_memories(pool: &SqlitePool, keep_id: &str, merge_id: &str) -> Result<(), String> {
     let conn = pool.get().map_err(|e| format!("pool: {}", e))?;
-    let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S").to_string();
+    let now = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string();
 
     let tx = conn
         .unchecked_transaction()

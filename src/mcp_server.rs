@@ -1439,9 +1439,9 @@ async fn handle_tool_call(
                     let ents = dec.entities.clone();
                     let egs = dec.edges.clone();
                     let _ = tokio::task::spawn_blocking(move || {
-                        use chrono::Utc;
+                        use chrono::Local;
                         let Ok(conn) = st_s.pool.get() else { return };
-                        let now = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+                        let now = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
                         let mut ensure = |name: &str, etype: &str| -> Option<String> {
                             let eid = crate::consolidation::auto_entity_id(&ns_g, name);
                             let _ = conn.execute(
@@ -1574,7 +1574,7 @@ fn record_recall_access(state: &Arc<AppState>, fused: &[search::rrf::FusedResult
     }
     let ids: Vec<String> = fused.iter().map(|r| r.memory_id.clone()).collect();
     let pool = state.pool.clone();
-    let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S").to_string();
+    let now = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string();
     let task = move || {
         if let Ok(conn) = pool.get() {
             if let Ok(tx) = conn.unchecked_transaction() {

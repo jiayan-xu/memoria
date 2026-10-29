@@ -33,7 +33,7 @@ fn tags_json(tags: &str) -> Value {
 
 /// 当前时刻（ISO-8601 含字面量 T，与 remember / valid_at 字典序比较一致）。
 fn now_iso() -> String {
-    chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S").to_string()
+    chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string()
 }
 
 /// 合成 `memory_profile` 只读视图。
