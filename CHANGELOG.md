@@ -1,5 +1,23 @@
 # 演进日志 / CHANGELOG
 
+## 2026-10-29 — 修复交接协议 v1 读侧断链（memory_context 不出 handoff 锚点）
+
+### 缺陷
+协议 v1（#31）把锚点以 `category='handoff'` 落库，但 `memory_profile` 的 dynamic
+查询白名单只有 `decision/fact/pattern`——**按协议写的锚点永远进不了新会话上下文**。
+此前未被发现的巧合掩盖：上一份锚点恰好以 `decision` 类目写入。10-29 凌晨端到端
+复测（memory_observe 写 → memory_context 读）暴露：写入 status=observed 成功，
+`memory_context` dynamic 15 条里无锚点。
+
+### 修复（`src/tools/profile.rs`）
+- dynamic 主查询不动（handoff 本就不在其白名单）；新增 handoff 专查：取最新
+  ≤3 条未取代（`superseded_by IS NULL`）、active、`valid_*` 生效的锚点**置顶**
+  prepend 到 dynamic 列表。
+- 渲染沿用 `derive_kind`：锚点以 `[handoff]` 标签出现在 prompt_block。
+- 读侧回归（生产热态实测）：`memory_context` 现返回 `f8a2a042f4b4778b` 锚点置顶。
+
+---
+
 ## 2026-10-28 — 交接协议 v1（跨智能体任务接力）
 
 ### 背景：无缝切换卖点的最后一公里
