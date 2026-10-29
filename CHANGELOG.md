@@ -57,7 +57,16 @@ memoria 卖点「智能体无缝切换」实测卡在接入侧：客户端各自
   MCP 条目含 schema 外键 `transport`，被客户端严格 schema 静默丢弃（移除后恢复加载）。
   WorkBuddy 渲染仍待验（其 memoria 连接器装而未用，见下）。
 - `memoria connect <client>` 一键接入（注册身份+发钥+按客户端格式生成配置）。
-- WorkBuddy memoria 连接器装而未用（工具快照零 memoria 工具），待修。
+- ~~WorkBuddy memoria 连接器装而未用（工具快照零 memoria 工具），待修~~
+  **已装通 + 验证完成（2026-10-29）**：工具快照（10-28 23:15 起）含 memoria 全套 63 工具
+  （经 agent-core 网关合并面，`memory_context`/`memory_observe` 描述为带行为指令的新版）。
+  无头实弹验证（codebuddy CLI + `--mcp-config` 直挂 :9003）：**读侧打通**——memory_context
+  经 ToolSearch→DeferExecuteTool 成功执行，最新锚点 `f8a2a042f4b4778b` 全文拉回。
+  两个通道性发现：①instructions 不渲染（与 ZCode 同款，源码定性：WB 运行时无 SDK
+  instructions 消费点）；②**工具描述通道被延迟加载削弱**——WB 的 ToolSearch 初始只列
+  `mcp__memoria__*` 工具名不带描述，【会话开场必须先调我】不在初始上下文，schema 按
+  需加载后才可见。故 WB 里协议无法靠服务端通道自驱，开场接力需工作区侧提示
+  （AGENTS.md/工作区规则）或客户端配置预载 memoria schema。
 
 ---
 
