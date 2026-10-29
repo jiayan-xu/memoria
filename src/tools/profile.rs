@@ -158,6 +158,59 @@ pub fn memory_profile(
     }
 
     let static_text = render_static_text(&static_items);
+
+    // ── handoff 锚点：交接协议 v1 读侧补链（2026-10-29）──
+    // 协议规定锚点以 category='handoff' 落库，而下方 dynamic 主查询只认
+    // decision/fact/pattern —— 锚点永远进不了新会话上下文，读侧断链
+    // （2026-10-28 晚实测 memory_context 发现）。此处单独取最新未取代的
+    // active 锚点置顶；主查询无需改动（handoff 本就不在其白名单内）。
+    const HANDOFF_ANCHOR_LIMIT: usize = 3;
+    let ho_sql = format!(
+        "SELECT id, content, category, importance, tags, created_at FROM memories \
+         WHERE namespace = ? \
+           AND category = 'handoff' \
+           {tip} \
+           AND (valid_from IS NULL OR valid_from <= ?) \
+           AND (valid_to IS NULL OR valid_to >= ?) \
+           AND (confirm_status IS NULL OR confirm_status = 'active') \
+         ORDER BY created_at DESC \
+         LIMIT {HANDOFF_ANCHOR_LIMIT}",
+        tip = tip_clause
+    );
+    let mut ho_stmt = conn
+        .prepare(&ho_sql)
+        .map_err(|e| format!("prepare handoff: {}", e))?;
+    let ho_rows = ho_stmt
+        .query_map(
+            rusqlite::params![namespace, t, t],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, String>(4).unwrap_or_default(),
+                    row.get::<_, String>(5).unwrap_or_default(),
+                ))
+            },
+        )
+        .map_err(|e| format!("query handoff: {}", e))?;
+    let mut ho_items: Vec<Value> = Vec::new();
+    for row in ho_rows.flatten() {
+        let (id, content, category, importance, tags, created_at) = row;
+        ho_items.push(json!({
+            "id": id,
+            "kind": derive_kind(&category, &tags),
+            "content": content,
+            "importance": importance,
+            "created_at": created_at,
+            "category": category,
+            "tags": tags_json(&tags),
+        }));
+    }
+    ho_items.extend(dyn_items);
+    let dyn_items = ho_items;
+
     let dynamic_text = render_dynamic_text(&dyn_items);
 
     Ok(json!({
