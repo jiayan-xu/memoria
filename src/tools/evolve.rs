@@ -22,7 +22,7 @@ pub fn evolution_write_enabled() -> bool {
 }
 
 fn now_iso() -> String {
-    chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S").to_string()
+    chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string()
 }
 
 fn gen_id(prefix: &str) -> String {

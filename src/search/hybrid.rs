@@ -275,7 +275,7 @@ pub fn hybrid_search_reported(
                     })
                     .map(|rows| rows.flatten().collect())
                     .unwrap_or_default();
-                let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S").to_string();
+                let now = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string();
                 let ref_time = as_of.unwrap_or_else(|| now.as_str());
                 let downweight = env_f64("MEMORIA_HISTORY_DOWNWEIGHT", 0.5).clamp(0.0, 1.0);
                 // 先算 keep 标记（与 unique 顺序一致）
@@ -564,7 +564,8 @@ fn two_stage_rerank(
     let sem_exact_boost = env_f64("MEMORIA_SEM_EXACT_BOOST", 1.0).max(0.0);
     let k_freq = env_f64("MEMORIA_FREQ_K", 10.0).max(1.0);
     let lambda = env_f64("MEMORIA_RECENCY_LAMBDA", 0.01).max(0.0);
-    let now_secs = chrono::Utc::now().timestamp();
+    // 与下方 last_recalled 解析（and_utc）同构：本地挂钟按同一口径折算，差值才正确
+                let now_secs = chrono::Local::now().naive_local().and_utc().timestamp();
     // Phase A P0-2（WeKnora 吸收）：clamp01 显式处理 NaN/±Inf——非有限分数破坏
     // sort 全序关系，稳定排序下表现为同分顺序不可复现而非 panic，极难定位。
     fn clamp01(x: f64) -> f64 {

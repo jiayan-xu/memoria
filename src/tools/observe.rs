@@ -71,7 +71,7 @@ pub fn observe(
         }
     }
 
-    let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S").to_string();
+    let now = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string();
 
     let (content, raw_ref) = distill(dialog);
     // Phase A P0-1（WeKnora 吸收）：观察流写入同过脱敏门（记忆每轮召回重发到模型）。

@@ -1,5 +1,23 @@
 # 演进日志 / CHANGELOG
 
+## 2026-10-29 — 修复记录时间为 UTC（用户实测 WB 接力时暴露）
+
+### 缺陷
+memories 业务时间线全链用 `chrono::Utc::now()`（写入 created_at/updated_at、observe、
+evolve、profile as_of、recall 的 last_recalled、entities 时间戳），中国单时区用户在
+WB 里看到「2026-10-29 02:50 写入」（实际本地 10:50），时间直觉全错。
+
+### 修复（memories/entities 业务链 8 处切 `chrono::Local`）
+- remember(2)/observe/evolve/profile now_iso/hybrid as_of 基线/mcp_server entities
+  与 last_recalled——存储、过滤、排序同一口径，整体自洽。
+- 连带修 hybrid recency 时区错位隐患：`now_secs` 与 `last_recalled` 解析（and_utc）
+  保持同构口径（本地挂钟按同一折算），差值恒等于真实差值；存储切 Local 后新记忆
+  不会被误判 8 小时旧而遭降权。
+- 保持 UTC 不动：health/auth token/imp_exp 导出/审计 rfc3339（带 Z 的运维面，
+  不参与 memories 时间线）。
+- 新旧记录混排安全：旧记录 UTC 值恒小于切换后 Local 值（+8h），created_at 排序
+  单调不回退。
+
 ## 2026-10-29 — 修复交接协议 v1 读侧断链（memory_context 不出 handoff 锚点）
 
 ### 缺陷
