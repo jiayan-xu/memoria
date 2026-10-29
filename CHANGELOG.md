@@ -74,7 +74,13 @@ memoria 卖点「智能体无缝切换」实测卡在接入侧：客户端各自
   `memory_context`，最新锚点全文拉回。验证过程中顺带修复 ZCode 配置问题：memoria
   MCP 条目含 schema 外键 `transport`，被客户端严格 schema 静默丢弃（移除后恢复加载）。
   WorkBuddy 渲染仍待验（其 memoria 连接器装而未用，见下）。
-- `memoria connect <client>` 一键接入（注册身份+发钥+按客户端格式生成配置）。
+- `memoria connect <client>` 一键接入升级为**四件套**（2026-10-29 用户拍板，实测反推的设计）：
+  ①注册身份 ②发钥 ③按客户端格式写 MCP 配置 ④**在工作区生成/合并 AGENTS.md 接力规则块**
+  （幂等标记 `<!-- memoria-connect begin/end -->`；规则=跨会话问题先查 memoria、开场可拉
+  memory_context、轮末三段式 memory_observe）。第④件是实测反推的必需品：ZCode/WB 均不渲染
+  initialize.instructions、WB 工具描述被 ToolSearch 延迟加载——服务端通道被客户端削弱是常态，
+  「接入即落工作区规则」才能无感接续（2026-10-29 手动为 C:/Users/user 工作区补了 AGENTS.md，
+  connect 把这一步自动化）。
 - ~~WorkBuddy memoria 连接器装而未用（工具快照零 memoria 工具），待修~~
   **已装通 + 验证完成（2026-10-29）**：工具快照（10-28 23:15 起）含 memoria 全套 63 工具
   （经 agent-core 网关合并面，`memory_context`/`memory_observe` 描述为带行为指令的新版）。
