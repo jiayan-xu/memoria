@@ -26,8 +26,8 @@ pub fn keyword_search(
     let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     // LIKE 兜底（2026-08-01 召回率根因修复）：
-    // memories_fts 用默认 unicode61 分词器，连续 CJK 文本被索引为单个整块 token，
-    // jieba 切词产生的词 token 无法 MATCH（如 '[pattern] 前端改版...' 整句是一个 token）。
+    // 连续 CJK 文本在 FTS 里常被索引为单个整块 token，jieba 切词产生的词 token 无法
+    // MATCH（如 '[pattern] 前端改版...' 整句是一个 token）。
     // 对中文查询 FTS 常返回空/泛化噪音，旧版（memoria 0.2.x）用 LIKE 子串兜底 recall=1.00。
     // 此处恢复并**前置**：LIKE 是精确子串匹配，其命中应优先于 FTS OR 泛化召回（RRF 按 rank
     // 加权，前置可确保目标进入高权重位置）。仅对纯英文/代码查询（无 CJK）跳过，避免噪音。
