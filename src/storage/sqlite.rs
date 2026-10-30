@@ -89,8 +89,10 @@ pub fn init_core_tables(pool: &SqlitePool) -> Result<(), String> {
         );
 
         -- Memories FTS5 (virtual table)
+        -- tags 入索引（2026-10-30）：此前仅 content+namespace，tags 查询在关键词通道
+        -- 结构上不可达，导致守护把「标签检索能力缺失」误报成召回回归。
         CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
-            content, namespace,
+            content, tags, namespace,
             content='memories',
             content_rowid='rowid'
         );
@@ -230,20 +232,20 @@ pub fn init_core_tables(pool: &SqlitePool) -> Result<(), String> {
         CREATE INDEX IF NOT EXISTS idx_mem_ns_created ON memories(namespace, created_at DESC);
         CREATE INDEX IF NOT EXISTS idx_msg_session ON messages(session_id);
 
-        -- FTS5 sync triggers for memories
+        -- FTS5 sync triggers for memories（含 tags 列）
         CREATE TRIGGER IF NOT EXISTS mem_ai AFTER INSERT ON memories BEGIN
-            INSERT INTO memories_fts(rowid, content, namespace)
-            VALUES (new.rowid, new.content, new.namespace);
+            INSERT INTO memories_fts(rowid, content, tags, namespace)
+            VALUES (new.rowid, new.content, new.tags, new.namespace);
         END;
         CREATE TRIGGER IF NOT EXISTS mem_ad AFTER DELETE ON memories BEGIN
-            INSERT INTO memories_fts(memories_fts, rowid, content, namespace)
-            VALUES ('delete', old.rowid, old.content, old.namespace);
+            INSERT INTO memories_fts(memories_fts, rowid, content, tags, namespace)
+            VALUES ('delete', old.rowid, old.content, old.tags, old.namespace);
         END;
         CREATE TRIGGER IF NOT EXISTS mem_au AFTER UPDATE ON memories BEGIN
-            INSERT INTO memories_fts(memories_fts, rowid, content, namespace)
-            VALUES ('delete', old.rowid, old.content, old.namespace);
-            INSERT INTO memories_fts(rowid, content, namespace)
-            VALUES (new.rowid, new.content, new.namespace);
+            INSERT INTO memories_fts(memories_fts, rowid, content, tags, namespace)
+            VALUES ('delete', old.rowid, old.content, old.tags, old.namespace);
+            INSERT INTO memories_fts(rowid, content, tags, namespace)
+            VALUES (new.rowid, new.content, new.tags, new.namespace);
         END;
     ").map_err(|e| format!("create tables: {}", e))?;
 
@@ -259,6 +261,7 @@ pub fn init_core_tables(pool: &SqlitePool) -> Result<(), String> {
     migrate_access_count(pool)?;
     migrate_hype_vectors(pool)?;
     migrate_consolidation_log(pool)?;
+    migrate_memories_fts_tags(pool)?;
 
     Ok(())
 }
@@ -304,6 +307,68 @@ pub fn migrate_access_count(pool: &SqlitePool) -> Result<(), String> {
             .map_err(|e| format!("add memories.access_count: {}", e))?;
         println!("[Memoria] Migration: added memories.access_count column");
     }
+    Ok(())
+}
+
+/// tags 入 `memories_fts`（2026-10-30）：老库 FTS 只有 content/namespace，tags 查询在
+/// 关键词通道结构上不可达。外部内容表无法 ALTER 加列，检测到缺 tags 或触发器仍写旧列
+/// 时重建 FTS 与同步触发器。幂等：已是新结构则跳过；外部表本身只是索引，重建不丢业务数据。
+pub fn migrate_memories_fts_tags(pool: &SqlitePool) -> Result<(), String> {
+    let conn = pool.get().map_err(|e| format!("pool get: {}", e))?;
+    let has_tags: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('memories_fts') WHERE name = 'tags'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    let trigger_sql: String = conn
+        .query_row(
+            "SELECT COALESCE((SELECT sql FROM sqlite_master WHERE type='trigger' AND name='mem_ai'), '')",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or_default();
+    if has_tags > 0 && trigger_sql.contains("new.tags") {
+        return Ok(());
+    }
+    drop(conn);
+
+    let conn = pool.get().map_err(|e| format!("pool get: {}", e))?;
+    let tx = conn
+        .unchecked_transaction()
+        .map_err(|e| format!("begin fts tags migration: {}", e))?;
+    tx.execute_batch(
+        "DROP TRIGGER IF EXISTS mem_ai;
+         DROP TRIGGER IF EXISTS mem_ad;
+         DROP TRIGGER IF EXISTS mem_au;
+         DROP TABLE IF EXISTS memories_fts;
+         CREATE VIRTUAL TABLE memories_fts USING fts5(
+             content, tags, namespace,
+             content='memories',
+             content_rowid='rowid'
+         );
+         INSERT INTO memories_fts(rowid, content, tags, namespace)
+             SELECT rowid, content, tags, namespace FROM memories;
+         CREATE TRIGGER mem_ai AFTER INSERT ON memories BEGIN
+             INSERT INTO memories_fts(rowid, content, tags, namespace)
+             VALUES (new.rowid, new.content, new.tags, new.namespace);
+         END;
+         CREATE TRIGGER mem_ad AFTER DELETE ON memories BEGIN
+             INSERT INTO memories_fts(memories_fts, rowid, content, tags, namespace)
+             VALUES ('delete', old.rowid, old.content, old.tags, old.namespace);
+         END;
+         CREATE TRIGGER mem_au AFTER UPDATE ON memories BEGIN
+             INSERT INTO memories_fts(memories_fts, rowid, content, tags, namespace)
+             VALUES ('delete', old.rowid, old.content, old.tags, old.namespace);
+             INSERT INTO memories_fts(rowid, content, tags, namespace)
+             VALUES (new.rowid, new.content, new.tags, new.namespace);
+         END;",
+    )
+    .map_err(|e| format!("migrate memories_fts tags: {}", e))?;
+    tx.commit()
+        .map_err(|e| format!("commit memories_fts tags migration: {}", e))?;
+    println!("[Memoria] Migration: rebuilt memories_fts with tags column + sync triggers");
     Ok(())
 }
 
