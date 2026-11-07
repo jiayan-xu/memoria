@@ -380,10 +380,20 @@ async fn api_graph(
     Extension(auth): Extension<AuthResult>,
     Query(q): Query<GraphQuery>,
 ) -> Result<Json<Value>, StatusCode> {
-    // 主数据 ns；旧前端 default 几乎无边，统一映射到 agent/xujiayan
-    let ns_raw = q.namespace.as_deref().unwrap_or("agent/xujiayan");
-    let ns = if ns_raw.is_empty() || ns_raw == "default" {
-        "agent/xujiayan"
+    // v1.2 P2-⑥（2026-11-07）：默认 ns 取调用者授权首项——同事带 badge 打开图谱页
+    // 免 403（原先硬编码 admin 视角 agent/xujiayan，fail-closed 无泄漏纯 UX）；
+    // admin（allowed=["*"]）与旧前端 default 回退主库，行为不变。
+    // 显式传 namespace 仍走 check_ns_access，fail-closed 语义不变。
+    let self_default = auth
+        .allowed_ns
+        .iter()
+        .map(|s| s.trim())
+        .find(|s| !s.is_empty() && *s != "*")
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "agent/xujiayan".to_string());
+    let ns_raw = q.namespace.as_deref().unwrap_or("");
+    let ns: &str = if ns_raw.is_empty() || ns_raw == "default" {
+        self_default.as_str()
     } else {
         ns_raw
     };
