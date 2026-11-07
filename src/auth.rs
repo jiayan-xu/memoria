@@ -361,10 +361,12 @@ pub fn ct_eq(a: &str, b: &str) -> bool {
 /// 授权 ns 与目标 ns 满足以下任一即放行：
 /// - 完全一致（`ns == namespace`）
 /// - 目标是授权 ns 的后代（`namespace` 以 `ns/` 开头）
-/// - 授权 ns 是目标的后代（两者共享同一子树，`ns` 以 `namespace/` 开头）
 ///
-/// 例：授权 `org/公司/div/工程线` 可覆盖其下 `dept/工程部/proj/P1` 等全部后代；
-///     部门级工具 `dept/工程部` 又对其下属 `proj/P1` 可见（共享子树）。
+/// 2026-11-07（方案 P1-2）：移除原「授权 ns 是目标后代」的祖先方向放行。
+/// 该方向使持有 `agent/浦发/财务部/张三` 的账号可请求父级 `agent/浦发` 并通过
+/// 校验，判定偏宽松。写路径此前已由 `check_ns_write` 单向下沉，此处读路径同步
+/// 收紧，两层策略一致；实查注册表当前无依赖祖先方向的授权配置。
+/// 部门共享子树请显式把父级 ns 写入 `allowed_ns`（如 `org/.../dept/gufei`）。
 pub fn check_ns_access(auth: &AuthResult, namespace: &str) -> bool {
     if auth.role == "admin" {
         return true;
@@ -372,11 +374,9 @@ pub fn check_ns_access(auth: &AuthResult, namespace: &str) -> bool {
     if auth.allowed_ns.contains(&"*".to_string()) {
         return true;
     }
-    auth.allowed_ns.iter().any(|ns| {
-        *ns == namespace
-            || namespace.starts_with(&format!("{}/", ns))
-            || ns.starts_with(&format!("{}/", namespace))
-    })
+    auth.allowed_ns
+        .iter()
+        .any(|ns| *ns == namespace || namespace.starts_with(&format!("{}/", ns)))
 }
 
 /// D0-NS R4（2026-11-07）：写入类操作的 namespace 策略。

@@ -581,6 +581,21 @@ mod tests {
         assert!(!is_sealed_read_tool("some_future_write_tool"));
     }
 
+    /// P1-2：读路径也收紧为仅子级，祖先方向不再放行
+    #[test]
+    fn read_access_no_longer_grants_ancestor() {
+        let user = AuthResult {
+            agent_id: "staff".into(),
+            allowed_ns: vec!["agent/dept/team/staff".into()],
+            role: "user".into(),
+        };
+        assert!(auth::check_ns_access(&user, "agent/dept/team/staff"));
+        assert!(auth::check_ns_access(&user, "agent/dept/team/staff/sub"));
+        assert!(!auth::check_ns_access(&user, "agent/dept"));
+        assert!(!auth::check_ns_access(&user, "agent/dept/team"));
+        assert!(!auth::check_ns_access(&user, "agent/other"));
+    }
+
     /// require_admin：角色优先，key 兜底，空配置不误放行
     #[test]
     fn require_admin_role_and_key() {
