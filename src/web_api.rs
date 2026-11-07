@@ -209,6 +209,10 @@ async fn api_upload_document(
             format!("无权限写入命名空间 {namespace}"),
         );
     }
+    // D0-NS R4：写入额外走统一策略层（封存名单对 admin 同样生效 + 禁祖先方向）
+    if let Err(reason) = auth::check_ns_write(&auth, &namespace) {
+        return json_err(StatusCode::FORBIDDEN, reason);
+    }
     let Some(kind) = document::detect_kind(&filename, content_type.as_deref()) else {
         return json_err(
             StatusCode::UNSUPPORTED_MEDIA_TYPE,
@@ -435,6 +439,14 @@ async fn api_graph(
     }
 
     // 关系边：两端都已在种子集，或（全量模式）可扩展进图
+    // 2026-11-06 修：原 SQL 带 `LIMIT 12000`，而「两端都在种子集」的过滤发生在
+    // 下面的 Rust 层，导致高权重但两端不在种子集内的边先占满名额，真正该展示的
+    // 边被截断（实测 agent/xujiayan 全表有 4482 条命中边，旧逻辑只捞到 209 条；
+    // limit=1200 时图谱仅 195 条连线，看起来「边全没了」）。
+    // 二次修：all 视图会在下面的循环里动态扩展节点集，若遍历全表，`id_set` 会
+    // 被 `node_cap` 早早填满，后续边两端都进不去（实测边数 3600→587）。因此按
+    // 视图分设扫描上限：value 不截断（由 `edge_cap` 收敛），all 保留 12000。
+    let edge_scan_limit: i64 = if value_only { i64::MAX } else { 12_000 };
     if let Ok(mut estmt) = conn.prepare(
         "SELECT source_id, target_id, relation_type, COALESCE(weight, 0.5)
          FROM memory_relations
@@ -446,9 +458,9 @@ async fn api_graph(
              OR valid_to > datetime('now')
            )
          ORDER BY weight DESC, id DESC
-         LIMIT 12000",
+         LIMIT ?2",
     ) {
-        if let Ok(erows) = estmt.query_map([ns], |r| {
+        if let Ok(erows) = estmt.query_map(rusqlite::params![ns, edge_scan_limit], |r| {
             Ok((
                 r.get::<_, String>(0)?,
                 r.get::<_, String>(1)?,
@@ -1035,6 +1047,10 @@ async fn api_update_memory(
     if !auth::check_ns_access(&auth, &mem_ns) {
         return Err(StatusCode::FORBIDDEN);
     }
+    // D0-NS R4：写操作统一策略层（封存名单 / 禁祖先方向）
+    if auth::check_ns_write(&auth, &mem_ns).is_err() {
+        return Err(StatusCode::FORBIDDEN);
+    }
 
     if let Some(ref content) = body.content {
         conn.execute(
@@ -1106,6 +1122,10 @@ async fn api_delete_memory(
         })
         .map_err(|_| StatusCode::NOT_FOUND)?;
     if !auth::check_ns_access(&auth, &mem_ns) {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    // D0-NS R4：写操作统一策略层（封存名单 / 禁祖先方向）
+    if auth::check_ns_write(&auth, &mem_ns).is_err() {
         return Err(StatusCode::FORBIDDEN);
     }
 

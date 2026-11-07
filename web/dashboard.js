@@ -553,6 +553,10 @@ function cleanGraphLabel(n) {
 
 var graphNetwork = null;
 async function loadGraph() {
+  // 2026-11-06：1200 节点 / 3000+ 边时数据与物理布局都需要时间，先给反馈，
+  // 避免首屏空白被误认为「边没了」。首帧绘制后由 afterDrawing 恢复完整统计。
+  const _hint0 = document.getElementById('graph-hint');
+  if (_hint0) _hint0.textContent = '⏳ 正在加载图谱数据…';
   try {
     // 默认高价值视图（pattern/fact/decision…）；要看全量加 &include=all
     const data = await api('/graph?namespace=' + encodeURIComponent(currentNs()) + '&limit=1200&include=value');
@@ -592,6 +596,9 @@ async function loadGraph() {
     if (graphNetwork) graphNetwork.destroy();
     const summary = data.summary || {};
     graphNetwork = new vis.Network(container, { nodes: new vis.DataSet(nodes), edges: new vis.DataSet(edges) }, {
+      // 2026-11-06：1200 节点 / 3000+ 边时 vis-network 的 improvedLayout 会卡住并报
+      // 「could not be positioned」，首屏长时间空白。关闭后直接交给 forceAtlas2Based。
+      layout: { improvedLayout: false },
       physics: { solver: 'forceAtlas2Based', forceAtlas2Based: { gravitationalConstant: -30, centralGravity: 0.005 } },
       interaction: { hover: true, tooltipDelay: 200 },
       nodes: { shape: 'dot' },
@@ -606,7 +613,11 @@ async function loadGraph() {
       var tm = summary.total_memories != null ? (' / ' + summary.total_memories) : '';
       var tall = summary.total_memories_all != null ? (' · 全库 ' + summary.total_memories_all) : '';
       var tr = summary.total_relations != null ? (' / ' + summary.total_relations) : '';
-      hint.textContent = 'NS ' + currentNs() + ' · ' + view + ' · 点 ' + nodes.length + tm + tall + ' · 边 ' + edges.length + tr + ' (采样预览)';
+      var finalHint = 'NS ' + currentNs() + ' · ' + view + ' · 点 ' + nodes.length + tm + tall + ' · 边 ' + edges.length + tr + ' (采样预览)';
+      hint.textContent = '⏳ 正在渲染图谱布局（' + nodes.length + ' 点 / ' + edges.length + ' 边）…';
+      graphNetwork.once('afterDrawing', function () { hint.textContent = finalHint; });
+      // 兜底：极端情况下 afterDrawing 未触发（如无节点），3 秒后也恢复统计
+      setTimeout(function () { if (hint.textContent.indexOf('⏳') === 0) hint.textContent = finalHint; }, 3000);
     }
   } catch (e) {
     document.getElementById('graph-container').innerHTML = '<div class="empty"><div class="icon">⚠️</div>' + escHtml(e.message) + '</div>';
