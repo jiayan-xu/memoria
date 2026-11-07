@@ -2,6 +2,12 @@
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
+<link rel="icon" href="data:,">
+<!-- 2026-11-06 修：/app（无尾斜杠）由 ServeDir 直接返回本页，相对资源会被解析到
+     根路径 / 并撞上鉴权 401，导致 dashboard.js 加载失败、saveAuth 未定义，
+     「保存凭证」点击无反应。固定 base 后 /app 与 /app/ 行为一致；
+     页面所有 API 请求均为 / 开头的绝对路径，不受 base 影响。 -->
+<base href="/app/">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Memoria 记忆中心</title>
 <script src="vis-network.min.js"></script>

@@ -361,10 +361,12 @@ pub fn ct_eq(a: &str, b: &str) -> bool {
 /// 授权 ns 与目标 ns 满足以下任一即放行：
 /// - 完全一致（`ns == namespace`）
 /// - 目标是授权 ns 的后代（`namespace` 以 `ns/` 开头）
-/// - 授权 ns 是目标的后代（两者共享同一子树，`ns` 以 `namespace/` 开头）
 ///
-/// 例：授权 `org/公司/div/工程线` 可覆盖其下 `dept/工程部/proj/P1` 等全部后代；
-///     部门级工具 `dept/工程部` 又对其下属 `proj/P1` 可见（共享子树）。
+/// 2026-11-07（方案 P1-2）：移除原「授权 ns 是目标后代」的祖先方向放行。
+/// 该方向使持有 `agent/浦发/财务部/张三` 的账号可请求父级 `agent/浦发` 并通过
+/// 校验，判定偏宽松。写路径此前已由 `check_ns_write` 单向下沉，此处读路径同步
+/// 收紧，两层策略一致；实查注册表当前无依赖祖先方向的授权配置。
+/// 部门共享子树请显式把父级 ns 写入 `allowed_ns`（如 `org/.../dept/gufei`）。
 pub fn check_ns_access(auth: &AuthResult, namespace: &str) -> bool {
     if auth.role == "admin" {
         return true;
@@ -372,11 +374,60 @@ pub fn check_ns_access(auth: &AuthResult, namespace: &str) -> bool {
     if auth.allowed_ns.contains(&"*".to_string()) {
         return true;
     }
-    auth.allowed_ns.iter().any(|ns| {
-        *ns == namespace
-            || namespace.starts_with(&format!("{}/", ns))
-            || ns.starts_with(&format!("{}/", namespace))
-    })
+    auth.allowed_ns
+        .iter()
+        .any(|ns| *ns == namespace || namespace.starts_with(&format!("{}/", ns)))
+}
+
+/// D0-NS R4（2026-11-07）：写入类操作的 namespace 策略。
+///
+/// 背景：agent-core 侧 `resolve_memory_ns` 的显式 ns 分支（含 `write_deny_ns`）
+/// 在生产链路不可达（`caller_ns` 恒传 None），单靠 agent-core 无法阻止绕过它直连
+/// MCP 的写入。因此在 memoria 侧补一层统一写入策略，覆盖所有入口。
+///
+/// - 读操作继续用 `check_ns_access`（保留部门共享子树的双向匹配语义，读不受限）；
+/// - 写操作用本函数：**封存名单对 admin 同样生效** + 仅「== / 子级」下沉授权
+///   （去掉 `ns.starts_with(target + "/")` 的祖先方向，堵住父级越权写）。
+pub fn write_sealed_ns() -> Vec<String> {
+    std::env::var("MEMORIA_WRITE_DENY_NS")
+        .ok()
+        .map(|s| {
+            s.split(',')
+                .map(str::trim)
+                .filter(|x| !x.is_empty())
+                .map(String::from)
+                .collect()
+        })
+        .unwrap_or_else(|| {
+            vec![
+                "agent/user".to_string(),
+                "agent/user/user/user".to_string(),
+            ]
+        })
+}
+
+pub fn is_write_sealed(namespace: &str) -> bool {
+    write_sealed_ns().iter().any(|d| d == namespace)
+}
+
+/// 写入前置校验。Ok(()) = 允许；Err(原因) = 拒绝并应写审计。
+pub fn check_ns_write(auth: &AuthResult, namespace: &str) -> Result<(), String> {
+    if is_write_sealed(namespace) {
+        return Err(format!("namespace '{}' 已只读封存，禁止写入", namespace));
+    }
+    if auth.role == "admin" || auth.allowed_ns.iter().any(|s| s == "*") {
+        return Ok(());
+    }
+    // 仅完全一致或目标是授权 ns 的后代；禁止祖先方向（父级共享桶越权写）
+    let granted = auth
+        .allowed_ns
+        .iter()
+        .any(|g| g == namespace || namespace.starts_with(&format!("{}/", g)));
+    if granted {
+        Ok(())
+    } else {
+        Err(format!("namespace '{}' 未获写授权", namespace))
+    }
 }
 
 /// 审计日志参数脱敏（移除敏感字段值，保留结构）

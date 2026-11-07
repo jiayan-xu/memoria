@@ -437,6 +437,49 @@ pub const PERMISSION_MATRIX: &[Entry] = &[
     },
 ];
 
+/// D0-NS R4（2026-11-07）：封存命名空间（`MEMORIA_WRITE_DENY_NS`）的只读放行清单。
+///
+/// 采用**只读白名单**而非写工具黑名单：新工具默认按「写工具」处理（fail-closed），
+/// 只有明确无副作用的查询工具能读封存桶。写工具额外走 `auth::check_ns_write`：
+/// 封存名单对 admin 同样生效 + 禁止祖先方向的授权下沉。
+const SEALED_READ_ALLOW: &[&str] = &[
+    "memory_search",
+    "memory_search_v2",
+    "memory_recall",
+    "memory_context",
+    "memory_recent_decisions",
+    "memory_profile",
+    "memory_graph",
+    "memory_graph_query",
+    "memory_export",
+    "memory_fetch_unconsolidated",
+    "memory_ops_status",
+    "memory_health",
+    "memory_quota_status",
+    "memory_backup_list",
+    "memory_backup_verify",
+    "memory_migration_manifest",
+    "memory_user_prefs",
+    "db_stats",
+    "system_status",
+    "get_allowed_ns",
+    "entity_search",
+    "cross_agent_query",
+    "audit_query",
+    "evolution_log_query",
+    "agent_list",
+    "a2a_recv",
+    "dream_state_get",
+    "skill_market_list_installed",
+    "skill_market_search",
+    "skill_market_info",
+];
+
+/// 该工具是否允许读取已封存（只读）命名空间。
+pub fn is_sealed_read_tool(tool: &str) -> bool {
+    SEALED_READ_ALLOW.contains(&tool)
+}
+
 /// 在矩阵中查找某工具的权限条目
 pub fn matrix_lookup(tool: &str) -> Option<&'static Entry> {
     PERMISSION_MATRIX.iter().find(|e| e.tool == tool)
@@ -499,6 +542,58 @@ mod tests {
                 e.tool
             );
         }
+    }
+
+    /// D0-NS R4：封存命名空间对 admin 同样禁止写入，正常主库不受影响
+    #[test]
+    fn write_sealed_blocks_even_admin() {
+        let admin = AuthResult {
+            agent_id: "admin".into(),
+            allowed_ns: vec!["*".into()],
+            role: "admin".into(),
+        };
+        assert!(crate::auth::check_ns_write(&admin, "agent/user").is_err());
+        assert!(crate::auth::check_ns_write(&admin, "agent/user/user/user").is_err());
+        assert!(crate::auth::check_ns_write(&admin, "agent/xujiayan").is_ok());
+    }
+
+    /// D0-NS R4：写授权只允许 == / 子级，禁止祖先方向（父级共享桶越权写）
+    #[test]
+    fn write_grants_child_only_not_ancestor() {
+        let user = AuthResult {
+            agent_id: "u_x".into(),
+            allowed_ns: vec!["agent/u_x".into()],
+            role: "read_write".into(),
+        };
+        assert!(crate::auth::check_ns_write(&user, "agent/u_x").is_ok());
+        assert!(crate::auth::check_ns_write(&user, "agent/u_x/sub").is_ok());
+        assert!(crate::auth::check_ns_write(&user, "agent").is_err());
+        assert!(crate::auth::check_ns_write(&user, "agent/u_y").is_err());
+    }
+
+    /// D0-NS R4：只读白名单 fail-closed——未登记的新工具默认按写工具处理
+    #[test]
+    fn sealed_read_allowlist_is_fail_closed() {
+        assert!(is_sealed_read_tool("memory_search"));
+        assert!(is_sealed_read_tool("memory_export"));
+        assert!(!is_sealed_read_tool("memory_remember"));
+        assert!(!is_sealed_read_tool("memory_import"));
+        assert!(!is_sealed_read_tool("some_future_write_tool"));
+    }
+
+    /// P1-2：读路径也收紧为仅子级，祖先方向不再放行
+    #[test]
+    fn read_access_no_longer_grants_ancestor() {
+        let user = AuthResult {
+            agent_id: "staff".into(),
+            allowed_ns: vec!["agent/dept/team/staff".into()],
+            role: "user".into(),
+        };
+        assert!(auth::check_ns_access(&user, "agent/dept/team/staff"));
+        assert!(auth::check_ns_access(&user, "agent/dept/team/staff/sub"));
+        assert!(!auth::check_ns_access(&user, "agent/dept"));
+        assert!(!auth::check_ns_access(&user, "agent/dept/team"));
+        assert!(!auth::check_ns_access(&user, "agent/other"));
     }
 
     /// require_admin：角色优先，key 兜底，空配置不误放行

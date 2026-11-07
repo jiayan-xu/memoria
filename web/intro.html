@@ -188,7 +188,7 @@
     <div class="hero-stat"><span class="num" id="memCount">加载中...</span><span class="label">记忆条目</span></div>
     <div class="hero-stat"><span class="num" id="dataSources">加载中...</span><span class="label">数据源</span></div>
     <div class="hero-stat"><span class="num" id="version">加载中...</span><span class="label">当前版本</span></div>
-    <div class="hero-stat"><span class="num" id="uptime">计算中...</span><span class="label">持续运行</span></div>
+    <div class="hero-stat"><span class="num" id="uptime">--</span><span class="label">服务状态</span></div>
   </div>
 </section>
 
@@ -262,8 +262,15 @@ document.addEventListener('DOMContentLoaded', () => {
   }, 300);
   
   // 动态加载统计数据
+  // 2026-11-06 修：/stats 需鉴权；旧版既没带头、又硬编码了早已废弃的中文命名空间，
+  // 结果恒定 401、首页统计数字永远是占位符。改为读本机保存的凭据与当前命名空间。
   var xhrStats = new XMLHttpRequest();
-  xhrStats.open('GET', '/stats?namespace=' + encodeURIComponent('常熟浦发2/工程部/固废监管'), true);
+  var _aid = (localStorage.getItem('memoria_agent_id') || '').trim();
+  var _akey = (localStorage.getItem('memoria_agent_key') || '').trim();
+  var _ns = (localStorage.getItem('memoria_namespace') || 'agent/xujiayan').trim() || 'agent/xujiayan';
+  xhrStats.open('GET', '/stats?namespace=' + encodeURIComponent(_ns), true);
+  xhrStats.setRequestHeader('X-Agent-Id', _aid);
+  xhrStats.setRequestHeader('X-Agent-Key', _akey);
   xhrStats.onload = function() {
     if (xhrStats.status === 200) {
       var stats = JSON.parse(xhrStats.responseText);
@@ -288,11 +295,9 @@ document.addEventListener('DOMContentLoaded', () => {
       var fv = document.getElementById('footerVersion');
       if (fv && health.version) fv.textContent = 'v' + health.version;
       var up = document.getElementById('uptime');
-      if (up && health.cumulative_days) {
-        var days = Math.floor(health.cumulative_days);
-        var hours = Math.round((health.cumulative_days - days) * 24);
-        up.textContent = days + '天' + (hours > 0 ? hours + '时' : '');
-      }
+      // 2026-11-06 修：/health 并不返回 cumulative_days，旧逻辑让该项永远停在「计算中...」。
+      // 改为展示真实可用的服务状态。
+      if (up) up.textContent = health.status === 'ok' ? '在线' : '异常';
     }
   };
   xhrHealth.send();

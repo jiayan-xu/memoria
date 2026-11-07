@@ -2,6 +2,7 @@
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
+<link rel="icon" href="data:,">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Memoria · 时间线</title>
 <style>
@@ -118,9 +119,26 @@ main { max-width: 1100px; margin: 0 auto; padding: 24px; }
   <div class="timeline" id="timeline"></div>
 </main>
 <script>
+// 2026-11-06 修：/stats 与 /decay_timeline 都需 X-Agent-Id / X-Agent-Key，
+// 旧版裸 fetch 一律 401，页面统计永远停在 "--"。凭据由记忆中心顶栏保存到本机。
+function memAuthHeaders() {
+  return { 'X-Agent-Id': (localStorage.getItem('memoria_agent_id') || '').trim(),
+           'X-Agent-Key': (localStorage.getItem('memoria_agent_key') || '').trim() };
+}
+function memNs() {
+  return (localStorage.getItem('memoria_namespace') || 'agent/xujiayan').trim() || 'agent/xujiayan';
+}
+function needAuthMsg() {
+  return '<div style="color:#ff6b6b;padding:12px">请先在 <a href="/app/" style="color:#a78bfa">记忆中心</a> 顶栏填写并保存 Agent Id / Key，再回到本页刷新</div>';
+}
+function hasCreds() {
+  const h = memAuthHeaders(); return !!(h['X-Agent-Id'] && h['X-Agent-Key']);
+}
 async function loadStats() {
+  if (!hasCreds()) { document.getElementById('timeline').innerHTML = needAuthMsg(); return; }
   try {
-    const r = await fetch('/stats');
+    const r = await fetch('/stats?namespace=' + encodeURIComponent(memNs()), { headers: memAuthHeaders() });
+    if (r.status === 401) { document.getElementById('timeline').innerHTML = needAuthMsg(); return; }
     const d = await r.json();
     document.getElementById('statSessions').textContent = d.sessions ?? '--';
     document.getElementById('statMessages').textContent = d.messages ?? '--';
@@ -140,9 +158,11 @@ async function loadStats() {
 
 async function loadTimeline() {
   const el = document.getElementById('timeline');
+  if (!hasCreds()) { el.innerHTML = needAuthMsg(); return; }
   el.innerHTML = '<div style="color:var(--text2)">加载中...</div>';
   try {
-    const r = await fetch('/decay_timeline?days=90');
+    const r = await fetch('/decay_timeline?days=90', { headers: memAuthHeaders() });
+    if (r.status === 401) { el.innerHTML = needAuthMsg(); return; }
     const data = await r.json();
     if (!data?.entries?.length) {
       el.innerHTML = '<div style="color:var(--text2)">暂无衰减记录</div>';

@@ -217,6 +217,9 @@ fn block_on_rerank(
 /// 构建 axum Router
 pub fn build_app(state: Arc<AppState>) -> Router {
     Router::new()
+        // 2026-11-06 修：未匹配路由会被全局 fallback 判 401，直接访问
+        // http://host:9003/ 是空白页。给根路径一条明确路由跳转到 Web UI。
+        .route("/", get(|| async { axum::response::Redirect::temporary("/app/") }))
         .route("/mcp", post(handle_mcp))
         .route("/health", get(health_check))
         .route("/health/full", get(health_check_full))
@@ -1102,6 +1105,26 @@ async fn handle_tool_call(
             false,
         );
         return rpc_error(id, -32002, &format!("Namespace '{}' not authorized.", ns));
+    }
+    // ── D0-NS R4（2026-11-07）：写入类工具统一策略层 ──
+    // 补上 agent-core 侧 `resolve_memory_ns` 显式分支在生产链路不可达的缺口：
+    // 该分支（含 write_deny_ns 封存）因 caller_ns 恒传 explicit=None 永不触发，
+    // 直连 MCP 传 namespace="agent/user" 仍可写封存桶。此处覆盖所有 MCP 入口：
+    //   * 封存名单对 admin 同样禁止写入；
+    //   * 写授权只允许 ==/子级，禁止祖先方向（父级共享桶越权写）。
+    // 只读白名单工具与 NsPolicy::None 工具不受影响——读历史数据不受限。
+    let ns_governed = !matches!(ns_policy, Some(crate::permissions::NsPolicy::None));
+    if ns_governed && !crate::permissions::is_sealed_read_tool(tool) {
+        if let Err(reason) = auth::check_ns_write(&auth, ns) {
+            spawn_audit(
+                state,
+                agent_id,
+                tool,
+                &serde_json::to_string(&args).unwrap_or_else(|_| format!("{:?}", args)),
+                false,
+            );
+            return rpc_error(id, -32002, &reason);
+        }
     }
     // P1：转为 owned，断开对 safe_args 的借用——后续整合 hook 需可变注入 supersedes_id
     let ns = ns.to_string();
