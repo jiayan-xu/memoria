@@ -91,7 +91,8 @@ pub fn register_agent(
     hasher.update(raw_token.as_bytes());
     let badge_token = format!("{:x}", hasher.finalize());
 
-    let expires = (chrono::Utc::now() + chrono::Duration::days(365))
+    // v1.2 P1-6（2026-11-07 拍板）：badge 有效期 365 -> 180 天；登录自愈路径已有，到期重登即续
+    let expires = (chrono::Utc::now() + chrono::Duration::days(180))
         .format("%Y-%m-%dT%H:%M:%S")
         .to_string();
 
@@ -231,7 +232,8 @@ pub fn register_user(
     hasher.update(format!("{}{}", password, user_id).as_bytes());
     let badge_token = format!("{:x}", hasher.finalize());
 
-    let expires = (chrono::Utc::now() + chrono::Duration::days(365))
+    // v1.2 P1-6（2026-11-07 拍板）：badge 有效期 365 -> 180 天；登录自愈路径已有，到期重登即续
+    let expires = (chrono::Utc::now() + chrono::Duration::days(180))
         .format("%Y-%m-%dT%H:%M:%S")
         .to_string();
 
@@ -306,7 +308,7 @@ pub fn authenticate(
     let conn = pool.get().map_err(|e| format!("pool: {}", e))?;
 
     let row = conn.query_row(
-        "SELECT badge_token, namespace, permission FROM agent_registry
+        "SELECT badge_token, namespace, permission, COALESCE(status, 'active') FROM agent_registry
          WHERE agent_id = ? AND expires_at > datetime('now')",
         rusqlite::params![agent_id],
         |row| {
@@ -314,12 +316,20 @@ pub fn authenticate(
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
             ))
         },
     );
 
     match row {
-        Ok((stored_token, ns_list, permission)) => {
+        Ok((stored_token, ns_list, permission, status)) => {
+            // v1.2 D3（2026-11-07）：归档账号 badge 一律拒绝（保留数据与行，仅禁用）。
+            // 归档写入口（OCR v1.2）：仓库内无 admin 工具写 status，运维用 SQL——
+            //   UPDATE agent_registry SET status='archived' WHERE agent_id='<id>';
+            // 比较做 trim + 大小写归一（防手工 SQL 写 'ARCHIVED' 等致门禁 fail-open）。
+            if status.trim().eq_ignore_ascii_case("archived") {
+                return Err(format!("agent archived: {}", agent_id));
+            }
             if !ct_eq(&stored_token, badge_token) {
                 return Err("invalid badge token".to_string());
             }
@@ -572,6 +582,11 @@ pub fn init_auth_tables(pool: &SqlitePool) -> Result<(), String> {
             expires_at TEXT,
             last_heartbeat TEXT
         );
+        CREATE TABLE IF NOT EXISTS ns_alias (
+            alias         TEXT PRIMARY KEY,
+            canonical_ns  TEXT NOT NULL,
+            created_at    TEXT DEFAULT (datetime('now'))
+        );
         CREATE TABLE IF NOT EXISTS skill_catalog (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT UNIQUE NOT NULL,
@@ -628,6 +643,19 @@ pub fn init_auth_tables(pool: &SqlitePool) -> Result<(), String> {
         ),
         [],
     );
+
+    // v1.2 P1-1/D3（2026-11-07）：agent_registry.status 归档标记（幂等 ALTER）
+    let has_status: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('agent_registry') WHERE name = 'status'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    if has_status == 0 {
+        conn.execute_batch("ALTER TABLE agent_registry ADD COLUMN status TEXT DEFAULT 'active';")
+            .map_err(|e| format!("add status column: {}", e))?;
+    }
 
     // 清理超期分区（>90 天）
     cleanup_stale_tables(&conn);
