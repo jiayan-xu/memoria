@@ -2626,10 +2626,16 @@ fn dispatch(
             // 调用者自身（to == 自己）或 admin(*) 始终允许；其余必须落在 allowed_ns 内。
             let target_ns = format!("agent/{}", to);
             let self_msg = to == _auth.agent_id;
-            if !self_msg && !auth::check_ns_access(_auth, &target_ns) {
-                return format!(
-                    r#"{{"status":"error","message":"无权向该 Agent 发送消息（超出命名空间授权范围）"}}"#
-                );
+            // OCR v1.2 security·high 修复：a2a_send 实际向 agent/{to} INSERT 记忆，
+            // 原先只过读规则（check_ns_access），封存桶对 admin 也可写——改走写闸
+            // （check_ns_write：封存名单对 admin 同样生效 + 仅 ==/子级授权）。
+            if !self_msg {
+                if let Err(reason) = auth::check_ns_write(_auth, &target_ns) {
+                    return format!(
+                        r#"{{"status":"error","message":"{}"}}"#,
+                        reason
+                    );
+                }
             }
             // Phase A P0-1（WeKnora 吸收）：a2a 消息同样入 memories 表、会被召回
             // 重发到模型，写入前过同一道脱敏门。

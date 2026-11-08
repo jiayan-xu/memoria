@@ -417,7 +417,13 @@ pub fn write_sealed_ns() -> Vec<String> {
 }
 
 pub fn is_write_sealed(namespace: &str) -> bool {
-    write_sealed_ns().iter().any(|d| d == namespace)
+    // OCR v1.2 security·high 修复：精确等值 → 前缀语义（== 或子级）+ 归一化
+    // （trim / 去尾斜杠），否则 `agent/user/任意子路径` 或带尾斜杠变体可绕过封存。
+    let ns = namespace.trim().trim_end_matches('/');
+    write_sealed_ns().iter().any(|d| {
+        let d = d.trim().trim_end_matches('/');
+        ns == d || ns.starts_with(&format!("{}/", d))
+    })
 }
 
 /// 写入前置校验。Ok(()) = 允许；Err(原因) = 拒绝并应写审计。
@@ -710,4 +716,21 @@ pub fn cleanup_agent_registry(pool: &SqlitePool) -> Result<(usize, Vec<String>),
         removed += 1;
     }
     Ok((removed, dead_ids))
+}
+
+#[cfg(test)]
+mod seal_tests {
+    use super::*;
+
+    #[test]
+    fn seal_covers_subtree_and_normalized_variants() {
+        // OCR v1.2 security·high：前缀语义 + 归一化（trim/尾斜杠）
+        assert!(is_write_sealed("agent/user"));
+        assert!(is_write_sealed("agent/user/"));
+        assert!(is_write_sealed(" agent/user "));
+        assert!(is_write_sealed("agent/user/任意子路径"));
+        assert!(is_write_sealed("agent/user/user/user"));
+        assert!(!is_write_sealed("agent/xujiayan"));
+        assert!(!is_write_sealed("agent/userx")); // 前缀串撞不上（无分隔符）
+    }
 }
