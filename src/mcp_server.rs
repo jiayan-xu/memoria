@@ -2740,8 +2740,9 @@ fn dispatch(
             match state.auth_pool.get() {
                 Ok(conn) => {
                     let result = (|| -> Result<String, String> {
+                        // v1.2 D3（2026-11-08）：归档账号不出现在任何名单（通讯录/目录源）
                         let mut stmt = conn.prepare(
-                            "SELECT agent_id, display_name, namespace, permission, created_at FROM agent_registry ORDER BY created_at"
+                            "SELECT agent_id, display_name, namespace, permission, created_at FROM agent_registry                              WHERE COALESCE(status, 'active') != 'archived' ORDER BY created_at"
                         ).map_err(|e| format!("prepare: {}", e))?;
                         let rows: Vec<serde_json::Value> = stmt.query_map([], |row| Ok(serde_json::json!({
                             "agent_id":row.get::<_,String>(0)?,"display_name":row.get::<_,String>(1)?,
