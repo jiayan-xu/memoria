@@ -1132,39 +1132,215 @@ async fn handle_tool_call(
     // ── P2：memory_graph_query —— Kuzu 时序图谱代理（异步早返回，不进 dispatch）──
     // entity → /neighbors 多跳；cypher → /query 只读；缺省 → /stats。sidecar 不可用 → 错误 JSON（不挂起）。
     if tool == "memory_graph_query" {
-        let has_entity = safe_args.get("entity").and_then(|v| v.as_str()).map(|s| !s.trim().is_empty()).unwrap_or(false);
-        let has_cypher = safe_args.get("cypher").and_then(|v| v.as_str()).map(|s| !s.trim().is_empty()).unwrap_or(false);
-        let path = if has_entity { "/neighbors" } else if has_cypher { "/query" } else { "/stats" };
-        let mut body = serde_json::Map::new();
-        body.insert("namespace".into(), serde_json::json!(ns));
-        for k in ["entity", "cypher", "as_of", "depth", "name"] {
-            if let Some(v) = safe_args.get(k) {
-                body.insert(k.into(), v.clone());
-            }
+        // NS 对齐 P3（2026-11-08）：Kuzu 边车缺位补偿——原生 ns-scoped 图谱查询，
+        // 直查 entities/entity_mentions/entity_edges（自带 namespace 列，硬过滤）。
+        // cypher 模式需要 Kuzu（未部署）：明确报错，不再代理到不存在的全局存储
+        // （顺带消灭"cypher 绕过 ns 过滤读全局图谱"的门禁问题）。
+        let has_cypher = safe_args
+            .get("cypher")
+            .and_then(|v| v.as_str())
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false);
+        if has_cypher {
+            spawn_audit(state, agent_id, tool, &format!("ns={} mode=cypher", ns), false);
+            return rpc_ok_text(
+                id,
+                &serde_json::json!({
+                    "error": "cypher 模式需要 Kuzu 边车（当前未部署）。请改用 entity 查邻居，或留空查统计。"
+                })
+                .to_string(),
+            );
         }
-        if path == "/neighbors" {
-            // neighbors 端点读 "name" 参数
-            if let Some(v) = safe_args.get("entity") {
-                body.insert("name".into(), v.clone());
+        let entity_arg = safe_args
+            .get("entity")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        let depth = safe_args
+            .get("depth")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(1)
+            .clamp(1, 3) as i64;
+        let ns_exact = ns.to_string();
+        let ns_prefix = format!("{}/", ns_exact);
+        let pool = state.pool.clone();
+        let ns_for_task = ns_exact.clone();
+        let prefix_for_task = ns_prefix.clone();
+        let entity_for_task = entity_arg.clone();
+        let graph_json = tokio::task::spawn_blocking(move || {
+            let conn = match pool.get() {
+                Ok(c) => c,
+                Err(e) => return serde_json::json!({"error": format!("pool: {e}")}),
+            };
+            // 统计口径：ns 精确 + 子树（org 共享子树一并可见）
+            let ent_count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM entities WHERE namespace=?1 OR namespace LIKE ?2||'/%'",
+                    rusqlite::params![ns_for_task, ns_prefix],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0);
+            let edge_count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM entity_edges WHERE namespace=?1 OR namespace LIKE ?2||'/%'",
+                    rusqlite::params![ns_for_task, ns_prefix],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0);
+            if entity_for_task.is_empty() {
+                let mut by_type = std::collections::BTreeMap::new();
+                if let Ok(mut stmt) = conn.prepare(
+                    "SELECT entity_type, COUNT(*) FROM entities \
+                     WHERE namespace=?1 OR namespace LIKE ?2||'/%' GROUP BY entity_type",
+                ) {
+                    if let Ok(rows) = stmt.query_map(rusqlite::params![ns_for_task, ns_prefix], |r| {
+                        Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+                    }) {
+                        for row in rows.flatten() {
+                            by_type.insert(row.0, row.1);
+                        }
+                    }
+                }
+                return serde_json::json!({
+                    "stats": {
+                        "namespace": ns_for_task,
+                        "entities": ent_count,
+                        "edges": edge_count,
+                        "by_type": by_type,
+                    }
+                });
             }
-        }
-        let gurl = state.graph_url.trim_end_matches('/').to_string();
-        let resp = state
-            .http_client
-            .post(format!("{}{}", gurl, path))
-            .timeout(std::time::Duration::from_secs(5))
-            .json(&body)
-            .send()
-            .await;
-        let text = match resp {
-            Ok(r) => r.text().await.unwrap_or_else(|_| "{\"error\":\"graph service read failed\"}".to_string()),
-            Err(_) => "{\"error\":\"graph service unavailable\"}".to_string(),
-        };
+            // neighbors：实体名（name 或 aliases 精确段）起步，最多 depth 跳
+            let seed_ids: Vec<String> = {
+                let mut stmt = match conn.prepare(
+                    "SELECT id FROM entities \
+                     WHERE (namespace=?1 OR namespace LIKE ?2||'/%') \
+                     AND (name=?3 OR (','||aliases||',') LIKE '%,'||?3||',%')",
+                ) {
+                    Ok(s2) => s2,
+                    Err(e) => return serde_json::json!({"error": format!("seed: {e}")}),
+                };
+                match stmt.query_map(rusqlite::params![ns_for_task, ns_prefix, entity_for_task], |r| {
+                    r.get::<_, String>(0)
+                }) {
+                    Ok(rows) => rows.flatten().collect(),
+                    Err(e) => return serde_json::json!({"error": format!("seed q: {e}")}),
+                }
+            };
+            if seed_ids.is_empty() {
+                return serde_json::json!({
+                    "error": format!("实体「{}」在当前命名空间不存在", entity_for_task),
+                    "hint": "检查名称，或该实体的记忆尚未抽取实体",
+                });
+            }
+            let mut hops = std::collections::HashMap::new();
+            for id in &seed_ids {
+                hops.insert(id.clone(), 0i64);
+            }
+            let mut frontier = seed_ids.clone();
+            for hop in 1..=depth {
+                if frontier.is_empty() {
+                    break;
+                }
+                let ph = frontier.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+                let q2 = format!(
+                    "SELECT DISTINCT CASE WHEN source_entity_id IN ({ph}) THEN target_entity_id \
+                     ELSE source_entity_id END AS nid FROM entity_edges \
+                     WHERE (source_entity_id IN ({ph}) OR target_entity_id IN ({ph})) \
+                     AND (namespace=?1 OR namespace LIKE ?2||'/%')",
+                    ph = ph,
+                );
+                let mut params2: Vec<String> = Vec::new();
+                params2.push(ns_for_task.clone());
+                params2.push(ns_prefix.clone());
+                params2.extend(frontier.clone());
+                let qp: Vec<&str> = params2.iter().map(|x| x.as_str()).collect();
+                if let Ok(mut stmt) = conn.prepare(&q2) {
+                    if let Ok(rows) = stmt.query_map(rusqlite::params_from_iter(qp.iter()), |r| {
+                        r.get::<_, String>(0)
+                    }) {
+                        let mut next = Vec::new();
+                        for nid in rows.flatten() {
+                            if !hops.contains_key(&nid) {
+                                hops.insert(nid.clone(), hop);
+                                next.push(nid);
+                            }
+                        }
+                        frontier = next;
+                    }
+                }
+            }
+            let ids: Vec<String> = hops.keys().cloned().collect();
+            let ph = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+            let mut nodes = Vec::new();
+            {
+                let q = format!(
+                    "SELECT id, entity_type, name, summary FROM entities WHERE id IN ({ph})"
+                );
+                if let Ok(mut stmt) = conn.prepare(&q) {
+                    let qp: Vec<&str> = ids.iter().map(|x| x.as_str()).collect();
+                    if let Ok(rows) =
+                        stmt.query_map(rusqlite::params_from_iter(qp.iter()), |r| {
+                            Ok(serde_json::json!({
+                                "id": r.get::<_, String>(0)?,
+                                "type": r.get::<_, String>(1)?,
+                                "name": r.get::<_, String>(2)?,
+                                "summary": r.get::<_, String>(3)?,
+                            }))
+                        })
+                    {
+                        for n in rows.flatten() {
+                            nodes.push(n);
+                        }
+                    }
+                }
+            }
+            let mut edges = Vec::new();
+            {
+                let q = format!(
+                    "SELECT source_entity_id, target_entity_id, relation_type, weight \
+                     FROM entity_edges WHERE namespace=?1 OR namespace LIKE ?2||'/%'"
+                );
+                if let Ok(mut stmt) = conn.prepare(&q) {
+                    if let Ok(rows) = stmt.query_map(
+                        rusqlite::params![ns_for_task, ns_prefix],
+                        |r| {
+                            Ok(serde_json::json!({
+                                "source": r.get::<_, String>(0)?,
+                                "target": r.get::<_, String>(1)?,
+                                "relation": r.get::<_, String>(2)?,
+                                "weight": r.get::<_, f64>(3)?,
+                            }))
+                        },
+                    ) {
+                        for e in rows.flatten() {
+                            let src = e["source"].as_str().unwrap_or("").to_string();
+                            let dst = e["target"].as_str().unwrap_or("").to_string();
+                            if hops.contains_key(&src) && hops.contains_key(&dst) {
+                                edges.push(e);
+                            }
+                        }
+                    }
+                }
+            }
+            serde_json::json!({
+                "namespace": ns_for_task,
+                "root": entity_for_task,
+                "hops": depth,
+                "nodes": nodes,
+                "edges": edges,
+            })
+        })
+        .await
+        .unwrap_or_else(|_| serde_json::json!({"error": "graph join failed"}));
+        let text = serde_json::to_string(&graph_json)
+            .unwrap_or_else(|_| "{\"error\":\"graph serialize failed\"}".to_string());
         spawn_audit(
             state,
             agent_id,
             tool,
-            &format!("ns={} path={}", ns, path),
+            &format!("ns={} entity={} depth={}", ns, entity_arg, depth),
             !text.contains("\"error\""),
         );
         return rpc_ok_text(id, &text);
@@ -2626,10 +2802,16 @@ fn dispatch(
             // 调用者自身（to == 自己）或 admin(*) 始终允许；其余必须落在 allowed_ns 内。
             let target_ns = format!("agent/{}", to);
             let self_msg = to == _auth.agent_id;
-            if !self_msg && !auth::check_ns_access(_auth, &target_ns) {
-                return format!(
-                    r#"{{"status":"error","message":"无权向该 Agent 发送消息（超出命名空间授权范围）"}}"#
-                );
+            // OCR v1.2 security·high 修复：a2a_send 实际向 agent/{to} INSERT 记忆，
+            // 原先只过读规则（check_ns_access），封存桶对 admin 也可写——改走写闸
+            // （check_ns_write：封存名单对 admin 同样生效 + 仅 ==/子级授权）。
+            if !self_msg {
+                if let Err(reason) = auth::check_ns_write(_auth, &target_ns) {
+                    return format!(
+                        r#"{{"status":"error","message":"{}"}}"#,
+                        reason
+                    );
+                }
             }
             // Phase A P0-1（WeKnora 吸收）：a2a 消息同样入 memories 表、会被召回
             // 重发到模型，写入前过同一道脱敏门。
@@ -2740,8 +2922,9 @@ fn dispatch(
             match state.auth_pool.get() {
                 Ok(conn) => {
                     let result = (|| -> Result<String, String> {
+                        // v1.2 D3（2026-11-08）：归档账号不出现在任何名单（通讯录/目录源）
                         let mut stmt = conn.prepare(
-                            "SELECT agent_id, display_name, namespace, permission, created_at FROM agent_registry ORDER BY created_at"
+                            "SELECT agent_id, display_name, namespace, permission, created_at FROM agent_registry                              WHERE COALESCE(status, 'active') != 'archived' ORDER BY created_at"
                         ).map_err(|e| format!("prepare: {}", e))?;
                         let rows: Vec<serde_json::Value> = stmt.query_map([], |row| Ok(serde_json::json!({
                             "agent_id":row.get::<_,String>(0)?,"display_name":row.get::<_,String>(1)?,
