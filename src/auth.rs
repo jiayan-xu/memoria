@@ -227,6 +227,12 @@ pub fn register_user(
         .filter(|s| !s.trim().is_empty())
         .map(|s| s.to_string())
         .unwrap_or_else(|| format!("agent/{}", user_id));
+    // 2026-11-23 P0 修复（纵深）：模块级拒绝通配符——"*" 只能作为 admin 身份的
+    // allowed_ns 铸造，绝不能落成任何账号的 namespace（否则 login_user 后
+    // allowed_ns 含 * 即全库读写）。handler 层已有校验，此处兜其他调用方。
+    if namespace.contains('*') {
+        return Err("namespace 不得包含通配符 *".to_string());
+    }
     // badge_token = SHA256(password || user_id)
     let mut hasher = Sha256::new();
     hasher.update(format!("{}{}", password, user_id).as_bytes());
@@ -336,7 +342,8 @@ pub fn authenticate(
             let allowed_ns: Vec<String> = ns_list
                 .split(',')
                 .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
+                // F6 纵深（2026-11-23）：非 admin 行即便历史数据含 "*" 也不授予通配授权
+                .filter(|s| !s.is_empty() && s != "*")
                 .collect();
             Ok(AuthResult {
                 agent_id: agent_id.to_string(),
@@ -428,6 +435,11 @@ pub fn is_write_sealed(namespace: &str) -> bool {
 
 /// 写入前置校验。Ok(()) = 允许；Err(原因) = 拒绝并应写审计。
 pub fn check_ns_write(auth: &AuthResult, namespace: &str) -> Result<(), String> {
+    // F6（2026-11-23）：通配符不是真实命名空间——写入指向 * 一律拒绝（先于 admin 放行，
+    // 防「admin 显式传 ns=*」在本地纵深上开洞）。
+    if namespace.contains('*') {
+        return Err("namespace 不得包含通配符 *".to_string());
+    }
     if is_write_sealed(namespace) {
         return Err(format!("namespace '{}' 已只读封存，禁止写入", namespace));
     }
