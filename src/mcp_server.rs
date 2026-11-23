@@ -2510,6 +2510,29 @@ fn dispatch(
                 return r#"{"status":"error","message":"口令至少 6 位"}"#.to_string();
             }
             let ns_override = args.get("namespace").and_then(|v| v.as_str());
+            // 2026-11-23 P0 修复：namespace_override 必须过与写路径同一道 ns 闸——
+            // 此前完全不校验，任意持 badge 的智能体可注册指向 agent/xujiayan 的账号
+            //（主记忆区全读写）甚至 "*"（login 后 allowed_ns 含 *，绕过整个 ACL）。
+            if let Some(ns_raw) = ns_override {
+                let ns = ns_raw.trim();
+                if !ns.is_empty() {
+                    if ns.split(',').any(|seg| seg.trim().contains('*')) {
+                        return r#"{"status":"error","message":"namespace 不得包含通配符 *"}"#
+                            .to_string();
+                    }
+                    if auth::is_write_sealed(ns) {
+                        return r#"{"status":"error","message":"namespace 指向只读封存区，禁止注册"}"#
+                            .to_string();
+                    }
+                    let caller_admin =
+                        _auth.role == "admin" || _auth.allowed_ns.iter().any(|s| s == "*");
+                    if !caller_admin {
+                        if let Err(e) = auth::check_ns_write(&_auth, ns) {
+                            return format!(r#"{{"status":"error","message":"越权: {}"}}"#, e);
+                        }
+                    }
+                }
+            }
             match auth::register_user(
                 &state.auth_pool,
                 user_id,
