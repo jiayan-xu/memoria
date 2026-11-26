@@ -203,9 +203,51 @@ def parse_tags(tags):
 
 
 def extract_content_query(content):
-    """正文关键词查询：统一取规范化正文前 40 字，不再受 tags 质量影响。"""
-    c = re.sub(r"\s+", " ", (content or "").strip())
-    return c[:40]
+    """正文关键词查询：取规范化正文前 40 字，不受 tags 质量影响。
+
+    2026-11-26 修复：注入了文档元数据头的记忆（[文档块 x/y] / [文档]）前 40 字
+    全是文件名、类型、字符数、章节名等元数据，零正文语义 → 关键词查询必然召回
+    不到自身，是 11/21 起正文关键词@5 连续假阳性的根因（文档块类样本 kw@5 仅
+    6/38，剔除后 71%）。这里先剥离元数据头，再跳过标题/引用等结构行取第一条
+    实质正文，保证查询与真实用户输入一致。普通记忆行为不变。
+    """
+    c = (content or "").strip()
+    if is_document_content(c):
+        c = strip_document_header(c)
+    return re.sub(r"\s+", " ", c.strip())[:40]
+
+
+def is_document_content(content):
+    """识别注入了文档元数据头的记忆：文档块或整文档。"""
+    c = (content or "").lstrip()
+    return c.startswith("[文档块") or c.startswith("[文档]")
+
+
+def strip_document_header(content):
+    """剥离文档元数据头，取第一条实质正文行作为查询源。
+
+    覆盖两种注入格式：
+      - [文档块 x/y] path · title › section  →  头部整行 + ## 章节标题跳过
+      - [文档] path\\n类型/字符/分块/路径\\n---  →  --- 之前全部跳过
+    再跳过 # 标题行（跨文档重复的章节名无区分度）与空行/纯符号行，对 > 引用、
+    - 列表、数字序号剥前缀后取第一条正文；**加粗标记**一并清除。
+    """
+    c = (content or "").strip()
+    if c.startswith("[文档块"):
+        c = re.sub(r"^\[文档块\s+\d+/\d+\][^\n]*\n?", "", c, count=1).strip()
+    elif c.startswith("[文档]"):
+        marker = c.find("\n---\n")
+        if marker != -1:
+            c = c[marker + len("\n---\n"):].strip()
+    for line in c.splitlines():
+        s = line.strip()
+        if not s or s.startswith("#") or set(s) <= set("-*_> "):
+            continue
+        s = re.sub(r"^(?:>\s*|[-*+]\s+|\d+\.\s+|•\s+)", "", s).strip()
+        s = s.replace("**", "").strip()
+        if s:
+            return s
+    return c
 
 
 def extract_tag_query(tags):
